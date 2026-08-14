@@ -151,6 +151,7 @@ Failed attempts stay in operational logs rather than the product model.
 | --- | --- | --- |
 | `id` | `uuid` | Primary key and receipt ID |
 | `workspace_id` | `uuid` | FK to `workspaces` |
+| `person_id` | `uuid` | Immutable composite FK to `people` |
 | `collector_key` | `text` | Source installation/device |
 | `observed_native_session_id` | `text` | Nullable immutable collector hint |
 | `source_kind` | `text` | `rollout`, `hook`, or `collector` |
@@ -187,8 +188,14 @@ enforces one generation key per sequence and one sequence per key. Truncation
 or replacement starts the next `generation_seq`; opaque generation keys are
 never sorted lexically.
 
-There is deliberately no resolved `session_id` here. Source receipts remain
-immutable; versioned events own semantic session attribution.
+`person_id` is the server-authenticated attribution at receipt time. It is not
+taken from the collector payload or recomputed from later credential
+configuration. There is deliberately no resolved `session_id` here. Source
+receipts remain immutable; versioned events own semantic session attribution.
+
+The first committed batch for a native session fixes `sessions.person_id`.
+Later batches with conflicting person attribution are normalization errors and
+cannot silently rewrite that cache.
 
 ### `telemetry.native_records`
 
@@ -593,6 +600,7 @@ sessions(workspace_id, parent_session_id, started_at, id)
 ingest_batches(workspace_id, collector_key, source_kind, source_stream_key,
                generation_seq, generation_key, start_offset, end_offset) unique
 ingest_batches(workspace_id, id) unique
+ingest_batches(workspace_id, person_id, committed_at, id)
 
 native_records(batch_id, source_start_offset) unique
 native_records(workspace_id, occurred_at, id)
@@ -637,7 +645,9 @@ workspaces/{workspace_id}/collectors/{collector_key}/
 ```
 
 External Storage I/O never runs inside a database transaction or while holding
-an advisory lock. The ingest path is:
+an advisory lock. The collector durably spools the encoded object once and
+reuses those exact stored bytes for every retry; it never recompresses the same
+source range. The ingest path is:
 
 1. Check for an existing committed batch. An exact identity, range, and hash
    match returns its receipt immediately.
@@ -669,6 +679,7 @@ receipt_version
 status = 'committed'
 batch_id
 workspace_id
+person_id
 collector_key
 source_kind
 source_stream_key
@@ -703,10 +714,10 @@ application, ingest, and normalizer services.
 
 V0 uses one server-owned ingest credential or an environment-configured
 collector allowlist. After authenticating a request, the ingest server derives
-`workspace_id`, `person_id`, and the permitted `collector_key`; it never trusts
-those values from the collector envelope. The Codex plugin receives only its
-scoped ingest credential. It never receives a Supabase secret/service-role key
-or a direct database credential.
+`workspace_id`, `person_id`, and the permitted `collector_key`, and persists
+them on the batch; it never trusts those values from the collector envelope.
+The Codex plugin receives only its scoped ingest credential. It never receives
+a Supabase secret/service-role key or a direct database credential.
 
 Database grants seal the normalization contract:
 
@@ -772,6 +783,8 @@ write isolation.
   collector retains its spool item until every receipt identity field matches.
 - Spoofed workspace, person, or collector identifiers are ignored or rejected;
   the authenticated server mapping supplies the persisted values.
+- Later credential remapping cannot change historical batch attribution, and a
+  conflicting person for the same native session cannot rewrite its cache.
 - Invalid enum values, hashes, ranges, wall bounds, usage fields, collector
   offsets, JSON/excerpt sizes, and tombstone shapes fail their database
   constraints.
