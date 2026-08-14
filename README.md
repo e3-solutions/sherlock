@@ -3,5 +3,9 @@
 Codex session telemetry for team-wide activity analysis, starting with a
 correct, auditable Flame graph.
 
-The deliberately small v0 source-of-truth contract is documented in
-[docs/data-schema.md](docs/data-schema.md).
+The Supabase database foundation is implemented; the collector drain and
+product read paths are next.
+
+- [Data architecture and drain contract](docs/data-schema.md)
+- [Canonical database migration](supabase/migrations/20260814225047_initial_sherlock_schema.sql)
+- [Database verification](supabase/tests/database/schema.test.sql)
