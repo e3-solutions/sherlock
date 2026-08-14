@@ -14,7 +14,7 @@ flowchart LR
     C["Codex collector"] --> O["Immutable source objects"]
     O --> R["Batch receipts and native records"]
     R --> E["Versioned normalized events"]
-    E --> A["Versioned activity reducer"]
+    E --> A["Versioned activity spans"]
     A --> F["Flame API"]
     E --> M["Future MCP"]
     O --> T["Transcript reader"]
@@ -22,13 +22,14 @@ flowchart LR
 
 - Object storage keeps the complete immutable Codex evidence.
 - Postgres indexes source bytes and their versioned semantic interpretation.
-- Flame intervals, frames, summaries, and MCP responses are derived results.
+- Activity spans are a rebuildable projection. Flame frames, summaries, and
+  MCP responses remain derived results.
 - Expensive read results may be cached by snapshot token and query parameters;
   they are not new facts.
 
 ## Complexity budget
 
-V0 has **six tables**:
+V0 has **seven tables**:
 
 1. `telemetry.workspaces`
 2. `telemetry.people`
@@ -36,9 +37,10 @@ V0 has **six tables**:
 4. `telemetry.ingest_batches`
 5. `telemetry.native_records`
 6. `telemetry.events`
+7. `analytics.activity_spans`
 
-It has at most four supported read contracts. A seventh table requires a
-measured workload or a query that these six cannot answer correctly.
+It has at most four supported read contracts. An eighth table requires a
+measured workload or a query that these seven cannot answer correctly.
 
 V0 intentionally has:
 
@@ -46,8 +48,9 @@ V0 intentionally has:
   classification tables;
 - one sparse typed `events` table for messages, tools, usage, lifecycle,
   presence, heartbeats, and stream watermarks;
-- no triggers, partitions, materialized spans, stored Flame buckets, or daily
+- one append-only activity-span projection, not stored Flame buckets or daily
   aggregates;
+- no triggers, partitions, or build/snapshot tables;
 - no permission, incident, project, provider, search, recommendation, or
   MCP-specific tables.
 
@@ -61,8 +64,9 @@ V0 intentionally has:
 - Hashes are lowercase hexadecimal SHA-256.
 - Complete prompts, messages, reasoning, tool payloads, and native JSON never
   live in Postgres.
-- `ingest_batches`, `native_records`, and `events` are append-only.
-  Re-normalization appends a new version; it never rewrites old facts.
+- `ingest_batches`, `native_records`, `events`, and `activity_spans` are
+  append-only. Re-normalization and span correction append new versions; they
+  never rewrite old facts.
 - Every foreign key is indexed. Repeated `workspace_id` values use composite
   foreign keys so child and parent workspaces cannot disagree.
 - JSONB is limited to small labels that are not used by core queries.
@@ -277,6 +281,70 @@ report observed size, locally captured offset, and last acknowledged committed
 offset. Normalized coverage is derived from native records and sentinel events;
 the client does not claim it.
 
+### `analytics.activity_spans`
+
+An append-only, rebuildable projection of intervals during which one session
+was active or merely detected as open. Flame reads spans instead of repeatedly
+reconstructing lifecycle and tool pairs from events.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `bigint` | Identity primary key |
+| `workspace_id` | `uuid` | Composite tenant FK |
+| `session_id` | `uuid` | Composite FK to `sessions` |
+| `person_id` | `uuid` | Copied composite FK to `people` |
+| `span_key` | `text` | Stable logical interval key |
+| `activity_version` | `text` | Reducer algorithm version |
+| `valid_from_event_id` | `bigint` | Composite event FK that introduced this version |
+| `started_at` | `timestamptz` | Nullable only for a tombstone |
+| `ended_at` | `timestamptz` | Nullable only for a tombstone; exclusive |
+| `span_state` | `text` | `active` or `detected_open` |
+| `activity_kind` | `text` | `turn`, `tool`, `point`, `hook_tail`, or `presence` |
+| `timing_basis` | `text` | `lifecycle`, `native_duration`, `paired_events`, `point`, or `provisional` |
+| `confidence` | `text` | `exact` or `inferred` |
+| `estimated_start` | `boolean` | Required |
+| `estimated_end` | `boolean` | Required |
+| `actor_role` | `text` | Role under this activity version |
+| `project_key` | `text` | Nullable event-time grouping |
+| `start_event_id` | `bigint` | Nullable composite evidence FK |
+| `end_event_id` | `bigint` | Nullable composite evidence FK |
+| `is_tombstone` | `boolean` | Removes an earlier span at this cutoff |
+| `created_at` | `timestamptz` | Required |
+
+Unique:
+
+`(workspace_id, activity_version, span_key, valid_from_event_id)`.
+
+`span_key` identifies the same logical interval across corrections. A tool-call
+point and the later exact call/result interval therefore share a key. The later
+row replaces the earlier row for newer snapshots without deleting audit
+history. A tombstone removes an interval that later evidence proves should not
+exist. Non-tombstones require `ended_at > started_at`; tombstones require both
+times to be null. All cited events must belong to the same workspace and
+session and have IDs at or below `valid_from_event_id`.
+
+For a snapshot, select the greatest `valid_from_event_id <= event_cutoff_id`
+for each `(activity_version, span_key)`, then discard tombstones and intervals
+outside the requested window. To keep this bounded, first find span keys with
+any historical version overlapping the window, then use the span-key/version
+index to fetch their latest eligible rows.
+
+When normalization commits a record's events, the activity reducer recomputes
+every affected `span_key` and inserts any new span versions in that same
+transaction while holding the workspace lock. `valid_from_event_id` is the
+greatest triggering event ID. Thus an event cutoff can never expose an event
+without its corresponding current span version.
+
+Only fully backfilled activity versions become active. To introduce a new
+version, rebuild it from the selected canonical events, validate it through the
+acceptance suite, then atomically switch the server's active version. Existing
+tokens keep their old version and remain reproducible while those span rows are
+retained.
+
+Spans copy the person, role, and event-time project dimensions required by the
+graph so Flame does not depend on mutable session caches. They remain derived:
+the selected events and `activity_version` can rebuild them completely.
+
 ## Immutable query snapshots
 
 The first read resolves a signed snapshot token containing:
@@ -291,12 +359,12 @@ issued_at
 ```
 
 No snapshot table is required. Correct cutoffs use a short per-workspace
-advisory transaction lock shared by batch registration, event projection, and
-snapshot resolution:
+advisory transaction lock shared by batch registration, event-and-span
+projection, and snapshot resolution:
 
 1. Writers acquire the lock before allocating record or event IDs.
-2. The normalizer version is immutable and emits at least one projection per
-   selected record.
+2. The normalizer version is immutable, emits at least one projection per
+   selected record, and writes affected span versions in the same transaction.
 3. While holding the lock, the resolver chooses the greatest contiguous record
    cutoff for which every record has a sealed projection set, then the matching
    event cutoff.
@@ -313,11 +381,15 @@ transcript, usage, health, and coverage reads apply this same fence. Clients
 cannot forge or widen a token. A cache key includes the complete token plus
 canonical query parameters.
 
+Every selected span must match the token's workspace and `activity_version`.
+Its `valid_from_event_id` must be at or below the event cutoff, and the latest
+eligible version of its `span_key` wins. New evidence can append corrected
+spans but cannot change the result of an older token.
+
 ## Activity reducer and Flame contract
 
-The `activity_version` names deterministic service code that converts selected
-canonical events into half-open activity intervals. Persist this code and its
-tests, not its output rows.
+The `activity_version` names deterministic service code that converts canonical
+events into the versioned half-open intervals stored in `activity_spans`.
 
 Derivation order is:
 
@@ -353,9 +425,9 @@ All Flame windows are `[start_at, end_at)`:
   reported as partial, not guessed.
 
 The Flame UI chooses display resolution, including ten-minute frames. Frames
-are never stored as telemetry facts. If measured read cost becomes material,
-the first optimization is a bounded cache. Persisted versioned spans are added
-only after that cache proves insufficient.
+are never stored as telemetry facts. Window queries read the latest eligible
+span version per key, then union intervals and calculate buckets, concurrency,
+and peaks. The completed response may still be cached by snapshot and query.
 
 ## Supported read contracts
 
@@ -415,6 +487,16 @@ events(workspace_id, related_session_id, occurred_at, id)
   where related_session_id is not null
 events(workspace_id, collector_key, server_received_at desc, id desc)
   where event_kind in ('collector_heartbeat', 'stream_watermark')
+
+activity_spans(workspace_id, activity_version, span_key,
+               valid_from_event_id desc) unique
+activity_spans(workspace_id, activity_version, started_at, ended_at, span_key)
+  where is_tombstone = false
+activity_spans(workspace_id, session_id, activity_version, started_at, id)
+activity_spans(workspace_id, person_id, activity_version, started_at, id)
+activity_spans(workspace_id, valid_from_event_id)
+activity_spans(workspace_id, start_event_id) where start_event_id is not null
+activity_spans(workspace_id, end_event_id) where end_event_id is not null
 ```
 
 Use keyset pagination with `(occurred_at, id)`. Do not partition until fact
@@ -450,7 +532,7 @@ semantic session or parent.
 
 - authentication, roles, RLS policies, and membership history;
 - separate installations, threads, runs, generic edges, and claim tables;
-- activity-span, frame, daily aggregate, and snapshot tables;
+- frame, daily aggregate, build, and snapshot tables;
 - editable project and repository catalogs;
 - incident and alert persistence;
 - multi-provider normalization;
@@ -469,6 +551,9 @@ and RLS remain separate concerns.
 - Exact lifecycle bounds, suspension-aware end-aligned duration, paired
   call/result, missing-pair one-second point, capped hook tail, and passive-only
   presence.
+- A one-second provisional span is replaced by an exact span under the same
+  `span_key`; the old snapshot retains the point and the new snapshot sees the
+  exact interval.
 - Fork replay and hook/rollout duplicates remain in source evidence but count
   once in activity, prompt, and usage results.
 - A delegation wrapper with native user role does not count as a human prompt;
