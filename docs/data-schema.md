@@ -1,707 +1,495 @@
-# Sherlock Data Schema
+# Sherlock v0 Data Architecture
 
-Status: proposed source-of-truth contract for v0.
+Status: proposed source-of-truth contract for the first Sherlock product.
 
-This document defines the durable data model for Sherlock. It is intentionally
-product-agnostic: dashboards, flame graphs, alerts, exports, and future analyses
-must be derived from these facts rather than becoming new sources of truth.
+Sherlock v0 tracks Codex sessions and powers a correct rebuild of the Flame
+graph. It is deliberately not a general telemetry platform yet.
 
-## Goals
+## Decision
 
-- Preserve every supported agent thread, subagent, prompt, message, tool event,
-  usage observation, lifecycle event, and unknown native record.
-- Make every indexed fact traceable to exact immutable source bytes.
-- Make root/parent/spawn lineage and activity ownership explicit.
-- Distinguish agent silence from collector, capture, upload, and normalization
-  failures using independent heartbeats and per-run watermarks.
-- Keep Postgres small and fast by storing complete transcript bodies and native
-  payloads in object storage.
-- Keep labels controlled, versioned, understandable, and forward-compatible.
-- Support live views and arbitrary historical analysis from the same facts.
-- Allow new collectors, normalizers, incident rules, and product views without
-  rewriting raw history.
-
-## Non-goals
-
-- Ten-minute windows, flame buckets, and UI groupings are not stored facts.
-- Postgres is not the transcript warehouse.
-- A recent message does not prove an agent is active.
-- A missing message does not prove an agent or collector is stalled.
-- Unknown native records are not dropped or coerced into a known type.
-
-## System boundaries
+Use three layers and keep product output out of the database:
 
 ```mermaid
 flowchart LR
-    C["Collector and local drain"] --> S["Immutable Storage objects"]
-    C --> B["Ingest batch ledger"]
-    S --> B
-    B --> R["Thin record facts"]
-    C --> H["Heartbeats and run watermarks"]
-    R --> I["Versioned incident derivation"]
-    H --> I
-    B --> I
-    R --> V["Versioned analytical views"]
-    H --> V
-    I --> V
-    V --> P["Dashboard, exports, and future products"]
+    C["Codex collector"] --> O["Immutable source objects"]
+    O --> R["Batch receipts and native records"]
+    R --> E["Versioned normalized events"]
+    E --> A["Versioned activity reducer"]
+    A --> F["Flame API"]
+    E --> M["Future MCP"]
+    O --> T["Transcript reader"]
 ```
 
-Storage owns complete evidence. Postgres owns identity, lineage, delivery
-receipts, compact analytical facts, health observations, and evidence-backed
-incident assertions.
+- Object storage keeps the complete immutable Codex evidence.
+- Postgres indexes source bytes and their versioned semantic interpretation.
+- Flame intervals, frames, summaries, and MCP responses are derived results.
+- Expensive read results may be cached by snapshot token and query parameters;
+  they are not new facts.
 
-## Database organization
+## Complexity budget
 
-- `telemetry`: durable fact tables.
-- `analytics`: versioned views and optional rebuildable materializations.
-- `private`: internal ingest functions and operational helpers that must not be
-  exposed through the Data API.
+V0 has **six tables**:
 
-All exposed tables use explicit grants and RLS. Exposed views must use
-`security_invoker = true`. Product code should prefer `analytics` views and a
-transcript-reading API over direct access to telemetry tables.
+1. `telemetry.workspaces`
+2. `telemetry.people`
+3. `telemetry.sessions`
+4. `telemetry.ingest_batches`
+5. `telemetry.native_records`
+6. `telemetry.events`
 
-## Entity overview
+It has at most four supported read contracts. A seventh table requires a
+measured workload or a query that these six cannot answer correctly.
 
-```mermaid
-erDiagram
-    WORKSPACES ||--o{ WORKSPACE_MEMBERS : contains
-    WORKSPACE_MEMBERS ||--o{ AGENT_INSTALLATIONS : owns
-    WORKSPACE_MEMBERS ||--o{ AGENT_THREADS : initiates
-    AGENT_THREADS ||--o{ AGENT_THREADS : parents
-    AGENT_THREADS ||--o{ AGENT_RUNS : executes
-    AGENT_RUNS ||--o{ AGENT_RUNS : spawns
-    AGENT_INSTALLATIONS ||--o{ AGENT_RUNS : runs
-    AGENT_RUNS ||--o{ INGEST_BATCHES : delivers
-    INGEST_BATCHES ||--o{ AGENT_RECORDS : indexes
-    AGENT_INSTALLATIONS ||--o{ COLLECTOR_HEARTBEATS : emits
-    COLLECTOR_HEARTBEATS ||--o{ RUN_WATERMARKS : reports
-    AGENT_RUNS ||--o{ RUN_WATERMARKS : measures
-    AGENT_RUNS ||--o{ AGENT_INCIDENTS : affects
-    INGEST_BATCHES ||--o{ AGENT_INCIDENTS : evidences
-    AGENT_RECORDS ||--o{ AGENT_INCIDENTS : evidences
-```
+V0 intentionally has:
 
-## Common conventions
+- one `sessions` table, not separate thread, run, edge, installation, and
+  classification tables;
+- one sparse typed `events` table for messages, tools, usage, lifecycle,
+  presence, heartbeats, and stream watermarks;
+- no triggers, partitions, materialized spans, stored Flame buckets, or daily
+  aggregates;
+- no permission, incident, project, provider, search, recommendation, or
+  MCP-specific tables.
 
-- Entity identifiers use `uuid`.
-- High-volume append-only fact identifiers may use `bigint generated always as
-  identity`.
-- All timestamps use `timestamptz`.
-- Text uses `text` plus explicit checks where controlled values are required.
-- Byte offsets use zero-based, half-open ranges: `[start_offset, end_offset)`.
-- Source offsets always refer to the uncompressed native source stream.
-- Hashes use lowercase hexadecimal SHA-256.
-- `workspace_id` is repeated on tenant-owned rows so common queries and RLS do
-  not require parent-table lookups.
-- Tenant-owned relationships use composite foreign keys such as
-  `(workspace_id, run_id) -> agent_runs(workspace_id, id)` so a globally valid
-  UUID cannot create a cross-workspace relationship.
-- Foreign-key columns must be indexed.
-- Controlled values are enforced with checks or small reference dictionaries;
-  arbitrary new strings must not silently fragment analytical categories.
-- Large or complete native payloads never appear in Postgres JSONB columns.
-- Small extensibility JSON is allowed only where documented and must be bounded.
-- Rows retain client observation time and server receipt time separately.
+## Conventions
 
-## Core tables
+- Entity IDs are UUIDs. High-volume append-only fact IDs are identity
+  `bigint`s.
+- All times are `timestamptz`. Source, collector-observed, and server-received
+  times stay distinct.
+- Time and byte ranges are half-open: `[start, end)`.
+- Hashes are lowercase hexadecimal SHA-256.
+- Complete prompts, messages, reasoning, tool payloads, and native JSON never
+  live in Postgres.
+- `ingest_batches`, `native_records`, and `events` are append-only.
+  Re-normalization appends a new version; it never rewrites old facts.
+- Every foreign key is indexed. Repeated `workspace_id` values use composite
+  foreign keys so child and parent workspaces cannot disagree.
+- JSONB is limited to small labels that are not used by core queries.
+- Codex is the only provider in v0. Generalize after a second provider supplies
+  real requirements.
+
+## Tables
 
 ### `telemetry.workspaces`
 
-One tenant and analysis boundary.
+A lightweight team and query boundary. V0 can contain one row; this is not a
+permission model.
 
-| Column | Type | Rules |
+| Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` | Primary key |
-| `slug` | `text` | Unique, stable machine name |
-| `name` | `text` | Human-readable name |
+| `slug` | `text` | Unique stable key |
+| `name` | `text` | Display name |
 | `created_at` | `timestamptz` | Required |
-| `updated_at` | `timestamptz` | Required |
 
-### `telemetry.workspace_members`
+### `telemetry.people`
 
-One person inside a workspace. This table is both the attribution anchor and
-the workspace authorization membership. `auth_user_id` may be attached later;
-telemetry can begin with a stable external identity.
+The stable human attribution used for team-wide and person-wide statistics.
 
-| Column | Type | Rules |
+| Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` | Primary key |
 | `workspace_id` | `uuid` | FK to `workspaces` |
-| `auth_user_id` | `uuid` | Nullable FK to `auth.users` |
-| `identity_key` | `text` | Stable collector identity within workspace |
+| `identity_key` | `text` | Stable collector identity |
 | `display_name` | `text` | Nullable |
 | `email` | `text` | Nullable normalized email |
-| `role` | `text` | `owner`, `admin`, or `analyst` |
-| `status` | `text` | `active` or `inactive` |
 | `created_at` | `timestamptz` | Required |
-| `updated_at` | `timestamptz` | Required |
 
-Required uniqueness:
+Unique: `(workspace_id, identity_key)` and `(workspace_id, id)`.
 
-- `(workspace_id, identity_key)`
-- `(workspace_id, auth_user_id)` when `auth_user_id` is not null
+### `telemetry.sessions`
 
-### `telemetry.agent_installations`
+One row is one native Codex execution stream. A primary task and every worker
+are separate sessions.
 
-One installed collector/device. Mutable version and health fields are current
-caches only; historical proof lives on batches and heartbeats.
-
-| Column | Type | Rules |
-| --- | --- | --- |
-| `id` | `uuid` | Primary key; generated once by the collector |
-| `workspace_id` | `uuid` | FK to `workspaces` |
-| `member_id` | `uuid` | FK to `workspace_members` |
-| `installation_key` | `text` | Unique within workspace |
-| `hostname` | `text` | Nullable |
-| `local_username` | `text` | Nullable |
-| `os_name` | `text` | Nullable |
-| `architecture` | `text` | Nullable |
-| `current_codex_version` | `text` | Nullable cache |
-| `current_plugin_version` | `text` | Nullable cache |
-| `current_contract_version` | `text` | Nullable cache |
-| `last_heartbeat_at` | `timestamptz` | Nullable server receipt time |
-| `last_error_code` | `text` | Nullable cache |
-| `created_at` | `timestamptz` | Required |
-| `updated_at` | `timestamptz` | Required |
-
-Required uniqueness: `(workspace_id, installation_key)`.
-
-### `telemetry.agent_threads`
-
-One durable native conversation. A main thread may contain resumed executions;
-a subagent may have its own native thread linked to the thread that spawned it.
-The dashboard lists root threads and recursively includes descendants.
-
-| Column | Type | Rules |
+| Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` | Primary key |
 | `workspace_id` | `uuid` | FK to `workspaces` |
-| `member_id` | `uuid` | Immutable attribution FK |
-| `provider` | `text` | Initially `codex`; open to future collectors |
-| `native_thread_id` | `text` | Native durable identifier |
-| `root_thread_id` | `uuid` | Self FK; root uses its own ID |
-| `parent_thread_id` | `uuid` | Nullable self FK |
-| `thread_kind` | `text` | `main`, `subagent`, or `unknown` |
-| `title` | `text` | Nullable |
-| `repo_remote` | `text` | Nullable; never an admission filter |
-| `repo_name` | `text` | Nullable normalized label |
-| `branch` | `text` | Nullable |
-| `started_at` | `timestamptz` | First known native activity |
-| `last_activity_at` | `timestamptz` | Latest source activity cache |
-| `archived_at` | `timestamptz` | Nullable native archive time |
+| `person_id` | `uuid` | Composite FK to `people` |
+| `collector_key` | `text` | Stable installation/device key |
+| `native_session_id` | `text` | Codex execution identifier |
+| `native_thread_id` | `text` | Nullable conversation/resume grouping |
+| `parent_session_id` | `uuid` | Nullable resolved self FK cache |
+| `parent_native_session_id` | `text` | Nullable child-first parent evidence |
+| `actor_role` | `text` | Current `primary`, `worker`, `guardian`, `automation`, or `unknown` cache |
+| `role_version` | `text` | Current classifier version cache |
+| `title` | `text` | Nullable current label |
+| `project_key` | `text` | Nullable current repo/path grouping |
+| `repo_remote` | `text` | Nullable current context |
+| `branch` | `text` | Nullable current context |
+| `cwd` | `text` | Nullable current context |
+| `model` | `text` | Nullable current context |
+| `started_at` | `timestamptz` | First known source activity cache |
+| `ended_at` | `timestamptz` | Nullable explicit end cache |
 | `created_at` | `timestamptz` | Required |
 | `updated_at` | `timestamptz` | Required |
 
-Required uniqueness: `(workspace_id, provider, native_thread_id)`.
+Unique: `(workspace_id, collector_key, native_session_id)` and
+`(workspace_id, id)`.
 
-Thread parents may arrive after child threads. Ingestion creates explicit
-lineage stubs or defers FK validation; it must not discard child-first data.
+A resume with the same native session ID remains the same row and appears as
+lifecycle events. If Codex emits a new session ID, it becomes a new row that can
+share `native_thread_id` with the earlier execution.
 
-### `telemetry.agent_runs`
-
-One observed agent execution or activation within a thread. Main agents,
-resumed executions, and subagents are separate rows. Parent and spawn evidence
-identify who spawned each subagent.
-
-| Column | Type | Rules |
-| --- | --- | --- |
-| `id` | `uuid` | Primary key |
-| `workspace_id` | `uuid` | FK to `workspaces` |
-| `thread_id` | `uuid` | FK to `agent_threads` |
-| `installation_id` | `uuid` | FK to `agent_installations` |
-| `member_id` | `uuid` | Immutable activity attribution FK |
-| `provider` | `text` | Initially `codex` |
-| `native_run_id` | `text` | Native runtime/session identifier |
-| `root_run_id` | `uuid` | Self FK; execution-tree root uses its own ID |
-| `parent_run_id` | `uuid` | Nullable self FK |
-| `spawn_record_id` | `bigint` | Nullable FK to exact spawn record |
-| `agent_role` | `text` | `main`, `subagent`, or `unknown` |
-| `lineage_source` | `text` | Native, hook, rollout, or inferred source |
-| `lineage_confidence` | `text` | `exact`, `inferred`, or `missing` |
-| `lifecycle_state` | `text` | `starting`, `running`, `waiting`, `ended`, `failed`, or `unknown` |
-| `default_model` | `text` | Nullable |
-| `started_at` | `timestamptz` | Required source time |
-| `last_activity_at` | `timestamptz` | Nullable source activity cache |
-| `ended_at` | `timestamptz` | Nullable explicit end time |
-| `created_at` | `timestamptz` | Required |
-| `updated_at` | `timestamptz` | Required |
-
-Required uniqueness: `(workspace_id, provider, native_run_id)`.
-
-Parent rows may arrive after children. Ingestion creates explicit lineage stubs
-or defers FK validation; it must not discard child-first telemetry.
+`parent_native_session_id` preserves child-before-parent evidence. Resolved
+parent, role, title, and repository fields are current caches only. Snapshot
+queries derive lineage, role, and event-time project context from selected
+events, so later cache updates cannot change an existing result.
 
 ### `telemetry.ingest_batches`
 
-The authoritative proof-of-delivery ledger. One row represents one immutable
-native source range and one immutable Storage object.
+One immutable, successfully committed source chunk and its object receipt.
+Failed attempts stay in operational logs rather than the product model.
 
-| Column | Type | Rules |
+| Column | Type | Notes |
 | --- | --- | --- |
-| `id` | `uuid` | Primary key and receipt identifier |
+| `id` | `uuid` | Primary key and receipt ID |
 | `workspace_id` | `uuid` | FK to `workspaces` |
-| `installation_id` | `uuid` | FK to `agent_installations` |
-| `thread_id` | `uuid` | FK to `agent_threads` |
-| `run_id` | `uuid` | FK to `agent_runs` |
-| `source_kind` | `text` | `codex_rollout`, `codex_hook`, `collector`, or future native source |
-| `source_stream_id` | `text` | Stable identifier for one append-only source stream |
-| `file_generation` | `text` | Changes on truncation/replacement/rewrite |
-| `start_offset` | `bigint` | Inclusive native byte offset |
-| `end_offset` | `bigint` | Exclusive native byte offset |
-| `source_byte_count` | `bigint` | Must equal `end_offset - start_offset` |
-| `source_sha256` | `text` | Hash of uncompressed native bytes |
-| `storage_bucket` | `text` | Required |
-| `storage_path` | `text` | Unique immutable path |
-| `storage_encoding` | `text` | Initially `gzip` or `identity` |
+| `collector_key` | `text` | Source installation/device |
+| `observed_native_session_id` | `text` | Nullable immutable collector hint |
+| `source_kind` | `text` | `rollout`, `hook`, or `collector` |
+| `source_stream_key` | `text` | Stable key within source kind |
+| `generation_key` | `text` | Immutable native generation identity |
+| `generation_seq` | `bigint` | Monotonic order within the stream |
+| `start_offset` | `bigint` | Inclusive uncompressed source offset |
+| `end_offset` | `bigint` | Exclusive uncompressed source offset |
+| `source_byte_count` | `bigint` | Equals `end_offset - start_offset` |
+| `source_sha256` | `text` | Hash of uncompressed source bytes |
+| `storage_path` | `text` | Unique immutable object path |
+| `storage_encoding` | `text` | `gzip` or `identity` |
 | `stored_byte_count` | `bigint` | Encoded object size |
-| `stored_sha256` | `text` | Hash of exact stored object bytes |
-| `delivery_status` | `text` | `reserved`, `uploaded`, `committed`, or `rejected` |
-| `expected_record_count` | `integer` | Native JSONL records beginning in this range |
-| `indexed_record_count` | `integer` | Known plus unknown record rows |
-| `unknown_record_count` | `integer` | Indexed unknown native records |
-| `parse_error_count` | `integer` | Records preserved but not parseable |
-| `first_event_at` | `timestamptz` | Nullable source time |
-| `last_event_at` | `timestamptz` | Nullable source time |
-| `codex_version` | `text` | Exact version reported for this batch |
-| `plugin_version` | `text` | Exact version that captured this batch |
-| `contract_version` | `text` | Upload envelope version |
-| `normalizer_version` | `text` | Labeling/parser version used at ingest time |
-| `reserved_at` | `timestamptz` | Nullable |
-| `uploaded_at` | `timestamptz` | Nullable |
-| `committed_at` | `timestamptz` | Nullable |
-| `rejected_at` | `timestamptz` | Nullable |
-| `created_at` | `timestamptz` | Required |
-
-Required uniqueness:
-
-- `(run_id, source_kind, source_stream_id, file_generation, start_offset, end_offset)`
-- `(storage_bucket, storage_path)`
-
-Conflicting overlapping ranges are rejected under a per-source-stream
-transaction lock. Gaps may exist temporarily during out-of-order delivery but
-must remain visible in coverage views.
-
-### `telemetry.agent_records`
-
-A compact, append-only analytical index. It never contains a complete prompt,
-message, reasoning body, tool input/result, attachment, or native JSON payload.
-
-| Column | Type | Rules |
-| --- | --- | --- |
-| `id` | `bigint` | Identity primary key |
-| `workspace_id` | `uuid` | FK to `workspaces` |
-| `thread_id` | `uuid` | FK to `agent_threads` |
-| `run_id` | `uuid` | FK to `agent_runs` |
-| `batch_id` | `uuid` | FK to batch containing the record's first byte |
-| `source_kind` | `text` | Native observation source |
-| `source_record_key` | `text` | Stable identity of original observation |
-| `logical_event_key` | `text` | Groups equivalent hook/rollout observations |
-| `source_priority` | `smallint` | Higher value is more authoritative |
-| `dedupe_confidence` | `text` | `exact`, `probable`, or `unknown` |
-| `superseded_by_record_id` | `bigint` | Nullable self FK |
-| `record_kind` | `text` | Controlled canonical kind |
-| `record_subtype` | `text` | Nullable finer label |
-| `occurred_at` | `timestamptz` | Native/source event time |
-| `observed_at` | `timestamptz` | Collector observation time |
-| `ingested_at` | `timestamptz` | Server receipt time |
-| `normalized_at` | `timestamptz` | Labeling completion time |
-| `message_role` | `text` | Nullable native role |
-| `message_origin` | `text` | Controlled semantic origin |
-| `turn_id` | `text` | Nullable |
-| `parent_record_id` | `bigint` | Nullable self FK |
-| `related_run_id` | `uuid` | Nullable FK for spawn/message relationships |
-| `tool_call_id` | `text` | Nullable |
-| `tool_name` | `text` | Nullable |
-| `tool_status` | `text` | Nullable controlled label |
-| `model` | `text` | Nullable |
-| `usage_stream_key` | `text` | Nullable counter-stream identity |
-| `usage_scope` | `text` | Nullable |
-| `usage_is_cumulative` | `boolean` | Nullable |
-| `input_tokens` | `bigint` | Nullable, nonnegative |
-| `cached_input_tokens` | `bigint` | Nullable, nonnegative |
-| `output_tokens` | `bigint` | Nullable, nonnegative |
-| `reasoning_tokens` | `bigint` | Nullable, nonnegative |
-| `total_tokens` | `bigint` | Nullable, nonnegative |
-| `native_type` | `text` | Nullable exact native label |
-| `native_payload_type` | `text` | Nullable exact native payload label |
-| `source_generation` | `text` | Required for native stream records |
-| `source_start_offset` | `bigint` | Inclusive native record offset |
-| `source_end_offset` | `bigint` | Exclusive native record offset |
-| `source_record_index` | `integer` | Stable order within generation |
-| `source_record_sha256` | `text` | Hash of exact native record bytes |
-| `content_sha256` | `text` | Nullable semantic content hash |
-| `content_byte_size` | `bigint` | Nullable complete content size |
-| `content_excerpt` | `text` | Nullable, explicitly truncated to at most 1 KiB |
-| `attributes` | `jsonb` | Small labels only; object and at most 8 KiB |
-| `normalizer_version` | `text` | Required |
-| `created_at` | `timestamptz` | Required |
-
-Required uniqueness:
-
-`(run_id, source_kind, source_record_key, normalizer_version)`
-
-Recommended `record_kind` values:
-
-- `message`
-- `reasoning`
-- `tool_call`
-- `tool_result`
-- `agent_spawn`
-- `agent_message`
-- `usage`
-- `lifecycle`
-- `error`
-- `unknown`
-
-Recommended `message_origin` values:
-
-- `human`
-- `parent_agent`
-- `subagent`
-- `system`
-- `resumed_context`
-- `unknown`
-
-New native types begin as `unknown` with exact provenance. A later normalizer may
-append a newly versioned projection without changing or deleting the source
-bytes or older projections.
-
-### `telemetry.collector_heartbeats`
-
-One immutable heartbeat from an installation. Heartbeats are emitted
-independently of transcript output while active runs exist.
-
-| Column | Type | Rules |
-| --- | --- | --- |
-| `id` | `bigint` | Identity primary key |
-| `workspace_id` | `uuid` | FK to `workspaces` |
-| `installation_id` | `uuid` | FK to `agent_installations` |
-| `heartbeat_key` | `text` | Client idempotency key |
-| `client_observed_at` | `timestamptz` | Client clock |
-| `server_received_at` | `timestamptz` | Authoritative receipt clock |
-| `active_run_count` | `integer` | Nonnegative |
-| `pending_record_count` | `bigint` | Nonnegative |
-| `pending_byte_count` | `bigint` | Nonnegative |
+| `stored_sha256` | `text` | Hash of stored object bytes |
+| `record_count` | `integer` | Positive; records beginning in this range |
+| `first_occurred_at` | `timestamptz` | Nullable source time |
+| `last_occurred_at` | `timestamptz` | Nullable source time |
 | `codex_version` | `text` | Nullable |
-| `plugin_version` | `text` | Required |
+| `collector_version` | `text` | Nullable |
 | `contract_version` | `text` | Required |
-| `last_error_code` | `text` | Nullable |
-| `attributes` | `jsonb` | Small bounded operational labels |
-| `created_at` | `timestamptz` | Required |
+| `committed_at` | `timestamptz` | Required server time |
 
-Required uniqueness: `(installation_id, heartbeat_key)`.
+Unique:
 
-### `telemetry.run_watermarks`
+- `(workspace_id, collector_key, source_kind, source_stream_key, generation_seq,
+  generation_key, start_offset, end_offset)` identifies a range;
+- `(workspace_id, id)` supports tenant-consistent child FKs;
+- `storage_path` identifies one object.
 
-One run/stream snapshot reported by a heartbeat. Separating it from the
-heartbeat header avoids arrays and makes per-agent stall analysis direct SQL.
+An exact retry with the same range and hash returns the existing receipt. A
+conflicting range or hash is rejected under a lock scoped to workspace,
+collector, source kind, and stream. Under that lock, the ingest service also
+enforces one generation key per sequence and one sequence per key. Truncation
+or replacement starts the next `generation_seq`; opaque generation keys are
+never sorted lexically.
 
-| Column | Type | Rules |
+There is deliberately no resolved `session_id` here. Source receipts remain
+immutable; versioned events own semantic session attribution.
+
+### `telemetry.native_records`
+
+One immutable locator for every native record, including unknown and malformed
+records. This is source identity, not interpretation.
+
+| Column | Type | Notes |
 | --- | --- | --- |
-| `heartbeat_id` | `bigint` | FK to `collector_heartbeats` |
-| `workspace_id` | `uuid` | FK to `workspaces` |
-| `run_id` | `uuid` | FK to `agent_runs` |
-| `source_kind` | `text` | Source stream kind |
-| `source_stream_id` | `text` | Stable stream identifier |
-| `file_generation` | `text` | Required |
-| `latest_observed_size` | `bigint` | Native source size |
-| `captured_through_offset` | `bigint` | Locally spooled through |
-| `committed_through_offset` | `bigint` | Server receipt committed through |
-| `normalized_through_offset` | `bigint` | Completely indexed through |
-| `run_lease_state` | `text` | `active`, `ending`, `ended`, or `unknown` |
+| `id` | `bigint` | Identity primary key |
+| `workspace_id` | `uuid` | Composite FK to batch workspace |
+| `batch_id` | `uuid` | FK to `ingest_batches` |
+| `record_index` | `integer` | Order within the batch |
+| `source_start_offset` | `bigint` | Inclusive stream offset |
+| `source_end_offset` | `bigint` | Exclusive stream offset |
+| `record_sha256` | `text` | Exact native record hash |
+| `native_type` | `text` | Nullable exact native label |
+| `native_payload_type` | `text` | Nullable exact payload label |
+| `occurred_at` | `timestamptz` | Nullable native time |
+| `parse_status` | `text` | `ok`, `unknown`, or `malformed` |
 | `created_at` | `timestamptz` | Required |
 
-Primary key:
+Unique: `(batch_id, record_index)`, `(batch_id, source_start_offset)`, and
+`(workspace_id, id)`.
 
-`(heartbeat_id, run_id, source_kind, source_stream_id, file_generation)`
+Keeping native records separate from events is non-negotiable: one record can
+produce several semantic events, and later normalizers must reinterpret it
+without changing source history.
 
-All offsets are nonnegative and may not exceed `latest_observed_size`.
+### `telemetry.events`
 
-### `telemetry.agent_incidents`
+An append-only, versioned semantic projection of a native record. The table is
+intentionally sparse; fields that drive Flame and MCP queries are typed.
 
-A rebuildable, versioned assertion produced from direct records, delivery
-receipts, heartbeats, and watermarks. Incidents are never unversioned mutable
-client labels.
+| Column group | Fields |
+| --- | --- |
+| Identity | `id`, `workspace_id`, `session_id`, `source_record_id`, `normalizer_version`, `projection_index` |
+| Canonicalization | `canonical_scope_key`, `logical_event_key`, `source_priority`, `is_replay` |
+| Classification | `event_kind`, `event_subtype`, `phase`, `actor_role` |
+| Timing | `occurred_at`, `observed_at`, `server_received_at`, `wall_started_at`, `wall_ended_at`, `native_duration_ms` |
+| Native links | `native_item_id`, `turn_id`, `tool_call_id`, `related_session_id` |
+| Message/tool | `message_role`, `message_origin`, `tool_name`, `tool_status` |
+| Context | `model`, `project_key`, `repo_remote`, `branch`, `cwd` |
+| Usage | `usage_stream_key`, `usage_scope`, `usage_is_cumulative`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens` |
+| Collector state | `collector_key`, `lease_state`, `source_kind`, `source_stream_key`, `generation_seq`, `observed_size`, `captured_offset`, `committed_offset`, `pending_record_count`, `pending_byte_count`, `error_code` |
+| Content index | `content_sha256`, `content_byte_size`, `content_excerpt` |
+| Extension | `attributes`, `created_at` |
 
-| Column | Type | Rules |
-| --- | --- | --- |
-| `id` | `uuid` | Primary key |
-| `workspace_id` | `uuid` | FK to `workspaces` |
-| `installation_id` | `uuid` | Nullable FK |
-| `thread_id` | `uuid` | Nullable FK |
-| `run_id` | `uuid` | Nullable FK |
-| `incident_kind` | `text` | Controlled kind |
-| `severity` | `text` | `info`, `warning`, `error`, or `critical` |
-| `status` | `text` | `open` or `resolved` |
-| `detector_name` | `text` | Required |
-| `detector_version` | `text` | Required |
-| `detector_thresholds` | `jsonb` | Small immutable rule parameters |
-| `evidence_heartbeat_id` | `bigint` | Nullable FK |
-| `evidence_batch_id` | `uuid` | Nullable FK |
-| `evidence_record_id` | `bigint` | Nullable FK |
-| `started_at` | `timestamptz` | Earliest supported incident time |
-| `detected_at` | `timestamptz` | Required |
-| `resolved_at` | `timestamptz` | Nullable |
-| `summary` | `text` | Short human-readable explanation |
-| `created_at` | `timestamptz` | Required |
-| `updated_at` | `timestamptz` | Required |
+Required uniqueness:
 
-Recommended `incident_kind` values:
+`(source_record_id, normalizer_version, projection_index)`.
 
-- `heartbeat_missing`
-- `capture_stall`
-- `upload_stall`
-- `normalization_stall`
-- `coverage_gap`
-- `hash_mismatch`
-- `parse_error`
-- `collector_error`
-- `agent_failure`
-- `tool_failure`
+Every record processed by a normalizer emits at least one event. A record with
+no product meaning emits an `ignored` sentinel; an uninterpretable record emits
+`unknown`. All projections for one `(source_record_id, normalizer_version)` are
+computed and inserted in one transaction while holding the workspace lock;
+after commit that pair/version is sealed against more events. This makes full
+normalization completeness observable without another receipt table.
 
-An incident must reference at least one concrete evidence row or direct native
-record. Recomputing a rule version may supersede prior assertions but must not
-erase them silently.
+`session_id` is the nullable, versioned resolved attribution; collector-only
+and unresolved events may leave it null. `content_excerpt` is at most 1 KiB and
+`attributes` at most 8 KiB. Full content is resolved through the native record
+and batch object.
 
-## Storage contract
+Core event kinds are `message`, `reasoning`, `tool_call`, `tool_result`,
+`agent_spawn`, `agent_message`, `usage`, `lifecycle`, `collector_heartbeat`,
+`session_presence`, `stream_watermark`, `error`, `ignored`, and `unknown`.
 
-### Bucket
+Core message origins are `human`, `parent_agent`, `worker`, `system`,
+`resumed_context`, and `unknown`.
 
-Use a private bucket such as `agent-telemetry-raw`.
+Hook/rollout duplicates and replayed fork ancestors remain separate source
+facts. Canonical selection applies only when both keys are non-null and
+partitions by:
 
 ```text
-workspaces/{workspace_id}/
-  runs/{run_id}/
-    streams/{source_kind}/{source_stream_id}/
-      generations/{file_generation}/
-        {start_offset}-{end_offset}-{source_sha256}.jsonl.gz
+(canonical_scope_key, normalizer_version, logical_event_key, event_kind)
 ```
 
-Rules:
+`canonical_scope_key` normally identifies the native conversation/fork family,
+allowing inherited replay in a child to resolve to its original event without
+deduplicating unrelated sessions. Selection uses source priority, then source
+time, then event ID as deterministic tie-breakers. A non-null logical key
+requires a non-null canonical scope; otherwise the event is invalid. Unkeyed
+events are never deduplicated, and `is_replay` events never create new
+activity, prompts, or usage.
 
-- Objects are immutable and uploaded with overwrite/upsert disabled.
-- Paths include source identity, native range, and content hash.
-- Target approximately 1 MiB of uncompressed source bytes per object.
-- Prefer newline-aligned chunks and flush promptly for live visibility.
-- Support an oversized-record path without truncating native data.
-- Store both uncompressed source and encoded object hashes and sizes.
-- Native record offsets always address the uncompressed source stream.
-- Fetch and decompress bounded gzip objects; do not treat compressed HTTP byte
-  ranges as native-record ranges.
-- A duplicate-object response is accepted only after verifying the expected
-  stored object identity and metadata.
-- Complete hook payloads that do not exist in rollout JSONL are stored as their
-  own immutable source stream.
+Collector heartbeats and watermarks enter through `source_kind = 'collector'`
+and the same immutable batch/record path as every other fact. Client samples
+report observed size, locally captured offset, and last acknowledged committed
+offset. Normalized coverage is derived from native records and sentinel events;
+the client does not claim it.
 
-Supabase Storage does not provide S3 object versioning, so new immutable paths
-are required instead of overwriting objects.
+## Immutable query snapshots
 
-## Delivery state machine
+The first read resolves a signed snapshot token containing:
 
 ```text
-reserved -> uploaded -> committed
-     |           |          |
-     +-----------+----------+-> rejected
+workspace_id
+native_record_cutoff_id
+event_cutoff_id
+normalizer_version
+activity_version
+issued_at
 ```
 
-1. Reserve the exact source stream, generation, and native byte range under a
-   per-stream transaction lock.
-2. Treat an identical retry as the same batch; reject conflicting overlaps.
-3. Upload the immutable object with overwrite disabled.
-4. Verify source and stored hashes and byte sizes.
-5. Insert known and unknown record facts transactionally.
-6. Reconcile counts and record provenance.
-7. Mark the batch `committed` and return a signed receipt containing batch ID,
-   stream, generation, range, source hash, and committed status.
-8. Delete the local spool item only after the client validates that receipt.
-9. Reconcile abandoned reservations and orphan objects asynchronously.
+No snapshot table is required. Correct cutoffs use a short per-workspace
+advisory transaction lock shared by batch registration, event projection, and
+snapshot resolution:
 
-A committed receipt guarantees:
+1. Writers acquire the lock before allocating record or event IDs.
+2. The normalizer version is immutable and emits at least one projection per
+   selected record.
+3. While holding the lock, the resolver chooses the greatest contiguous record
+   cutoff for which every record has a sealed projection set, then the matching
+   event cutoff.
+4. The server signs the token. Later writes receive greater IDs and cannot
+   change rows selected by the token.
 
-- The exact source bytes are durably stored.
-- The authoritative batch row is committed.
-- Every indexed record points to valid native provenance.
-- `expected_record_count = indexed_record_count + parse_error_count`.
-- `unknown_record_count <= indexed_record_count`.
-- No conflicting overlap exists.
-- Retrying the same envelope returns the same batch identity.
+Every selected event must satisfy all of: matching workspace and normalizer,
+`events.id <= event_cutoff_id`, and its joined
+`native_records.id <= native_record_cutoff_id`. This prevents an early event
+for a later, out-of-order record from leaking beyond the complete source
+prefix. Coverage uses only batches reached through selected native records;
+zero-record batches are rejected at ingest. All overview, detail, timeline,
+transcript, usage, health, and coverage reads apply this same fence. Clients
+cannot forge or widen a token. A cache key includes the complete token plus
+canonical query parameters.
 
-Chunks should normally end on JSONL boundaries so synchronous normalization can
-finish before acknowledgment. Oversized or cross-boundary records must be
-reconstructed from adjacent ranges without discarding either range.
+## Activity reducer and Flame contract
 
-## Canonical definitions
+The `activity_version` names deterministic service code that converts selected
+canonical events into half-open activity intervals. Persist this code and its
+tests, not its output rows.
 
-These definitions belong in versioned analytical SQL, not dashboard code.
+Derivation order is:
 
-- **Human prompt:** canonical message with `message_origin = 'human'`.
-  Unknown-origin messages remain visible but are not silently counted as human.
-- **Active:** a run is not explicitly ended and a fresh independent heartbeat
-  lists an active lease for it.
-- **No output:** heartbeat fresh, run lease active, native source size unchanged.
-- **Capture stall:** native source size advances while captured offset does not
-  across a versioned threshold.
-- **Upload stall:** captured offset advances while committed offset does not.
-- **Normalization stall:** committed coverage advances while normalized offset
-  does not.
-- **Collector offline:** a previously active installation misses the versioned
-  heartbeat threshold. Its runs become unknown, not automatically ended.
-- **Coverage gap:** committed ranges do not cover `[0, latest_observed_size)` for
-  a source generation.
-- **Caught up:** committed coverage reaches the latest observed native size.
-- **Complete:** explicit run termination plus gap-free committed coverage and
-  reconciled normalization counts.
-- **Activity time:** native `occurred_at`; delayed upload time must not light up
-  a historical activity window.
+1. exact native lifecycle bounds;
+2. native monotonic duration, end-aligned when wall bounds include suspension;
+3. paired call/result or start/end events using native call and turn IDs;
+4. a one-second point for an unpaired rollout signal;
+5. an explicitly estimated hook-only tail capped at 60 seconds.
 
-## Versioned analytical views
+Passive `detected_open` presence is a different interval state. It never
+contributes to active seconds, active concurrency, or token rates.
 
-Initial reusable views:
+All Flame windows are `[start_at, end_at)`:
 
-- `analytics.canonical_records_v1`: highest-priority unsuperseded record for
-  each `(run_id, logical_event_key)` under a named normalizer policy.
-- `analytics.run_lineage_v1`: thread, root, parent, spawn record, source, and
-  lineage confidence.
-- `analytics.thread_overview_v1`: durable root threads and aggregate activity.
-- `analytics.thread_agent_tree_v1`: recursive main/subagent hierarchy.
-- `analytics.thread_timeline_v1`: ordered canonical record metadata with
-  Storage locators, not complete content.
-- `analytics.human_prompts_v1`: human prompt facts and bounded previews.
-- `analytics.activity_facts_v1`: canonical activity joined to member, thread,
-  run, version, and provenance dimensions.
-- `analytics.active_agents_v1`: explicit heartbeat-backed live agent leases.
-- `analytics.run_coverage_v1`: native coverage, gaps, counts, and caught-up
-  state by source generation.
-- `analytics.run_health_v1`: separate lifecycle, collector, capture, upload,
-  normalization, and coverage states.
-- `analytics.usage_deltas_v1`: deltas partitioned by run, generation, usage
-  stream, scope, and model, including reset detection.
-- `analytics.incidents_v1`: incident evidence joined to affected people and
-  agents.
-- `analytics.record_storage_locator_v1`: committed objects required to
-  reconstruct a selected native record.
-- `analytics.flame_activity_v1`: narrow activity facts for visualization;
-  windows and buckets remain query parameters.
+- **Person active seconds:** clip active intervals to the window, then union
+  them across all of that person's sessions. The result cannot exceed the
+  wall-clock window.
+- **Agent session seconds:** union within each session, then sum sessions. This
+  can exceed wall time when workers run concurrently.
+- **Team person seconds:** sum person active seconds. Do not confuse it with
+  unioned team coverage.
+- **Session count:** distinct sessions with qualifying active intervals.
+- **Peak concurrency:** union each session's intervals, then sweep endpoints,
+  processing ends before starts at equal timestamps.
+- **Role peaks:** calculate each role's peak independently. Role composition at
+  the overall peak is the exact active set at that point.
+- **Human prompts:** canonical, non-replay messages with
+  `message_origin = 'human'`. Delegation wrappers and resumed context do not
+  count even if their native role is `user`.
+- **Usage:** partition cumulative counters by session, stream, scope, and model.
+  Use the observation immediately before the range as baseline; a decreasing
+  counter is a reset and contributes its current value. Missing baselines are
+  reported as partial, not guessed.
 
-All product lists use keyset pagination, normally `(occurred_at, id)` or
-`(last_activity_at, id)`, rather than deep `offset` pagination.
+The Flame UI chooses display resolution, including ten-minute frames. Frames
+are never stored as telemetry facts. If measured read cost becomes material,
+the first optimization is a bounded cache. Persisted versioned spans are added
+only after that cache proves insufficient.
 
-## Critical indexes
+## Supported read contracts
 
-At minimum:
+1. `flame_window(workspace_id, start_at, end_at, snapshot_token?)`
+2. `flame_frame_detail(snapshot_token, frame_start, frame_end, filters)`
+3. `session_timeline(snapshot_token, session_id, cursor, content_mode)`
+4. `usage(snapshot_token, scope, start_at, end_at, cursor)`
+
+The first call returns the resolved snapshot token. Every later call reuses it
+and reports `ok`, `partial`, `unavailable`, or `no_data` plus coverage gaps.
+Zero is returned only when coverage is complete.
+
+`session_timeline` owns both metadata and bounded content retrieval, so the
+transcript reader is not a hidden fifth contract. With `content_mode =
+selected`, it:
+
+1. joins events to source records and applies both token cutoffs plus the
+   selected workspace and normalizer version;
+2. resolves the corresponding committed batch objects only;
+3. orders them by source kind, stream, `generation_seq`, and byte offset;
+4. verifies hashes, decompresses, and slices exact source ranges;
+5. returns content with record ID, byte range, and hash citations.
+
+Unknown and malformed record locators are included when their batch's immutable
+native-session hint matches the requested session. Newer records never appear
+under an older token.
+
+The future MCP is a thin service over these four contracts. It can expose
+team-, person-, session-, and `project_key`-wide usage, transcripts, and cited
+feedback without acquiring its own fact schema.
+
+## Minimal indexes
 
 ```text
-workspace_members(workspace_id, identity_key) unique
-workspace_members(auth_user_id, workspace_id) where auth_user_id is not null
+people(workspace_id, identity_key) unique
 
-agent_installations(workspace_id, member_id, id)
-agent_installations(workspace_id, last_heartbeat_at desc, id)
+sessions(workspace_id, collector_key, native_session_id) unique
+sessions(workspace_id, person_id, started_at, id)
+sessions(workspace_id, parent_session_id, started_at, id)
+  where parent_session_id is not null
 
-agent_threads(workspace_id, provider, native_thread_id) unique
-agent_threads(workspace_id, member_id, last_activity_at desc, id)
-agent_threads(workspace_id, root_thread_id, started_at, id)
-agent_threads(workspace_id, parent_thread_id, started_at, id)
-  where parent_thread_id is not null
+ingest_batches(workspace_id, collector_key, source_kind, source_stream_key,
+               generation_seq, generation_key, start_offset, end_offset) unique
+ingest_batches(workspace_id, id) unique
 
-agent_runs(workspace_id, provider, native_run_id) unique
-agent_runs(workspace_id, thread_id, started_at, id)
-agent_runs(workspace_id, root_run_id, started_at, id)
-agent_runs(workspace_id, parent_run_id, started_at, id)
-  where parent_run_id is not null
-agent_runs(workspace_id, member_id, last_activity_at desc, id)
+native_records(batch_id, source_start_offset) unique
+native_records(workspace_id, occurred_at, id)
 
-ingest_batches(run_id, source_kind, source_stream_id,
-               file_generation, start_offset, end_offset)
-ingest_batches(workspace_id, reserved_at)
-  where delivery_status <> 'committed'
-
-agent_records(workspace_id, run_id, occurred_at, id)
-agent_records(workspace_id, occurred_at desc, id desc)
-agent_records(workspace_id, run_id, logical_event_key,
-              source_priority desc, id)
-agent_records(workspace_id, occurred_at desc, id desc)
-  where record_kind = 'message'
-    and message_origin = 'human'
-    and superseded_by_record_id is null
-agent_records(workspace_id, tool_name, occurred_at desc, id desc)
-  where record_kind = 'tool_call'
-    and superseded_by_record_id is null
-
-collector_heartbeats(workspace_id, installation_id,
-                     server_received_at desc, id desc)
-run_watermarks(run_id, created_at desc, heartbeat_id desc)
-
-agent_incidents(workspace_id, status, detected_at desc, id)
-agent_incidents(workspace_id, run_id, detected_at desc, id)
-  where run_id is not null
+events(source_record_id, normalizer_version, projection_index) unique
+events(workspace_id, session_id, occurred_at, id)
+events(workspace_id, canonical_scope_key, normalizer_version,
+       logical_event_key, event_kind, source_priority desc, id)
+  where canonical_scope_key is not null and logical_event_key is not null
+events(workspace_id, occurred_at, id)
+  where event_kind = 'message' and message_origin = 'human'
+events(workspace_id, related_session_id, occurred_at, id)
+  where related_session_id is not null
+events(workspace_id, collector_key, server_received_at desc, id desc)
+  where event_kind in ('collector_heartbeat', 'stream_watermark')
 ```
 
-Do not partition tables preemptively. Revisit time partitioning when append-only
-fact tables approach operational thresholds such as roughly 100 million rows or
-when retention/maintenance measurements justify it.
+Use keyset pagination with `(occurred_at, id)`. Do not partition until fact
+tables approach measured operational thresholds, such as roughly 100 million
+rows, or retention maintenance justifies it.
 
-## Content retrieval and analysis
+## Storage and ingest contract
 
-- Thread and activity lists query compact Postgres facts.
-- Opening a record resolves overlapping committed batches, downloads each
-  bounded object once, verifies hashes, decompresses it, and slices the native
-  record range.
-- Opening a full transcript streams batches in generation/offset order and
-  groups concurrent agent streams by lineage and source time.
-- Clients cache immutable objects by hash.
-- Full-content search or large-scale analysis may later create derived Parquet,
-  Iceberg, vector, or search indexes from immutable Storage objects. Those are
-  rebuildable products, not new source-of-truth records.
+Use a private immutable bucket and content-addressed paths:
 
-## Modularity and evolution
+```text
+workspaces/{workspace_id}/collectors/{collector_key}/
+  {source_kind}/{source_stream_key}/generations/{generation_seq}-{generation_key}/
+    {start_offset}-{end_offset}-{source_sha256}.jsonl.gz
+```
 
-- A new provider adds a collector and normalizer while retaining the batch and
-  fact contracts.
-- A new native record type is preserved immediately as `unknown` and labeled by
-  a later normalizer version.
-- A new incident definition creates a new detector version and rebuildable
-  assertions.
-- A new product screen adds or versions an analytical view.
-- A new warehouse reads the same immutable objects and fact exports.
-- Raw objects, source hashes, native identifiers, and source offsets are never
-  reinterpreted or overwritten.
+The ingest path is intentionally short:
 
-## Required acceptance tests
+1. Receive and validate one normally newline-aligned source chunk.
+2. Under the stream lock, reject conflicting overlap or identify an exact
+   retry.
+3. Upload to a new immutable path with overwrite disabled.
+4. Verify source and stored sizes and hashes.
+5. Insert the committed batch and all native record locators transactionally.
+6. Return the receipt; the collector deletes its spool item only after
+   validating it.
 
-- Root thread plus nested subagents and child-before-parent arrival.
-- Exact prompt/message/tool transcript reconstruction from Storage.
-- Crash before reservation, after reservation, after upload, after DB commit,
-  and after response loss.
-- Exact retry and conflicting retry.
-- Out-of-order batches, missing ranges, overlapping ranges, file truncation,
-  replacement, mutation, and generation changes.
-- Unknown native record, malformed JSONL, partial final line, and oversized
-  record.
-- Plugin/Codex/contract/normalizer version change during one thread.
-- Fresh heartbeat with no output, missing heartbeat, capture stall, upload
-  stall, normalization stall, and recovery.
-- Hook/rollout logical duplicate and canonical source selection.
-- Cumulative usage reset and multiple usage streams/scopes/models.
-- Membership-scoped reads and explicit Data API grants.
-- Raw object hash round-trip and full-thread export.
+Oversized records use a dedicated object rather than truncation. Malformed,
+unknown, and child-before-parent evidence is never rejected for lacking a
+semantic session or parent.
 
-## Supabase implementation notes
+## Deferred until a product proves it needs them
 
-- Supabase Storage is S3-compatible, but bucket object versioning is not
-  supported; immutable unique paths are therefore part of the correctness
-  contract.
-- New tables should receive explicit role grants. RLS and grants are separate
-  layers and both must be intentional.
-- Views exposed through the Data API must use `security_invoker = true` so they
-  obey underlying RLS.
-- Service-role or secret keys remain server-side and never ship in the plugin or
-  dashboard client.
+- authentication, roles, RLS policies, and membership history;
+- separate installations, threads, runs, generic edges, and claim tables;
+- activity-span, frame, daily aggregate, and snapshot tables;
+- editable project and repository catalogs;
+- incident and alert persistence;
+- multi-provider normalization;
+- transcript search, embeddings, and recommendation storage;
+- warehouse exports and table partitioning.
 
-References:
+The application server can use private schemas and a direct database
+connection in v0. If Supabase Data API access is added, migrations must include
+explicit grants; new public tables are no longer automatically exposed. Grants
+and RLS remain separate concerns.
 
-- [Supabase Storage](https://supabase.com/docs/guides/storage)
-- [Supabase S3 compatibility](https://supabase.com/docs/guides/storage/s3/compatibility)
-- [Supabase Row Level Security](https://supabase.com/docs/guides/database/postgres/row-level-security)
-- [Supabase Data API grants change](https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically)
+## Acceptance tests
+
+- Primary session, nested workers, child-before-parent arrival, same-ID resume,
+  and new-ID resume sharing `native_thread_id`.
+- Exact lifecycle bounds, suspension-aware end-aligned duration, paired
+  call/result, missing-pair one-second point, capped hook tail, and passive-only
+  presence.
+- Fork replay and hook/rollout duplicates remain in source evidence but count
+  once in activity, prompt, and usage results.
+- A delegation wrapper with native user role does not count as a human prompt;
+  a genuine human prompt does.
+- Cumulative usage `100 -> 130 -> 5` yields deltas `30` and reset delta `5`,
+  with streams, scopes, and models isolated.
+- Snapshot A remains byte- and count-stable for frame, detail, transcript,
+  usage, health, and coverage reads after new data creates snapshot B.
+- A native record normalized to no semantic event emits `ignored`, proving
+  completeness at the selected cutoff.
+- Exact retry is idempotent; conflicting overlap or hash is rejected;
+  truncation increments `generation_seq`; missing ranges remain visible.
+- Fresh lease with no output, missing heartbeat, capture stall, upload stall,
+  and normalization stall remain distinguishable.
+- Person-, session-, team-, and project-key aggregation handles overlapping
+  workers without double counting.
+- Complete transcripts round-trip from immutable objects using record offsets
+  and hashes.
+
+## Supabase references
+
+- [Storage](https://supabase.com/docs/guides/storage)
+- [S3 compatibility](https://supabase.com/docs/guides/storage/s3/compatibility)
+- [Data API grants change](https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically)
