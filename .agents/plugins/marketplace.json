@@ -1,0 +1,20 @@
+{
+  "name": "coreedge-agent-telemetry",
+  "interface": {
+    "displayName": "Core Edge Agent Telemetry"
+  },
+  "plugins": [
+    {
+      "name": "codex-session-logging",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-session-logging"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
