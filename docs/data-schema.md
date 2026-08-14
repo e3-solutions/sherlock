@@ -734,6 +734,39 @@ exclusive insert grant is not a substitute for that invariant. If Data API
 access is introduced later, expose purpose-built read surfaces and add explicit
 grants and RLS together. Database grants and RLS solve different problems.
 
+### Implemented rollout-only delivery boundary
+
+The first delivery slice implements `sherlock.rollout-batch.v1` and
+`sherlock.committed-receipt.v1` without changing the seven-table schema:
+
+- the Python collector writes one atomic file per manifest plus stable gzip
+  payload under `pending`, claims it by rename into `processing`, recovers
+  interrupted claims, and quarantines permanent local/protocol failures under
+  `dead-letter`;
+- rollout capture uses a separate nonblocking lock, a bounded round-robin
+  candidate cursor, path/device/inode/size/prefix replacement detection,
+  monotonic `generation_seq`, an opaque generation key, and checkpoints the
+  source offset only after durable enqueue;
+- the drain holds a nonblocking process lock, sends independent streams in
+  parallel, preserves generation/offset order within a stream, rescans until
+  quiescent, and does not busy-retry a transiently failed stream in one pass;
+- the Supabase Edge Function authenticates a scoped bearer credential against
+  a server-side token-hash allowlist and derives workspace, person, and
+  collector attribution from that configuration;
+- the function verifies stored and uncompressed bytes plus every record hash,
+  uploads with overwrite disabled, verifies an existing object's bytes, then
+  uses Supabase's server-provided database URL with prepared statements
+  disabled for pooler compatibility;
+- under a stream advisory transaction lock and `SET LOCAL ROLE
+  sherlock_ingest`, it rechecks exact retries, generation mappings, and range
+  overlap before atomically inserting one batch and all native-record locators.
+
+Deployment configuration is intentionally external to source control. The
+function requires a collector allowlist secret in addition to Supabase's
+built-in server environment; rollout discovery integration supplies the
+bounded candidate paths to the collector. Normalization, snapshot resolution,
+Flame reads, and a product API remain deferred.
+
 ## Deferred until a product proves it needs them
 
 - product membership, manager roles, row-level read policies, and membership
