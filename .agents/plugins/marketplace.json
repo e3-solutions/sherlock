@@ -1,14 +1,14 @@
 {
-  "name": "coreedge-agent-telemetry",
+  "name": "sherlock",
   "interface": {
-    "displayName": "Core Edge Agent Telemetry"
+    "displayName": "Sherlock"
   },
   "plugins": [
     {
-      "name": "codex-session-logging",
+      "name": "sherlock",
       "source": {
         "source": "local",
-        "path": "./plugins/codex-session-logging"
+        "path": "./plugins/sherlock"
       },
       "policy": {
         "installation": "INSTALLED_BY_DEFAULT",

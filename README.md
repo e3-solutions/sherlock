@@ -1,4 +1,3 @@
-# Codex Agent Telemetry
+# Sherlock
 
-Internal monorepo scaffold for the Codex session collector, telemetry backend, and dashboard.
-
+Internal monorepo scaffold for agent telemetry collection, analysis, and auditability.

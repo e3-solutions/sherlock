@@ -1,0 +1,19 @@
+{
+  "name": "sherlock",
+  "version": "0.1.0",
+  "description": "Capture auditable agent telemetry.",
+  "author": {
+    "name": "Core Edge Solution"
+  },
+  "interface": {
+    "displayName": "Sherlock",
+    "shortDescription": "Capture auditable agent telemetry.",
+    "longDescription": "Capture complete thread, agent, and delivery telemetry for internal analysis.",
+    "developerName": "Core Edge Solution",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Capture this agent session."
+    ]
+  }
+}
