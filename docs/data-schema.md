@@ -238,14 +238,25 @@ intentionally sparse; fields that drive Flame and MCP queries are typed.
 
 Required uniqueness:
 
-`(source_record_id, normalizer_version, projection_index)`.
+`(source_record_id, normalizer_version, projection_index)`. Also require
+`(workspace_id, session_id, id)` so span evidence can use a tenant- and
+session-consistent composite foreign key.
 
 Every record processed by a normalizer emits at least one event. A record with
 no product meaning emits an `ignored` sentinel; an uninterpretable record emits
-`unknown`. All projections for one `(source_record_id, normalizer_version)` are
-computed and inserted in one transaction while holding the workspace lock;
-after commit that pair/version is sealed against more events. This makes full
-normalization completeness observable without another receipt table.
+`unknown`. Parsing and projection preparation may run concurrently outside the
+database transaction. Under the workspace lock, however, the normalizer may
+commit only the smallest unsealed `native_records.id` for that workspace and
+normalizer version. It rechecks whether `(source_record_id,
+normalizer_version)` is already sealed, then inserts every projection and every
+affected span version in one transaction. After commit, that pair/version is
+sealed against more events. An exact retry is a no-op that returns the existing
+projection IDs. This makes full normalization completeness observable without
+another receipt table.
+
+`normalizer_version` is an immutable content or deploy hash. Aliases such as
+`latest`, mutable semantic versions, and environment names are invalid because
+they would make old snapshot tokens change meaning.
 
 `session_id` is the nullable, versioned resolved attribution; collector-only
 and unresolved events may leave it null. `content_excerpt` is at most 1 KiB and
@@ -315,6 +326,12 @@ Unique:
 
 `(workspace_id, activity_version, span_key, valid_from_event_id)`.
 
+`valid_from_event_id`, `start_event_id`, and `end_event_id` use composite
+`(workspace_id, session_id, event_id)` foreign keys to
+`events(workspace_id, session_id, id)`. `person_id` uses the existing composite
+workspace foreign key. These constraints make the copied query dimensions and
+all span evidence tenant- and session-consistent.
+
 `span_key` identifies the same logical interval across corrections. A tool-call
 point and the later exact call/result interval therefore share a key. The later
 row replaces the earlier row for newer snapshots without deleting audit
@@ -333,7 +350,9 @@ When normalization commits a record's events, the activity reducer recomputes
 every affected `span_key` and inserts any new span versions in that same
 transaction while holding the workspace lock. `valid_from_event_id` is the
 greatest triggering event ID. Thus an event cutoff can never expose an event
-without its corresponding current span version.
+without its corresponding current span version. Each `activity_version` is
+bound to exactly one immutable `normalizer_version`; the server rejects a
+snapshot pairing that was not validated together.
 
 Only fully backfilled activity versions become active. To introduce a new
 version, rebuild it from the selected canonical events, validate it through the
@@ -359,17 +378,33 @@ issued_at
 ```
 
 No snapshot table is required. Correct cutoffs use a short per-workspace
-advisory transaction lock shared by batch registration, event-and-span
-projection, and snapshot resolution:
+advisory transaction lock shared by batch registration, ordered event-and-span
+publication, and snapshot resolution. Parsing and other preparation stay
+outside this transaction:
 
-1. Writers acquire the lock before allocating record or event IDs.
-2. The normalizer version is immutable, emits at least one projection per
-   selected record, and writes affected span versions in the same transaction.
-3. While holding the lock, the resolver chooses the greatest contiguous record
-   cutoff for which every record has a sealed projection set, then the matching
-   event cutoff.
-4. The server signs the token. Later writes receive greater IDs and cannot
-   change rows selected by the token.
+1. Batch registration acquires the workspace lock before allocating native
+   record IDs.
+2. A normalizer may prepare records concurrently, but under the lock it commits
+   only the smallest unsealed `native_records.id` for that workspace and
+   normalizer version. If a smaller unsealed record now exists, it releases the
+   lock without publishing the prepared later record.
+3. The normalizer rechecks the seal and atomically inserts the record's complete
+   event set plus every affected span version. Only then is the next record
+   eligible to publish.
+4. While holding the same lock, the resolver chooses the greatest contiguous
+   native-record cutoff whose records all have sealed projections, then the
+   matching event cutoff.
+5. The server signs the token. Later publications receive greater IDs and
+   cannot change rows selected by the token.
+
+“Contiguous” means every existing `native_records.id` in the workspace at or
+below the cutoff is sealed for the selected normalizer. Gaps created by other
+workspaces sharing the global identity sequence are ignored. This ordered
+publication rule also guarantees that a span eligible by `valid_from_event_id`
+cannot have been derived from a native record beyond the token's native-record
+cutoff. If v0 later needs out-of-order publication, add
+`valid_from_native_record_id` to spans and apply both fences; do not weaken this
+invariant implicitly.
 
 Every selected event must satisfy all of: matching workspace and normalizer,
 `events.id <= event_cutoff_id`, and its joined
@@ -459,6 +494,92 @@ The future MCP is a thin service over these four contracts. It can expose
 team-, person-, session-, and `project_key`-wide usage, transcripts, and cited
 feedback without acquiring its own fact schema.
 
+## Required database constraints
+
+These invariants are database constraints, not application-only validation.
+Controlled vocabularies use `CHECK` constraints in v0 rather than lookup
+tables. Required text identity fields are non-empty, and every SHA-256 column
+is either null where documented or matches `^[0-9a-f]{64}$`.
+
+```text
+sessions:
+  parent_session_id is null or parent_session_id <> id
+  ended_at is null or ended_at >= started_at
+  actor_role in ('primary', 'worker', 'guardian', 'automation', 'unknown')
+
+ingest_batches:
+  source_kind in ('rollout', 'hook', 'collector')
+  storage_encoding in ('gzip', 'identity')
+  generation_seq >= 0
+  start_offset >= 0
+  end_offset > start_offset
+  source_byte_count = end_offset - start_offset
+  stored_byte_count > 0
+  record_count > 0
+  (first_occurred_at is null) = (last_occurred_at is null)
+  first_occurred_at is null or first_occurred_at <= last_occurred_at
+
+native_records:
+  record_index >= 0
+  source_start_offset >= 0
+  source_end_offset > source_start_offset
+  parse_status in ('ok', 'unknown', 'malformed')
+
+events:
+  projection_index >= 0
+  source_priority >= 0
+  is_replay is not null
+  event_kind in
+    ('message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
+     'agent_message', 'usage', 'lifecycle', 'collector_heartbeat',
+     'session_presence', 'stream_watermark', 'error', 'ignored', 'unknown')
+  actor_role is null or actor_role in
+    ('primary', 'worker', 'guardian', 'automation', 'unknown')
+  message_origin is null or message_origin in
+    ('human', 'parent_agent', 'worker', 'system', 'resumed_context', 'unknown')
+  native_duration_ms is null or native_duration_ms >= 0
+  (wall_started_at is null) = (wall_ended_at is null)
+  wall_started_at is null or wall_ended_at >= wall_started_at
+  each of input_tokens, cached_input_tokens, output_tokens, reasoning_tokens,
+    total_tokens, observed_size, captured_offset, committed_offset,
+    pending_record_count, pending_byte_count, and content_byte_size is null
+    or >= 0
+  logical_event_key is null or canonical_scope_key is not null
+  event_kind <> 'usage' or
+    (usage_stream_key is not null and usage_is_cumulative is not null)
+  captured_offset is null or
+    (observed_size is not null and captured_offset <= observed_size)
+  committed_offset is null or
+    (observed_size is not null and committed_offset <= observed_size)
+  committed_offset is null or captured_offset is null or
+    committed_offset <= captured_offset
+  content_excerpt is null or octet_length(content_excerpt) <= 1024
+  attributes is null or
+    (jsonb_typeof(attributes) = 'object' and pg_column_size(attributes) <= 8192)
+
+activity_spans:
+  span_state in ('active', 'detected_open')
+  activity_kind in ('turn', 'tool', 'point', 'hook_tail', 'presence')
+  timing_basis in
+    ('lifecycle', 'native_duration', 'paired_events', 'point', 'provisional')
+  confidence in ('exact', 'inferred')
+  actor_role in ('primary', 'worker', 'guardian', 'automation', 'unknown')
+  estimated_start is not null and estimated_end is not null
+  is_tombstone is not null
+  (is_tombstone and started_at is null and ended_at is null) or
+    (not is_tombstone and started_at is not null and ended_at > started_at)
+  start_event_id is null or start_event_id <= valid_from_event_id
+  end_event_id is null or end_event_id <= valid_from_event_id
+```
+
+Cross-row rules cannot be expressed as row-local `CHECK`s. The ingest service
+therefore verifies, in the batch insert transaction, that every native-record
+range is contained by its batch range, that record indexes and offsets are in
+order without duplicates, and that `record_count` equals the number inserted.
+Composite foreign keys enforce copied workspace identity throughout the seven
+tables. Span evidence additionally uses the workspace/session/event composite
+key defined above.
+
 ## Minimal indexes
 
 ```text
@@ -477,9 +598,11 @@ native_records(batch_id, source_start_offset) unique
 native_records(workspace_id, occurred_at, id)
 
 events(source_record_id, normalizer_version, projection_index) unique
+events(workspace_id, session_id, id) unique
 events(workspace_id, session_id, occurred_at, id)
 events(workspace_id, canonical_scope_key, normalizer_version,
-       logical_event_key, event_kind, source_priority desc, id)
+       logical_event_key, event_kind, source_priority desc,
+       occurred_at asc nulls last, id)
   where canonical_scope_key is not null and logical_event_key is not null
 events(workspace_id, occurred_at, id)
   where event_kind = 'message' and message_origin = 'human'
@@ -513,24 +636,97 @@ workspaces/{workspace_id}/collectors/{collector_key}/
     {start_offset}-{end_offset}-{source_sha256}.jsonl.gz
 ```
 
-The ingest path is intentionally short:
+External Storage I/O never runs inside a database transaction or while holding
+an advisory lock. The ingest path is:
 
-1. Receive and validate one normally newline-aligned source chunk.
-2. Under the stream lock, reject conflicting overlap or identify an exact
-   retry.
-3. Upload to a new immutable path with overwrite disabled.
-4. Verify source and stored sizes and hashes.
-5. Insert the committed batch and all native record locators transactionally.
-6. Return the receipt; the collector deletes its spool item only after
-   validating it.
+1. Check for an existing committed batch. An exact identity, range, and hash
+   match returns its receipt immediately.
+2. Validate the normally newline-aligned source chunk and calculate its source
+   and stored hashes and sizes.
+3. Upload to the content-addressed path with overwrite disabled.
+4. If Storage reports that the path exists, read its metadata or bytes and
+   verify the stored size and hash. A mismatch is a hard integrity error.
+5. Begin a short database transaction, acquire the stream advisory lock, and
+   recheck idempotency, range overlap, and generation-key/sequence consistency.
+6. Bulk-insert the committed batch and all native-record locators.
+7. Commit and return the receipt.
+
+This deliberately accepts a recoverable orphan-object window instead of adding
+a reservation table:
+
+- Storage succeeded but the database failed: retry verifies the existing
+  object and inserts the receipt.
+- The database committed but the response was lost: retry returns the existing
+  receipt.
+- Concurrent conflicting uploads: one batch row commits; an object belonging
+  to the rejected attempt is operational cleanup and is never queryable as a
+  fact.
+
+The versioned receipt response contains exactly:
+
+```text
+receipt_version
+status = 'committed'
+batch_id
+workspace_id
+collector_key
+source_kind
+source_stream_key
+generation_key
+generation_seq
+start_offset
+end_offset
+source_byte_count
+source_sha256
+storage_path
+stored_byte_count
+stored_sha256
+record_count
+contract_version
+committed_at
+```
+
+The collector deletes its spool item only after validating `status` and the
+stable stream identity, generation, byte range, source hash, and batch ID in
+this receipt. A Storage upload alone is never an acknowledgement.
 
 Oversized records use a dedicated object rather than truncation. Malformed,
 unknown, and child-before-parent evidence is never rejected for lacking a
 semantic session or parent.
 
+## Service boundaries and ingest authentication
+
+Deferring product permissions does not mean accepting anonymous or
+collector-chosen tenancy. All seven tables live in private schemas that are not
+exposed through the Supabase Data API. The database is reachable only by the
+application, ingest, and normalizer services.
+
+V0 uses one server-owned ingest credential or an environment-configured
+collector allowlist. After authenticating a request, the ingest server derives
+`workspace_id`, `person_id`, and the permitted `collector_key`; it never trusts
+those values from the collector envelope. The Codex plugin receives only its
+scoped ingest credential. It never receives a Supabase secret/service-role key
+or a direct database credential.
+
+Database grants seal the normalization contract:
+
+- the ingest role may insert committed batches and native records, but cannot
+  insert, update, or delete events or spans;
+- only the normalizer role may insert into `telemetry.events` and
+  `analytics.activity_spans`;
+- application read roles cannot write append-only facts;
+- direct updates and deletes on batches, records, events, and spans are revoked
+  from every application role.
+
+The normalizer role still follows the ordered workspace-lock protocol; its
+exclusive insert grant is not a substitute for that invariant. If Data API
+access is introduced later, expose purpose-built read surfaces and add explicit
+grants and RLS together. Database grants and RLS solve different problems.
+
 ## Deferred until a product proves it needs them
 
-- authentication, roles, RLS policies, and membership history;
+- product membership, manager roles, row-level read policies, and membership
+  history;
 - separate installations, threads, runs, generic edges, and claim tables;
 - frame, daily aggregate, build, and snapshot tables;
 - editable project and repository catalogs;
@@ -539,10 +735,9 @@ semantic session or parent.
 - transcript search, embeddings, and recommendation storage;
 - warehouse exports and table partitioning.
 
-The application server can use private schemas and a direct database
-connection in v0. If Supabase Data API access is added, migrations must include
-explicit grants; new public tables are no longer automatically exposed. Grants
-and RLS remain separate concerns.
+The service authentication and database grants above are part of v0. What is
+deferred is the user-facing permission model, not collector authentication or
+write isolation.
 
 ## Acceptance tests
 
@@ -562,10 +757,24 @@ and RLS remain separate concerns.
   with streams, scopes, and models isolated.
 - Snapshot A remains byte- and count-stable for frame, detail, transcript,
   usage, health, and coverage reads after new data creates snapshot B.
+- Parsers prepare later records concurrently, but publication remains in
+  per-workspace native-record order; no later record or derived span leaks into
+  a snapshot whose native-record cutoff excludes it. Global identity gaps from
+  other workspaces do not block publication.
 - A native record normalized to no semantic event emits `ignored`, proving
-  completeness at the selected cutoff.
+  completeness at the selected cutoff. An exact normalizer retry is a no-op,
+  later projections for a sealed record/version are rejected, and app/ingest
+  roles cannot write events or spans.
 - Exact retry is idempotent; conflicting overlap or hash is rejected;
   truncation increments `generation_seq`; missing ranges remain visible.
+- Storage-success/database-failure, database-success/response-loss, and
+  concurrent-conflict retries all converge on one committed receipt. The
+  collector retains its spool item until every receipt identity field matches.
+- Spoofed workspace, person, or collector identifiers are ignored or rejected;
+  the authenticated server mapping supplies the persisted values.
+- Invalid enum values, hashes, ranges, wall bounds, usage fields, collector
+  offsets, JSON/excerpt sizes, and tombstone shapes fail their database
+  constraints.
 - Fresh lease with no output, missing heartbeat, capture stall, upload stall,
   and normalization stall remain distinguishable.
 - Person-, session-, team-, and project-key aggregation handles overlapping
@@ -576,5 +785,6 @@ and RLS remain separate concerns.
 ## Supabase references
 
 - [Storage](https://supabase.com/docs/guides/storage)
+- [Standard uploads](https://supabase.com/docs/guides/storage/uploads/standard-uploads)
 - [S3 compatibility](https://supabase.com/docs/guides/storage/s3/compatibility)
 - [Data API grants change](https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically)
