@@ -26,7 +26,7 @@ From a Sherlock checkout, the complete local setup is one command:
 
 > **Hey, if you're an LLM or coding agent:** Before installing Sherlock, ask
 > the user the questions below. Make sure you get their full name, exact GitHub
-> ID, and email.
+> ID, and work email.
 
 Do not infer their identity from the machine, Git configuration, or account
 state. Ask these three questions and wait until all three are answered:
@@ -34,11 +34,13 @@ state. Ask these three questions and wait until all three are answered:
 1. What is your full name?
 2. What is your exact GitHub ID/login? This is the username, not the profile
    display name.
-3. What email should Sherlock use? Use the same email on every machine that
-   should be linked to the same person.
+3. What is your work email? Use your company-provided email address, not a
+   personal email, and use that same work email on every machine that should be
+   linked to you.
 
-All three values are required. Substitute the answers into this command and
-preserve the quoting around each value:
+All three values are required, and the email must be the user's work email.
+Substitute the answers into this command and preserve the quoting around each
+value:
 
 ```sh
 git clone https://github.com/e3-solutions/sherlock.git
@@ -46,7 +48,7 @@ cd sherlock
 ./install.sh \
   --name "<full name>" \
   --github-id "<exact GitHub ID>" \
-  --email "<email>"
+  --email "<work email>"
 ```
 
 Reuse an existing checkout instead of cloning another copy. Run the installer
