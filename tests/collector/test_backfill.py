@@ -535,6 +535,7 @@ class BackfillUploadTests(unittest.TestCase):
             transport.upload(item)
 
         constructor.assert_called_once()
+        self.assertEqual(constructor.call_args.kwargs["timeout"], 90.0)
         self.assertEqual(len(connection.requests), 2)
         self.assertTrue(connection.requests[0][2].startswith(BULK_MAGIC))
         self.assertEqual(

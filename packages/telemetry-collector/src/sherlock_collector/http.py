@@ -118,7 +118,7 @@ class HttpTransport:
         endpoint: str,
         principal: CollectorIdentity | str,
         *,
-        timeout_seconds: float = 20.0,
+        timeout_seconds: float = 90.0,
     ):
         parsed = urlsplit(endpoint)
         if (

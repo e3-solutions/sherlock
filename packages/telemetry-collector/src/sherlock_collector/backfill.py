@@ -44,7 +44,9 @@ UPLOAD_STATE_VERSION = "sherlock.backfill-upload-state.v1"
 ARCHIVE_MANIFEST_PATH = "manifest.json"
 MAX_ARCHIVE_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_BATCH_MANIFEST_BYTES = 16 * 1024 * 1024
-UPLOAD_SESSION_GROUP_SIZE = 32
+# Preserve cross-session request packing while letting short groups finish,
+# report progress, and checkpoint promptly under high worker counts.
+UPLOAD_SESSION_GROUP_SIZE = 8
 DEFAULT_EXPORT_WORKERS = min(8, max(1, os.cpu_count() or 1))
 SESSION_ID_RE = re.compile(
     r"(?:^|[-_])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"

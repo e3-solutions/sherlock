@@ -38,11 +38,16 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
     const detail = await response.text();
     const alreadyExists = response.status === 409 ||
       (response.status === 400 && /already exists|duplicate/i.test(detail));
-    if (!alreadyExists) {
+    // Storage documents concurrent create-only uploads as an already-exists
+    // response. In practice, a losing insert can surface as a 5xx after the
+    // winning request has committed the object. Treat that ambiguous result as
+    // idempotent only after reading and hashing the immutable object.
+    const mayHaveCommitted = alreadyExists || response.status >= 500;
+    if (!mayHaveCommitted) {
       throw new IngestError(
         "storage_upload_failed",
         `immutable Storage upload failed (${response.status})`,
-        response.status >= 500 ? 503 : 500,
+        500,
       );
     }
     const existing = await fetch(objectUrl(this.supabaseUrl, path), {
@@ -50,8 +55,10 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
     });
     if (!existing.ok) {
       throw new IngestError(
-        "storage_verify_failed",
-        `existing Storage object could not be read (${existing.status})`,
+        alreadyExists ? "storage_verify_failed" : "storage_upload_failed",
+        alreadyExists
+          ? `existing Storage object could not be read (${existing.status})`
+          : `immutable Storage upload failed (${response.status})`,
         503,
       );
     }
