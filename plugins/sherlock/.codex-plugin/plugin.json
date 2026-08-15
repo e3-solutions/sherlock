@@ -1,19 +1,30 @@
 {
   "name": "sherlock",
-  "version": "0.1.0",
-  "description": "Capture auditable agent telemetry.",
+  "version": "0.1.0+codex.20260815005234",
+  "description": "Capture Codex rollout telemetry durably without blocking hooks.",
   "author": {
-    "name": "Core Edge Solution"
+    "name": "E3 Solutions",
+    "url": "https://github.com/e3-solutions"
   },
+  "homepage": "https://github.com/e3-solutions/sherlock",
+  "repository": "https://github.com/e3-solutions/sherlock",
+  "license": "UNLICENSED",
+  "keywords": [
+    "telemetry",
+    "codex",
+    "rollout"
+  ],
   "interface": {
     "displayName": "Sherlock",
-    "shortDescription": "Capture auditable agent telemetry.",
-    "longDescription": "Capture complete thread, agent, and delivery telemetry for internal analysis.",
-    "developerName": "Core Edge Solution",
+    "shortDescription": "Durable Codex rollout capture.",
+    "longDescription": "Discovers recent Codex rollouts, spools exact source bytes locally, and drains immutable batches through Sherlock's server boundary.",
+    "developerName": "E3 Solutions",
     "category": "Productivity",
-    "capabilities": [],
+    "capabilities": [
+      "Background telemetry"
+    ],
     "defaultPrompt": [
-      "Capture this agent session."
+      "Show me how to verify Sherlock telemetry capture."
     ]
   }
 }

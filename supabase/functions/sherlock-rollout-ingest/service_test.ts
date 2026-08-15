@@ -15,7 +15,7 @@ import {
   type ImmutableStorage,
   IngestService,
 } from "./service.ts";
-import { assertExactRecords } from "./postgres.ts";
+import { advisoryLockIdentity, assertExactRecords } from "./postgres.ts";
 
 function assert(
   condition: unknown,
@@ -267,4 +267,20 @@ Deno.test("timestamp identity preserves PostgreSQL microseconds", () => {
     timestampMicros("2026-08-14T00:00:00.123456Z") !==
       timestampMicros("2026-08-14T00:00:00.123999Z"),
   );
+});
+
+Deno.test("advisory lock identity is PostgreSQL-safe and tuple-distinct", async () => {
+  const { attribution, manifest } = await fixture();
+  const identity = advisoryLockIdentity(attribution, manifest);
+  const first = advisoryLockIdentity(
+    { ...attribution, collector_key: "collector:rollout" },
+    { ...manifest, source_stream_key: "stream" },
+  );
+  const second = advisoryLockIdentity(
+    { ...attribution, collector_key: "collector" },
+    { ...manifest, source_stream_key: "rollout:stream" },
+  );
+
+  assert(!identity.includes("\u0000"), "PostgreSQL text cannot contain NUL");
+  assert(first !== second, "tuple boundaries must remain unambiguous");
 });

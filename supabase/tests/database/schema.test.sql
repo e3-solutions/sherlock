@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(36);
+select plan(37);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -27,6 +27,10 @@ select ok(
 select ok(
   exists (select 1 from pg_roles where rolname = 'sherlock_reader'),
   'reader role exists'
+);
+select ok(
+  pg_has_role('postgres', 'sherlock_ingest', 'member'),
+  'Edge Function database login can assume the constrained ingest role'
 );
 
 select ok(
@@ -208,6 +212,7 @@ begin
     (select count(*) = 3 from pg_roles where rolname in (
       'sherlock_ingest', 'sherlock_normalizer', 'sherlock_reader'
     )) and
+    pg_has_role('postgres', 'sherlock_ingest', 'member') and
     exists (
       select 1 from storage.buckets
       where id = 'telemetry-raw' and public = false
@@ -241,7 +246,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 36,
+  'assertion_count', 37,
   'tables', 7,
   'private_bucket', 'telemetry-raw'
 ) as verification;

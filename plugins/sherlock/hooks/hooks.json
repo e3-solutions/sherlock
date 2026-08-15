@@ -1,0 +1,44 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'root=${CODEX_HOME:-\"$HOME/.codex\"}; script=$(ls -td \"$root\"/plugins/cache/*/sherlock/*/scripts/run_hook.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" SessionStart || exit 0'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'root=${CODEX_HOME:-\"$HOME/.codex\"}; script=$(ls -td \"$root\"/plugins/cache/*/sherlock/*/scripts/run_hook.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" UserPromptSubmit || exit 0'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'root=${CODEX_HOME:-\"$HOME/.codex\"}; script=$(ls -td \"$root\"/plugins/cache/*/sherlock/*/scripts/run_hook.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" PostToolUse || exit 0'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'root=${CODEX_HOME:-\"$HOME/.codex\"}; script=$(ls -td \"$root\"/plugins/cache/*/sherlock/*/scripts/run_hook.py 2>/dev/null | head -n 1); [ -n \"$script\" ] && exec python3 \"$script\" Stop || exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}
