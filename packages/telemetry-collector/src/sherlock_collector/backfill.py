@@ -26,7 +26,7 @@ from .contract import (
     validate_committed_receipt,
     validate_stored_payload,
 )
-from .drain import TransientUploadError, UploadTransport
+from .drain import PermanentUploadError, TransientUploadError, UploadTransport
 from .rollout import (
     DEFAULT_CHUNK_BYTES,
     DEFAULT_MAX_OBJECT_BYTES,
@@ -837,6 +837,19 @@ def _upload_items(
                 validate_committed_receipt(item.manifest, receipt)
                 for item, receipt in zip(items, raw_receipts, strict=True)
             )
+        except PermanentUploadError as error:
+            if len(items) > 1:
+                midpoint = len(items) // 2
+                return (
+                    *_upload_items(transport, items[:midpoint], retries),
+                    *_upload_items(transport, items[midpoint:], retries),
+                )
+            manifest = items[0].manifest
+            raise PermanentUploadError(
+                f"{error}; batch={manifest.spool_key} "
+                f"stream={manifest.source_stream_key} "
+                f"range={manifest.start_offset}-{manifest.end_offset}"
+            ) from error
         except TransientUploadError:
             if attempt >= retries:
                 raise

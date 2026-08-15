@@ -29,7 +29,7 @@ from sherlock_collector.contract import (
     build_rollout_batch,
     validate_stored_payload,
 )
-from sherlock_collector.drain import TransientUploadError
+from sherlock_collector.drain import PermanentUploadError, TransientUploadError
 from sherlock_collector.http import (
     BULK_CONTENT_TYPE,
     BULK_MAGIC,
@@ -112,6 +112,19 @@ class RecordingBulkTransport(RecordingTransport):
                 raise TransientUploadError("retry me")
             self.groups.append(tuple(item.manifest.spool_key for item in items))
             self.items.extend(items)
+        return [committed_receipt(item.manifest) for item in items]
+
+
+class SelectivePermanentBulkTransport(RecordingBulkTransport):
+    def __init__(self, rejected_key):
+        super().__init__()
+        self.rejected_key = rejected_key
+
+    def upload_many(self, items):
+        self.groups.append(tuple(item.manifest.spool_key for item in items))
+        if any(item.manifest.spool_key == self.rejected_key for item in items):
+            raise PermanentUploadError("range overlap")
+        self.items.extend(items)
         return [committed_receipt(item.manifest) for item in items]
 
 
@@ -495,6 +508,28 @@ class BackfillUploadTests(unittest.TestCase):
                 BackfillError, "upload workers must be between 1 and 16"
             ):
                 upload_archive(archive, RecordingTransport(), workers=17)
+
+    def test_bulk_permanent_failure_is_bisected_to_exact_batch(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self.make_archive(root)
+            manifest = read_manifest(archive)
+            rejected_key = manifest["sessions"][0]["batch_keys"][1]
+            transport = SelectivePermanentBulkTransport(rejected_key)
+
+            with self.assertRaisesRegex(
+                PermanentUploadError, f"batch={rejected_key}.*range="
+            ):
+                upload_archive(
+                    archive,
+                    transport,
+                    workers=1,
+                    retries=0,
+                    resume=False,
+                )
+
+            self.assertTrue(any(len(group) > 1 for group in transport.groups))
+            self.assertIn((rejected_key,), transport.groups)
 
     def test_http_transport_reuses_https_connection_for_binary_requests(self):
         manifest, stored = build_rollout_batch(

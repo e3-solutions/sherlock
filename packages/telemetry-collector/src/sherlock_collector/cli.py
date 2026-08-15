@@ -23,7 +23,7 @@ from .config import (
     default_state_root,
     load_config,
 )
-from .drain import Drain
+from .drain import Drain, PermanentUploadError, TransientUploadError
 from .hook import capture_and_spawn_drain, run_hook
 from .http import HttpTransport
 from .rollout import RolloutCapturer
@@ -234,7 +234,13 @@ def main(argv: list[str] | None = None) -> int:
                 resume=not args.no_resume,
                 progress=_ProgressPrinter("Uploading"),
             )
-        except (BackfillError, OSError, zipfile.BadZipFile) as error:
+        except (
+            BackfillError,
+            OSError,
+            zipfile.BadZipFile,
+            PermanentUploadError,
+            TransientUploadError,
+        ) as error:
             print(f"backfill upload failed: {error}", file=sys.stderr)
             return 74
         print(json.dumps(asdict(upload_outcome), sort_keys=True))

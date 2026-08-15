@@ -53,7 +53,7 @@ Use the collector configuration installed by Sherlock:
 ```sh
 python3 plugins/sherlock/scripts/upload_history.py \
   ./sherlock-codex-history.zip \
-  --workers 32
+  --workers 16
 ```
 
 `--config /path/to/collector.json` overrides the default
@@ -79,6 +79,11 @@ sherlock-codex-history.zip.upload-state.json
 Use `--retries N`, `--state /secure/path/state.json`, or `--no-resume` when an
 operator needs different behavior. Server receipts remain idempotent even
 without a local checkpoint.
+
+Each archive gets its own checkpoint beside the ZIP. A newly named export can
+be uploaded immediately without clearing anything. If an archive is replaced
+in place with `--force`, remove its matching `.upload-state.json` first or use
+a new `--state` path; never reuse a checkpoint from a different archive.
 
 On success, stdout contains a machine-readable summary with uploaded/skipped
 batch counts and source bytes uploaded. Raw transcript bytes remain immutable
