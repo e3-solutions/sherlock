@@ -126,7 +126,16 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
             completed = subprocess.run(
-                ["sh", str(INSTALLER)],
+                [
+                    "sh",
+                    str(INSTALLER),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "TEST@example.com",
+                ],
                 cwd=ROOT,
                 env=environment,
                 check=False,
@@ -137,6 +146,10 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             config = codex_home / "sherlock" / "collector.json"
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            configured = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(configured["name"], "Test User")
+            self.assertEqual(configured["github_id"], "test-user")
+            self.assertEqual(configured["email"], "test@example.com")
             self.assertNotIn("opaque-team-token", completed.stdout)
             self.assertNotIn("opaque-team-token", completed.stderr)
             self.assertIn("Trusted 4 Sherlock hooks", completed.stdout)

@@ -111,7 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         return 78
     outcome = Drain(
         spool,
-        HttpTransport(configuration.endpoint, configuration.token),
+        HttpTransport(
+            configuration.endpoint,
+            configuration.token,
+            configuration.identity,
+        ),
     ).run()
     print(json.dumps(asdict(outcome), sort_keys=True))
     return 0 if not outcome.locked else 75

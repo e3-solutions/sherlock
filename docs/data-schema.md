@@ -11,9 +11,8 @@ tables across two private schemas and one private Storage bucket.
 
 Use these in order:
 
-1. [`supabase/migrations/20260814225047_initial_sherlock_schema.sql`](../supabase/migrations/20260814225047_initial_sherlock_schema.sql)
-   is authoritative for exact columns, constraints, indexes, roles, grants,
-   and bucket configuration.
+1. [`supabase/migrations`](../supabase/migrations) is authoritative for exact
+   columns, constraints, indexes, roles, grants, and bucket configuration.
 2. [`supabase/tests/database/schema.test.sql`](../supabase/tests/database/schema.test.sql)
    verifies the security and integrity properties on a real database.
 3. This document explains responsibilities, relationships, and application
@@ -67,7 +66,7 @@ database columns.
 | Table | Responsibility | Writer behavior |
 | --- | --- | --- |
 | `telemetry.workspaces` | Team and tenant boundary | Provisioned administratively |
-| `telemetry.people` | Stable human attribution inside a workspace | Provisioned administratively |
+| `telemetry.people` | Stable human attribution inside a workspace | Server resolves normalized email and refreshes declared profile fields |
 | `telemetry.sessions` | Current cache for one native Codex execution stream | Normalizer may insert and update |
 | `telemetry.ingest_batches` | Receipt for one committed source byte range and Storage object | Ingest may insert only |
 | `telemetry.native_records` | Exact locator and parse status for each native record | Ingest may insert only |
@@ -177,9 +176,10 @@ fact. These grants separate collection from interpretation and product reads.
 `sherlock.rollout-batch.v1` and `sherlock.committed-receipt.v1` implement these
 application rules without changing the seven-table schema:
 
-1. Authenticate the collector on the server and derive `workspace_id`,
-   `person_id`, and the permitted `collector_key`. Never trust client-supplied
-   tenancy or person attribution.
+1. Authenticate the shared team credential on the server and derive
+   `workspace_id`. Normalize the declared email, resolve one `person_id` per
+   workspace/email, and derive a machine-specific `collector_key` from the
+   email plus persistent installation UUID. Never accept client-supplied IDs.
 2. Durably spool a source chunk and its encoded object once. Retries must reuse
    the exact bytes rather than recompressing them.
 3. Upload to a content-addressed path with overwrite disabled. If the object
@@ -192,7 +192,7 @@ application rules without changing the seven-table schema:
    record ranges are ordered, unique, contained by the batch, and equal the
    declared record count.
 6. Return a versioned committed receipt containing the stable stream,
-   generation, byte range, hashes, batch ID, and authenticated attribution.
+   generation, byte range, hashes, batch ID, and server-resolved attribution.
 7. Delete the local spool item only after every receipt identity field matches.
    A successful Storage upload alone is not an acknowledgement.
 
@@ -206,6 +206,12 @@ in both expected failure windows:
 
 An orphaned object from a rejected conflict is operational cleanup, not a
 queryable telemetry fact.
+
+Name, GitHub login, and email are declared by a teammate holding the shared
+workspace credential; they are not proof of control of that email account.
+This is the intentional internal-team trust boundary. Batch `person_id` remains
+immutable after commit, and two installations declaring the same normalized
+email resolve to the same person.
 
 ## Planned application behavior
 

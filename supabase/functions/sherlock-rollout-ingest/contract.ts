@@ -7,9 +7,14 @@ export const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 export const NATIVE_LABEL_BYTES = 256;
 export const IDENTITY_HINT_BYTES = 512;
 export const VERSION_HINT_BYTES = 128;
+export const PERSON_NAME_BYTES = 256;
+export const EMAIL_BYTES = 320;
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_SEGMENT = /^[A-Za-z0-9._~-]{1,200}$/;
+const GITHUB_ID = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
+const UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface RecordLocator {
   record_index: number;
@@ -50,6 +55,13 @@ export interface Attribution {
   collector_key: string;
 }
 
+export interface CollectorIdentity {
+  name: string;
+  github_id: string;
+  email: string;
+  installation_id: string;
+}
+
 export interface CommittedReceipt extends Attribution {
   receipt_version: typeof RECEIPT_VERSION;
   status: "committed";
@@ -71,6 +83,7 @@ export interface CommittedReceipt extends Attribution {
 }
 
 export interface IngestEnvelope {
+  collector: CollectorIdentity;
   manifest: BatchManifest;
   stored_payload: Uint8Array;
 }
@@ -230,6 +243,81 @@ function safeSegment(value: unknown, field: string): string {
   return result;
 }
 
+function identityText(
+  value: unknown,
+  field: string,
+  maximumBytes: number,
+): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new IngestError(
+      "invalid_identity",
+      `collector.${field} is required`,
+      400,
+    );
+  }
+  const result = value.trim();
+  if (new TextEncoder().encode(result).byteLength > maximumBytes) {
+    throw new IngestError(
+      "invalid_identity",
+      `collector.${field} exceeds ${maximumBytes} UTF-8 bytes`,
+      400,
+    );
+  }
+  return result;
+}
+
+export function parseCollectorIdentity(value: unknown): CollectorIdentity {
+  const input = object(value, "collector");
+  const name = identityText(input.name, "name", PERSON_NAME_BYTES);
+  const githubId = identityText(input.github_id, "github_id", 39).toLowerCase();
+  const email = identityText(input.email, "email", EMAIL_BYTES).toLowerCase();
+  const installationId = identityText(
+    input.installation_id,
+    "installation_id",
+    36,
+  ).toLowerCase();
+  if (!GITHUB_ID.test(githubId)) {
+    throw new IngestError(
+      "invalid_identity",
+      "collector.github_id must be a GitHub login",
+      400,
+    );
+  }
+  if (
+    email.split("@").length !== 2 ||
+    /\s|[\u0000-\u001f]/.test(email) ||
+    email.startsWith("@") ||
+    email.endsWith("@")
+  ) {
+    throw new IngestError(
+      "invalid_identity",
+      "collector.email must be a valid address",
+      400,
+    );
+  }
+  const domain = email.split("@")[1];
+  if (domain.startsWith(".") || domain.endsWith(".")) {
+    throw new IngestError(
+      "invalid_identity",
+      "collector.email must be a valid address",
+      400,
+    );
+  }
+  if (!UUID_V4.test(installationId)) {
+    throw new IngestError(
+      "invalid_identity",
+      "collector.installation_id must be a canonical UUIDv4",
+      400,
+    );
+  }
+  return {
+    name,
+    github_id: githubId,
+    email,
+    installation_id: installationId,
+  };
+}
+
 function decodeBase64(value: unknown): Uint8Array {
   if (typeof value !== "string" || value.length === 0) {
     throw new IngestError(
@@ -309,6 +397,7 @@ function parseRecord(value: unknown): RecordLocator {
 
 export function parseEnvelope(value: unknown): IngestEnvelope {
   const input = object(value, "request");
+  const collector = parseCollectorIdentity(input.collector);
   const raw = object(input.manifest, "manifest");
   if (!Array.isArray(raw.records)) {
     throw new IngestError("invalid_manifest", "records must be an array", 400);
@@ -378,6 +467,7 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
   };
   validateManifest(manifest);
   return {
+    collector,
     manifest,
     stored_payload: decodeBase64(input.stored_payload_base64),
   };

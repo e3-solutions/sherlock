@@ -7,10 +7,13 @@ DEFAULT_ENDPOINT="https://psmuyotyyojrkojycyzz.supabase.co/functions/v1/sherlock
 CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 TOKEN_STDIN=0
+NAME=""
+GITHUB_ID=""
+EMAIL=""
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--token-stdin]
+Usage: ./install.sh --name NAME --github-id LOGIN --email EMAIL [--token-stdin]
 
 Installs the Sherlock Codex plugin, collector runtime/config, and trusts only
 the installed Sherlock hooks.
@@ -20,27 +23,43 @@ Environment overrides:
   CODEX_HOME            Codex state directory (default: ~/.codex)
   PYTHON_BIN             Python 3 executable (default: python3)
   SHERLOCK_INGEST_URL    Collector endpoint
-  SHERLOCK_INGEST_TOKEN  Collector token (otherwise prompted without echo)
+  SHERLOCK_INGEST_TOKEN  Shared team credential (otherwise prompted without echo)
 EOF
 }
 
-case "${1:-}" in
-  "") ;;
-  --token-stdin)
-    TOKEN_STDIN=1
-    shift
-    ;;
-  -h|--help)
-    usage
-    exit 0
-    ;;
-  *)
-    usage >&2
-    exit 2
-    ;;
-esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --name)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      NAME=$2
+      shift 2
+      ;;
+    --github-id|--github_id)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      GITHUB_ID=$2
+      shift 2
+      ;;
+    --email)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      EMAIL=$2
+      shift 2
+      ;;
+    --token-stdin)
+      TOKEN_STDIN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
-if [ "$#" -ne 0 ]; then
+if [ -z "$NAME" ] || [ -z "$GITHUB_ID" ] || [ -z "$EMAIL" ]; then
   usage >&2
   exit 2
 fi
@@ -78,11 +97,17 @@ if [ "$TOKEN_STDIN" -eq 1 ]; then
   "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install.py" \
     --endpoint "$ENDPOINT" \
     --codex-home "$CODEX_HOME" \
+    --name "$NAME" \
+    --github-id "$GITHUB_ID" \
+    --email "$EMAIL" \
     --token-stdin
 else
   "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install.py" \
     --endpoint "$ENDPOINT" \
-    --codex-home "$CODEX_HOME"
+    --codex-home "$CODEX_HOME" \
+    --name "$NAME" \
+    --github-id "$GITHUB_ID" \
+    --email "$EMAIL"
 fi
 
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install_marketplace.py" \

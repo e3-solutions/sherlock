@@ -1,10 +1,10 @@
 # Rollout batch v1
 
 `sherlock.rollout-batch.v1` is the collector-to-ingest manifest for one
-immutable gzip-encoded rollout byte range. The request contains exactly one
-manifest plus `stored_payload_base64`; workspace, person, collector, object
-path, and batch ID are deliberately absent because the authenticated server
-owns them.
+immutable gzip-encoded rollout byte range. The request contains declared
+collector identity, one manifest, and `stored_payload_base64`; workspace,
+person, collector key, object path, and batch ID are deliberately absent
+because the authorized server resolves them.
 
 The manifest contains source stream and generation identity, half-open byte
 bounds, source and stored sizes/SHA-256 values, optional native-session and

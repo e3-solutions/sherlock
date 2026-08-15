@@ -1,12 +1,18 @@
-import { type Attribution, IngestError, sha256Hex } from "./contract.ts";
+import { type CollectorIdentity, IngestError, sha256Hex } from "./contract.ts";
 
-interface CollectorConfiguration extends Attribution {
+export interface CollectorGrant {
+  workspace_id: string;
+  collector_key_prefix: string;
+}
+
+interface CollectorConfiguration extends CollectorGrant {
   token_sha256: string;
 }
 
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/;
+const COLLECTOR_KEY_PREFIX = /^[A-Za-z0-9._~-]{1,160}$/;
 
 function configurationError(message: string): never {
   throw new IngestError("invalid_configuration", message, 500);
@@ -46,7 +52,6 @@ export function parseCollectorConfigurations(
       const field of [
         "token_sha256",
         "workspace_id",
-        "person_id",
         "collector_key",
       ]
     ) {
@@ -60,18 +65,24 @@ export function parseCollectorConfigurations(
     if (
       !SHA256.test(entry.token_sha256 as string) ||
       !UUID.test(entry.workspace_id as string) ||
-      !UUID.test(entry.person_id as string)
+      !COLLECTOR_KEY_PREFIX.test(entry.collector_key as string)
     ) {
-      configurationError("collector IDs or token hash are invalid");
+      configurationError(
+        "collector workspace, key prefix, or token hash is invalid",
+      );
     }
-    return entry as unknown as CollectorConfiguration;
+    return {
+      token_sha256: entry.token_sha256 as string,
+      workspace_id: entry.workspace_id as string,
+      collector_key_prefix: entry.collector_key as string,
+    };
   });
 }
 
 export async function authenticate(
   authorization: string | null,
   configurations: CollectorConfiguration[],
-): Promise<Attribution> {
+): Promise<CollectorGrant> {
   if (!authorization?.startsWith("Bearer ")) {
     unauthorized("collector bearer credential is required");
   }
@@ -88,7 +99,16 @@ export async function authenticate(
   }
   return {
     workspace_id: match.workspace_id,
-    person_id: match.person_id,
-    collector_key: match.collector_key,
+    collector_key_prefix: match.collector_key_prefix,
   };
+}
+
+export async function collectorKeyForIdentity(
+  grant: CollectorGrant,
+  identity: CollectorIdentity,
+): Promise<string> {
+  const digest = await sha256Hex(
+    new TextEncoder().encode(`${identity.email}\0${identity.installation_id}`),
+  );
+  return `${grant.collector_key_prefix}-${digest.slice(0, 32)}`;
 }

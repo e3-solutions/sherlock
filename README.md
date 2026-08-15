@@ -8,29 +8,32 @@ repo-local Codex plugin are implemented. Normalization and product read paths
 remain separate work.
 
 - [Data architecture and drain contract](docs/data-schema.md)
-- [Canonical database migration](supabase/migrations/20260814225047_initial_sherlock_schema.sql)
+- [Database migrations](supabase/migrations)
 - [Database verification](supabase/tests/database/schema.test.sql)
 
 ## Install the Codex plugin
 
-Each teammate needs an opaque collector token mapped to their own person and
-collector identity on the server. Do not share one teammate's token. From a
+The team shares one opaque workspace credential. Each teammate supplies their
+identity once; normalized email links the same person across machines, while a
+generated installation UUID keeps each machine's drain stream distinct. From a
 Sherlock checkout, the complete local setup is one command:
 
 ```sh
-./install.sh
+./install.sh --name "Ada Lovelace" --github-id ada --email ada@example.com
 ```
 
 The script registers the repo marketplace, installs the collector and plugin,
 and persists trust for only the installed `sherlock@sherlock` hooks using
-Codex's own hook hashes. It prompts for the token without echoing it or placing
-it in shell history. For secret-manager automation, pass it on standard input
-with `./install.sh --token-stdin`. It is stored with the endpoint in
+Codex's own hook hashes. It prompts for the shared team credential without
+echoing it or placing it in shell history. For secret-manager automation, pass
+it on standard input with the same identity flags plus `--token-stdin`. It is
+stored with the endpoint and identity in
 `$CODEX_HOME/sherlock/collector.json` (default `~/.codex/sherlock/collector.json`)
-with mode `0600`; the directory is mode `0700`. `SHERLOCK_INGEST_URL` and
-`SHERLOCK_INGEST_TOKEN` may be used instead when Codex inherits both variables.
-`CODEX_BIN`, `CODEX_HOME`, and `PYTHON_BIN` are optional installation overrides.
-No Supabase service key or database URL belongs on the client.
+with mode `0600`; the directory is mode `0700`. Reinstalling preserves the
+installation UUID. `SHERLOCK_INGEST_URL` and `SHERLOCK_INGEST_TOKEN` may be used
+instead when Codex inherits both variables. `CODEX_BIN`, `CODEX_HOME`, and
+`PYTHON_BIN` are optional installation overrides. No Supabase service key or
+database URL belongs on the client.
 
 Hooks discover active/recent rollout paths from Codex's SQLite state. Exact
 source bytes and checkpoints live under `$CODEX_HOME/sherlock/telemetry`.

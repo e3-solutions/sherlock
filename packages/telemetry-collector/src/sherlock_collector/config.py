@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -13,9 +15,29 @@ class ConfigurationError(ValueError):
 
 
 @dataclass(frozen=True)
+class CollectorIdentity:
+    name: str
+    github_id: str
+    email: str
+    installation_id: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "github_id": self.github_id,
+            "email": self.email,
+            "installation_id": self.installation_id,
+        }
+
+
+@dataclass(frozen=True)
 class CollectorConfig:
     endpoint: str
     token: str
+    identity: CollectorIdentity
+
+
+GITHUB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
 
 
 def default_codex_home() -> Path:
@@ -53,6 +75,51 @@ def validate_endpoint(value: object) -> str:
     return value
 
 
+def _bounded(value: object, field: str, maximum_bytes: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"{field} is required")
+    normalized = value.strip()
+    if len(normalized.encode("utf-8")) > maximum_bytes:
+        raise ConfigurationError(f"{field} exceeds {maximum_bytes} UTF-8 bytes")
+    return normalized
+
+
+def validate_identity(
+    *,
+    name: object,
+    github_id: object,
+    email: object,
+    installation_id: object,
+) -> CollectorIdentity:
+    normalized_name = _bounded(name, "name", 256)
+    normalized_github_id = _bounded(github_id, "github_id", 39).lower()
+    if not GITHUB_ID.fullmatch(normalized_github_id):
+        raise ConfigurationError("github_id must be a GitHub login")
+    normalized_email = _bounded(email, "email", 320).lower()
+    if (
+        normalized_email.count("@") != 1
+        or any(character.isspace() or ord(character) < 32 for character in normalized_email)
+    ):
+        raise ConfigurationError("email must be a valid address")
+    local, domain = normalized_email.split("@")
+    if not local or not domain or domain.startswith(".") or domain.endswith("."):
+        raise ConfigurationError("email must be a valid address")
+    try:
+        parsed_installation_id = uuid.UUID(str(installation_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ConfigurationError("installation_id must be a UUIDv4") from error
+    if parsed_installation_id.version != 4 or str(parsed_installation_id) != str(
+        installation_id
+    ).lower():
+        raise ConfigurationError("installation_id must be a canonical UUIDv4")
+    return CollectorIdentity(
+        name=normalized_name,
+        github_id=normalized_github_id,
+        email=normalized_email,
+        installation_id=str(parsed_installation_id),
+    )
+
+
 def _read_owner_only(path: Path) -> dict[str, object]:
     try:
         details = path.stat()
@@ -68,7 +135,14 @@ def _read_owner_only(path: Path) -> dict[str, object]:
         raise ConfigurationError("the collector config is unreadable") from error
     if not isinstance(value, dict):
         raise ConfigurationError("the collector config must be a JSON object")
-    unexpected = set(value) - {"endpoint", "token"}
+    unexpected = set(value) - {
+        "endpoint",
+        "token",
+        "name",
+        "github_id",
+        "email",
+        "installation_id",
+    }
     if unexpected:
         raise ConfigurationError("the collector config contains unsupported fields")
     return value
@@ -79,6 +153,9 @@ def load_config(
     *,
     codex_home: Path | str | None = None,
 ) -> CollectorConfig:
+    file_values = _read_owner_only(
+        Path(path or default_config_path(codex_home)).expanduser().resolve()
+    )
     endpoint = os.environ.get("SHERLOCK_INGEST_URL")
     token = os.environ.get("SHERLOCK_INGEST_TOKEN")
     if (endpoint is None) != (token is None):
@@ -86,11 +163,18 @@ def load_config(
             "SHERLOCK_INGEST_URL and SHERLOCK_INGEST_TOKEN must be set together"
         )
     if endpoint is None:
-        file_values = _read_owner_only(
-            Path(path or default_config_path(codex_home)).expanduser().resolve()
-        )
         endpoint = file_values.get("endpoint")
         token = file_values.get("token")
     if not isinstance(token, str) or not token:
         raise ConfigurationError("SHERLOCK_INGEST_TOKEN is required")
-    return CollectorConfig(validate_endpoint(endpoint), token)
+    identity = validate_identity(
+        name=os.environ.get("SHERLOCK_NAME", file_values.get("name")),
+        github_id=os.environ.get(
+            "SHERLOCK_GITHUB_ID", file_values.get("github_id")
+        ),
+        email=os.environ.get("SHERLOCK_EMAIL", file_values.get("email")),
+        installation_id=os.environ.get(
+            "SHERLOCK_INSTALLATION_ID", file_values.get("installation_id")
+        ),
+    )
+    return CollectorConfig(validate_endpoint(endpoint), token, identity)
