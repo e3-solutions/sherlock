@@ -53,7 +53,7 @@ Use the collector configuration installed by Sherlock:
 ```sh
 python3 plugins/sherlock/scripts/upload_history.py \
   ./sherlock-codex-history.zip \
-  --workers 4
+  --workers 32
 ```
 
 `--config /path/to/collector.json` overrides the default
@@ -63,9 +63,14 @@ together instead.
 
 The uploader verifies source and stored hashes before each request, preserves
 batch order inside a session, and processes independent sessions concurrently.
-It retries transient failures four times by default. Successful session
-checkpoints are written beside the archive, so rerunning the exact command
-continues efficiently:
+It packs up to 32 batches from adjacent sessions into each bounded binary
+request, sends gzip payloads without base64 expansion, compresses the highly
+repetitive manifest metadata, and reuses one persistent HTTPS connection per
+worker. Rollout payloads are not recompressed. An in-place progress bar tracks
+completed sessions on a terminal; redirected logs receive compact periodic
+updates. It retries transient failures four times by default.
+Successful session checkpoints are written beside the archive, so rerunning
+the exact command continues efficiently:
 
 ```text
 sherlock-codex-history.zip.upload-state.json

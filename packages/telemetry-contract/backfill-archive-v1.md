@@ -50,13 +50,16 @@ bytes and is therefore not permitted by the v1 exact-retry contract.
 
 The uploader treats the archive as untrusted input. It rejects duplicate,
 missing, unexpected, or unsafe member names and bounds every decoded JSON
-manifest. Before submitting a session for the first time, it validates every
-batch/range/hash and reconstructs the full-session hash. A checkpointed
-session is skipped only after its prior exact receipts and the unchanged
+manifest. It validates each batch/range/hash before submission and reconstructs
+the full-session hash before checkpointing that session. A checkpointed session
+is skipped only after its prior exact receipts and the unchanged
 archive-manifest hash establish that it was already validated and committed.
 
-Sessions upload concurrently; batches within one session upload in source
-offset order. Transient requests use bounded exponential retry. The adjacent
+Sessions upload concurrently; batches within one session are packed into
+bounded binary requests and ingested in source-offset order. The wire protocol
+gzip-compresses manifest JSON, sends the existing immutable rollout gzip bytes
+directly, and never base64-expands payloads. Transient requests use bounded
+exponential retry. The adjacent
 `<archive>.upload-state.json` checkpoint is bound to the SHA-256 of the archive
 manifest and is atomically updated after each completed session. The uploader
 also verifies the ZIP central directory contains exactly the members named by

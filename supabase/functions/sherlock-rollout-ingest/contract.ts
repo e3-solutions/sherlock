@@ -4,6 +4,13 @@ export const MAX_STORED_BYTES = 6 * 1024 * 1024;
 export const MAX_SOURCE_BYTES = 5 * 1024 * 1024;
 export const MAX_RECORDS = 20_000;
 export const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
+export const MAX_BULK_ITEMS = 32;
+export const MAX_BULK_SOURCE_BYTES = 20 * 1024 * 1024;
+export const MAX_BULK_MANIFEST_BYTES = 16 * 1024 * 1024;
+export const MAX_BULK_MANIFEST_TOTAL_BYTES = 20 * 1024 * 1024;
+export const BULK_CONTENT_TYPE = "application/vnd.sherlock.rollout-bulk.v2";
+export const BULK_RECEIPT_VERSION = "sherlock.bulk-receipts.v1";
+const BULK_MAGIC = new TextEncoder().encode("SHRBULK2");
 export const NATIVE_LABEL_BYTES = 256;
 export const IDENTITY_HINT_BYTES = 512;
 export const VERSION_HINT_BYTES = 128;
@@ -338,9 +345,8 @@ function parseRecord(value: unknown): RecordLocator {
   };
 }
 
-export function parseEnvelope(value: unknown): IngestEnvelope {
-  const input = object(value, "request");
-  const raw = object(input.manifest, "manifest");
+export function parseManifest(value: unknown): BatchManifest {
+  const raw = object(value, "manifest");
   if (!Array.isArray(raw.records)) {
     throw new IngestError("invalid_manifest", "records must be an array", 400);
   }
@@ -408,10 +414,181 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
     ),
   };
   validateManifest(manifest);
+  return manifest;
+}
+
+export function parseEnvelope(value: unknown): IngestEnvelope {
+  const input = object(value, "request");
   return {
-    manifest,
+    manifest: parseManifest(input.manifest),
     stored_payload: decodeBase64(input.stored_payload_base64),
   };
+}
+
+export async function parseBulkEnvelope(
+  bytes: Uint8Array,
+): Promise<IngestEnvelope[]> {
+  if (bytes.byteLength < BULK_MAGIC.byteLength + 4) {
+    throw new IngestError("invalid_request", "bulk request is truncated", 400);
+  }
+  for (let index = 0; index < BULK_MAGIC.byteLength; index++) {
+    if (bytes[index] !== BULK_MAGIC[index]) {
+      throw new IngestError(
+        "invalid_request",
+        "bulk request magic is invalid",
+        400,
+      );
+    }
+  }
+  const view = new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  );
+  let offset = BULK_MAGIC.byteLength;
+  const itemCount = view.getUint32(offset);
+  offset += 4;
+  if (itemCount < 1 || itemCount > MAX_BULK_ITEMS) {
+    throw new IngestError(
+      "payload_too_large",
+      `bulk request must contain 1-${MAX_BULK_ITEMS} batches`,
+      413,
+    );
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const envelopes: IngestEnvelope[] = [];
+  let totalSourceBytes = 0;
+  let totalManifestBytes = 0;
+  for (let index = 0; index < itemCount; index++) {
+    if (offset + 12 > bytes.byteLength) {
+      throw new IngestError(
+        "invalid_request",
+        "bulk item header is truncated",
+        400,
+      );
+    }
+    const encodedManifestLength = view.getUint32(offset);
+    const manifestLength = view.getUint32(offset + 4);
+    const payloadLength = view.getUint32(offset + 8);
+    offset += 12;
+    if (
+      encodedManifestLength < 1 ||
+      manifestLength < 2 ||
+      manifestLength > MAX_BULK_MANIFEST_BYTES ||
+      payloadLength < 1 ||
+      payloadLength > MAX_STORED_BYTES ||
+      offset + encodedManifestLength + payloadLength > bytes.byteLength
+    ) {
+      throw new IngestError(
+        "invalid_request",
+        "bulk item lengths are invalid",
+        400,
+      );
+    }
+    totalManifestBytes += manifestLength;
+    if (totalManifestBytes > MAX_BULK_MANIFEST_TOTAL_BYTES) {
+      throw new IngestError(
+        "payload_too_large",
+        "bulk manifests exceed 20 MiB",
+        413,
+      );
+    }
+    const manifestBytes = await decompressManifestBounded(
+      bytes.subarray(offset, offset + encodedManifestLength),
+      manifestLength,
+    );
+    let rawManifest: unknown;
+    try {
+      rawManifest = JSON.parse(decoder.decode(manifestBytes));
+    } catch {
+      throw new IngestError(
+        "invalid_manifest",
+        `bulk manifest ${index} is invalid JSON`,
+        400,
+      );
+    }
+    offset += encodedManifestLength;
+    const storedPayload = bytes.slice(offset, offset + payloadLength);
+    offset += payloadLength;
+    const manifest = parseManifest(rawManifest);
+    if (manifest.stored_byte_count !== storedPayload.byteLength) {
+      throw new IngestError(
+        "stored_integrity_mismatch",
+        `bulk payload ${index} size does not match its manifest`,
+        400,
+      );
+    }
+    totalSourceBytes += manifest.source_byte_count;
+    if (totalSourceBytes > MAX_BULK_SOURCE_BYTES) {
+      throw new IngestError(
+        "payload_too_large",
+        "bulk uncompressed source exceeds 20 MiB",
+        413,
+      );
+    }
+    envelopes.push({ manifest, stored_payload: storedPayload });
+  }
+  if (offset !== bytes.byteLength) {
+    throw new IngestError(
+      "invalid_request",
+      "bulk request has trailing bytes",
+      400,
+    );
+  }
+  return envelopes;
+}
+
+async function decompressManifestBounded(
+  encoded: Uint8Array,
+  expectedBytes: number,
+): Promise<Uint8Array> {
+  try {
+    const bytes = encoded.buffer.slice(
+      encoded.byteOffset,
+      encoded.byteOffset + encoded.byteLength,
+    ) as ArrayBuffer;
+    const reader = new Blob([bytes])
+      .stream()
+      .pipeThrough(new DecompressionStream("gzip"))
+      .getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > expectedBytes || total > MAX_BULK_MANIFEST_BYTES) {
+        await reader.cancel();
+        throw new IngestError(
+          "payload_too_large",
+          "bulk manifest exceeds its declared size",
+          413,
+        );
+      }
+      chunks.push(value);
+    }
+    if (total !== expectedBytes) {
+      throw new IngestError(
+        "invalid_manifest",
+        "bulk manifest size does not match its header",
+        400,
+      );
+    }
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof IngestError) throw error;
+    throw new IngestError(
+      "invalid_manifest",
+      "bulk manifest is not valid gzip",
+      400,
+    );
+  }
 }
 
 export function validateManifest(manifest: BatchManifest): void {

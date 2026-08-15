@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, cast
+from typing import Callable, Mapping, Sequence, cast
 
 from .contract import (
     MAX_RECORDS,
@@ -44,6 +44,7 @@ UPLOAD_STATE_VERSION = "sherlock.backfill-upload-state.v1"
 ARCHIVE_MANIFEST_PATH = "manifest.json"
 MAX_ARCHIVE_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_BATCH_MANIFEST_BYTES = 16 * 1024 * 1024
+UPLOAD_SESSION_GROUP_SIZE = 32
 DEFAULT_EXPORT_WORKERS = min(8, max(1, os.cpu_count() or 1))
 SESSION_ID_RE = re.compile(
     r"(?:^|[-_])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -817,13 +818,22 @@ def _batch_item(
     )
 
 
-def _upload_item(
-    transport: UploadTransport, item: SpoolItem, retries: int
-) -> Mapping[str, object]:
+def _upload_items(
+    transport: UploadTransport, items: Sequence[SpoolItem], retries: int
+) -> tuple[Mapping[str, object], ...]:
     for attempt in range(retries + 1):
         try:
-            receipt = transport.upload(item)
-            return validate_committed_receipt(item.manifest, receipt)
+            upload_many = getattr(transport, "upload_many", None)
+            if callable(upload_many):
+                raw_receipts = upload_many(items)
+            else:
+                raw_receipts = [transport.upload(item) for item in items]
+            if len(raw_receipts) != len(items):
+                raise BackfillError("upload receipt count does not match request")
+            return tuple(
+                validate_committed_receipt(item.manifest, receipt)
+                for item, receipt in zip(items, raw_receipts, strict=True)
+            )
         except TransientUploadError:
             if attempt >= retries:
                 raise
@@ -831,19 +841,101 @@ def _upload_item(
     raise AssertionError("retry loop did not return")
 
 
-def _upload_session(
+@dataclass
+class _SessionUploadProgress:
+    uploaded: set[str]
+    source_bytes: int = 0
+    skipped: int = 0
+
+
+class _BulkUploadBuffer:
+    def __init__(self, transport: UploadTransport, retries: int):
+        self.transport = transport
+        self.retries = retries
+        self.pending: list[tuple[SpoolItem, _SessionUploadProgress]] = []
+        self.pending_request_bytes = 12
+        self.pending_source_bytes = 0
+        self.pending_manifest_bytes = 0
+        self.max_batch_items = int(getattr(transport, "max_batch_items", 1))
+        self.max_request_bytes = int(
+            getattr(transport, "max_batch_request_bytes", 0)
+        )
+        self.max_source_bytes = int(
+            getattr(transport, "max_batch_source_bytes", 0)
+        )
+        self.max_manifest_bytes = int(
+            getattr(transport, "max_batch_manifest_bytes", 0)
+        )
+
+    def add(self, item: SpoolItem, owner: _SessionUploadProgress) -> None:
+        bulk_manifest_size = getattr(self.transport, "bulk_manifest_size", None)
+        if callable(bulk_manifest_size):
+            item_manifest_bytes = int(bulk_manifest_size(item))
+        else:
+            item_manifest_bytes = len(
+                json.dumps(
+                    item.manifest.to_dict(), separators=(",", ":")
+                ).encode("utf-8")
+            )
+        bulk_item_size = getattr(self.transport, "bulk_item_size", None)
+        item_request_bytes = (
+            int(bulk_item_size(item))
+            if callable(bulk_item_size)
+            else 8 + item_manifest_bytes + len(item.stored_payload)
+        )
+        item_source_bytes = item.manifest.source_byte_count
+        if self.pending and (
+            len(self.pending) >= self.max_batch_items
+            or (
+                self.max_request_bytes > 0
+                and self.pending_request_bytes + item_request_bytes
+                > self.max_request_bytes
+            )
+            or (
+                self.max_source_bytes > 0
+                and self.pending_source_bytes + item_source_bytes
+                > self.max_source_bytes
+            )
+            or (
+                self.max_manifest_bytes > 0
+                and self.pending_manifest_bytes + item_manifest_bytes
+                > self.max_manifest_bytes
+            )
+        ):
+            self.flush()
+        self.pending.append((item, owner))
+        self.pending_request_bytes += item_request_bytes
+        self.pending_source_bytes += item_source_bytes
+        self.pending_manifest_bytes += item_manifest_bytes
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        _upload_items(
+            self.transport,
+            [item for item, _owner in self.pending],
+            self.retries,
+        )
+        for item, owner in self.pending:
+            owner.uploaded.add(item.manifest.spool_key)
+            owner.source_bytes += item.manifest.source_byte_count
+        self.pending.clear()
+        self.pending_request_bytes = 12
+        self.pending_source_bytes = 0
+        self.pending_manifest_bytes = 0
+
+
+def _prepare_session_upload(
     archive: zipfile.ZipFile,
     session: Mapping[str, object],
     completed: set[str],
-    transport: UploadTransport,
-    retries: int,
-) -> tuple[set[str], int, int]:
+    buffer: _BulkUploadBuffer,
+) -> _SessionUploadProgress:
     keys = session["batch_keys"]
     assert isinstance(keys, list)
     if keys and all(key in completed for key in keys):
-        return set(), 0, len(keys)
-    uploaded: set[str] = set()
-    source_bytes = 0
+        return _SessionUploadProgress(set(), skipped=len(keys))
+    result = _SessionUploadProgress(set())
     stored_bytes = 0
     expected_offset = 0
     source_hash = hashlib.sha256()
@@ -867,9 +959,7 @@ def _upload_session(
         stored_bytes += item.manifest.stored_byte_count
         if key in completed:
             continue
-        _upload_item(transport, item, retries)
-        uploaded.add(key)
-        source_bytes += item.manifest.source_byte_count
+        buffer.add(item, result)
     expected_size = _integer(session.get("source_byte_count"), "source_byte_count")
     if expected_offset != expected_size:
         raise BackfillError(
@@ -885,7 +975,38 @@ def _upload_session(
         raise BackfillError(
             f"session {session.get('relative_path')} source hash does not match"
         )
-    return uploaded, source_bytes, len(keys) - len(uploaded)
+    return result
+
+
+def _upload_sessions(
+    archive: zipfile.ZipFile,
+    sessions: Sequence[Mapping[str, object]],
+    completed: set[str],
+    transport: UploadTransport,
+    retries: int,
+) -> tuple[tuple[set[str], int, int], ...]:
+    buffer = _BulkUploadBuffer(transport, retries)
+    results = [
+        _prepare_session_upload(archive, session, completed, buffer)
+        for session in sessions
+    ]
+    buffer.flush()
+    return tuple(
+        (result.uploaded, result.source_bytes, result.skipped)
+        for result in results
+    )
+
+
+def _upload_session(
+    archive: zipfile.ZipFile,
+    session: Mapping[str, object],
+    completed: set[str],
+    transport: UploadTransport,
+    retries: int,
+) -> tuple[set[str], int, int]:
+    return _upload_sessions(
+        archive, [session], completed, transport, retries
+    )[0]
 
 
 def upload_archive(
@@ -922,41 +1043,54 @@ def upload_archive(
         dirty_sessions = 0
         last_checkpoint_at = time.monotonic()
 
-        def run(session: Mapping[str, object]) -> tuple[set[str], int, int]:
+        session_groups = [
+            sessions[index : index + UPLOAD_SESSION_GROUP_SIZE]
+            for index in range(0, len(sessions), UPLOAD_SESSION_GROUP_SIZE)
+        ]
+
+        def run(
+            group: Sequence[Mapping[str, object]],
+        ) -> tuple[tuple[set[str], int, int], ...]:
             with completed_lock:
                 snapshot = set(completed)
-            return _upload_session(
-                archive_handle, session, snapshot, transport, retries
+            return _upload_sessions(
+                archive_handle, group, snapshot, transport, retries
             )
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(run, session): session for session in sessions}
+            futures = {
+                executor.submit(run, group): group for group in session_groups
+            }
             try:
                 for future in as_completed(futures):
-                    session = futures[future]
-                    newly_completed, source_bytes, skipped = future.result()
-                    with completed_lock:
-                        completed.update(newly_completed)
-                        if newly_completed:
-                            dirty_sessions += 1
-                        checkpoint_due = dirty_sessions >= 25 or (
-                            dirty_sessions > 0
-                            and time.monotonic() - last_checkpoint_at >= 2.0
-                        )
-                        if resume and checkpoint_due:
-                            _save_upload_state(checkpoint, manifest_hash, completed)
-                            dirty_sessions = 0
-                            last_checkpoint_at = time.monotonic()
-                    uploaded_total += len(newly_completed)
-                    skipped_total += skipped
-                    source_total += source_bytes
-                    finished += 1
-                    if progress:
-                        progress(
-                            finished,
-                            len(sessions),
-                            str(session.get("relative_path")),
-                        )
+                    group = futures[future]
+                    results = future.result()
+                    for session, result in zip(group, results, strict=True):
+                        newly_completed, source_bytes, skipped = result
+                        with completed_lock:
+                            completed.update(newly_completed)
+                            if newly_completed:
+                                dirty_sessions += 1
+                            checkpoint_due = dirty_sessions >= 25 or (
+                                dirty_sessions > 0
+                                and time.monotonic() - last_checkpoint_at >= 2.0
+                            )
+                            if resume and checkpoint_due:
+                                _save_upload_state(
+                                    checkpoint, manifest_hash, completed
+                                )
+                                dirty_sessions = 0
+                                last_checkpoint_at = time.monotonic()
+                        uploaded_total += len(newly_completed)
+                        skipped_total += skipped
+                        source_total += source_bytes
+                        finished += 1
+                        if progress:
+                            progress(
+                                finished,
+                                len(sessions),
+                                str(session.get("relative_path")),
+                            )
             except Exception:
                 for future in futures:
                     future.cancel()

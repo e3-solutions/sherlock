@@ -1,9 +1,11 @@
 import {
   type Attribution,
   type BatchManifest,
+  BULK_RECEIPT_VERSION,
   type CommittedReceipt,
   CONTRACT_VERSION,
   IngestError,
+  parseBulkEnvelope,
   parseEnvelope,
   RECEIPT_VERSION,
   sha256Hex,
@@ -22,6 +24,47 @@ function assert(
   message = "assertion failed",
 ): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+async function encodeBulk(
+  entries: Array<{ manifest: BatchManifest; stored: Uint8Array }>,
+): Promise<Uint8Array> {
+  const encoder = new TextEncoder();
+  const magic = encoder.encode("SHRBULK2");
+  const encoded = await Promise.all(entries.map(async (entry) => {
+    const manifest = encoder.encode(JSON.stringify(entry.manifest));
+    const compressed = new Blob([manifest])
+      .stream()
+      .pipeThrough(new CompressionStream("gzip"));
+    return {
+      manifest,
+      manifestGzip: new Uint8Array(
+        await new Response(compressed).arrayBuffer(),
+      ),
+      stored: entry.stored,
+    };
+  }));
+  const size = 12 + encoded.reduce(
+    (total, entry) =>
+      total + 12 + entry.manifestGzip.length + entry.stored.length,
+    0,
+  );
+  const body = new Uint8Array(size);
+  body.set(magic);
+  const view = new DataView(body.buffer);
+  view.setUint32(8, encoded.length);
+  let offset = 12;
+  for (const entry of encoded) {
+    view.setUint32(offset, entry.manifestGzip.length);
+    view.setUint32(offset + 4, entry.manifest.length);
+    view.setUint32(offset + 8, entry.stored.length);
+    offset += 12;
+    body.set(entry.manifestGzip, offset);
+    offset += entry.manifestGzip.length;
+    body.set(entry.stored, offset);
+    offset += entry.stored.length;
+  }
+  return body;
 }
 
 async function fixture(): Promise<{
@@ -254,6 +297,63 @@ Deno.test("oversized native record fragments retain their logical identity", asy
   assert(
     parsed.manifest.records[0].native_record_sha256 === nativeRecordHash,
   );
+});
+
+Deno.test("compressed binary bulk envelope avoids base64 and preserves order", async () => {
+  const { manifest, stored } = await fixture();
+  const second = {
+    ...manifest,
+    start_offset: 5,
+    end_offset: 10,
+    records: [{
+      ...manifest.records[0],
+      source_start_offset: 5,
+      source_end_offset: 10,
+    }],
+  };
+
+  const parsed = await parseBulkEnvelope(
+    await encodeBulk([
+      { manifest, stored },
+      { manifest: second, stored },
+    ]),
+  );
+
+  assert(parsed.length === 2);
+  assert(parsed[0].manifest.start_offset === 0);
+  assert(parsed[1].manifest.start_offset === 5);
+  assert(parsed[0].stored_payload.byteLength === stored.byteLength);
+  assert(BULK_RECEIPT_VERSION === "sherlock.bulk-receipts.v1");
+});
+
+Deno.test("binary bulk envelope rejects trailing bytes", async () => {
+  const { manifest, stored } = await fixture();
+  const encoded = await encodeBulk([{ manifest, stored }]);
+  const malformed = new Uint8Array(encoded.length + 1);
+  malformed.set(encoded);
+
+  try {
+    await parseBulkEnvelope(malformed);
+    assert(false, "trailing bytes should fail");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "invalid_request");
+  }
+});
+
+Deno.test("binary bulk envelope bounds decoded manifest expansion", async () => {
+  const { manifest, stored } = await fixture();
+  const encoded = await encodeBulk([{ manifest, stored }]);
+  const view = new DataView(encoded.buffer);
+  view.setUint32(16, view.getUint32(16) - 1);
+
+  try {
+    await parseBulkEnvelope(encoded);
+    assert(false, "manifest expansion beyond its declaration should fail");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "payload_too_large");
+  }
 });
 
 Deno.test("streaming decompression rejects a small gzip bomb", async () => {

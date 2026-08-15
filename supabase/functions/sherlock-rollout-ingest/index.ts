@@ -1,5 +1,15 @@
 import { authenticate, parseCollectorConfigurations } from "./auth.ts";
-import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
+import {
+  type Attribution,
+  BULK_CONTENT_TYPE,
+  BULK_RECEIPT_VERSION,
+  type CommittedReceipt,
+  type IngestEnvelope,
+  IngestError,
+  MAX_REQUEST_BYTES,
+  parseBulkEnvelope,
+  parseEnvelope,
+} from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
 import { IngestService } from "./service.ts";
 import { SupabaseImmutableStorage } from "./storage.ts";
@@ -39,8 +49,28 @@ async function handler(request: Request): Promise<Response> {
       request.headers.get("authorization"),
       configurations,
     );
-    const body = await readJsonBounded(request);
-    const envelope = parseEnvelope(body);
+    const body = await readBodyBounded(request);
+    const contentType = request.headers.get("content-type")?.split(";", 1)[0]
+      .trim().toLowerCase();
+    if (contentType === BULK_CONTENT_TYPE) {
+      const envelopes = await parseBulkEnvelope(body);
+      const receipts = await ingestMany(attribution, envelopes);
+      return Response.json({
+        receipt_version: BULK_RECEIPT_VERSION,
+        receipts,
+      }, {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    if (contentType !== "application/json") {
+      throw new IngestError(
+        "unsupported_media_type",
+        "content-type must be JSON or Sherlock bulk v2",
+        415,
+      );
+    }
+    const envelope = parseEnvelope(decodeJson(body));
     const receipt = await ingestService().ingest(
       attribution,
       envelope.manifest,
@@ -65,7 +95,24 @@ async function handler(request: Request): Promise<Response> {
   }
 }
 
-async function readJsonBounded(request: Request): Promise<unknown> {
+async function ingestMany(
+  attribution: Attribution,
+  envelopes: IngestEnvelope[],
+): Promise<CommittedReceipt[]> {
+  const receipts: CommittedReceipt[] = [];
+  for (const envelope of envelopes) {
+    receipts.push(
+      await ingestService().ingest(
+        attribution,
+        envelope.manifest,
+        envelope.stored_payload,
+      ),
+    );
+  }
+  return receipts;
+}
+
+async function readBodyBounded(request: Request): Promise<Uint8Array> {
   const declaredLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
     throw new IngestError(
@@ -100,6 +147,10 @@ async function readJsonBounded(request: Request): Promise<unknown> {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return bytes;
+}
+
+function decodeJson(bytes: Uint8Array): unknown {
   try {
     return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {

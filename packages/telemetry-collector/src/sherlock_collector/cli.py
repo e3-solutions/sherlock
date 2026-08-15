@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import time
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
@@ -25,6 +27,48 @@ from .hook import capture_and_spawn_drain, run_hook
 from .http import HttpTransport
 from .rollout import RolloutCapturer
 from .spool import DurableSpool
+
+
+class _ProgressPrinter:
+    def __init__(self, action: str):
+        self.action = action
+        self.last_rendered_at = 0.0
+        self.previous_width = 0
+
+    def __call__(self, current: int, total: int, path: str) -> None:
+        if total < 1:
+            return
+        if not sys.stderr.isatty():
+            interval = max(1, total // 100)
+            if current == 1 or current == total or current % interval == 0:
+                print(
+                    f"{self.action} {current}/{total}: {path}",
+                    file=sys.stderr,
+                )
+            return
+        now = time.monotonic()
+        if current < total and now - self.last_rendered_at < 0.05:
+            return
+        self.last_rendered_at = now
+        ratio = min(1.0, current / total)
+        bar_width = 24
+        completed = round(bar_width * ratio)
+        bar = "#" * completed + "-" * (bar_width - completed)
+        prefix = (
+            f"{self.action} [{bar}] {current:,}/{total:,} {ratio:6.1%} "
+        )
+        terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
+        available = max(0, terminal_width - len(prefix) - 1)
+        label = path
+        if len(label) > available:
+            label = ("…" + label[-(available - 1) :]) if available > 1 else ""
+        line = (prefix + label)[: terminal_width - 1]
+        padding = " " * max(0, self.previous_width - len(line))
+        sys.stderr.write(f"\r{line}{padding}")
+        sys.stderr.flush()
+        self.previous_width = len(line)
+        if current >= total:
+            sys.stderr.write("\n")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -158,9 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                 state_root=state_root,
                 force=args.force,
                 workers=args.workers,
-                progress=lambda current, total, path: print(
-                    f"exported {current}/{total}: {path}", file=sys.stderr
-                ),
+                progress=_ProgressPrinter("Exporting"),
             )
         except (BackfillError, OSError, zipfile.BadZipFile) as error:
             print(f"backfill export failed: {error}", file=sys.stderr)
@@ -182,9 +224,7 @@ def main(argv: list[str] | None = None) -> int:
                 retries=args.retries,
                 state_path=args.state,
                 resume=not args.no_resume,
-                progress=lambda current, total, path: print(
-                    f"uploaded {current}/{total}: {path}", file=sys.stderr
-                ),
+                progress=_ProgressPrinter("Uploading"),
             )
         except (BackfillError, OSError, zipfile.BadZipFile) as error:
             print(f"backfill upload failed: {error}", file=sys.stderr)
