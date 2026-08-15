@@ -267,6 +267,15 @@ class ConfigurationTests(unittest.TestCase):
                     / "cli.py"
                 ).is_file()
             )
+            self.assertTrue(
+                (
+                    codex_home
+                    / "sherlock"
+                    / "runtime"
+                    / "sherlock_collector"
+                    / "backfill.py"
+                ).is_file()
+            )
             self.assertNotIn("opaque-installer-token", completed.stdout)
             self.assertNotIn("opaque-installer-token", completed.stderr)
 

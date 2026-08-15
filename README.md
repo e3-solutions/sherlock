@@ -8,6 +8,7 @@ repo-local Codex plugin are implemented. Normalization and product read paths
 remain separate work.
 
 - [Data architecture and drain contract](docs/data-schema.md)
+- [Historical Codex backfill](docs/backfill.md)
 - [Canonical database migration](supabase/migrations/20260814225047_initial_sherlock_schema.sql)
 - [Database verification](supabase/tests/database/schema.test.sql)
 

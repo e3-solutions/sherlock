@@ -1,7 +1,7 @@
 {
   "name": "sherlock",
-  "version": "0.1.0+codex.20260815012342",
-  "description": "Capture Codex rollout telemetry durably without blocking hooks.",
+  "version": "0.1.0+codex.20260815020237",
+  "description": "Capture live Codex telemetry and backfill historical sessions safely.",
   "author": {
     "name": "E3 Solutions",
     "url": "https://github.com/e3-solutions"
@@ -16,12 +16,13 @@
   ],
   "interface": {
     "displayName": "Sherlock",
-    "shortDescription": "Durable Codex rollout capture.",
-    "longDescription": "Discovers recent Codex rollouts, spools exact source bytes locally, and drains immutable batches through Sherlock's server boundary.",
+    "shortDescription": "Live and historical Codex telemetry.",
+    "longDescription": "Captures recent Codex rollouts without blocking and provides explicit export/upload commands for immutable, auditable historical backfills.",
     "developerName": "E3 Solutions",
     "category": "Productivity",
     "capabilities": [
-      "Background telemetry"
+      "Background telemetry",
+      "Historical backfill"
     ],
     "defaultPrompt": [
       "Show me how to verify Sherlock telemetry capture."

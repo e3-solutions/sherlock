@@ -4,9 +4,11 @@ import argparse
 import json
 import os
 import sys
+import zipfile
 from dataclasses import asdict
 from pathlib import Path
 
+from .backfill import BackfillError, export_archive, upload_archive
 from .config import (
     ConfigurationError,
     default_codex_home,
@@ -31,6 +33,32 @@ def parser() -> argparse.ArgumentParser:
     hook = commands.add_parser("hook")
     hook.add_argument("event_name")
     commands.add_parser("drain")
+    backfill_export = commands.add_parser(
+        "backfill-export",
+        help="Export every active and archived Codex rollout to a verified ZIP.",
+    )
+    backfill_export.add_argument("--output", required=True, type=Path)
+    backfill_export.add_argument(
+        "--acknowledge-sensitive-data",
+        action="store_true",
+        help="Confirm that prompts, tool data, and responses may be included.",
+    )
+    backfill_export.add_argument(
+        "--force", action="store_true", help="Replace an existing output archive."
+    )
+    backfill_upload = commands.add_parser(
+        "backfill-upload",
+        help="Verify and upload a Sherlock backfill ZIP through the ingest API.",
+    )
+    backfill_upload.add_argument("archive", type=Path)
+    backfill_upload.add_argument("--workers", type=int, default=4)
+    backfill_upload.add_argument("--retries", type=int, default=4)
+    backfill_upload.add_argument("--state", type=Path)
+    backfill_upload.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not read or write the adjacent upload checkpoint.",
+    )
     return result
 
 
@@ -50,7 +78,6 @@ def main(argv: list[str] | None = None) -> int:
     state_root = Path(
         args.state_root or default_state_root(codex_home)
     ).expanduser().resolve()
-    spool = DurableSpool(state_root / "queue")
     source_root = str(Path(__file__).resolve().parents[1])
     environment = os.environ.copy()
     environment.update(
@@ -65,7 +92,8 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
     if args.command == "capture":
-        outcome = capture_and_spawn_drain(
+        spool = DurableSpool(state_root / "queue")
+        capture_outcome = capture_and_spawn_drain(
             RolloutCapturer(state_root, spool),
             args.rollout,
             [
@@ -81,10 +109,10 @@ def main(argv: list[str] | None = None) -> int:
             ],
             drain_environment=environment,
         )
-        print(json.dumps(asdict(outcome), sort_keys=True))
-        return 0 if not outcome.locked else 75
+        print(json.dumps(asdict(capture_outcome), sort_keys=True))
+        return 0 if not capture_outcome.locked else 75
     if args.command == "hook":
-        outcome = run_hook(
+        hook_outcome = run_hook(
             args.event_name,
             _payload_from_stdin(),
             codex_home=codex_home,
@@ -102,19 +130,58 @@ def main(argv: list[str] | None = None) -> int:
             ],
             drain_environment=environment,
         )
-        print(json.dumps(asdict(outcome), sort_keys=True))
+        print(json.dumps(asdict(hook_outcome), sort_keys=True))
+        return 0
+    if args.command == "backfill-export":
+        if not args.acknowledge_sensitive_data:
+            print(
+                "refusing to export: pass --acknowledge-sensitive-data to confirm "
+                "that Codex sessions can contain prompts, responses, tool data, and secrets",
+                file=sys.stderr,
+            )
+            return 64
+        try:
+            export_outcome = export_archive(
+                codex_home,
+                args.output,
+                state_root=state_root,
+                force=args.force,
+                progress=lambda current, total, path: print(
+                    f"exported {current}/{total}: {path}", file=sys.stderr
+                ),
+            )
+        except (BackfillError, OSError, zipfile.BadZipFile) as error:
+            print(f"backfill export failed: {error}", file=sys.stderr)
+            return 74
+        print(json.dumps(asdict(export_outcome), sort_keys=True))
         return 0
     try:
         configuration = load_config(args.config, codex_home=codex_home)
     except ConfigurationError as error:
         print(f"sherlock collector is not configured: {error}", file=sys.stderr)
         return 78
-    outcome = Drain(
-        spool,
-        HttpTransport(configuration.endpoint, configuration.token),
-    ).run()
-    print(json.dumps(asdict(outcome), sort_keys=True))
-    return 0 if not outcome.locked else 75
+    transport = HttpTransport(configuration.endpoint, configuration.token)
+    if args.command == "backfill-upload":
+        try:
+            upload_outcome = upload_archive(
+                args.archive,
+                transport,
+                workers=args.workers,
+                retries=args.retries,
+                state_path=args.state,
+                resume=not args.no_resume,
+                progress=lambda current, total, path: print(
+                    f"uploaded {current}/{total}: {path}", file=sys.stderr
+                ),
+            )
+        except (BackfillError, OSError, zipfile.BadZipFile) as error:
+            print(f"backfill upload failed: {error}", file=sys.stderr)
+            return 74
+        print(json.dumps(asdict(upload_outcome), sort_keys=True))
+        return 0
+    drain_outcome = Drain(DurableSpool(state_root / "queue"), transport).run()
+    print(json.dumps(asdict(drain_outcome), sort_keys=True))
+    return 0 if not drain_outcome.locked else 75
 
 
 if __name__ == "__main__":
