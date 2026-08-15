@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sherlock-telemetry-collector"
+version = "0.1.0"
+description = "Durable rollout capture and drain for Sherlock"
+requires-python = ">=3.11"
+
+[project.scripts]
+sherlock-collector = "sherlock_collector.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
