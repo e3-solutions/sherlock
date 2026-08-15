@@ -1,4 +1,4 @@
-import { authenticate, parseCollectorConfigurations } from "./auth.ts";
+import { publicCollectorGrant } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
 import { IngestService } from "./service.ts";
@@ -12,17 +12,27 @@ function required(name: string): string {
   return value;
 }
 
-let service: IngestService | null = null;
-function ingestService(): IngestService {
-  if (service) return service;
-  service = new IngestService(
-    new SupabaseImmutableStorage(
-      required("SUPABASE_URL"),
-      required("SUPABASE_SERVICE_ROLE_KEY"),
+let backend: {
+  service: IngestService;
+  batches: PostgresBatchRepository;
+} | null = null;
+function ingestBackend(): {
+  service: IngestService;
+  batches: PostgresBatchRepository;
+} {
+  if (backend) return backend;
+  const batches = PostgresBatchRepository.connect(required("SUPABASE_DB_URL"));
+  backend = {
+    batches,
+    service: new IngestService(
+      new SupabaseImmutableStorage(
+        required("SUPABASE_URL"),
+        required("SUPABASE_SERVICE_ROLE_KEY"),
+      ),
+      batches,
     ),
-    PostgresBatchRepository.connect(required("SUPABASE_DB_URL")),
-  );
-  return service;
+  };
+  return backend;
 }
 
 async function handler(request: Request): Promise<Response> {
@@ -32,16 +42,15 @@ async function handler(request: Request): Promise<Response> {
         status: 405,
       });
     }
-    const configurations = parseCollectorConfigurations(
-      required("SHERLOCK_COLLECTORS_JSON"),
-    );
-    const attribution = await authenticate(
-      request.headers.get("authorization"),
-      configurations,
-    );
+    const grant = publicCollectorGrant(required("SHERLOCK_WORKSPACE_ID"));
     const body = await readJsonBounded(request);
     const envelope = parseEnvelope(body);
-    const receipt = await ingestService().ingest(
+    const current = ingestBackend();
+    const attribution = await current.batches.resolveAttribution(
+      grant,
+      envelope.collector,
+    );
+    const receipt = await current.service.ingest(
       attribution,
       envelope.manifest,
       envelope.stored_payload,

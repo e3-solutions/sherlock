@@ -11,6 +11,10 @@ import {
   timestampMicros,
 } from "./contract.ts";
 import {
+  collectorKeyForIdentity,
+  publicCollectorGrant,
+} from "./attribution.ts";
+import {
   type BatchRepository,
   type ImmutableStorage,
   IngestService,
@@ -23,6 +27,13 @@ function assert(
 ): asserts condition {
   if (!condition) throw new Error(message);
 }
+
+const COLLECTOR = {
+  name: "Test User",
+  github_id: "test-user",
+  email: "test@example.com",
+  installation_id: "00000000-0000-4000-8000-000000000001",
+};
 
 async function fixture(): Promise<{
   attribution: Attribution;
@@ -211,6 +222,7 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
 
   try {
     parseEnvelope({
+      collector: COLLECTOR,
       manifest: {
         ...manifest,
         first_occurred_at: "2026-02-30T00:00:00Z",
@@ -223,6 +235,36 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
     assert(error instanceof IngestError);
     assert(error.status === 400);
   }
+});
+
+Deno.test("public ingest is scoped to the configured workspace", () => {
+  const grant = publicCollectorGrant(
+    "00000000-0000-4000-8000-000000000001",
+  );
+
+  assert(grant.workspace_id === "00000000-0000-4000-8000-000000000001");
+  assert(grant.collector_key_prefix === "team");
+  assert(!("person_id" in grant), "configuration must not fix person identity");
+});
+
+Deno.test("collector keys distinguish machines while email remains the person key", async () => {
+  const grant = {
+    workspace_id: "00000000-0000-4000-8000-000000000001",
+    collector_key_prefix: "team",
+  };
+  const first = await collectorKeyForIdentity(grant, COLLECTOR);
+  const repeat = await collectorKeyForIdentity(grant, COLLECTOR);
+  const secondMachine = await collectorKeyForIdentity(grant, {
+    ...COLLECTOR,
+    installation_id: "00000000-0000-4000-8000-000000000002",
+  });
+
+  assert(first === repeat, "one installation must keep a stable collector key");
+  assert(
+    first !== secondMachine,
+    "two installations must have distinct collector keys",
+  );
+  assert(first.startsWith("team-"));
 });
 
 Deno.test("streaming decompression rejects a small gzip bomb", async () => {

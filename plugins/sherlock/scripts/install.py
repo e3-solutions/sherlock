@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import shutil
@@ -17,12 +16,27 @@ def arguments() -> argparse.Namespace:
     )
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--codex-home", type=Path)
-    parser.add_argument(
-        "--token-stdin",
-        action="store_true",
-        help="Read the opaque collector token from one line on stdin.",
-    )
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--github-id", "--github_id", dest="github_id", required=True)
+    parser.add_argument("--email", required=True)
     return parser.parse_args()
+
+
+def existing_installation_id(path: Path) -> str | None:
+    try:
+        if path.stat().st_mode & 0o077:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    candidate = value.get("installation_id")
+    try:
+        parsed = uuid.UUID(str(candidate))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return str(parsed) if parsed.version == 4 and str(parsed) == candidate else None
 
 
 def atomic_json(path: Path, value: dict[str, str]) -> None:
@@ -68,25 +82,35 @@ def main() -> int:
     if not package.is_dir():
         raise SystemExit("run this installer from a Sherlock repository checkout")
     sys.path.insert(0, str(package.parent))
-    from sherlock_collector.config import ConfigurationError, validate_endpoint
+    from sherlock_collector.config import (
+        ConfigurationError,
+        validate_endpoint,
+        validate_identity,
+    )
 
     try:
         endpoint = validate_endpoint(args.endpoint)
     except ConfigurationError as error:
         raise SystemExit(f"invalid collector endpoint: {error}") from error
-    if args.token_stdin:
-        token = input().rstrip("\n")
-    else:
-        token = os.environ.get("SHERLOCK_INGEST_TOKEN") or getpass.getpass(
-            "Sherlock collector token: "
-        )
-    if not token:
-        raise SystemExit("collector token is required")
     root = codex_home / "sherlock"
+    config_path = root / "collector.json"
+    installation_id = existing_installation_id(config_path) or str(uuid.uuid4())
+    try:
+        identity = validate_identity(
+            name=args.name,
+            github_id=args.github_id,
+            email=args.email,
+            installation_id=installation_id,
+        )
+    except ConfigurationError as error:
+        raise SystemExit(f"invalid collector identity: {error}") from error
     install_runtime(package, root / "runtime" / "sherlock_collector")
-    atomic_json(root / "collector.json", {"endpoint": endpoint, "token": token})
+    atomic_json(
+        config_path,
+        {"endpoint": endpoint, **identity.to_dict()},
+    )
     print(f"Installed collector runtime under {root}")
-    print("Stored the endpoint and opaque token in owner-only collector.json")
+    print("Stored the endpoint and identity in owner-only collector.json")
     return 0
 
 

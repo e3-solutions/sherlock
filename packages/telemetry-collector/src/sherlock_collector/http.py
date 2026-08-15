@@ -7,21 +7,27 @@ import urllib.error
 import urllib.request
 from typing import Mapping
 
+from .config import CollectorIdentity
 from .drain import PermanentUploadError, TransientUploadError
 from .spool import SpoolItem
 
 
 class HttpTransport:
     def __init__(
-        self, endpoint: str, credential: str, *, timeout_seconds: float = 20.0
+        self,
+        endpoint: str,
+        identity: CollectorIdentity,
+        *,
+        timeout_seconds: float = 20.0,
     ):
         self.endpoint = endpoint
-        self.credential = credential
+        self.identity = identity
         self.timeout_seconds = timeout_seconds
 
     def upload(self, item: SpoolItem) -> Mapping[str, object]:
         body = json.dumps(
             {
+                "collector": self.identity.to_dict(),
                 "manifest": item.manifest.to_dict(),
                 "stored_payload_base64": base64.b64encode(item.stored_payload).decode(
                     "ascii"
@@ -34,7 +40,6 @@ class HttpTransport:
             data=body,
             method="POST",
             headers={
-                "Authorization": f"Bearer {self.credential}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": "sherlock-telemetry-collector/0.1.0",

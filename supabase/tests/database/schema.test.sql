@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(37);
+select plan(42);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -15,6 +15,7 @@ select has_table('telemetry', 'ingest_batches', 'ingest_batches table exists');
 select has_table('telemetry', 'native_records', 'native_records table exists');
 select has_table('telemetry', 'events', 'events table exists');
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
+select has_column('telemetry', 'people', 'github_id', 'people records GitHub identity');
 
 select ok(
   exists (select 1 from pg_roles where rolname = 'sherlock_ingest'),
@@ -67,6 +68,22 @@ select ok(
 select ok(
   has_table_privilege('sherlock_ingest', 'telemetry.native_records', 'insert'),
   'ingest can insert native records'
+);
+select ok(
+  has_column_privilege('sherlock_ingest', 'telemetry.people', 'id', 'insert'),
+  'ingest can create a server-resolved person'
+);
+select ok(
+  has_column_privilege('sherlock_ingest', 'telemetry.people', 'github_id', 'update'),
+  'ingest can refresh declared person metadata'
+);
+select ok(
+  not has_column_privilege('sherlock_ingest', 'telemetry.people', 'identity_key', 'update'),
+  'ingest cannot rewrite a person identity key'
+);
+select ok(
+  not has_table_privilege('sherlock_ingest', 'telemetry.people', 'delete'),
+  'ingest cannot delete people'
 );
 select ok(
   not has_table_privilege('sherlock_ingest', 'telemetry.events', 'insert'),
@@ -225,6 +242,10 @@ begin
     not has_table_privilege('authenticated', 'telemetry.ingest_batches', 'select') and
     has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'insert') and
     has_table_privilege('sherlock_ingest', 'telemetry.native_records', 'insert') and
+    has_column_privilege('sherlock_ingest', 'telemetry.people', 'id', 'insert') and
+    has_column_privilege('sherlock_ingest', 'telemetry.people', 'github_id', 'update') and
+    not has_column_privilege('sherlock_ingest', 'telemetry.people', 'identity_key', 'update') and
+    not has_table_privilege('sherlock_ingest', 'telemetry.people', 'delete') and
     not has_table_privilege('sherlock_ingest', 'telemetry.events', 'insert') and
     not has_table_privilege('sherlock_ingest', 'analytics.activity_spans', 'insert') and
     has_table_privilege('sherlock_normalizer', 'telemetry.events', 'insert') and
@@ -246,7 +267,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 37,
+  'assertion_count', 42,
   'tables', 7,
   'private_bucket', 'telemetry-raw'
 ) as verification;

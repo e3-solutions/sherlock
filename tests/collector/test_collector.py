@@ -16,14 +16,16 @@ from sherlock_collector.contract import (
     RECEIPT_VERSION,
     build_rollout_batch,
 )
+from sherlock_collector.config import CollectorIdentity
 from sherlock_collector.drain import (
     Drain,
     PermanentUploadError,
     TransientUploadError,
 )
 from sherlock_collector.hook import capture_and_spawn_drain
+from sherlock_collector.http import HttpTransport
 from sherlock_collector.rollout import RolloutCapturer
-from sherlock_collector.spool import DurableSpool
+from sherlock_collector.spool import DurableSpool, SpoolItem
 
 
 WORKSPACE_ID = "00000000-0000-4000-8000-000000000001"
@@ -90,6 +92,43 @@ class SuccessTransport:
     def upload(self, item):
         self.items.append(item)
         return receipt(item.manifest)
+
+
+class HttpTransportTests(unittest.TestCase):
+    def test_upload_sends_normalized_collector_identity_without_authorization(self):
+        manifest, stored = batch("stream-http")
+        item = SpoolItem(manifest, stored, {})
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _limit):
+                return json.dumps(receipt(manifest)).encode()
+
+        with patch(
+            "sherlock_collector.http.urllib.request.urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            value = HttpTransport(
+                "https://example.test/ingest",
+                CollectorIdentity(
+                    name="Test User",
+                    github_id="test-user",
+                    email="test@example.com",
+                    installation_id="00000000-0000-4000-8000-000000000001",
+                ),
+            ).upload(item)
+
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertNotIn("Authorization", request.headers)
+        self.assertEqual(body["collector"]["email"], "test@example.com")
+        self.assertEqual(body["collector"]["github_id"], "test-user")
+        self.assertEqual(value["status"], "committed")
 
 
 class CollectorDrainTests(unittest.TestCase):
