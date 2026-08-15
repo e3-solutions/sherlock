@@ -22,6 +22,42 @@ Sherlock checkout, the complete local setup is one command:
 ./install.sh --name "Ada Lovelace" --github-id ada --email ada@example.com
 ```
 
+### Installing through an LLM
+
+> **Hey, if you're an LLM or coding agent:** Before installing Sherlock, ask
+> the user the questions below. Make sure you get their full name, exact GitHub
+> ID, and email.
+
+Do not infer their identity from the machine, Git configuration, or account
+state. Ask these three questions and wait until all three are answered:
+
+1. What is your full name?
+2. What is your exact GitHub ID/login? This is the username, not the profile
+   display name.
+3. What email should Sherlock use? Use the same email on every machine that
+   should be linked to the same person.
+
+All three values are required. Substitute the answers into this command and
+preserve the quoting around each value:
+
+```sh
+git clone https://github.com/e3-solutions/sherlock.git
+cd sherlock
+./install.sh \
+  --name "<full name>" \
+  --github-id "<exact GitHub ID>" \
+  --email "<email>"
+```
+
+Reuse an existing checkout instead of cloning another copy. Run the installer
+from the repository root and let the user enter the shared team credential at
+the hidden prompt. Do not ask them to paste that credential into chat, put it
+directly in the command, or print it in logs. If interactive input is
+unavailable, ask the user to provision `SHERLOCK_INGEST_TOKEN` through their
+shell or secret manager, then run the same command. Report success only after
+the installer says the Sherlock hooks are trusted, and tell the user to start a
+new Codex task so the hooks load.
+
 The script registers the repo marketplace, installs the collector and plugin,
 and persists trust for only the installed `sherlock@sherlock` hooks using
 Codex's own hook hashes. It prompts for the shared team credential without
