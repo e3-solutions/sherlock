@@ -182,7 +182,10 @@ export class PostgresBatchRepository implements BatchRepository {
 
   static connect(databaseUrl: string): PostgresBatchRepository {
     return new PostgresBatchRepository(
-      postgres(databaseUrl, { prepare: false, max: 2, idle_timeout: 20 }),
+      // Bulk ingestion is intentionally sequential within one request. A
+      // single connection per isolate preserves that throughput while keeping
+      // 32-worker backfills below small-project connection ceilings.
+      postgres(databaseUrl, { prepare: false, max: 1, idle_timeout: 20 }),
     );
   }
 
