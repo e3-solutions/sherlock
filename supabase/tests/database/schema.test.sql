@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(42);
+select plan(45);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -16,6 +16,19 @@ select has_table('telemetry', 'native_records', 'native_records table exists');
 select has_table('telemetry', 'events', 'events table exists');
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
 select has_column('telemetry', 'people', 'github_id', 'people records GitHub identity');
+select has_column(
+  'telemetry', 'events', 'message_search',
+  'normalized message excerpts have a generated search vector'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'telemetry'
+      and tablename = 'events'
+      and indexname = 'events_message_search_idx'
+  ),
+  'normalized message search has a partial GIN index'
+);
 
 select ok(
   exists (select 1 from pg_roles where rolname = 'sherlock_ingest'),
@@ -32,6 +45,10 @@ select ok(
 select ok(
   pg_has_role('postgres', 'sherlock_ingest', 'member'),
   'Edge Function database login can assume the constrained ingest role'
+);
+select ok(
+  pg_has_role('postgres', 'sherlock_normalizer', 'member'),
+  'Edge Function database login can assume the constrained normalizer role'
 );
 
 select ok(
@@ -230,6 +247,7 @@ begin
       'sherlock_ingest', 'sherlock_normalizer', 'sherlock_reader'
     )) and
     pg_has_role('postgres', 'sherlock_ingest', 'member') and
+    pg_has_role('postgres', 'sherlock_normalizer', 'member') and
     exists (
       select 1 from storage.buckets
       where id = 'telemetry-raw' and public = false
@@ -267,7 +285,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 42,
+  'assertion_count', 45,
   'tables', 7,
   'private_bucket', 'telemetry-raw'
 ) as verification;
