@@ -1,6 +1,6 @@
 {
   "name": "sherlock",
-  "version": "0.1.0+codex.20260815012342",
+  "version": "0.1.0+codex.20260815014830",
   "description": "Capture Codex rollout telemetry durably without blocking hooks.",
   "author": {
     "name": "E3 Solutions",

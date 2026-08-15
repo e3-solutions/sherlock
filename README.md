@@ -13,22 +13,23 @@ remain separate work.
 
 ## Install the Codex plugin
 
-From a Sherlock checkout, register the repo marketplace, install the collector
-runtime/config, and install the plugin:
+Each teammate needs an opaque collector token mapped to their own person and
+collector identity on the server. Do not share one teammate's token. From a
+Sherlock checkout, the complete local setup is one command:
 
 ```sh
-codex plugin marketplace add .
-python3 plugins/sherlock/scripts/install.py \
-  --endpoint https://psmuyotyyojrkojycyzz.supabase.co/functions/v1/sherlock-rollout-ingest
-codex plugin add sherlock@sherlock
+./install.sh
 ```
 
-The installer prompts for the token without echoing it or placing it in shell
-history. For secret-manager automation, pass it on standard input with
-`--token-stdin`. It is stored with the endpoint in
+The script registers the repo marketplace, installs the collector and plugin,
+and persists trust for only the installed `sherlock@sherlock` hooks using
+Codex's own hook hashes. It prompts for the token without echoing it or placing
+it in shell history. For secret-manager automation, pass it on standard input
+with `./install.sh --token-stdin`. It is stored with the endpoint in
 `$CODEX_HOME/sherlock/collector.json` (default `~/.codex/sherlock/collector.json`)
 with mode `0600`; the directory is mode `0700`. `SHERLOCK_INGEST_URL` and
 `SHERLOCK_INGEST_TOKEN` may be used instead when Codex inherits both variables.
+`CODEX_BIN`, `CODEX_HOME`, and `PYTHON_BIN` are optional installation overrides.
 No Supabase service key or database URL belongs on the client.
 
 Hooks discover active/recent rollout paths from Codex's SQLite state. Exact
@@ -38,8 +39,8 @@ source bytes and checkpoints live under `$CODEX_HOME/sherlock/telemetry`.
 and detach network drain, so an offline endpoint does not block Codex and the
 next eligible hook retries pending batches.
 
-Start a new Codex task after installation so the app loads the hook companion.
-Verify installation with:
+Start a new Codex task after installation so the app loads the trusted hook
+companion. Verify installation with:
 
 ```sh
 codex plugin list --marketplace sherlock
