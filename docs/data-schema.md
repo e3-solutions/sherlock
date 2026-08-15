@@ -1,7 +1,7 @@
 # Sherlock v0 Data Architecture
 
-Status: the Supabase database foundation is implemented. The collector drain,
-normalizer, snapshot resolver, and Flame read APIs are not implemented yet.
+Status: the Supabase database foundation and rollout collector drain are
+implemented. The normalizer, snapshot resolver, and Flame read APIs are not.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
 views separate from source data. The database is intentionally small: seven
@@ -36,6 +36,8 @@ Keeping one exact definition prevents the architecture notes from drifting.
 - Three no-login database roles separate ingest, normalization, and reads.
 - Thirty-six database assertions cover the core schema, grants, bucket, and
   representative integrity failures.
+- The rollout collector and ingest function implement the versioned immutable
+  batch and committed-receipt contract described below.
 
 The migration does not create Storage object policies or a user-facing
 permission model. Future services must connect server-side and assume only the
@@ -55,7 +57,7 @@ flowchart LR
     N --> T["Future transcript reader"]
 ```
 
-The drain will put complete source bytes in Storage. PostgreSQL will contain
+The drain puts complete source bytes in Storage. PostgreSQL contains
 immutable receipts and locators plus versioned interpretations. Complete
 prompts, messages, reasoning, tool payloads, and native JSON do not belong in
 database columns.
@@ -170,10 +172,10 @@ The ingest role cannot write events or spans. The normalizer cannot update or
 delete batches, native records, events, or spans. The reader cannot write any
 fact. These grants separate collection from interpretation and product reads.
 
-## Required drain contract
+## Implemented rollout drain contract
 
-The next implementation must preserve these rules. They are application
-requirements unless the migration explicitly enforces them.
+`sherlock.rollout-batch.v1` and `sherlock.committed-receipt.v1` implement these
+application rules without changing the seven-table schema:
 
 1. Authenticate the collector on the server and derive `workspace_id`,
    `person_id`, and the permitted `collector_key`. Never trust client-supplied
@@ -209,10 +211,6 @@ queryable telemetry fact.
 
 The current migration does not implement these behaviors:
 
-- advisory-lock protocols for stream registration or ordered normalization;
-- exact-retry receipt lookup and range-overlap detection;
-- generation-key/sequence consistency across multiple batches;
-- native-record containment, ordering, and declared-count validation;
 - normalizer sealing, canonical event selection, or replay suppression;
 - activity reduction and version activation;
 - signed snapshot tokens and contiguous publication cutoffs;
