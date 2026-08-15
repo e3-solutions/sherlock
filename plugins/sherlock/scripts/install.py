@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import shutil
@@ -20,11 +19,6 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--name", required=True)
     parser.add_argument("--github-id", "--github_id", dest="github_id", required=True)
     parser.add_argument("--email", required=True)
-    parser.add_argument(
-        "--token-stdin",
-        action="store_true",
-        help="Read the opaque collector token from one line on stdin.",
-    )
     return parser.parse_args()
 
 
@@ -98,14 +92,6 @@ def main() -> int:
         endpoint = validate_endpoint(args.endpoint)
     except ConfigurationError as error:
         raise SystemExit(f"invalid collector endpoint: {error}") from error
-    if args.token_stdin:
-        token = input().rstrip("\n")
-    else:
-        token = os.environ.get("SHERLOCK_INGEST_TOKEN") or getpass.getpass(
-            "Sherlock collector token: "
-        )
-    if not token:
-        raise SystemExit("collector token is required")
     root = codex_home / "sherlock"
     config_path = root / "collector.json"
     installation_id = existing_installation_id(config_path) or str(uuid.uuid4())
@@ -121,10 +107,10 @@ def main() -> int:
     install_runtime(package, root / "runtime" / "sherlock_collector")
     atomic_json(
         config_path,
-        {"endpoint": endpoint, "token": token, **identity.to_dict()},
+        {"endpoint": endpoint, **identity.to_dict()},
     )
     print(f"Installed collector runtime under {root}")
-    print("Stored the endpoint, team credential, and identity in owner-only collector.json")
+    print("Stored the endpoint and identity in owner-only collector.json")
     return 0
 
 

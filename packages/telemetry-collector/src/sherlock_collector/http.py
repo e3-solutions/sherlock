@@ -16,13 +16,11 @@ class HttpTransport:
     def __init__(
         self,
         endpoint: str,
-        credential: str,
         identity: CollectorIdentity,
         *,
         timeout_seconds: float = 20.0,
     ):
         self.endpoint = endpoint
-        self.credential = credential
         self.identity = identity
         self.timeout_seconds = timeout_seconds
 
@@ -42,7 +40,6 @@ class HttpTransport:
             data=body,
             method="POST",
             headers={
-                "Authorization": f"Bearer {self.credential}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": "sherlock-telemetry-collector/0.1.0",

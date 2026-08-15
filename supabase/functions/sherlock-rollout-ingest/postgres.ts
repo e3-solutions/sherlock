@@ -1,5 +1,5 @@
 import postgres from "npm:postgres@3.4.7";
-import { type CollectorGrant, collectorKeyForIdentity } from "./auth.ts";
+import { type CollectorGrant, collectorKeyForIdentity } from "./attribution.ts";
 import {
   type Attribution,
   type BatchManifest,

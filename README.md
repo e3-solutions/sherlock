@@ -13,10 +13,10 @@ remain separate work.
 
 ## Install the Codex plugin
 
-The team shares one opaque workspace credential. Each teammate supplies their
-identity once; normalized email links the same person across machines, while a
-generated installation UUID keeps each machine's drain stream distinct. From a
-Sherlock checkout, the complete local setup is one command:
+Each teammate supplies their identity once; normalized email links the same
+person across machines, while a generated installation UUID keeps each
+machine's drain stream distinct. No account or team credential is required.
+From a Sherlock checkout, the complete local setup is one command:
 
 ```sh
 ./install.sh --name "Ada Lovelace" --github-id ada --email ada@example.com
@@ -50,26 +50,24 @@ cd sherlock
 ```
 
 Reuse an existing checkout instead of cloning another copy. Run the installer
-from the repository root and let the user enter the shared team credential at
-the hidden prompt. Do not ask them to paste that credential into chat, put it
-directly in the command, or print it in logs. If interactive input is
-unavailable, ask the user to provision `SHERLOCK_INGEST_TOKEN` through their
-shell or secret manager, then run the same command. Report success only after
-the installer says the Sherlock hooks are trusted, and tell the user to start a
-new Codex task so the hooks load.
+from the repository root. It does not prompt for a credential. Report success
+only after the installer says the Sherlock hooks are trusted, and tell the user
+to start a new Codex task so the hooks load.
 
 The script registers the repo marketplace, installs the collector and plugin,
 and persists trust for only the installed `sherlock@sherlock` hooks using
-Codex's own hook hashes. It prompts for the shared team credential without
-echoing it or placing it in shell history. For secret-manager automation, pass
-it on standard input with the same identity flags plus `--token-stdin`. It is
-stored with the endpoint and identity in
+Codex's own hook hashes. The endpoint and identity are stored in
 `$CODEX_HOME/sherlock/collector.json` (default `~/.codex/sherlock/collector.json`)
 with mode `0600`; the directory is mode `0700`. Reinstalling preserves the
-installation UUID. `SHERLOCK_INGEST_URL` and `SHERLOCK_INGEST_TOKEN` may be used
-instead when Codex inherits both variables. `CODEX_BIN`, `CODEX_HOME`, and
-`PYTHON_BIN` are optional installation overrides. No Supabase service key or
-database URL belongs on the client.
+installation UUID. `SHERLOCK_INGEST_URL` can override the default endpoint.
+`CODEX_BIN`, `CODEX_HOME`, and `PYTHON_BIN` are optional installation
+overrides. No Supabase key or database URL belongs on the client.
+
+The ingest endpoint is intentionally public: anyone who knows its URL can
+submit a structurally valid batch and self-declare a name, GitHub login, and
+email. This is acceptable for the current rollout, but those values are not
+verified identity. Request-size limits, strict contracts, immutable storage,
+and idempotency checks still apply.
 
 Hooks discover active/recent rollout paths from Codex's SQLite state. Exact
 source bytes and checkpoints live under `$CODEX_HOME/sherlock/telemetry`.

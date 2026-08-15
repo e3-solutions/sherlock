@@ -227,28 +227,28 @@ class ConfigurationTests(unittest.TestCase):
                 loaded.endpoint,
                 "https://example.test/functions/v1/ingest",
             )
-            self.assertEqual(loaded.token, "opaque-test-token")
             self.assertEqual(loaded.identity.email, "test@example.com")
             path.chmod(0o640)
             with self.assertRaisesRegex(ConfigurationError, "owner-only"):
                 load_config(path)
 
-    def test_partial_environment_configuration_is_rejected(self):
-        cases = (
-            {"SHERLOCK_INGEST_URL": "https://example.test/ingest"},
-            {"SHERLOCK_INGEST_TOKEN": "opaque-test-token"},
-        )
-        for environment in cases:
-            with self.subTest(environment=sorted(environment)):
-                with patch.dict(os.environ, environment, clear=True):
-                    with self.assertRaisesRegex(ConfigurationError, "set together"):
-                        load_config()
+    def test_endpoint_environment_override_does_not_require_a_token(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "collector.json"
+            path.write_text(json.dumps(IDENTITY_CONFIG), encoding="utf-8")
+            path.chmod(0o600)
+            with patch.dict(
+                os.environ,
+                {"SHERLOCK_INGEST_URL": "https://example.test/ingest"},
+                clear=True,
+            ):
+                loaded = load_config(path)
 
-    def test_installer_copies_runtime_and_never_prints_token(self):
+            self.assertEqual(loaded.endpoint, "https://example.test/ingest")
+
+    def test_installer_copies_runtime_and_writes_identity_only_config(self):
         with TemporaryDirectory() as temporary:
             codex_home = Path(temporary) / "codex"
-            environment = os.environ.copy()
-            environment["SHERLOCK_INGEST_TOKEN"] = "opaque-installer-token"
             completed = subprocess.run(
                 [
                     sys.executable,
@@ -267,7 +267,6 @@ class ConfigurationTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
-                env=environment,
             )
 
             config = codex_home / "sherlock" / "collector.json"
@@ -281,9 +280,8 @@ class ConfigurationTests(unittest.TestCase):
                     / "cli.py"
                 ).is_file()
             )
-            self.assertNotIn("opaque-installer-token", completed.stdout)
-            self.assertNotIn("opaque-installer-token", completed.stderr)
             installed = json.loads(config.read_text(encoding="utf-8"))
+            self.assertNotIn("token", installed)
             self.assertEqual(installed["email"], "test@example.com")
             self.assertEqual(installed["github_id"], "test-user")
             self.assertEqual(
@@ -294,8 +292,6 @@ class ConfigurationTests(unittest.TestCase):
     def test_installer_rejects_invalid_endpoint_before_writing_config(self):
         with TemporaryDirectory() as temporary:
             codex_home = Path(temporary) / "codex"
-            environment = os.environ.copy()
-            environment["SHERLOCK_INGEST_TOKEN"] = "opaque-installer-token"
             completed = subprocess.run(
                 [
                     sys.executable,
@@ -314,19 +310,14 @@ class ConfigurationTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
-                env=environment,
             )
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertFalse((codex_home / "sherlock" / "collector.json").exists())
-            self.assertNotIn("opaque-installer-token", completed.stdout)
-            self.assertNotIn("opaque-installer-token", completed.stderr)
 
     def test_installer_reuses_the_machine_installation_id(self):
         with TemporaryDirectory() as temporary:
             codex_home = Path(temporary) / "codex"
-            environment = os.environ.copy()
-            environment["SHERLOCK_INGEST_TOKEN"] = "opaque-installer-token"
             command = [
                 sys.executable,
                 str(INSTALLER),
@@ -342,10 +333,10 @@ class ConfigurationTests(unittest.TestCase):
                 "test@example.com",
             ]
 
-            subprocess.run(command, check=True, capture_output=True, env=environment)
+            subprocess.run(command, check=True, capture_output=True)
             config = codex_home / "sherlock" / "collector.json"
             first = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
-            subprocess.run(command, check=True, capture_output=True, env=environment)
+            subprocess.run(command, check=True, capture_output=True)
             second = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
 
             self.assertEqual(first, second)
@@ -425,7 +416,6 @@ class HookIntegrationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "endpoint": "http://127.0.0.1:9/ingest",
-                        "token": "offline",
                         **IDENTITY_CONFIG,
                     }
                 ),

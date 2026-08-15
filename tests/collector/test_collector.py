@@ -95,7 +95,7 @@ class SuccessTransport:
 
 
 class HttpTransportTests(unittest.TestCase):
-    def test_upload_sends_team_credential_and_normalized_collector_identity(self):
+    def test_upload_sends_normalized_collector_identity_without_authorization(self):
         manifest, stored = batch("stream-http")
         item = SpoolItem(manifest, stored, {})
 
@@ -115,7 +115,6 @@ class HttpTransportTests(unittest.TestCase):
         ) as urlopen:
             value = HttpTransport(
                 "https://example.test/ingest",
-                "shared-team-secret",
                 CollectorIdentity(
                     name="Test User",
                     github_id="test-user",
@@ -126,7 +125,7 @@ class HttpTransportTests(unittest.TestCase):
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data)
-        self.assertEqual(request.headers["Authorization"], "Bearer shared-team-secret")
+        self.assertNotIn("Authorization", request.headers)
         self.assertEqual(body["collector"]["email"], "test@example.com")
         self.assertEqual(body["collector"]["github_id"], "test-user")
         self.assertEqual(value["status"], "committed")

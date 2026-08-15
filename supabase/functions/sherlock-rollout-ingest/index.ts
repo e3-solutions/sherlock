@@ -1,4 +1,4 @@
-import { authenticate, parseCollectorConfigurations } from "./auth.ts";
+import { publicCollectorGrant } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
 import { IngestService } from "./service.ts";
@@ -42,13 +42,7 @@ async function handler(request: Request): Promise<Response> {
         status: 405,
       });
     }
-    const configurations = parseCollectorConfigurations(
-      required("SHERLOCK_COLLECTORS_JSON"),
-    );
-    const grant = await authenticate(
-      request.headers.get("authorization"),
-      configurations,
-    );
+    const grant = publicCollectorGrant(required("SHERLOCK_WORKSPACE_ID"));
     const body = await readJsonBounded(request);
     const envelope = parseEnvelope(body);
     const current = ingestBackend();

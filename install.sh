@@ -6,14 +6,13 @@ REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
 DEFAULT_ENDPOINT="https://psmuyotyyojrkojycyzz.supabase.co/functions/v1/sherlock-rollout-ingest"
 CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
-TOKEN_STDIN=0
 NAME=""
 GITHUB_ID=""
 EMAIL=""
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh --name NAME --github-id LOGIN --email EMAIL [--token-stdin]
+Usage: ./install.sh --name NAME --github-id LOGIN --email EMAIL
 
 Installs the Sherlock Codex plugin, collector runtime/config, and trusts only
 the installed Sherlock hooks.
@@ -23,7 +22,6 @@ Environment overrides:
   CODEX_HOME            Codex state directory (default: ~/.codex)
   PYTHON_BIN             Python 3 executable (default: python3)
   SHERLOCK_INGEST_URL    Collector endpoint
-  SHERLOCK_INGEST_TOKEN  Shared team credential (otherwise prompted without echo)
 EOF
 }
 
@@ -43,10 +41,6 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       EMAIL=$2
       shift 2
-      ;;
-    --token-stdin)
-      TOKEN_STDIN=1
-      shift
       ;;
     -h|--help)
       usage
@@ -93,22 +87,12 @@ fi
 
 ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
 
-if [ "$TOKEN_STDIN" -eq 1 ]; then
-  "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install.py" \
-    --endpoint "$ENDPOINT" \
-    --codex-home "$CODEX_HOME" \
-    --name "$NAME" \
-    --github-id "$GITHUB_ID" \
-    --email "$EMAIL" \
-    --token-stdin
-else
-  "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install.py" \
-    --endpoint "$ENDPOINT" \
-    --codex-home "$CODEX_HOME" \
-    --name "$NAME" \
-    --github-id "$GITHUB_ID" \
-    --email "$EMAIL"
-fi
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install.py" \
+  --endpoint "$ENDPOINT" \
+  --codex-home "$CODEX_HOME" \
+  --name "$NAME" \
+  --github-id "$GITHUB_ID" \
+  --email "$EMAIL"
 
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install_marketplace.py" \
   --codex-bin "$CODEX_BIN" \

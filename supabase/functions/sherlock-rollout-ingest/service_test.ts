@@ -11,10 +11,9 @@ import {
   timestampMicros,
 } from "./contract.ts";
 import {
-  authenticate,
   collectorKeyForIdentity,
-  parseCollectorConfigurations,
-} from "./auth.ts";
+  publicCollectorGrant,
+} from "./attribution.ts";
 import {
   type BatchRepository,
   type ImmutableStorage,
@@ -238,22 +237,14 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
   }
 });
 
-Deno.test("team credential grants a workspace without fixing a person", async () => {
-  const token = "shared-team-secret";
-  const configurations = parseCollectorConfigurations(JSON.stringify([{
-    token_sha256: await sha256Hex(new TextEncoder().encode(token)),
-    workspace_id: "00000000-0000-4000-8000-000000000001",
-    collector_key: "team",
-  }]));
-
-  const grant = await authenticate(`Bearer ${token}`, configurations);
+Deno.test("public ingest is scoped to the configured workspace", () => {
+  const grant = publicCollectorGrant(
+    "00000000-0000-4000-8000-000000000001",
+  );
 
   assert(grant.workspace_id === "00000000-0000-4000-8000-000000000001");
   assert(grant.collector_key_prefix === "team");
-  assert(
-    !("person_id" in grant),
-    "team credential must not fix person identity",
-  );
+  assert(!("person_id" in grant), "configuration must not fix person identity");
 });
 
 Deno.test("collector keys distinguish machines while email remains the person key", async () => {

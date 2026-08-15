@@ -33,7 +33,6 @@ class CollectorIdentity:
 @dataclass(frozen=True)
 class CollectorConfig:
     endpoint: str
-    token: str
     identity: CollectorIdentity
 
 
@@ -135,6 +134,8 @@ def _read_owner_only(path: Path) -> dict[str, object]:
         raise ConfigurationError("the collector config is unreadable") from error
     if not isinstance(value, dict):
         raise ConfigurationError("the collector config must be a JSON object")
+    # Accept but ignore tokens left by the previous authenticated collector so
+    # upgrading the runtime cannot strand already-spooled telemetry.
     unexpected = set(value) - {
         "endpoint",
         "token",
@@ -157,16 +158,8 @@ def load_config(
         Path(path or default_config_path(codex_home)).expanduser().resolve()
     )
     endpoint = os.environ.get("SHERLOCK_INGEST_URL")
-    token = os.environ.get("SHERLOCK_INGEST_TOKEN")
-    if (endpoint is None) != (token is None):
-        raise ConfigurationError(
-            "SHERLOCK_INGEST_URL and SHERLOCK_INGEST_TOKEN must be set together"
-        )
     if endpoint is None:
         endpoint = file_values.get("endpoint")
-        token = file_values.get("token")
-    if not isinstance(token, str) or not token:
-        raise ConfigurationError("SHERLOCK_INGEST_TOKEN is required")
     identity = validate_identity(
         name=os.environ.get("SHERLOCK_NAME", file_values.get("name")),
         github_id=os.environ.get(
@@ -177,4 +170,4 @@ def load_config(
             "SHERLOCK_INSTALLATION_ID", file_values.get("installation_id")
         ),
     )
-    return CollectorConfig(validate_endpoint(endpoint), token, identity)
+    return CollectorConfig(validate_endpoint(endpoint), identity)

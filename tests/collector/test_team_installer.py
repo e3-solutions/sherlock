@@ -120,7 +120,6 @@ class TeamInstallerTests(unittest.TestCase):
                     "PYTHON_BIN": sys.executable,
                     "SHERLOCK_FAKE_CAPTURE": str(capture),
                     "SHERLOCK_FAKE_EXISTING_MARKETPLACE": str(old_checkout),
-                    "SHERLOCK_INGEST_TOKEN": "opaque-team-token",
                     "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
                 }
             )
@@ -150,8 +149,7 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertEqual(configured["name"], "Test User")
             self.assertEqual(configured["github_id"], "test-user")
             self.assertEqual(configured["email"], "test@example.com")
-            self.assertNotIn("opaque-team-token", completed.stdout)
-            self.assertNotIn("opaque-team-token", completed.stderr)
+            self.assertNotIn("token", configured)
             self.assertIn("Trusted 4 Sherlock hooks", completed.stdout)
             calls = [json.loads(line) for line in capture.read_text().splitlines()]
             self.assertEqual(

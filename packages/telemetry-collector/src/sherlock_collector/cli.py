@@ -113,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
         spool,
         HttpTransport(
             configuration.endpoint,
-            configuration.token,
             configuration.identity,
         ),
     ).run()

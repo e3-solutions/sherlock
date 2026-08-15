@@ -117,8 +117,8 @@ application error; it must not rewrite `sessions.person_id`.
 
 An ingest batch identifies a non-empty half-open byte range `[start, end)`, its
 source and stored hashes, the Storage path, encoding, generation, record count,
-and authenticated person attribution. Its `person_id` is fixed at commit time
-and is never inferred again from mutable credential configuration.
+and server-resolved person attribution. Its `person_id` is fixed at commit time
+and is never inferred again from mutable identity configuration.
 
 Native records locate every source record, including unknown or malformed
 ones. They remain separate from events because one native record may produce
@@ -176,10 +176,10 @@ fact. These grants separate collection from interpretation and product reads.
 `sherlock.rollout-batch.v1` and `sherlock.committed-receipt.v1` implement these
 application rules without changing the seven-table schema:
 
-1. Authenticate the shared team credential on the server and derive
-   `workspace_id`. Normalize the declared email, resolve one `person_id` per
-   workspace/email, and derive a machine-specific `collector_key` from the
-   email plus persistent installation UUID. Never accept client-supplied IDs.
+1. Scope the public endpoint to its server-configured `workspace_id`. Normalize
+   the declared email, resolve one `person_id` per workspace/email, and derive a
+   machine-specific `collector_key` from the email plus persistent installation
+   UUID. Never accept client-supplied IDs.
 2. Durably spool a source chunk and its encoded object once. Retries must reuse
    the exact bytes rather than recompressing them.
 3. Upload to a content-addressed path with overwrite disabled. If the object
@@ -207,11 +207,11 @@ in both expected failure windows:
 An orphaned object from a rejected conflict is operational cleanup, not a
 queryable telemetry fact.
 
-Name, GitHub login, and email are declared by a teammate holding the shared
-workspace credential; they are not proof of control of that email account.
-This is the intentional internal-team trust boundary. Batch `person_id` remains
-immutable after commit, and two installations declaring the same normalized
-email resolve to the same person.
+The endpoint is intentionally unauthenticated. Anyone who knows its URL can
+submit a valid batch and declare a name, GitHub login, and email; those values
+are not proof of identity or email control. Batch `person_id` remains immutable
+after commit, and two installations declaring the same normalized email resolve
+to the same person.
 
 ## Planned application behavior
 
