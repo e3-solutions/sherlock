@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -20,6 +21,8 @@ NATIVE_LABEL_BYTES = 256
 IDENTITY_HINT_BYTES = 512
 VERSION_HINT_BYTES = 128
 MAX_RECORDS = 20_000
+MAX_SOURCE_BYTES = 5 * 1024 * 1024
+MAX_STORED_BYTES = 6 * 1024 * 1024
 
 
 class ContractError(ValueError):
@@ -72,18 +75,6 @@ class RecordLocator:
     occurred_at: str | None
     parse_status: str
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "record_index": self.record_index,
-            "source_start_offset": self.source_start_offset,
-            "source_end_offset": self.source_end_offset,
-            "record_sha256": self.record_sha256,
-            "native_type": self.native_type,
-            "native_payload_type": self.native_payload_type,
-            "occurred_at": self.occurred_at,
-            "parse_status": self.parse_status,
-        }
-
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RecordLocator":
         parse_status = _nonempty(value.get("parse_status"), "record.parse_status")
@@ -92,13 +83,8 @@ class RecordLocator:
         native_type = value.get("native_type")
         native_payload_type = value.get("native_payload_type")
         occurred_at = value.get("occurred_at")
-        for field, item in (
-            ("native_type", native_type),
-            ("native_payload_type", native_payload_type),
-            ("occurred_at", occurred_at),
-        ):
-            if item is not None:
-                _nonempty(item, f"record.{field}")
+        if occurred_at is not None:
+            _nonempty(occurred_at, "record.occurred_at")
         return cls(
             record_index=_integer(value.get("record_index"), "record.record_index"),
             source_start_offset=_integer(
@@ -159,27 +145,7 @@ class BatchManifest:
         return sha256_hex(canonical)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "contract_version": self.contract_version,
-            "source_kind": self.source_kind,
-            "source_stream_key": self.source_stream_key,
-            "generation_key": self.generation_key,
-            "generation_seq": self.generation_seq,
-            "start_offset": self.start_offset,
-            "end_offset": self.end_offset,
-            "source_byte_count": self.source_byte_count,
-            "source_sha256": self.source_sha256,
-            "storage_encoding": self.storage_encoding,
-            "stored_byte_count": self.stored_byte_count,
-            "stored_sha256": self.stored_sha256,
-            "record_count": self.record_count,
-            "records": [record.to_dict() for record in self.records],
-            "observed_native_session_id": self.observed_native_session_id,
-            "first_occurred_at": self.first_occurred_at,
-            "last_occurred_at": self.last_occurred_at,
-            "codex_version": self.codex_version,
-            "collector_version": self.collector_version,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "BatchManifest":
@@ -235,10 +201,15 @@ class BatchManifest:
             raise ContractError("source_byte_count must equal the byte range")
         if self.record_count != len(self.records) or not self.records:
             raise ContractError("record_count must equal the non-empty records array")
+        if (
+            self.record_count > MAX_RECORDS
+            or self.source_byte_count > MAX_SOURCE_BYTES
+            or self.stored_byte_count > MAX_STORED_BYTES
+        ):
+            raise ContractError("batch exceeds rollout v1 limits")
         if (self.first_occurred_at is None) != (self.last_occurred_at is None):
             raise ContractError("first/last occurred timestamps must be paired")
         previous_end: int | None = None
-        starts: set[int] = set()
         for index, record in enumerate(self.records):
             if record.record_index != index:
                 raise ContractError("record indexes must be ordered and contiguous")
@@ -248,19 +219,10 @@ class BatchManifest:
                 record.source_start_offset < record.source_end_offset <= self.end_offset
             ):
                 raise ContractError("record range is outside its batch")
-            if record.source_start_offset in starts:
-                raise ContractError("record source offsets must be unique")
             if previous_end is not None and record.source_start_offset < previous_end:
                 raise ContractError("record ranges must be ordered and non-overlapping")
-            starts.add(record.source_start_offset)
             previous_end = record.source_end_offset
-        for field in (
-            "observed_native_session_id",
-            "first_occurred_at",
-            "last_occurred_at",
-            "codex_version",
-            "collector_version",
-        ):
+        for field in ("first_occurred_at", "last_occurred_at"):
             item = getattr(self, field)
             if item is not None:
                 _nonempty(item, field)
@@ -278,15 +240,6 @@ class BatchManifest:
                 "record.native_payload_type",
                 NATIVE_LABEL_BYTES,
             )
-
-
-@dataclass(frozen=True)
-class CommittedReceipt:
-    values: Mapping[str, Any]
-
-    @property
-    def batch_id(self) -> str:
-        return str(self.values["batch_id"])
 
 
 def _record_locator(
@@ -363,6 +316,8 @@ def build_rollout_batch(
 ) -> tuple[BatchManifest, bytes]:
     if not source_bytes:
         raise ContractError("source batch must not be empty")
+    if len(source_bytes) > MAX_SOURCE_BYTES:
+        raise ContractError("source batch exceeds rollout v1 limits")
     parts = source_bytes.split(b"\n")
     lines = [part + b"\n" for part in parts[:-1]]
     if parts[-1]:
@@ -437,7 +392,7 @@ def validate_committed_receipt(
     value: Mapping[str, Any],
     *,
     expected_attribution: Mapping[str, str] | None = None,
-) -> CommittedReceipt:
+) -> dict[str, Any]:
     if set(value) != RECEIPT_FIELDS:
         raise ReceiptMismatch(
             "receipt fields do not match the committed receipt contract"
@@ -476,9 +431,13 @@ def validate_committed_receipt(
         except ContractError as error:
             raise ReceiptMismatch(str(error)) from error
     try:
-        datetime.fromisoformat(str(value["committed_at"]).replace("Z", "+00:00"))
+        committed_at = datetime.fromisoformat(
+            str(value["committed_at"]).replace("Z", "+00:00")
+        )
     except ValueError as error:
         raise ReceiptMismatch("receipt committed_at must be ISO-8601") from error
+    if committed_at.tzinfo is None:
+        raise ReceiptMismatch("receipt committed_at must include a timezone")
     canonical_path = (
         f"workspaces/{value['workspace_id']}/collectors/{value['collector_key']}/"
         f"{manifest.source_kind}/{manifest.source_stream_key}/generations/"
@@ -496,7 +455,7 @@ def validate_committed_receipt(
                 raise ReceiptMismatch(
                     f"receipt {field} does not match local configuration"
                 )
-    return CommittedReceipt(dict(value))
+    return dict(value)
 
 
 def validate_stored_payload(manifest: BatchManifest, stored: bytes) -> bytes:
@@ -506,9 +465,12 @@ def validate_stored_payload(manifest: BatchManifest, stored: bytes) -> bytes:
     ):
         raise ContractError("stored payload size/hash does not match its manifest")
     try:
-        source = gzip.decompress(stored)
+        with gzip.GzipFile(fileobj=io.BytesIO(stored)) as payload:
+            source = payload.read(MAX_SOURCE_BYTES + 1)
     except (OSError, EOFError) as error:
         raise ContractError("stored payload is not valid gzip") from error
+    if len(source) > MAX_SOURCE_BYTES:
+        raise ContractError("source payload exceeds rollout v1 limits")
     if (
         len(source) != manifest.source_byte_count
         or sha256_hex(source) != manifest.source_sha256

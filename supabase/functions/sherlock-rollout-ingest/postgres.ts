@@ -5,6 +5,7 @@ import {
   type CommittedReceipt,
   IngestError,
   receiptFromRow,
+  storagePath,
   timestampMicros,
 } from "./contract.ts";
 import type { BatchRepository } from "./service.ts";
@@ -21,6 +22,7 @@ const RECEIPT_COLUMNS = `
 
 function assertExact(
   row: Record<string, unknown>,
+  attribution: Attribution,
   manifest: BatchManifest,
 ): void {
   const expected: Record<string, unknown> = {
@@ -36,6 +38,7 @@ function assertExact(
     last_occurred_at: manifest.last_occurred_at,
     codex_version: manifest.codex_version,
     collector_version: manifest.collector_version,
+    storage_path: storagePath(attribution, manifest),
   };
   for (const [field, value] of Object.entries(expected)) {
     const actual = typeof value === "number" ? Number(row[field]) : row[field];
@@ -122,6 +125,38 @@ async function assertCommittedRecords(
   assertExactRecords(rows as Record<string, unknown>[], manifest);
 }
 
+async function findExactBatch(
+  sql: Queryable,
+  attribution: Attribution,
+  manifest: BatchManifest,
+): Promise<Record<string, unknown> | null> {
+  const rows = await sql.unsafe(
+    `select ${RECEIPT_COLUMNS}, storage_encoding, observed_native_session_id,
+            to_char(first_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as first_occurred_at,
+            to_char(last_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as last_occurred_at,
+            codex_version, collector_version
+       from telemetry.ingest_batches
+      where workspace_id = $1 and collector_key = $2 and source_kind = $3
+        and source_stream_key = $4 and generation_seq = $5
+        and generation_key = $6 and start_offset = $7 and end_offset = $8`,
+    [
+      attribution.workspace_id,
+      attribution.collector_key,
+      manifest.source_kind,
+      manifest.source_stream_key,
+      manifest.generation_seq,
+      manifest.generation_key,
+      manifest.start_offset,
+      manifest.end_offset,
+    ],
+  );
+  if (rows.length === 0) return null;
+  const row = rows[0] as Record<string, unknown>;
+  assertExact(row, attribution, manifest);
+  await assertCommittedRecords(sql, attribution.workspace_id, row.id, manifest);
+  return row;
+}
+
 export class PostgresBatchRepository implements BatchRepository {
   constructor(private readonly sql: Sql) {}
 
@@ -135,36 +170,8 @@ export class PostgresBatchRepository implements BatchRepository {
     attribution: Attribution,
     manifest: BatchManifest,
   ): Promise<CommittedReceipt | null> {
-    const rows = await this.sql.unsafe(
-      `select ${RECEIPT_COLUMNS}, storage_encoding, observed_native_session_id,
-              to_char(first_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as first_occurred_at,
-              to_char(last_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as last_occurred_at,
-              codex_version, collector_version
-         from telemetry.ingest_batches
-        where workspace_id = $1 and collector_key = $2 and source_kind = $3
-          and source_stream_key = $4 and generation_seq = $5
-          and generation_key = $6 and start_offset = $7 and end_offset = $8`,
-      [
-        attribution.workspace_id,
-        attribution.collector_key,
-        manifest.source_kind,
-        manifest.source_stream_key,
-        manifest.generation_seq,
-        manifest.generation_key,
-        manifest.start_offset,
-        manifest.end_offset,
-      ],
-    );
-    if (rows.length === 0) return null;
-    const row = rows[0] as Record<string, unknown>;
-    assertExact(row, manifest);
-    await assertCommittedRecords(
-      this.sql,
-      attribution.workspace_id,
-      row.id,
-      manifest,
-    );
-    return receiptFromRow(row);
+    const row = await findExactBatch(this.sql, attribution, manifest);
+    return row ? receiptFromRow(row) : null;
   }
 
   async commit(
@@ -184,35 +191,9 @@ export class PostgresBatchRepository implements BatchRepository {
         lockIdentity,
       ]);
 
-      const existing = await tx.unsafe(
-        `select ${RECEIPT_COLUMNS}, storage_encoding, observed_native_session_id,
-                to_char(first_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as first_occurred_at,
-                to_char(last_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as last_occurred_at,
-                codex_version, collector_version
-           from telemetry.ingest_batches
-          where workspace_id = $1 and collector_key = $2 and source_kind = $3
-            and source_stream_key = $4 and generation_seq = $5
-            and generation_key = $6 and start_offset = $7 and end_offset = $8`,
-        [
-          attribution.workspace_id,
-          attribution.collector_key,
-          manifest.source_kind,
-          manifest.source_stream_key,
-          manifest.generation_seq,
-          manifest.generation_key,
-          manifest.start_offset,
-          manifest.end_offset,
-        ],
-      );
-      if (existing.length > 0) {
-        const row = existing[0] as Record<string, unknown>;
-        assertExact(row, manifest);
-        await assertCommittedRecords(
-          tx,
-          attribution.workspace_id,
-          row.id,
-          manifest,
-        );
+      const existing = await findExactBatch(tx, attribution, manifest);
+      if (existing) {
+        const row = existing;
         return receiptFromRow(row);
       }
 

@@ -13,17 +13,18 @@ def capture_and_spawn_drain(
     drain_command: Sequence[str],
 ) -> CaptureResult:
     """Durably capture local bytes, then detach a drain without awaiting network."""
-    result = capturer.capture(rollout_paths)
     try:
-        subprocess.Popen(
-            list(drain_command),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except OSError:
-        # Capture is already durable. A later hook is intentionally a recovery signal.
-        pass
-    return result
+        return capturer.capture(rollout_paths)
+    finally:
+        try:
+            subprocess.Popen(
+                list(drain_command),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError:
+            # Capture is already durable. A later hook is a recovery signal.
+            pass

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .contract import MAX_RECORDS, build_rollout_batch
+from .contract import ContractError, MAX_RECORDS, build_rollout_batch
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
@@ -106,7 +106,11 @@ class RolloutCapturer:
                 path = Path(raw_path)
                 if not path.is_file():
                     continue
-                with path.open("rb") as handle:
+                try:
+                    handle = path.open("rb")
+                except OSError:
+                    continue
+                with handle:
                     key = _stream_key(path)
                     state = states.get(key)
                     stat = os.fstat(handle.fileno())
@@ -214,6 +218,10 @@ class RolloutCapturer:
         overflow = handle.read(overflow_limit - len(candidate))
         complete = candidate + overflow
         newline = complete.find(b"\n", len(candidate))
+        if newline < 0 and remaining > overflow_limit:
+            raise ContractError(
+                f"native rollout record exceeds {self.max_object_bytes} bytes"
+            )
         return self._limit_records(complete if newline < 0 else complete[: newline + 1])
 
     @staticmethod

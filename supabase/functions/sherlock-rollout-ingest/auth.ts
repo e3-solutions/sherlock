@@ -8,6 +8,14 @@ const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/;
 
+function configurationError(message: string): never {
+  throw new IngestError("invalid_configuration", message, 500);
+}
+
+function unauthorized(message: string): never {
+  throw new IngestError("unauthorized", message, 401);
+}
+
 function constantTimeEqual(left: string, right: string): boolean {
   if (left.length !== right.length) return false;
   let difference = 0;
@@ -24,26 +32,14 @@ export function parseCollectorConfigurations(
   try {
     value = JSON.parse(raw);
   } catch {
-    throw new IngestError(
-      "invalid_configuration",
-      "collector allowlist is invalid JSON",
-      500,
-    );
+    configurationError("collector allowlist is invalid JSON");
   }
   if (!Array.isArray(value) || value.length === 0) {
-    throw new IngestError(
-      "invalid_configuration",
-      "collector allowlist is empty",
-      500,
-    );
+    configurationError("collector allowlist is empty");
   }
   return value.map((item) => {
     if (typeof item !== "object" || item === null) {
-      throw new IngestError(
-        "invalid_configuration",
-        "collector entry is invalid",
-        500,
-      );
+      configurationError("collector entry is invalid");
     }
     const entry = item as Record<string, unknown>;
     for (
@@ -58,11 +54,7 @@ export function parseCollectorConfigurations(
         typeof entry[field] !== "string" ||
         (entry[field] as string).length === 0
       ) {
-        throw new IngestError(
-          "invalid_configuration",
-          `${field} is invalid`,
-          500,
-        );
+        configurationError(`${field} is invalid`);
       }
     }
     if (
@@ -70,11 +62,7 @@ export function parseCollectorConfigurations(
       !UUID.test(entry.workspace_id as string) ||
       !UUID.test(entry.person_id as string)
     ) {
-      throw new IngestError(
-        "invalid_configuration",
-        "collector IDs or token hash are invalid",
-        500,
-      );
+      configurationError("collector IDs or token hash are invalid");
     }
     return entry as unknown as CollectorConfiguration;
   });
@@ -85,11 +73,7 @@ export async function authenticate(
   configurations: CollectorConfiguration[],
 ): Promise<Attribution> {
   if (!authorization?.startsWith("Bearer ")) {
-    throw new IngestError(
-      "unauthorized",
-      "collector bearer credential is required",
-      401,
-    );
+    unauthorized("collector bearer credential is required");
   }
   const token = authorization.slice("Bearer ".length);
   const tokenHash = await sha256Hex(new TextEncoder().encode(token));
@@ -100,11 +84,7 @@ export async function authenticate(
     }
   }
   if (!match) {
-    throw new IngestError(
-      "unauthorized",
-      "collector credential is invalid",
-      401,
-    );
+    unauthorized("collector credential is invalid");
   }
   return {
     workspace_id: match.workspace_id,

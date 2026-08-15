@@ -11,7 +11,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from sherlock_collector.contract import RECEIPT_VERSION, build_rollout_batch
+from sherlock_collector.contract import (
+    ContractError,
+    RECEIPT_VERSION,
+    build_rollout_batch,
+)
 from sherlock_collector.drain import (
     Drain,
     PermanentUploadError,
@@ -376,6 +380,18 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(len(self.spool.list_pending()), 1)
         popen.assert_called_once()
 
+    def test_hook_still_starts_recovery_drain_when_capture_fails(self):
+        with (
+            patch.object(self.capturer, "capture", side_effect=ContractError("bad")),
+            patch("sherlock_collector.hook.subprocess.Popen") as popen,
+            self.assertRaises(ContractError),
+        ):
+            capture_and_spawn_drain(
+                self.capturer, [self.rollout], ["sherlock-collector", "drain"]
+            )
+
+        popen.assert_called_once()
+
     def test_append_does_not_advance_generation(self):
         first_source = b'{"type":"first"}\n'
         self.rollout.write_bytes(first_source)
@@ -432,6 +448,23 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(result.enqueued, 1)
         item = self.spool.load(self.spool.list_pending()[0])
         self.assertEqual(item.manifest.record_count, 1)
+
+    def test_oversized_native_record_is_rejected_without_checkpointing(self):
+        self.rollout.write_bytes(b"x" * 1025)
+        capturer = RolloutCapturer(
+            self.root / "oversized-state",
+            self.spool,
+            chunk_bytes=128,
+            max_object_bytes=1024,
+        )
+
+        with self.assertRaisesRegex(ContractError, "native rollout record exceeds"):
+            capturer.capture([self.rollout])
+
+        self.assertEqual(self.spool.list_pending(), [])
+        self.assertFalse(
+            (self.root / "oversized-state" / "rollout-state.json").exists()
+        )
 
 
 if __name__ == "__main__":

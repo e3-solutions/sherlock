@@ -22,11 +22,3 @@ PYTHONPATH=packages/telemetry-collector/src \
 deno check supabase/functions/sherlock-rollout-ingest/index.ts
 deno test supabase/functions/sherlock-rollout-ingest/service_test.ts
 ```
-
-The Edge Function uses custom bearer authentication because collector tokens
-are not Supabase user JWTs. Configure `SHERLOCK_COLLECTORS_JSON` with token
-hashes plus server-owned workspace/person/collector attribution. Deployed Edge
-Functions receive `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and
-`SUPABASE_DB_URL` from Supabase; none of these server credentials belong in the
-collector. The database client disables prepared statements so the same code
-also works with a transaction-pooler URL in local or self-hosted environments.

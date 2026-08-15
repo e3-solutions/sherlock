@@ -44,7 +44,7 @@ class HttpTransport:
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds
             ) as response:
-                raw = response.read()
+                raw = response.read(65_537)
         except urllib.error.HTTPError as error:
             detail = error.read(4096).decode("utf-8", "replace")
             message = f"ingest returned HTTP {error.code}: {detail}"
@@ -53,6 +53,8 @@ class HttpTransport:
             raise PermanentUploadError(message) from error
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as error:
             raise TransientUploadError(f"ingest transport failed: {error}") from error
+        if len(raw) > 65_536:
+            raise TransientUploadError("ingest receipt exceeds 64 KiB")
         try:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:

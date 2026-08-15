@@ -53,10 +53,9 @@ class Drain:
                 return DrainResult(locked=True)
             recovered = self.spool.recover_processing()
             uploaded = requeued = dead_lettered = 0
-            failed_names: set[str] = set()
             blocked_streams: set[tuple[str, str]] = set()
             while True:
-                candidates = self._next_per_stream(failed_names, blocked_streams)
+                candidates = self._next_per_stream(blocked_streams)
                 if not candidates:
                     break
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -71,7 +70,6 @@ class Drain:
                             uploaded += 1
                         elif outcome == "requeued":
                             requeued += 1
-                            failed_names.add(path.name)
                             blocked_streams.add(stream)
                         elif outcome == "dead-lettered":
                             dead_lettered += 1
@@ -79,14 +77,11 @@ class Drain:
 
     def _next_per_stream(
         self,
-        failed_names: set[str],
         blocked_streams: set[tuple[str, str]],
     ) -> list[tuple[Path, tuple[str, str]]]:
         earliest: dict[tuple[str, str], tuple[tuple[int, int, int, str], Path]] = {}
         invalid: list[tuple[Path, tuple[str, str]]] = []
         for path in self.spool.list_pending():
-            if path.name in failed_names:
-                continue
             try:
                 manifest = self.spool.load(path).manifest
             except ContractError:

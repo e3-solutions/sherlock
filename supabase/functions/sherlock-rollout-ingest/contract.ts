@@ -437,14 +437,12 @@ export function validateManifest(manifest: BatchManifest): void {
     );
   }
   let previousEnd: number | null = null;
-  const starts = new Set<number>();
   manifest.records.forEach((record, index) => {
     if (
       record.record_index !== index ||
       record.source_start_offset < manifest.start_offset ||
       record.source_end_offset <= record.source_start_offset ||
       record.source_end_offset > manifest.end_offset ||
-      starts.has(record.source_start_offset) ||
       (previousEnd !== null && record.source_start_offset < previousEnd)
     ) {
       throw new IngestError(
@@ -453,7 +451,6 @@ export function validateManifest(manifest: BatchManifest): void {
         400,
       );
     }
-    starts.add(record.source_start_offset);
     previousEnd = record.source_end_offset;
   });
 }
