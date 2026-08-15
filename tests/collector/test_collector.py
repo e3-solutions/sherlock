@@ -362,6 +362,30 @@ class RolloutCaptureTests(unittest.TestCase):
         )
         self.assertEqual(item.manifest.end_offset, len(source))
 
+    def test_corrupt_primary_state_recovers_from_durable_backup(self):
+        first = b'{"type":"first"}\n'
+        second = b'{"type":"second"}\n'
+        self.rollout.write_bytes(first)
+        self.capturer.capture([self.rollout])
+        state_root = self.root / "state"
+        (state_root / "rollout-state.json").write_text(
+            "not-json\n",
+            encoding="utf-8",
+        )
+        with self.rollout.open("ab") as handle:
+            handle.write(second)
+
+        result = self.capturer.capture([self.rollout])
+
+        self.assertEqual(result.enqueued, 1)
+        manifests = [
+            self.spool.load(path).manifest for path in self.spool.list_pending()
+        ]
+        self.assertEqual({item.generation_seq for item in manifests}, {0})
+        self.assertEqual(len({item.generation_key for item in manifests}), 1)
+        appended = max(manifests, key=lambda item: item.start_offset)
+        self.assertEqual(appended.start_offset, len(first))
+
     def test_occurred_bounds_use_time_order_not_record_order(self):
         source = (
             b'{"type":"later","timestamp":"2026-08-14T02:00:00Z"}\n'
@@ -432,6 +456,68 @@ class RolloutCaptureTests(unittest.TestCase):
             for path in self.spool.list_pending()
         }
         self.assertEqual(len(streams), 2)
+
+    def test_capture_preserves_caller_priority_before_cursor_rotation(self):
+        prioritized = self.root / "z-prioritized.jsonl"
+        fallback = self.root / "a-fallback.jsonl"
+        prioritized.write_bytes(b'{"type":"prioritized"}\n')
+        fallback.write_bytes(b'{"type":"fallback"}\n')
+
+        result = self.capturer.capture(
+            [prioritized, fallback],
+            max_files=1,
+            priority_count=1,
+        )
+
+        self.assertEqual(result.enqueued, 1)
+        state = json.loads((self.root / "state" / "rollout-state.json").read_text())
+        only = next(iter(state["streams"].values()))
+        self.assertEqual(only["path"], str(prioritized.resolve()))
+
+    def test_priority_is_preserved_after_backlog_cursor_advances(self):
+        old = self.root / "old.jsonl"
+        backlog = self.root / "backlog.jsonl"
+        current = self.root / "current.jsonl"
+        for path in (old, backlog, current):
+            path.write_bytes(b'{"type":"event"}\n')
+        self.capturer.capture([old, backlog], max_files=1)
+
+        result = self.capturer.capture(
+            [current, old, backlog],
+            max_files=1,
+            priority_count=1,
+        )
+
+        self.assertEqual(result.enqueued, 1)
+        state = json.loads((self.root / "state" / "rollout-state.json").read_text())
+        self.assertIn(
+            str(current.resolve()),
+            {value["path"] for value in state["streams"].values()},
+        )
+
+    def test_best_effort_capture_does_not_let_bad_file_starve_good_file(self):
+        bad = self.root / "bad.jsonl"
+        good = self.root / "good.jsonl"
+        bad.write_bytes(b"x" * 1025)
+        good.write_bytes(b'{"type":"good"}\n')
+        capturer = RolloutCapturer(
+            self.root / "best-effort-state",
+            self.spool,
+            chunk_bytes=128,
+            max_object_bytes=1024,
+        )
+
+        result = capturer.capture([bad, good], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.enqueued, 1)
+        state = json.loads(
+            (self.root / "best-effort-state" / "rollout-state.json").read_text()
+        )
+        self.assertEqual(
+            {value["path"] for value in state["streams"].values()},
+            {str(good.resolve())},
+        )
 
     def test_capture_splits_before_server_record_limit(self):
         self.rollout.write_bytes(b"{}\n" * 20_001)

@@ -13,6 +13,18 @@ import type { BatchRepository } from "./service.ts";
 type Sql = ReturnType<typeof postgres>;
 type Queryable = Pick<Sql, "unsafe">;
 
+export function advisoryLockIdentity(
+  attribution: Attribution,
+  manifest: BatchManifest,
+): string {
+  return JSON.stringify([
+    attribution.workspace_id,
+    attribution.collector_key,
+    manifest.source_kind,
+    manifest.source_stream_key,
+  ]);
+}
+
 const RECEIPT_COLUMNS = `
   id, workspace_id, person_id, collector_key, source_kind, source_stream_key,
   generation_key, generation_seq, start_offset, end_offset, source_byte_count,
@@ -170,8 +182,11 @@ export class PostgresBatchRepository implements BatchRepository {
     attribution: Attribution,
     manifest: BatchManifest,
   ): Promise<CommittedReceipt | null> {
-    const row = await findExactBatch(this.sql, attribution, manifest);
-    return row ? receiptFromRow(row) : null;
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_ingest");
+      const row = await findExactBatch(tx, attribution, manifest);
+      return row ? receiptFromRow(row) : null;
+    });
   }
 
   async commit(
@@ -181,12 +196,7 @@ export class PostgresBatchRepository implements BatchRepository {
   ): Promise<CommittedReceipt> {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_ingest");
-      const lockIdentity = [
-        attribution.workspace_id,
-        attribution.collector_key,
-        manifest.source_kind,
-        manifest.source_stream_key,
-      ].join("\u0000");
+      const lockIdentity = advisoryLockIdentity(attribution, manifest);
       await tx.unsafe("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
         lockIdentity,
       ]);
