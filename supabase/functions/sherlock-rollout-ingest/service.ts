@@ -24,10 +24,19 @@ export interface BatchRepository {
   ): Promise<CommittedReceipt>;
 }
 
+export interface BatchNormalizer {
+  normalize(
+    receipt: CommittedReceipt,
+    manifest: BatchManifest,
+    source: Uint8Array,
+  ): Promise<void>;
+}
+
 export class IngestService {
   constructor(
     private readonly storage: ImmutableStorage,
     private readonly batches: BatchRepository,
+    private readonly normalizer?: BatchNormalizer,
   ) {}
 
   async ingest(
@@ -70,11 +79,14 @@ export class IngestService {
         );
       }
     }
-    const existing = await this.batches.findExact(attribution, manifest);
-    if (existing) return existing;
-    const path = storagePath(attribution, manifest);
-    await this.storage.ensure(path, storedPayload, manifest.stored_sha256);
-    return await this.batches.commit(attribution, manifest, path);
+    let receipt = await this.batches.findExact(attribution, manifest);
+    if (!receipt) {
+      const path = storagePath(attribution, manifest);
+      await this.storage.ensure(path, storedPayload, manifest.stored_sha256);
+      receipt = await this.batches.commit(attribution, manifest, path);
+    }
+    await this.normalizer?.normalize(receipt, manifest, source);
+    return receipt;
   }
 }
 

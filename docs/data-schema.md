@@ -1,7 +1,8 @@
 # Sherlock v0 Data Architecture
 
-Status: the Supabase database foundation and rollout collector drain are
-implemented. The normalizer, snapshot resolver, and Flame read APIs are not.
+Status: the Supabase database foundation, rollout collector drain, and first
+Codex normalizer are implemented. The snapshot resolver, activity reducer, and
+Flame read APIs are not.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
 views separate from source data. The database is intentionally small: seven
@@ -33,10 +34,13 @@ Keeping one exact definition prevents the architecture notes from drifting.
 - The private `telemetry-raw` bucket accepts gzip and binary objects up to
   50 MiB.
 - Three no-login database roles separate ingest, normalization, and reads.
-- Thirty-six database assertions cover the core schema, grants, bucket, and
+- Forty-five database assertions cover the core schema, grants, bucket, and
   representative integrity failures.
 - The rollout collector and ingest function implement the versioned immutable
   batch and committed-receipt contract described below.
+- The ingest request then projects every native record with the immutable
+  `sherlock.codex-rollout.v1` normalizer and indexes bounded user/assistant
+  message excerpts with PostgreSQL full-text search.
 
 The migration does not create Storage object policies or a user-facing
 permission model. Future services must connect server-side and assume only the
@@ -207,17 +211,43 @@ in both expected failure windows:
 An orphaned object from a rejected conflict is operational cleanup, not a
 queryable telemetry fact.
 
+## Implemented normalization contract
+
+Raw commit and normalization are deliberately two short database transactions
+inside one request. The immutable object, batch, and native locators commit
+first. The normalizer then reads the already-validated source bytes, upserts the
+session cache, and inserts one versioned event for every native record.
+
+If normalization fails after raw commit, the endpoint returns an error. The
+collector keeps its spool item. Its retry resolves the exact existing receipt
+without uploading or inserting raw data again, then retries the idempotent event
+projections. The unique source-record/version/projection key prevents duplicate
+events. A coverage check inside the normalizer transaction rejects any batch
+where a native record lacks a projection.
+
+The first version recognizes session metadata, turn context, user and assistant
+messages, cumulative token usage, reasoning, common tool calls/results,
+lifecycle records, native errors, and malformed/unknown records. Cumulative
+usage separates cached input and reasoning output from the inclusive native
+totals. Unknown records still produce observable `unknown` events.
+
+Only the bounded message excerpt is copied into PostgreSQL and indexed with a
+partial GIN full-text index. Full prompts, responses, reasoning, tool payloads,
+and native JSON remain solely in immutable Storage and are recoverable through
+their native-record locators.
+
 The endpoint is intentionally unauthenticated. Anyone who knows its URL can
 submit a valid batch and declare a name, GitHub login, and email; those values
 are not proof of identity or email control. Batch `person_id` remains immutable
 after commit, and two installations declaring the same normalized email resolve
 to the same person.
 
-## Planned application behavior
+## Deferred application behavior
 
-The current migration does not implement these behaviors:
+The current implementation does not yet provide:
 
-- normalizer sealing, canonical event selection, or replay suppression;
+- canonical event selection or semantic replay suppression across distinct
+  native records;
 - activity reduction and version activation;
 - signed snapshot tokens and contiguous publication cutoffs;
 - transcript, usage, health, coverage, or Flame read APIs.
