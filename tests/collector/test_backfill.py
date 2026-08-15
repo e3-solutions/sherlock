@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -274,6 +275,49 @@ class BackfillExportTests(unittest.TestCase):
             )
             self.assertEqual(session["generation_seq"], live_manifest.generation_seq)
             self.assertEqual(session["generation_key"], live_manifest.generation_key)
+
+    def test_export_fragments_oversized_native_records_without_changing_bytes(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            rollout = codex_home / "sessions" / "rollout-large.jsonl"
+            rollout.parent.mkdir(parents=True)
+            oversized = b'{"type":"event","data":"' + (b"x" * 2_500) + b'"}\n'
+            original = b'{"type":"before"}\n' + oversized + b'{"type":"after"}\n'
+            rollout.write_bytes(original)
+            output = root / "history.zip"
+
+            result = export_archive(
+                codex_home,
+                output,
+                chunk_bytes=128,
+                max_object_bytes=1_024,
+            )
+
+            self.assertGreater(result.batches, 3)
+            self.assertEqual(
+                reconstructed_sessions(output),
+                {("sessions", rollout.name): original},
+            )
+            with zipfile.ZipFile(output) as archive:
+                session = read_manifest(output)["sessions"][0]
+                fragments = []
+                for key in session["batch_keys"]:
+                    prefix = f"batches/{key[:2]}/{key}"
+                    manifest = BatchManifest.from_dict(
+                        json.loads(archive.read(f"{prefix}.manifest.json"))
+                    )
+                    fragments.extend(
+                        record
+                        for record in manifest.records
+                        if record.parse_status == "fragment"
+                    )
+            self.assertEqual([item.fragment_index for item in fragments], [0, 1, 2])
+            self.assertEqual({item.fragment_count for item in fragments}, {3})
+            self.assertEqual(
+                {item.native_record_sha256 for item in fragments},
+                {hashlib.sha256(oversized).hexdigest()},
+            )
 
 
 class BackfillUploadTests(unittest.TestCase):

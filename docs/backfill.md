@@ -35,6 +35,11 @@ It refuses to overwrite an existing path unless `--force` is present. If a
 live rollout changes during the snapshot, stop active Codex work and rerun;
 the incomplete temporary archive is removed.
 
+Very large single JSONL records (for example, tool results containing images
+or long command output) are split into bounded transport fragments. The ZIP
+retains the full native-record range and hash for every fragment, and joining
+the batches still reproduces the source rollout byte-for-byte.
+
 ## 2. Upload through Sherlock ingest
 
 Use the collector configuration installed by Sherlock:

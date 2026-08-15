@@ -26,12 +26,16 @@ stored byte counts, full-source SHA-256, optional native session ID, and an
 ordered list of batch keys. Absolute local paths, usernames, hostnames,
 database credentials, and collector credentials are not written to the ZIP.
 
-Each non-empty source file is split on native JSONL record boundaries using
-the same limits as `sherlock.rollout-batch.v1`. Each batch has the exact v1
-manifest and deterministic gzip payload accepted by the live ingest service.
-Concatenating the validated, uncompressed batch payloads in manifest order
-reconstructs the original file byte-for-byte. Empty source files have an
-explicit zero-byte member and no ingest batch.
+Each non-empty source file is normally split on native JSONL record boundaries
+using the same limits as `sherlock.rollout-batch.v1`. A native record larger
+than one batch is transported as ordered, bounded fragments. Fragment locators
+carry the native record's complete source range and SHA-256 plus a zero-based
+fragment index/count; `parse_status` is `fragment`. The database stores these
+facts explicitly, rather than misrepresenting fragments as independent native
+records. Each batch has the exact v1 manifest and deterministic gzip payload
+accepted by the ingest service. Concatenating validated, uncompressed batch
+payloads in manifest order reconstructs the original file byte-for-byte.
+Empty source files have an explicit zero-byte member and no ingest batch.
 
 Payload members use ZIP `STORE` because they are already gzip-compressed;
 JSON manifests use ZIP deflate. The complete archive and upload checkpoint

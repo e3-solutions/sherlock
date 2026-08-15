@@ -74,11 +74,16 @@ class RecordLocator:
     native_payload_type: str | None
     occurred_at: str | None
     parse_status: str
+    native_record_start_offset: int | None = None
+    native_record_end_offset: int | None = None
+    native_record_sha256: str | None = None
+    fragment_index: int | None = None
+    fragment_count: int | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RecordLocator":
         parse_status = _nonempty(value.get("parse_status"), "record.parse_status")
-        if parse_status not in {"ok", "unknown", "malformed"}:
+        if parse_status not in {"ok", "unknown", "malformed", "fragment"}:
             raise ContractError("record.parse_status is unsupported")
         native_type = value.get("native_type")
         native_payload_type = value.get("native_payload_type")
@@ -98,6 +103,45 @@ class RecordLocator:
             native_payload_type=native_payload_type,
             occurred_at=occurred_at,
             parse_status=parse_status,
+            native_record_start_offset=(
+                _integer(
+                    value.get("native_record_start_offset"),
+                    "record.native_record_start_offset",
+                )
+                if value.get("native_record_start_offset") is not None
+                else None
+            ),
+            native_record_end_offset=(
+                _integer(
+                    value.get("native_record_end_offset"),
+                    "record.native_record_end_offset",
+                    minimum=1,
+                )
+                if value.get("native_record_end_offset") is not None
+                else None
+            ),
+            native_record_sha256=(
+                _hash(
+                    value.get("native_record_sha256"),
+                    "record.native_record_sha256",
+                )
+                if value.get("native_record_sha256") is not None
+                else None
+            ),
+            fragment_index=(
+                _integer(value.get("fragment_index"), "record.fragment_index")
+                if value.get("fragment_index") is not None
+                else None
+            ),
+            fragment_count=(
+                _integer(
+                    value.get("fragment_count"),
+                    "record.fragment_count",
+                    minimum=2,
+                )
+                if value.get("fragment_count") is not None
+                else None
+            ),
         )
 
 
@@ -240,6 +284,41 @@ class BatchManifest:
                 "record.native_payload_type",
                 NATIVE_LABEL_BYTES,
             )
+            fragment_fields = (
+                record.native_record_start_offset,
+                record.native_record_end_offset,
+                record.native_record_sha256,
+                record.fragment_index,
+                record.fragment_count,
+            )
+            if record.parse_status == "fragment":
+                if any(value is None for value in fragment_fields):
+                    raise ContractError("fragment record metadata must be complete")
+                assert record.native_record_start_offset is not None
+                assert record.native_record_end_offset is not None
+                assert record.fragment_index is not None
+                assert record.fragment_count is not None
+                if not (
+                    record.native_record_start_offset
+                    <= record.source_start_offset
+                    < record.source_end_offset
+                    <= record.native_record_end_offset
+                ):
+                    raise ContractError("fragment range is outside its native record")
+                if record.fragment_index >= record.fragment_count:
+                    raise ContractError("fragment_index must be below fragment_count")
+                if (record.fragment_index == 0) != (
+                    record.source_start_offset == record.native_record_start_offset
+                ):
+                    raise ContractError("first fragment must start the native record")
+                if (record.fragment_index == record.fragment_count - 1) != (
+                    record.source_end_offset == record.native_record_end_offset
+                ):
+                    raise ContractError("last fragment must end the native record")
+            elif any(value is not None for value in fragment_fields):
+                raise ContractError(
+                    "non-fragment records cannot include fragment metadata"
+                )
 
 
 def _record_locator(
@@ -313,20 +392,56 @@ def build_rollout_batch(
     observed_native_session_id: str | None = None,
     codex_version: str | None = None,
     collector_version: str | None = None,
+    native_record_fragment: Mapping[str, Any] | None = None,
 ) -> tuple[BatchManifest, bytes]:
     if not source_bytes:
         raise ContractError("source batch must not be empty")
     if len(source_bytes) > MAX_SOURCE_BYTES:
         raise ContractError("source batch exceeds rollout v1 limits")
-    parts = source_bytes.split(b"\n")
-    lines = [part + b"\n" for part in parts[:-1]]
-    if parts[-1]:
-        lines.append(parts[-1])
-    records: list[RecordLocator] = []
-    offset = start_offset
-    for index, line in enumerate(lines):
-        records.append(_record_locator(line, offset, index))
-        offset += len(line)
+    if native_record_fragment is not None:
+        records = [
+            RecordLocator(
+                record_index=0,
+                source_start_offset=start_offset,
+                source_end_offset=start_offset + len(source_bytes),
+                record_sha256=sha256_hex(source_bytes),
+                native_type=None,
+                native_payload_type=None,
+                occurred_at=None,
+                parse_status="fragment",
+                native_record_start_offset=_integer(
+                    native_record_fragment.get("native_record_start_offset"),
+                    "native_record_start_offset",
+                ),
+                native_record_end_offset=_integer(
+                    native_record_fragment.get("native_record_end_offset"),
+                    "native_record_end_offset",
+                    minimum=1,
+                ),
+                native_record_sha256=_hash(
+                    native_record_fragment.get("native_record_sha256"),
+                    "native_record_sha256",
+                ),
+                fragment_index=_integer(
+                    native_record_fragment.get("fragment_index"), "fragment_index"
+                ),
+                fragment_count=_integer(
+                    native_record_fragment.get("fragment_count"),
+                    "fragment_count",
+                    minimum=2,
+                ),
+            )
+        ]
+    else:
+        parts = source_bytes.split(b"\n")
+        lines = [part + b"\n" for part in parts[:-1]]
+        if parts[-1]:
+            lines.append(parts[-1])
+        records = []
+        offset = start_offset
+        for index, line in enumerate(lines):
+            records.append(_record_locator(line, offset, index))
+            offset += len(line)
     if len(records) > MAX_RECORDS:
         raise ContractError(f"source batch exceeds {MAX_RECORDS} native records")
     stored = gzip.compress(source_bytes, compresslevel=6, mtime=0)

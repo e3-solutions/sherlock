@@ -64,6 +64,11 @@ async function fixture(): Promise<{
         native_payload_type: null,
         occurred_at: null,
         parse_status: "ok",
+        native_record_start_offset: null,
+        native_record_end_offset: null,
+        native_record_sha256: null,
+        fragment_index: null,
+        fragment_count: null,
       }],
       observed_native_session_id: null,
       first_occurred_at: null,
@@ -223,6 +228,32 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
     assert(error instanceof IngestError);
     assert(error.status === 400);
   }
+});
+
+Deno.test("oversized native record fragments retain their logical identity", async () => {
+  const { manifest, stored } = await fixture();
+  const nativeRecordHash = "a".repeat(64);
+  const parsed = parseEnvelope({
+    manifest: {
+      ...manifest,
+      records: [{
+        ...manifest.records[0],
+        native_type: null,
+        parse_status: "fragment",
+        native_record_start_offset: 0,
+        native_record_end_offset: 10,
+        native_record_sha256: nativeRecordHash,
+        fragment_index: 0,
+        fragment_count: 2,
+      }],
+    },
+    stored_payload_base64: btoa(String.fromCharCode(...stored)),
+  });
+
+  assert(parsed.manifest.records[0].parse_status === "fragment");
+  assert(
+    parsed.manifest.records[0].native_record_sha256 === nativeRecordHash,
+  );
 });
 
 Deno.test("streaming decompression rejects a small gzip bomb", async () => {

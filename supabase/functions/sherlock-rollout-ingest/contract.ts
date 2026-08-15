@@ -19,7 +19,12 @@ export interface RecordLocator {
   native_type: string | null;
   native_payload_type: string | null;
   occurred_at: string | null;
-  parse_status: "ok" | "unknown" | "malformed";
+  parse_status: "ok" | "unknown" | "malformed" | "fragment";
+  native_record_start_offset: number | null;
+  native_record_end_offset: number | null;
+  native_record_sha256: string | null;
+  fragment_index: number | null;
+  fragment_count: number | null;
 }
 
 export interface BatchManifest {
@@ -273,7 +278,11 @@ function decodeBase64(value: unknown): Uint8Array {
 function parseRecord(value: unknown): RecordLocator {
   const input = object(value, "record");
   const parseStatus = text(input.parse_status, "record.parse_status");
-  if (!(["ok", "unknown", "malformed"] as string[]).includes(parseStatus)) {
+  if (
+    !(["ok", "unknown", "malformed", "fragment"] as string[]).includes(
+      parseStatus,
+    )
+  ) {
     throw new IngestError(
       "invalid_manifest",
       "record.parse_status is unsupported",
@@ -304,6 +313,28 @@ function parseRecord(value: unknown): RecordLocator {
     ),
     occurred_at: nullableTimestamp(input.occurred_at, "record.occurred_at"),
     parse_status: parseStatus as RecordLocator["parse_status"],
+    native_record_start_offset: input.native_record_start_offset == null
+      ? null
+      : integer(
+        input.native_record_start_offset,
+        "record.native_record_start_offset",
+      ),
+    native_record_end_offset: input.native_record_end_offset == null
+      ? null
+      : integer(
+        input.native_record_end_offset,
+        "record.native_record_end_offset",
+        1,
+      ),
+    native_record_sha256: input.native_record_sha256 == null
+      ? null
+      : hash(input.native_record_sha256, "record.native_record_sha256"),
+    fragment_index: input.fragment_index == null
+      ? null
+      : integer(input.fragment_index, "record.fragment_index"),
+    fragment_count: input.fragment_count == null
+      ? null
+      : integer(input.fragment_count, "record.fragment_count", 2),
   };
 }
 
@@ -452,6 +483,49 @@ export function validateManifest(manifest: BatchManifest): void {
       );
     }
     previousEnd = record.source_end_offset;
+    const fragmentFields = [
+      record.native_record_start_offset,
+      record.native_record_end_offset,
+      record.native_record_sha256,
+      record.fragment_index,
+      record.fragment_count,
+    ];
+    if (record.parse_status === "fragment") {
+      if (fragmentFields.some((value) => value === null)) {
+        throw new IngestError(
+          "invalid_manifest",
+          "fragment record metadata must be complete",
+          400,
+        );
+      }
+      if (
+        (record.native_record_start_offset as number) >
+          record.source_start_offset ||
+        record.source_end_offset >
+          (record.native_record_end_offset as number) ||
+        (record.fragment_index as number) >=
+          (record.fragment_count as number) ||
+        ((record.fragment_index as number) === 0) !==
+          (record.source_start_offset ===
+            (record.native_record_start_offset as number)) ||
+        ((record.fragment_index as number) ===
+            (record.fragment_count as number) - 1) !==
+          (record.source_end_offset ===
+            (record.native_record_end_offset as number))
+      ) {
+        throw new IngestError(
+          "invalid_manifest",
+          "fragment metadata does not contain the source range",
+          400,
+        );
+      }
+    } else if (fragmentFields.some((value) => value !== null)) {
+      throw new IngestError(
+        "invalid_manifest",
+        "non-fragment records cannot include fragment metadata",
+        400,
+      );
+    }
   });
 }
 

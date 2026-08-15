@@ -53,11 +53,23 @@ class BackfillError(ValueError):
     """A local archive is incomplete, unsafe, or violates its contract."""
 
 
+class _OversizedNativeRecord(BackfillError):
+    pass
+
+
 @dataclass(frozen=True)
 class RolloutFile:
     scope: str
     relative_path: str
     path: Path
+
+
+@dataclass(frozen=True)
+class NativeRecordFragmentPlan:
+    start_offset: int
+    end_offset: int
+    sha256: str
+    fragment_count: int
 
 
 @dataclass(frozen=True)
@@ -194,8 +206,41 @@ def _read_chunk(
     complete = candidate + overflow
     newline = complete.find(b"\n", len(candidate))
     if newline < 0 and remaining > overflow_limit:
-        raise BackfillError(f"native rollout record exceeds {max_object_bytes} bytes")
+        raise _OversizedNativeRecord(
+            f"native rollout record exceeds {max_object_bytes} bytes"
+        )
     return _limit_records(complete if newline < 0 else complete[: newline + 1])
+
+
+def _native_record_fragment_plan(
+    handle,
+    start: int,
+    stable_end: int,
+    *,
+    fragment_bytes: int,
+) -> NativeRecordFragmentPlan:
+    handle.seek(start)
+    digest = hashlib.sha256()
+    end = start
+    while end < stable_end:
+        chunk = handle.read(min(1024 * 1024, stable_end - end))
+        if not chunk:
+            break
+        newline = chunk.find(b"\n")
+        selected = chunk if newline < 0 else chunk[: newline + 1]
+        digest.update(selected)
+        end += len(selected)
+        if newline >= 0:
+            break
+    length = end - start
+    if length <= fragment_bytes:
+        raise BackfillError("could not locate oversized native rollout record")
+    return NativeRecordFragmentPlan(
+        start_offset=start,
+        end_offset=end,
+        sha256=digest.hexdigest(),
+        fragment_count=(length + fragment_bytes - 1) // fragment_bytes,
+    )
 
 
 def _limit_records(source: bytes) -> bytes:
@@ -372,14 +417,44 @@ def _export_rollout(
         batch_keys: list[str] = []
         stored_bytes = 0
         offset = 0
+        fragment_plan: NativeRecordFragmentPlan | None = None
         while offset < before.st_size:
-            source = _read_chunk(
-                handle,
-                offset,
-                before.st_size,
-                chunk_bytes=chunk_bytes,
-                max_object_bytes=max_object_bytes,
-            )
+            fragment_metadata: dict[str, object] | None = None
+            if fragment_plan is None:
+                try:
+                    source = _read_chunk(
+                        handle,
+                        offset,
+                        before.st_size,
+                        chunk_bytes=chunk_bytes,
+                        max_object_bytes=max_object_bytes,
+                    )
+                except _OversizedNativeRecord:
+                    fragment_plan = _native_record_fragment_plan(
+                        handle,
+                        offset,
+                        before.st_size,
+                        fragment_bytes=max_object_bytes,
+                    )
+                    handle.seek(offset)
+                    source = handle.read(
+                        min(max_object_bytes, fragment_plan.end_offset - offset)
+                    )
+            else:
+                handle.seek(offset)
+                source = handle.read(
+                    min(max_object_bytes, fragment_plan.end_offset - offset)
+                )
+            if fragment_plan is not None:
+                fragment_metadata = {
+                    "native_record_start_offset": fragment_plan.start_offset,
+                    "native_record_end_offset": fragment_plan.end_offset,
+                    "native_record_sha256": fragment_plan.sha256,
+                    "fragment_index": (
+                        (offset - fragment_plan.start_offset) // max_object_bytes
+                    ),
+                    "fragment_count": fragment_plan.fragment_count,
+                }
             if not source:
                 raise BackfillError(
                     f"could not make progress reading {rollout.scope}/{rollout.relative_path}"
@@ -392,6 +467,7 @@ def _export_rollout(
                 start_offset=offset,
                 observed_native_session_id=_native_session_id(rollout.path),
                 collector_version=collector_version,
+                native_record_fragment=fragment_metadata,
             )
             existing = written_batches.get(manifest.spool_key)
             if existing is not None:
@@ -409,6 +485,8 @@ def _export_rollout(
             stored_bytes += len(stored)
             source_hash.update(source)
             offset = manifest.end_offset
+            if fragment_plan is not None and offset == fragment_plan.end_offset:
+                fragment_plan = None
         if before.st_size == 0:
             empty_path = f"empty/{session_key}.jsonl"
             archive.writestr(_zip_info(empty_path, compressed=False), b"")
