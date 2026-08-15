@@ -182,8 +182,11 @@ export class PostgresBatchRepository implements BatchRepository {
     attribution: Attribution,
     manifest: BatchManifest,
   ): Promise<CommittedReceipt | null> {
-    const row = await findExactBatch(this.sql, attribution, manifest);
-    return row ? receiptFromRow(row) : null;
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_ingest");
+      const row = await findExactBatch(tx, attribution, manifest);
+      return row ? receiptFromRow(row) : null;
+    });
   }
 
   async commit(

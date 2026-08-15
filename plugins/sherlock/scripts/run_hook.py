@@ -32,7 +32,14 @@ def main() -> int:
     if os.environ.get("SHERLOCK_CONFIG_PATH"):
         arguments.extend(["--config", os.environ["SHERLOCK_CONFIG_PATH"]])
     arguments.extend(["hook", event_name])
-    return collector_main(arguments)
+    try:
+        return collector_main(arguments)
+    except Exception as error:
+        print(
+            f"Sherlock telemetry capture failed ({type(error).__name__}): {error}",
+            file=sys.stderr,
+        )
+        return 0
 
 
 if __name__ == "__main__":

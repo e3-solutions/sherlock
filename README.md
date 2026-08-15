@@ -18,13 +18,14 @@ runtime/config, and install the plugin:
 
 ```sh
 codex plugin marketplace add .
-SHERLOCK_INGEST_TOKEN='<opaque collector token>' \
-  python3 plugins/sherlock/scripts/install.py \
+python3 plugins/sherlock/scripts/install.py \
   --endpoint https://psmuyotyyojrkojycyzz.supabase.co/functions/v1/sherlock-rollout-ingest
 codex plugin add sherlock@sherlock
 ```
 
-The token is not written to command output. It is stored with the endpoint in
+The installer prompts for the token without echoing it or placing it in shell
+history. For secret-manager automation, pass it on standard input with
+`--token-stdin`. It is stored with the endpoint in
 `$CODEX_HOME/sherlock/collector.json` (default `~/.codex/sherlock/collector.json`)
 with mode `0600`; the directory is mode `0700`. `SHERLOCK_INGEST_URL` and
 `SHERLOCK_INGEST_TOKEN` may be used instead when Codex inherits both variables.

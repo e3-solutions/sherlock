@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import shutil
+import sys
 import uuid
 from pathlib import Path
 
@@ -66,6 +67,13 @@ def main() -> int:
     package = repo_root / "packages" / "telemetry-collector" / "src" / "sherlock_collector"
     if not package.is_dir():
         raise SystemExit("run this installer from a Sherlock repository checkout")
+    sys.path.insert(0, str(package.parent))
+    from sherlock_collector.config import ConfigurationError, validate_endpoint
+
+    try:
+        endpoint = validate_endpoint(args.endpoint)
+    except ConfigurationError as error:
+        raise SystemExit(f"invalid collector endpoint: {error}") from error
     if args.token_stdin:
         token = input().rstrip("\n")
     else:
@@ -76,7 +84,7 @@ def main() -> int:
         raise SystemExit("collector token is required")
     root = codex_home / "sherlock"
     install_runtime(package, root / "runtime" / "sherlock_collector")
-    atomic_json(root / "collector.json", {"endpoint": args.endpoint, "token": token})
+    atomic_json(root / "collector.json", {"endpoint": endpoint, "token": token})
     print(f"Installed collector runtime under {root}")
     print("Stored the endpoint and opaque token in owner-only collector.json")
     return 0

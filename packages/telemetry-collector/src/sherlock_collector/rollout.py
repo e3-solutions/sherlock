@@ -33,6 +33,7 @@ class CaptureResult:
     enqueued: int = 0
     captured_bytes: int = 0
     locked: bool = False
+    errors: int = 0
 
 
 def _stream_key(path: Path) -> str:
@@ -74,6 +75,7 @@ class RolloutCapturer:
         self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.state_root, 0o700)
         self.state_path = self.state_root / "rollout-state.json"
+        self.state_backup_path = self.state_root / "rollout-state.previous.json"
         self.lock_path = self.state_root / "rollout-sync.lock"
         self.spool = spool
         self.chunk_bytes = chunk_bytes
@@ -87,6 +89,8 @@ class RolloutCapturer:
         native_session_ids: Mapping[str, str] | None = None,
         max_files: int = 16,
         max_sync_bytes: int = 2 * DEFAULT_CHUNK_BYTES,
+        best_effort: bool = False,
+        priority_count: int = 0,
     ) -> CaptureResult:
         with secure_lock(self.lock_path) as lock:
             try:
@@ -94,101 +98,134 @@ class RolloutCapturer:
             except BlockingIOError:
                 return CaptureResult(locked=True)
             states, candidate_cursor = self._load_state()
-            enqueued = captured = 0
-            all_paths = sorted({str(Path(item).resolve()) for item in paths})
-            if all_paths:
-                candidate_cursor %= len(all_paths)
-                rotated = all_paths[candidate_cursor:] + all_paths[:candidate_cursor]
-                selected_paths = rotated[:max_files]
+            enqueued = captured = errors = 0
+            all_paths = list(
+                dict.fromkeys(str(Path(item).resolve()) for item in paths)
+            )
+            priority_count = min(max(0, priority_count), len(all_paths), max_files)
+            priority_paths = all_paths[:priority_count]
+            backlog_paths = sorted(all_paths[priority_count:])
+            if backlog_paths:
+                candidate_cursor %= len(backlog_paths)
+                rotated = (
+                    backlog_paths[candidate_cursor:]
+                    + backlog_paths[:candidate_cursor]
+                )
+                selected_paths = priority_paths + rotated[: max_files - priority_count]
             else:
-                selected_paths = []
-            visited_candidates = 0
+                selected_paths = priority_paths
+            visited_backlog = 0
             for raw_path in selected_paths:
                 if captured >= max_sync_bytes:
                     break
-                visited_candidates += 1
+                if raw_path not in priority_paths:
+                    visited_backlog += 1
                 path = Path(raw_path)
-                if not path.is_file():
-                    continue
                 try:
-                    handle = path.open("rb")
-                except OSError:
+                    path_enqueued, path_captured = self._capture_path(
+                        path,
+                        states,
+                        native_session_ids or {},
+                        max_sync_bytes - captured,
+                        candidate_cursor,
+                    )
+                except (ContractError, OSError, ValueError):
+                    if not best_effort:
+                        raise
+                    errors += 1
                     continue
-                with handle:
-                    key = _stream_key(path)
-                    state = states.get(key)
-                    stat = os.fstat(handle.fileno())
-                    initial_empty_growth = (
-                        state is not None
-                        and state.prefix_length == 0
-                        and state.offset == 0
-                        and state.path == str(path)
-                        and state.device == stat.st_dev
-                        and state.inode == stat.st_ino
-                        and stat.st_size > 0
-                    )
-                    fingerprint_size = (
-                        stat.st_size
-                        if state is None or initial_empty_growth
-                        else min(state.prefix_length, stat.st_size)
-                    )
-                    prefix_length, prefix_sha = _prefix(handle, fingerprint_size)
-                    if initial_empty_growth:
-                        state.prefix_length = prefix_length
-                        state.prefix_sha256 = prefix_sha
-                    replaced = state is None or not self._same_generation(
-                        state, path, stat, prefix_length, prefix_sha
-                    )
-                    if replaced:
-                        sequence = 0 if state is None else state.generation_seq + 1
-                        state = StreamState(
-                            path=str(path),
-                            device=stat.st_dev,
-                            inode=stat.st_ino,
-                            prefix_length=prefix_length,
-                            prefix_sha256=prefix_sha,
-                            generation_seq=sequence,
-                            generation_key=_generation_key(
-                                path, stat.st_dev, stat.st_ino, prefix_sha, sequence
-                            ),
-                            offset=0,
-                        )
-                    stable_end = stat.st_size
-                    while state.offset < stable_end and captured < max_sync_bytes:
-                        remaining_budget = max_sync_bytes - captured
-                        source = self._read_chunk(
-                            handle,
-                            state.offset,
-                            stable_end,
-                            min(self.chunk_bytes, remaining_budget),
-                        )
-                        if not source:
-                            break
-                        manifest, stored = build_rollout_batch(
-                            source,
-                            source_stream_key=key,
-                            generation_key=state.generation_key,
-                            generation_seq=state.generation_seq,
-                            start_offset=state.offset,
-                            observed_native_session_id=(native_session_ids or {}).get(
-                                str(path)
-                            ),
-                            collector_version=self.collector_version,
-                        )
-                        self.spool.enqueue(manifest, stored)
-                        state.offset = manifest.end_offset
-                        states[key] = state
-                        self._save_state(states, candidate_cursor)
-                        enqueued += 1
-                        captured += len(source)
-                    states[key] = state
+                enqueued += path_enqueued
+                captured += path_captured
             next_cursor = (
-                (candidate_cursor + visited_candidates) % len(all_paths)
-                if all_paths
+                (candidate_cursor + visited_backlog) % len(backlog_paths)
+                if backlog_paths
                 else 0
             )
-            self._save_state(states, next_cursor)
-            return CaptureResult(enqueued, captured, False)
+            self._save_state(states, next_cursor, update_backup=True)
+            return CaptureResult(enqueued, captured, False, errors)
+
+    def _capture_path(
+        self,
+        path: Path,
+        states: dict[str, StreamState],
+        native_session_ids: Mapping[str, str],
+        byte_budget: int,
+        candidate_cursor: int,
+    ) -> tuple[int, int]:
+        if not path.is_file():
+            return 0, 0
+        with path.open("rb") as handle:
+            key = _stream_key(path)
+            state = states.get(key)
+            details = os.fstat(handle.fileno())
+            initial_empty_growth = (
+                state is not None
+                and state.prefix_length == 0
+                and state.offset == 0
+                and state.path == str(path)
+                and state.device == details.st_dev
+                and state.inode == details.st_ino
+                and details.st_size > 0
+            )
+            fingerprint_size = (
+                details.st_size
+                if state is None or initial_empty_growth
+                else min(state.prefix_length, details.st_size)
+            )
+            prefix_length, prefix_sha = _prefix(handle, fingerprint_size)
+            if initial_empty_growth:
+                state.prefix_length = prefix_length
+                state.prefix_sha256 = prefix_sha
+            replaced = state is None or not self._same_generation(
+                state, path, details, prefix_length, prefix_sha
+            )
+            if replaced:
+                sequence = 0 if state is None else state.generation_seq + 1
+                state = StreamState(
+                    path=str(path),
+                    device=details.st_dev,
+                    inode=details.st_ino,
+                    prefix_length=prefix_length,
+                    prefix_sha256=prefix_sha,
+                    generation_seq=sequence,
+                    generation_key=_generation_key(
+                        path,
+                        details.st_dev,
+                        details.st_ino,
+                        prefix_sha,
+                        sequence,
+                    ),
+                    offset=0,
+                )
+            stable_end = details.st_size
+            enqueued = captured = 0
+            while state.offset < stable_end and captured < byte_budget:
+                remaining_budget = byte_budget - captured
+                source = self._read_chunk(
+                    handle,
+                    state.offset,
+                    stable_end,
+                    min(self.chunk_bytes, remaining_budget),
+                )
+                if not source:
+                    break
+                manifest, stored = build_rollout_batch(
+                    source,
+                    source_stream_key=key,
+                    generation_key=state.generation_key,
+                    generation_seq=state.generation_seq,
+                    start_offset=state.offset,
+                    observed_native_session_id=native_session_ids.get(str(path)),
+                    collector_version=self.collector_version,
+                )
+                self.spool.enqueue(manifest, stored)
+                state.offset = manifest.end_offset
+                states[key] = state
+                self._save_state(states, candidate_cursor)
+                enqueued += 1
+                captured += len(source)
+            states[key] = state
+            return enqueued, captured
 
     @staticmethod
     def _same_generation(
@@ -242,9 +279,33 @@ class RolloutCapturer:
         return source
 
     def _load_state(self) -> tuple[dict[str, StreamState], int]:
-        if not self.state_path.exists():
-            return {}, 0
-        raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        errors: list[Exception] = []
+        for path in (self.state_path, self.state_backup_path):
+            if not path.exists():
+                continue
+            try:
+                result = self._read_state(path)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                errors.append(error)
+                continue
+            if path == self.state_backup_path:
+                self._save_state(*result)
+            return result
+        if errors:
+            raise ValueError("rollout state and backup are unreadable") from errors[0]
+        return {}, 0
+
+    @staticmethod
+    def _read_state(path: Path) -> tuple[dict[str, StreamState], int]:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("rollout state must be an object")
         if raw.get("state_version") != 1 or not isinstance(raw.get("streams"), dict):
             raise ValueError("unsupported rollout state")
         cursor = raw.get("candidate_cursor", 0)
@@ -256,13 +317,19 @@ class RolloutCapturer:
         )
 
     def _save_state(
-        self, states: Mapping[str, StreamState], candidate_cursor: int
+        self,
+        states: Mapping[str, StreamState],
+        candidate_cursor: int,
+        update_backup: bool = False,
     ) -> None:
+        value = {
+            "state_version": 1,
+            "candidate_cursor": candidate_cursor,
+            "streams": {key: asdict(value) for key, value in states.items()},
+        }
         _atomic_json(
             self.state_path,
-            {
-                "state_version": 1,
-                "candidate_cursor": candidate_cursor,
-                "streams": {key: asdict(value) for key, value in states.items()},
-            },
+            value,
         )
+        if update_backup:
+            _atomic_json(self.state_backup_path, value)

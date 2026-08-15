@@ -32,6 +32,7 @@ class HookResult:
     enqueued: int = 0
     captured_bytes: int = 0
     discovery_errors: int = 0
+    capture_errors: int = 0
     locked: bool = False
     skipped: str | None = None
 
@@ -53,12 +54,16 @@ def capture_and_spawn_drain(
     *,
     native_session_ids: Mapping[str, str] | None = None,
     drain_environment: Mapping[str, str] | None = None,
+    best_effort: bool = False,
+    priority_count: int = 0,
 ) -> CaptureResult:
     """Durably capture local bytes, then detach a drain without awaiting network."""
     try:
         return capturer.capture(
             rollout_paths,
             native_session_ids=native_session_ids,
+            best_effort=best_effort,
+            priority_count=priority_count,
         )
     finally:
         try:
@@ -105,6 +110,8 @@ def run_hook(
         drain_command,
         native_session_ids=discovery.native_session_ids,
         drain_environment=environment,
+        best_effort=True,
+        priority_count=discovery.priority_count,
     )
     return HookResult(
         event_name=event_name,
@@ -112,5 +119,6 @@ def run_hook(
         enqueued=outcome.enqueued,
         captured_bytes=outcome.captured_bytes,
         discovery_errors=len(discovery.errors),
+        capture_errors=outcome.errors,
         locked=outcome.locked,
     )

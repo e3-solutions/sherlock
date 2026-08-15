@@ -37,7 +37,7 @@ def default_config_path(codex_home: Path | str | None = None) -> Path:
     return home / "sherlock" / "collector.json"
 
 
-def _validate_endpoint(value: object) -> str:
+def validate_endpoint(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigurationError("SHERLOCK_INGEST_URL is required")
     parsed = urlparse(value)
@@ -79,15 +79,18 @@ def load_config(
     *,
     codex_home: Path | str | None = None,
 ) -> CollectorConfig:
-    file_values: dict[str, object] = {}
     endpoint = os.environ.get("SHERLOCK_INGEST_URL")
     token = os.environ.get("SHERLOCK_INGEST_TOKEN")
-    if endpoint is None or token is None:
+    if (endpoint is None) != (token is None):
+        raise ConfigurationError(
+            "SHERLOCK_INGEST_URL and SHERLOCK_INGEST_TOKEN must be set together"
+        )
+    if endpoint is None:
         file_values = _read_owner_only(
             Path(path or default_config_path(codex_home)).expanduser().resolve()
         )
-    endpoint = endpoint if endpoint is not None else file_values.get("endpoint")
-    token = token if token is not None else file_values.get("token")
+        endpoint = file_values.get("endpoint")
+        token = file_values.get("token")
     if not isinstance(token, str) or not token:
         raise ConfigurationError("SHERLOCK_INGEST_TOKEN is required")
-    return CollectorConfig(_validate_endpoint(endpoint), token)
+    return CollectorConfig(validate_endpoint(endpoint), token)
