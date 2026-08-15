@@ -30,6 +30,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--codex-home", type=Path)
     parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--workers", type=int)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
         "--acknowledge-sensitive-data",
@@ -50,6 +51,8 @@ def main() -> int:
     if args.state_root:
         global_args.extend(["--state-root", str(args.state_root)])
     command_args = ["backfill-export", "--output", str(args.output)]
+    if args.workers is not None:
+        command_args.extend(["--workers", str(args.workers)])
     if args.acknowledge_sensitive_data:
         command_args.append("--acknowledge-sensitive-data")
     if args.force:

@@ -107,6 +107,15 @@ def reconstructed_sessions(archive: Path) -> dict[tuple[str, str], bytes]:
     return result
 
 
+def batch_members(archive: Path) -> dict[str, bytes]:
+    with zipfile.ZipFile(archive) as handle:
+        return {
+            item.filename: handle.read(item)
+            for item in handle.infolist()
+            if item.filename.startswith("batches/")
+        }
+
+
 class BackfillExportTests(unittest.TestCase):
     def test_export_contains_every_active_and_archived_rollout_exactly(self):
         with TemporaryDirectory() as temporary:
@@ -185,6 +194,37 @@ class BackfillExportTests(unittest.TestCase):
 
             self.assertEqual(output.read_bytes(), b"keep-me")
 
+    def test_parallel_compression_is_identical_to_single_worker_output(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            rollout = codex_home / "sessions" / "rollout-parallel.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_bytes(
+                b"".join(
+                    json.dumps({"type": "event", "value": "x" * 200}).encode()
+                    + b"\n"
+                    for _ in range(200)
+                )
+            )
+            sequential = root / "sequential.zip"
+            parallel = root / "parallel.zip"
+
+            export_archive(codex_home, sequential, chunk_bytes=1_024, workers=1)
+            export_archive(codex_home, parallel, chunk_bytes=1_024, workers=4)
+
+            self.assertEqual(batch_members(sequential), batch_members(parallel))
+            self.assertEqual(
+                reconstructed_sessions(parallel),
+                {("sessions", rollout.name): rollout.read_bytes()},
+            )
+
+    def test_export_rejects_unbounded_worker_count(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(BackfillError, "workers must be between"):
+                export_archive(root, root / "history.zip", workers=33)
+
     def test_export_script_requires_acknowledgement_and_prints_json_summary(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -210,7 +250,7 @@ class BackfillExportTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 64)
             self.assertFalse(output.exists())
             completed = subprocess.run(
-                [*command, "--acknowledge-sensitive-data"],
+                [*command, "--workers", "2", "--acknowledge-sensitive-data"],
                 check=True,
                 capture_output=True,
                 text=True,

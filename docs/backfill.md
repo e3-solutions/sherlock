@@ -18,6 +18,7 @@ From a Sherlock checkout:
 ```sh
 python3 plugins/sherlock/scripts/export_history.py \
   --output "$PWD/sherlock-codex-history.zip" \
+  --workers 8 \
   --acknowledge-sensitive-data
 ```
 
@@ -34,6 +35,11 @@ The command writes through a temporary file and publishes the ZIP atomically.
 It refuses to overwrite an existing path unless `--force` is present. If a
 live rollout changes during the snapshot, stop active Codex work and rerun;
 the incomplete temporary archive is removed.
+
+`--workers` controls parallel gzip compression from 1 to 32. If omitted, the
+exporter uses the available CPU count capped at 8. Compression is bounded to
+one in-flight batch per worker and preserves the exact deterministic gzip
+bytes used by live capture, so retries cannot conflict by compression backend.
 
 Very large single JSONL records (for example, tool results containing images
 or long command output) are split into bounded transport fragments. The ZIP

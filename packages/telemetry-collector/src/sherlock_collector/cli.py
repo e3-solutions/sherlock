@@ -8,7 +8,12 @@ import zipfile
 from dataclasses import asdict
 from pathlib import Path
 
-from .backfill import BackfillError, export_archive, upload_archive
+from .backfill import (
+    DEFAULT_EXPORT_WORKERS,
+    BackfillError,
+    export_archive,
+    upload_archive,
+)
 from .config import (
     ConfigurationError,
     default_codex_home,
@@ -38,6 +43,12 @@ def parser() -> argparse.ArgumentParser:
         help="Export every active and archived Codex rollout to a verified ZIP.",
     )
     backfill_export.add_argument("--output", required=True, type=Path)
+    backfill_export.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_EXPORT_WORKERS,
+        help="Parallel compression workers (1-32).",
+    )
     backfill_export.add_argument(
         "--acknowledge-sensitive-data",
         action="store_true",
@@ -146,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.output,
                 state_root=state_root,
                 force=args.force,
+                workers=args.workers,
                 progress=lambda current, total, path: print(
                     f"exported {current}/{total}: {path}", file=sys.stderr
                 ),

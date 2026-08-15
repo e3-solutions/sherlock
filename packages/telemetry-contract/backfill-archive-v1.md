@@ -41,6 +41,11 @@ Payload members use ZIP `STORE` because they are already gzip-compressed;
 JSON manifests use ZIP deflate. The complete archive and upload checkpoint
 are owner-readable only (`0600`).
 
+Exporters may compress independent batches concurrently, but must publish
+batches in source-offset order and use the canonical deterministic gzip
+encoding. Changing compressors for the same source range can change stored
+bytes and is therefore not permitted by the v1 exact-retry contract.
+
 ## Upload behavior
 
 The uploader treats the archive as untrusted input. It rejects duplicate,

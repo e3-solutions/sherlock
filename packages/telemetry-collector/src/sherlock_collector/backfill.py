@@ -9,7 +9,9 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, cast
@@ -42,6 +44,7 @@ UPLOAD_STATE_VERSION = "sherlock.backfill-upload-state.v1"
 ARCHIVE_MANIFEST_PATH = "manifest.json"
 MAX_ARCHIVE_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_BATCH_MANIFEST_BYTES = 16 * 1024 * 1024
+DEFAULT_EXPORT_WORKERS = min(8, max(1, os.cpu_count() or 1))
 SESSION_ID_RE = re.compile(
     r"(?:^|[-_])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$",
@@ -321,11 +324,14 @@ def export_archive(
     force: bool = False,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+    workers: int = DEFAULT_EXPORT_WORKERS,
     collector_version: str = "0.1.0",
     progress: Callable[[int, int, str], None] | None = None,
 ) -> ExportResult:
     if not 0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES:
         raise BackfillError("invalid backfill chunk limits")
+    if workers < 1 or workers > 32:
+        raise BackfillError("workers must be between 1 and 32")
     home = Path(codex_home).expanduser().resolve()
     destination = Path(output).expanduser().resolve()
     if destination.exists() and not force:
@@ -351,9 +357,19 @@ def export_archive(
     written_batches: dict[str, BatchManifest] = {}
     total_source = total_stored = total_batches = 0
     try:
-        with zipfile.ZipFile(
-            temporary, "w", allowZip64=True, compresslevel=6, strict_timestamps=True
-        ) as archive:
+        with (
+            ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="sherlock-backfill-compress",
+            ) as compression_executor,
+            zipfile.ZipFile(
+                temporary,
+                "w",
+                allowZip64=True,
+                compresslevel=6,
+                strict_timestamps=True,
+            ) as archive,
+        ):
             for position, rollout in enumerate(rollouts, start=1):
                 session = _export_rollout(
                     archive,
@@ -361,6 +377,8 @@ def export_archive(
                     states,
                     states_by_file,
                     written_batches,
+                    compression_executor,
+                    max_in_flight=workers,
                     chunk_bytes=chunk_bytes,
                     max_object_bytes=max_object_bytes,
                     collector_version=collector_version,
@@ -400,7 +418,9 @@ def _export_rollout(
     states: Mapping[str, StreamState],
     states_by_file: Mapping[tuple[int, int], tuple[tuple[str, StreamState], ...]],
     written_batches: dict[str, BatchManifest],
+    compression_executor: ThreadPoolExecutor,
     *,
+    max_in_flight: int,
     chunk_bytes: int,
     max_object_bytes: int,
     collector_version: str,
@@ -416,59 +436,13 @@ def _export_rollout(
         source_hash = hashlib.sha256()
         batch_keys: list[str] = []
         stored_bytes = 0
-        offset = 0
+        read_offset = 0
         fragment_plan: NativeRecordFragmentPlan | None = None
-        while offset < before.st_size:
-            fragment_metadata: dict[str, object] | None = None
-            if fragment_plan is None:
-                try:
-                    source = _read_chunk(
-                        handle,
-                        offset,
-                        before.st_size,
-                        chunk_bytes=chunk_bytes,
-                        max_object_bytes=max_object_bytes,
-                    )
-                except _OversizedNativeRecord:
-                    fragment_plan = _native_record_fragment_plan(
-                        handle,
-                        offset,
-                        before.st_size,
-                        fragment_bytes=max_object_bytes,
-                    )
-                    handle.seek(offset)
-                    source = handle.read(
-                        min(max_object_bytes, fragment_plan.end_offset - offset)
-                    )
-            else:
-                handle.seek(offset)
-                source = handle.read(
-                    min(max_object_bytes, fragment_plan.end_offset - offset)
-                )
-            if fragment_plan is not None:
-                fragment_metadata = {
-                    "native_record_start_offset": fragment_plan.start_offset,
-                    "native_record_end_offset": fragment_plan.end_offset,
-                    "native_record_sha256": fragment_plan.sha256,
-                    "fragment_index": (
-                        (offset - fragment_plan.start_offset) // max_object_bytes
-                    ),
-                    "fragment_count": fragment_plan.fragment_count,
-                }
-            if not source:
-                raise BackfillError(
-                    f"could not make progress reading {rollout.scope}/{rollout.relative_path}"
-                )
-            manifest, stored = build_rollout_batch(
-                source,
-                source_stream_key=stream_key,
-                generation_key=generation_key,
-                generation_seq=generation_seq,
-                start_offset=offset,
-                observed_native_session_id=_native_session_id(rollout.path),
-                collector_version=collector_version,
-                native_record_fragment=fragment_metadata,
-            )
+        pending: deque[Future[tuple[BatchManifest, bytes]]] = deque()
+
+        def write_next_batch() -> None:
+            nonlocal stored_bytes
+            manifest, stored = pending.popleft().result()
             existing = written_batches.get(manifest.spool_key)
             if existing is not None:
                 reason = (
@@ -483,10 +457,75 @@ def _export_rollout(
             written_batches[manifest.spool_key] = manifest
             batch_keys.append(manifest.spool_key)
             stored_bytes += len(stored)
+
+        while read_offset < before.st_size:
+            fragment_metadata: dict[str, object] | None = None
+            if fragment_plan is None:
+                try:
+                    source = _read_chunk(
+                        handle,
+                        read_offset,
+                        before.st_size,
+                        chunk_bytes=chunk_bytes,
+                        max_object_bytes=max_object_bytes,
+                    )
+                except _OversizedNativeRecord:
+                    fragment_plan = _native_record_fragment_plan(
+                        handle,
+                        read_offset,
+                        before.st_size,
+                        fragment_bytes=max_object_bytes,
+                    )
+                    handle.seek(read_offset)
+                    source = handle.read(
+                        min(
+                            max_object_bytes,
+                            fragment_plan.end_offset - read_offset,
+                        )
+                    )
+            else:
+                handle.seek(read_offset)
+                source = handle.read(
+                    min(max_object_bytes, fragment_plan.end_offset - read_offset)
+                )
+            if fragment_plan is not None:
+                fragment_metadata = {
+                    "native_record_start_offset": fragment_plan.start_offset,
+                    "native_record_end_offset": fragment_plan.end_offset,
+                    "native_record_sha256": fragment_plan.sha256,
+                    "fragment_index": (
+                        (read_offset - fragment_plan.start_offset) // max_object_bytes
+                    ),
+                    "fragment_count": fragment_plan.fragment_count,
+                }
+            if not source:
+                raise BackfillError(
+                    f"could not make progress reading {rollout.scope}/{rollout.relative_path}"
+                )
+            pending.append(
+                compression_executor.submit(
+                    build_rollout_batch,
+                    source,
+                    source_stream_key=stream_key,
+                    generation_key=generation_key,
+                    generation_seq=generation_seq,
+                    start_offset=read_offset,
+                    observed_native_session_id=_native_session_id(rollout.path),
+                    collector_version=collector_version,
+                    native_record_fragment=fragment_metadata,
+                )
+            )
             source_hash.update(source)
-            offset = manifest.end_offset
-            if fragment_plan is not None and offset == fragment_plan.end_offset:
+            read_offset += len(source)
+            if (
+                fragment_plan is not None
+                and read_offset == fragment_plan.end_offset
+            ):
                 fragment_plan = None
+            if len(pending) >= max_in_flight:
+                write_next_batch()
+        while pending:
+            write_next_batch()
         if before.st_size == 0:
             empty_path = f"empty/{session_key}.jsonl"
             archive.writestr(_zip_info(empty_path, compressed=False), b"")
