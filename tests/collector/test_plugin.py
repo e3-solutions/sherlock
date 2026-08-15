@@ -22,6 +22,12 @@ SOURCE = ROOT / "packages" / "telemetry-collector" / "src"
 LAUNCHER = ROOT / "plugins" / "sherlock" / "scripts" / "run_hook.py"
 INSTALLER = ROOT / "plugins" / "sherlock" / "scripts" / "install.py"
 HOOKS = ROOT / "plugins" / "sherlock" / "hooks" / "hooks.json"
+IDENTITY_CONFIG = {
+    "name": "Test User",
+    "github_id": "test-user",
+    "email": "test@example.com",
+    "installation_id": "00000000-0000-4000-8000-000000000001",
+}
 
 
 def create_threads_database(path: Path, rows: list[dict[str, object]]) -> None:
@@ -208,6 +214,7 @@ class ConfigurationTests(unittest.TestCase):
                     {
                         "endpoint": "https://example.test/functions/v1/ingest",
                         "token": "opaque-test-token",
+                        **IDENTITY_CONFIG,
                     }
                 ),
                 encoding="utf-8",
@@ -220,28 +227,48 @@ class ConfigurationTests(unittest.TestCase):
                 loaded.endpoint,
                 "https://example.test/functions/v1/ingest",
             )
-            self.assertEqual(loaded.token, "opaque-test-token")
+            self.assertIsNotNone(loaded.identity)
+            assert loaded.identity is not None
+            self.assertEqual(loaded.identity.email, "test@example.com")
             path.chmod(0o640)
             with self.assertRaisesRegex(ConfigurationError, "owner-only"):
                 load_config(path)
 
-    def test_partial_environment_configuration_is_rejected(self):
-        cases = (
-            {"SHERLOCK_INGEST_URL": "https://example.test/ingest"},
-            {"SHERLOCK_INGEST_TOKEN": "opaque-test-token"},
-        )
-        for environment in cases:
-            with self.subTest(environment=sorted(environment)):
-                with patch.dict(os.environ, environment, clear=True):
-                    with self.assertRaisesRegex(ConfigurationError, "set together"):
-                        load_config()
+    def test_endpoint_environment_override_does_not_require_a_token(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "collector.json"
+            path.write_text(json.dumps(IDENTITY_CONFIG), encoding="utf-8")
+            path.chmod(0o600)
+            with patch.dict(
+                os.environ,
+                {"SHERLOCK_INGEST_URL": "https://example.test/ingest"},
+                clear=True,
+            ):
+                loaded = load_config(path)
 
-    def test_installer_copies_runtime_and_never_prints_token(self):
+            self.assertEqual(loaded.endpoint, "https://example.test/ingest")
+
+    def test_legacy_token_config_remains_uploadable_during_upgrade(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "collector.json"
+            path.write_text(
+                json.dumps({
+                    "endpoint": "https://example.test/functions/v1/ingest",
+                    "token": "opaque-test-token",
+                }),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            loaded = load_config(path)
+
+            self.assertIsNone(loaded.identity)
+            self.assertEqual(loaded.token, "opaque-test-token")
+
+    def test_installer_copies_runtime_and_writes_identity_only_config(self):
         with TemporaryDirectory() as temporary:
             codex_home = Path(temporary) / "codex"
-            environment = os.environ.copy()
-            environment["SHERLOCK_INGEST_TOKEN"] = "opaque-installer-token"
-            completed = subprocess.run(
+            subprocess.run(
                 [
                     sys.executable,
                     str(INSTALLER),
@@ -249,11 +276,16 @@ class ConfigurationTests(unittest.TestCase):
                     "https://example.test/functions/v1/ingest",
                     "--codex-home",
                     str(codex_home),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "TEST@example.com",
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
-                env=environment,
             )
 
             config = codex_home / "sherlock" / "collector.json"
@@ -276,14 +308,18 @@ class ConfigurationTests(unittest.TestCase):
                     / "backfill.py"
                 ).is_file()
             )
-            self.assertNotIn("opaque-installer-token", completed.stdout)
-            self.assertNotIn("opaque-installer-token", completed.stderr)
+            installed = json.loads(config.read_text(encoding="utf-8"))
+            self.assertNotIn("token", installed)
+            self.assertEqual(installed["email"], "test@example.com")
+            self.assertEqual(installed["github_id"], "test-user")
+            self.assertEqual(
+                uuid.UUID(installed["installation_id"]).version,
+                4,
+            )
 
     def test_installer_rejects_invalid_endpoint_before_writing_config(self):
         with TemporaryDirectory() as temporary:
             codex_home = Path(temporary) / "codex"
-            environment = os.environ.copy()
-            environment["SHERLOCK_INGEST_TOKEN"] = "opaque-installer-token"
             completed = subprocess.run(
                 [
                     sys.executable,
@@ -292,17 +328,46 @@ class ConfigurationTests(unittest.TestCase):
                     "http://example.test/ingest",
                     "--codex-home",
                     str(codex_home),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "test@example.com",
                 ],
                 check=False,
                 capture_output=True,
                 text=True,
-                env=environment,
             )
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertFalse((codex_home / "sherlock" / "collector.json").exists())
-            self.assertNotIn("opaque-installer-token", completed.stdout)
-            self.assertNotIn("opaque-installer-token", completed.stderr)
+
+    def test_installer_reuses_the_machine_installation_id(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            command = [
+                sys.executable,
+                str(INSTALLER),
+                "--endpoint",
+                "https://example.test/functions/v1/ingest",
+                "--codex-home",
+                str(codex_home),
+                "--name",
+                "Test User",
+                "--github-id",
+                "test-user",
+                "--email",
+                "test@example.com",
+            ]
+
+            subprocess.run(command, check=True, capture_output=True)
+            config = codex_home / "sherlock" / "collector.json"
+            first = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
+            subprocess.run(command, check=True, capture_output=True)
+            second = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
+
+            self.assertEqual(first, second)
 
 
 class HookCompanionTests(unittest.TestCase):
@@ -377,7 +442,10 @@ class HookIntegrationTests(unittest.TestCase):
             config = config_dir / "collector.json"
             config.write_text(
                 json.dumps(
-                    {"endpoint": "http://127.0.0.1:9/ingest", "token": "offline"}
+                    {
+                        "endpoint": "http://127.0.0.1:9/ingest",
+                        **IDENTITY_CONFIG,
+                    }
                 ),
                 encoding="utf-8",
             )

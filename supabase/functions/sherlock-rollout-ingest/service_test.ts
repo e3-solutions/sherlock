@@ -13,6 +13,10 @@ import {
   timestampMicros,
 } from "./contract.ts";
 import {
+  collectorKeyForIdentity,
+  publicCollectorGrant,
+} from "./attribution.ts";
+import {
   type BatchRepository,
   type ImmutableStorage,
   IngestService,
@@ -27,12 +31,19 @@ function assert(
 }
 
 async function encodeBulk(
-  entries: Array<{ manifest: BatchManifest; stored: Uint8Array }>,
+  entries: Array<{
+    collector?: typeof COLLECTOR;
+    manifest: BatchManifest;
+    stored: Uint8Array;
+  }>,
 ): Promise<Uint8Array> {
   const encoder = new TextEncoder();
   const magic = encoder.encode("SHRBULK2");
   const encoded = await Promise.all(entries.map(async (entry) => {
-    const manifest = encoder.encode(JSON.stringify(entry.manifest));
+    const metadata = entry.collector
+      ? { collector: entry.collector, manifest: entry.manifest }
+      : entry.manifest;
+    const manifest = encoder.encode(JSON.stringify(metadata));
     const compressed = new Blob([manifest])
       .stream()
       .pipeThrough(new CompressionStream("gzip"));
@@ -66,6 +77,13 @@ async function encodeBulk(
   }
   return body;
 }
+
+const COLLECTOR = {
+  name: "Test User",
+  github_id: "test-user",
+  email: "test@example.com",
+  installation_id: "00000000-0000-4000-8000-000000000001",
+};
 
 async function fixture(): Promise<{
   attribution: Attribution;
@@ -259,6 +277,7 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
 
   try {
     parseEnvelope({
+      collector: COLLECTOR,
       manifest: {
         ...manifest,
         first_occurred_at: "2026-02-30T00:00:00Z",
@@ -314,14 +333,15 @@ Deno.test("compressed binary bulk envelope avoids base64 and preserves order", a
 
   const parsed = await parseBulkEnvelope(
     await encodeBulk([
-      { manifest, stored },
-      { manifest: second, stored },
+      { collector: COLLECTOR, manifest, stored },
+      { collector: COLLECTOR, manifest: second, stored },
     ]),
   );
 
   assert(parsed.length === 2);
   assert(parsed[0].manifest.start_offset === 0);
   assert(parsed[1].manifest.start_offset === 5);
+  assert(parsed[0].collector?.email === "test@example.com");
   assert(parsed[0].stored_payload.byteLength === stored.byteLength);
   assert(BULK_RECEIPT_VERSION === "sherlock.bulk-receipts.v1");
 });
@@ -354,6 +374,36 @@ Deno.test("binary bulk envelope bounds decoded manifest expansion", async () => 
     assert(error instanceof IngestError);
     assert(error.code === "payload_too_large");
   }
+});
+
+Deno.test("public ingest is scoped to the configured workspace", () => {
+  const grant = publicCollectorGrant(
+    "00000000-0000-4000-8000-000000000001",
+  );
+
+  assert(grant.workspace_id === "00000000-0000-4000-8000-000000000001");
+  assert(grant.collector_key_prefix === "team");
+  assert(!("person_id" in grant), "configuration must not fix person identity");
+});
+
+Deno.test("collector keys distinguish machines while email remains the person key", async () => {
+  const grant = {
+    workspace_id: "00000000-0000-4000-8000-000000000001",
+    collector_key_prefix: "team",
+  };
+  const first = await collectorKeyForIdentity(grant, COLLECTOR);
+  const repeat = await collectorKeyForIdentity(grant, COLLECTOR);
+  const secondMachine = await collectorKeyForIdentity(grant, {
+    ...COLLECTOR,
+    installation_id: "00000000-0000-4000-8000-000000000002",
+  });
+
+  assert(first === repeat, "one installation must keep a stable collector key");
+  assert(
+    first !== secondMachine,
+    "two installations must have distinct collector keys",
+  );
+  assert(first.startsWith("team-"));
 });
 
 Deno.test("streaming decompression rejects a small gzip bomb", async () => {

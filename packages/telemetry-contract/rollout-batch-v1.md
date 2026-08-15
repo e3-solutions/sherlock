@@ -1,14 +1,15 @@
 # Rollout batch v1
 
 `sherlock.rollout-batch.v1` is the collector-to-ingest manifest for one
-immutable gzip-encoded rollout byte range. Workspace, person, collector,
-object path, and batch ID are deliberately absent because the authenticated
-server owns them.
+immutable gzip-encoded rollout byte range. A request declares collector
+identity or uses a legacy bearer credential; workspace, person, collector key,
+object path, and batch ID are deliberately absent because the authorized
+server resolves them.
 
-The ingest endpoint accepts the original JSON envelope containing one manifest
-plus `stored_payload_base64` for compatibility. High-throughput clients use
-`Content-Type: application/vnd.sherlock.rollout-bulk.v2` and this bounded
-binary body:
+The ingest endpoint accepts a JSON envelope containing collector identity, one
+manifest, and `stored_payload_base64`. Legacy clients may omit identity and use
+their existing bearer credential. High-throughput clients use `Content-Type:
+application/vnd.sherlock.rollout-bulk.v2` and this bounded binary body:
 
 ```text
 8 bytes   ASCII "SHRBULK2"
@@ -17,7 +18,7 @@ repeated item count times:
   4 bytes unsigned big-endian gzip manifest byte count
   4 bytes unsigned big-endian decoded manifest JSON byte count
   4 bytes unsigned big-endian gzip payload byte count
-  N bytes gzip-compressed UTF-8 manifest JSON
+  N bytes gzip-compressed UTF-8 item metadata JSON
   M bytes raw gzip payload
 ```
 
@@ -29,6 +30,9 @@ items in order. Its response is `sherlock.bulk-receipts.v1` with an ordered
 `receipts` array. Retrying a whole bulk request after a partial commit remains
 safe because each batch is independently idempotent. Only transport metadata
 is recompressed; the immutable rollout gzip payload passes through unchanged.
+Item metadata is `{ "collector": ..., "manifest": ... }`; legacy bulk clients
+may send the bare manifest and authenticate the whole request with a bearer
+credential.
 
 The manifest contains source stream and generation identity, half-open byte
 bounds, source and stored sizes/SHA-256 values, optional native-session and

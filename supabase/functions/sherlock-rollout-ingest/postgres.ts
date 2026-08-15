@@ -1,7 +1,9 @@
 import postgres from "npm:postgres@3.4.7";
+import { type CollectorGrant, collectorKeyForIdentity } from "./attribution.ts";
 import {
   type Attribution,
   type BatchManifest,
+  type CollectorIdentity,
   type CommittedReceipt,
   IngestError,
   receiptFromRow,
@@ -182,6 +184,76 @@ export class PostgresBatchRepository implements BatchRepository {
     return new PostgresBatchRepository(
       postgres(databaseUrl, { prepare: false, max: 2, idle_timeout: 20 }),
     );
+  }
+
+  async resolveAttribution(
+    grant: CollectorGrant,
+    identity: CollectorIdentity,
+  ): Promise<Attribution> {
+    const collectorKey = await collectorKeyForIdentity(grant, identity);
+    const personId = await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_ingest");
+      await tx.unsafe(
+        "select pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [JSON.stringify([grant.workspace_id, identity.email])],
+      );
+      const existing = await tx.unsafe(
+        `select id
+           from telemetry.people
+          where workspace_id = $1 and email = $2
+          order by created_at, id
+          limit 2`,
+        [grant.workspace_id, identity.email],
+      );
+      if (existing.length > 1) {
+        throw new IngestError(
+          "identity_conflict",
+          "more than one person has the supplied email",
+          409,
+        );
+      }
+      if (existing.length === 1) {
+        const id = String(existing[0].id);
+        await tx.unsafe(
+          `update telemetry.people
+              set display_name = $1, github_id = $2, email = $3
+            where workspace_id = $4 and id = $5`,
+          [
+            identity.name,
+            identity.github_id,
+            identity.email,
+            grant.workspace_id,
+            id,
+          ],
+        );
+        return id;
+      }
+
+      const inserted = await tx.unsafe(
+        `insert into telemetry.people (
+           id, workspace_id, identity_key, display_name, github_id, email
+         ) values ($1, $2, $3, $4, $5, $6)
+         on conflict (workspace_id, identity_key) do update set
+           display_name = excluded.display_name,
+           github_id = excluded.github_id,
+           email = excluded.email
+         returning id`,
+        [
+          crypto.randomUUID(),
+          grant.workspace_id,
+          `email:${identity.email}`,
+          identity.name,
+          identity.github_id,
+          identity.email,
+        ],
+      );
+      return String(inserted[0].id);
+    });
+    return {
+      workspace_id: grant.workspace_id,
+      person_id: personId,
+      collector_key: collectorKey,
+    };
   }
 
   async findExact(

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 from urllib.parse import urlsplit
 
+from .config import CollectorIdentity
 from .drain import PermanentUploadError, TransientUploadError
 from .spool import SpoolItem
 
@@ -36,10 +37,16 @@ class _EncodedBulkItem:
         return 12 + len(self.manifest_gzip) + len(self.item.stored_payload)
 
 
-def _encode_bulk_item(item: SpoolItem) -> _EncodedBulkItem:
-    manifest = json.dumps(
-        item.manifest.to_dict(), separators=(",", ":")
-    ).encode("utf-8")
+def _encode_bulk_item(
+    item: SpoolItem, identity: CollectorIdentity | None = None
+) -> _EncodedBulkItem:
+    metadata: object = item.manifest.to_dict()
+    if identity is not None:
+        metadata = {
+            "collector": identity.to_dict(),
+            "manifest": metadata,
+        }
+    manifest = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
     if len(manifest) > MAX_BULK_MANIFEST_BYTES:
         raise PermanentUploadError("bulk manifest exceeds 16 MiB")
     return _EncodedBulkItem(
@@ -92,9 +99,11 @@ def _encode_prepared_bulk_request(encoded: Sequence[_EncodedBulkItem]) -> bytes:
     return bytes(body)
 
 
-def encode_bulk_request(items: Sequence[SpoolItem]) -> bytes:
+def encode_bulk_request(
+    items: Sequence[SpoolItem], identity: CollectorIdentity | None = None
+) -> bytes:
     return _encode_prepared_bulk_request(
-        [_encode_bulk_item(item) for item in items]
+        [_encode_bulk_item(item, identity) for item in items]
     )
 
 
@@ -105,7 +114,11 @@ class HttpTransport:
     max_batch_manifest_bytes = MAX_BULK_MANIFEST_TOTAL_BYTES
 
     def __init__(
-        self, endpoint: str, credential: str, *, timeout_seconds: float = 20.0
+        self,
+        endpoint: str,
+        principal: CollectorIdentity | str,
+        *,
+        timeout_seconds: float = 20.0,
     ):
         parsed = urlsplit(endpoint)
         if (
@@ -116,7 +129,8 @@ class HttpTransport:
         ):
             raise ValueError("ingest endpoint must be an HTTPS URL without user info")
         self.endpoint = endpoint
-        self.credential = credential
+        self.identity = principal if isinstance(principal, CollectorIdentity) else None
+        self.credential = principal if isinstance(principal, str) else None
         self.timeout_seconds = timeout_seconds
         self.hostname = parsed.hostname
         self.port = parsed.port
@@ -138,7 +152,7 @@ class HttpTransport:
         key = item.manifest.spool_key
         encoded = prepared.get(key)
         if encoded is None:
-            encoded = _encode_bulk_item(item)
+            encoded = _encode_bulk_item(item, self.identity)
             prepared[key] = encoded
         return encoded
 
@@ -188,17 +202,19 @@ class HttpTransport:
 
     def _post(self, body: bytes) -> Mapping[str, object]:
         connection = self._connection()
+        headers = {
+            "Content-Type": BULK_CONTENT_TYPE,
+            "Accept": "application/json",
+            "User-Agent": "sherlock-telemetry-collector/0.1.0",
+        }
+        if self.credential is not None:
+            headers["Authorization"] = f"Bearer {self.credential}"
         try:
             connection.request(
                 "POST",
                 self.request_target,
                 body=body,
-                headers={
-                    "Authorization": f"Bearer {self.credential}",
-                    "Content-Type": BULK_CONTENT_TYPE,
-                    "Accept": "application/json",
-                    "User-Agent": "sherlock-telemetry-collector/0.1.0",
-                },
+                headers=headers,
             )
             response = connection.getresponse()
             raw = response.read(MAX_RECEIPT_BYTES + 1)

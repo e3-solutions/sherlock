@@ -1,6 +1,6 @@
 {
   "name": "sherlock",
-  "version": "0.1.0+codex.20260815020237",
+  "version": "0.1.0+codex.20260815030005",
   "description": "Capture live Codex telemetry and backfill historical sessions safely.",
   "author": {
     "name": "E3 Solutions",

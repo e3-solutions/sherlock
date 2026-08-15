@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import threading
@@ -16,14 +17,16 @@ from sherlock_collector.contract import (
     RECEIPT_VERSION,
     build_rollout_batch,
 )
+from sherlock_collector.config import CollectorIdentity
 from sherlock_collector.drain import (
     Drain,
     PermanentUploadError,
     TransientUploadError,
 )
 from sherlock_collector.hook import capture_and_spawn_drain
+from sherlock_collector.http import BULK_RECEIPT_VERSION, HttpTransport
 from sherlock_collector.rollout import RolloutCapturer
-from sherlock_collector.spool import DurableSpool
+from sherlock_collector.spool import DurableSpool, SpoolItem
 
 
 WORKSPACE_ID = "00000000-0000-4000-8000-000000000001"
@@ -90,6 +93,60 @@ class SuccessTransport:
     def upload(self, item):
         self.items.append(item)
         return receipt(item.manifest)
+
+
+class HttpTransportTests(unittest.TestCase):
+    def test_upload_sends_normalized_collector_identity_without_authorization(self):
+        manifest, stored = batch("stream-http")
+        item = SpoolItem(manifest, stored, {})
+
+        class Response:
+            status = 200
+
+            def read(self, _limit):
+                return json.dumps({
+                    "receipt_version": BULK_RECEIPT_VERSION,
+                    "receipts": [receipt(manifest)],
+                }).encode()
+
+            def getheader(self, _name, default=""):
+                return default
+
+        class Connection:
+            def __init__(self):
+                self.requests = []
+
+            def request(self, method, target, *, body, headers):
+                self.requests.append((method, target, body, headers))
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        connection = Connection()
+        with patch(
+            "sherlock_collector.http.http.client.HTTPSConnection",
+            return_value=connection,
+        ):
+            value = HttpTransport(
+                "https://example.test/ingest",
+                CollectorIdentity(
+                    name="Test User",
+                    github_id="test-user",
+                    email="test@example.com",
+                    installation_id="00000000-0000-4000-8000-000000000001",
+                ),
+            ).upload(item)
+
+        _method, _target, body, headers = connection.requests[0]
+        manifest_gzip_bytes = int.from_bytes(body[12:16], "big")
+        metadata = json.loads(gzip.decompress(body[24 : 24 + manifest_gzip_bytes]))
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(metadata["collector"]["email"], "test@example.com")
+        self.assertEqual(metadata["collector"]["github_id"], "test-user")
+        self.assertEqual(value["status"], "committed")
 
 
 class CollectorDrainTests(unittest.TestCase):

@@ -214,7 +214,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigurationError as error:
         print(f"sherlock collector is not configured: {error}", file=sys.stderr)
         return 78
-    transport = HttpTransport(configuration.endpoint, configuration.token)
+    principal = configuration.identity or configuration.token
+    assert principal is not None
+    transport = HttpTransport(configuration.endpoint, principal)
     if args.command == "backfill-upload":
         try:
             upload_outcome = upload_archive(
@@ -231,7 +233,9 @@ def main(argv: list[str] | None = None) -> int:
             return 74
         print(json.dumps(asdict(upload_outcome), sort_keys=True))
         return 0
-    drain_outcome = Drain(DurableSpool(state_root / "queue"), transport).run()
+    drain_outcome = Drain(
+        DurableSpool(state_root / "queue"), transport
+    ).run()
     print(json.dumps(asdict(drain_outcome), sort_keys=True))
     return 0 if not drain_outcome.locked else 75
 
