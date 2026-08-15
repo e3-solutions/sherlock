@@ -10,6 +10,11 @@ export const MAX_BULK_MANIFEST_BYTES = 16 * 1024 * 1024;
 export const MAX_BULK_MANIFEST_TOTAL_BYTES = 20 * 1024 * 1024;
 export const BULK_CONTENT_TYPE = "application/vnd.sherlock.rollout-bulk.v2";
 export const BULK_RECEIPT_VERSION = "sherlock.bulk-receipts.v1";
+export const COVERAGE_CONTENT_TYPE =
+  "application/vnd.sherlock.rollout-coverage.v1+json";
+export const COVERAGE_QUERY_VERSION = "sherlock.coverage-query.v1";
+export const COVERAGE_RESPONSE_VERSION = "sherlock.coverage.v1";
+export const MAX_COVERAGE_STREAMS = 128;
 const BULK_MAGIC = new TextEncoder().encode("SHRBULK2");
 export const NATIVE_LABEL_BYTES = 256;
 export const IDENTITY_HINT_BYTES = 512;
@@ -98,6 +103,25 @@ export interface IngestEnvelope {
   collector: CollectorIdentity | null;
   manifest: BatchManifest;
   stored_payload: Uint8Array;
+}
+
+export interface CoverageStreamQuery {
+  source_kind: "rollout";
+  source_stream_key: string;
+  generation_key: string;
+  generation_seq: number;
+  end_offset: number;
+}
+
+export interface CoverageQuery {
+  coverage_version: typeof COVERAGE_QUERY_VERSION;
+  collector: CollectorIdentity | null;
+  streams: CoverageStreamQuery[];
+}
+
+export interface CoverageRange extends CoverageStreamQuery {
+  start_offset: number;
+  source_sha256: string;
 }
 
 export class IngestError extends Error {
@@ -513,6 +537,82 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
       : parseCollectorIdentity(input.collector),
     manifest: parseManifest(input.manifest),
     stored_payload: decodeBase64(input.stored_payload_base64),
+  };
+}
+
+export function parseCoverageQuery(value: unknown): CoverageQuery {
+  const input = object(value, "request");
+  if (input.coverage_version !== COVERAGE_QUERY_VERSION) {
+    throw new IngestError(
+      "unsupported_contract",
+      "coverage query version is unsupported",
+      400,
+    );
+  }
+  if (!Array.isArray(input.streams) || input.streams.length === 0) {
+    throw new IngestError(
+      "invalid_request",
+      "coverage query streams must be a non-empty array",
+      400,
+    );
+  }
+  if (input.streams.length > MAX_COVERAGE_STREAMS) {
+    throw new IngestError(
+      "payload_too_large",
+      `coverage query exceeds ${MAX_COVERAGE_STREAMS} streams`,
+      413,
+    );
+  }
+  const seen = new Set<string>();
+  const streams = input.streams.map((value, index): CoverageStreamQuery => {
+    const stream = object(value, `streams[${index}]`);
+    if (stream.source_kind !== "rollout") {
+      throw new IngestError(
+        "unsupported_contract",
+        "coverage queries only support rollout sources",
+        400,
+      );
+    }
+    const parsed: CoverageStreamQuery = {
+      source_kind: "rollout",
+      source_stream_key: safeSegment(
+        stream.source_stream_key,
+        `streams[${index}].source_stream_key`,
+      ),
+      generation_key: safeSegment(
+        stream.generation_key,
+        `streams[${index}].generation_key`,
+      ),
+      generation_seq: integer(
+        stream.generation_seq,
+        `streams[${index}].generation_seq`,
+      ),
+      end_offset: integer(
+        stream.end_offset,
+        `streams[${index}].end_offset`,
+        1,
+      ),
+    };
+    const identity = JSON.stringify([
+      parsed.source_kind,
+      parsed.source_stream_key,
+    ]);
+    if (seen.has(identity)) {
+      throw new IngestError(
+        "invalid_request",
+        "coverage query contains duplicate streams",
+        400,
+      );
+    }
+    seen.add(identity);
+    return parsed;
+  });
+  return {
+    coverage_version: COVERAGE_QUERY_VERSION,
+    collector: input.collector == null
+      ? null
+      : parseCollectorIdentity(input.collector),
+    streams,
   };
 }
 

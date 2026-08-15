@@ -4,8 +4,10 @@ import {
   BULK_RECEIPT_VERSION,
   type CommittedReceipt,
   CONTRACT_VERSION,
+  COVERAGE_QUERY_VERSION,
   IngestError,
   parseBulkEnvelope,
+  parseCoverageQuery,
   parseEnvelope,
   RECEIPT_VERSION,
   sha256Hex,
@@ -355,6 +357,44 @@ Deno.test("binary bulk envelope rejects trailing bytes", async () => {
   try {
     await parseBulkEnvelope(malformed);
     assert(false, "trailing bytes should fail");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "invalid_request");
+  }
+});
+
+Deno.test("coverage query validates bounded immutable stream identities", () => {
+  const parsed = parseCoverageQuery({
+    coverage_version: COVERAGE_QUERY_VERSION,
+    collector: COLLECTOR,
+    streams: [{
+      source_kind: "rollout",
+      source_stream_key: "stream-test",
+      generation_key: "generation-test",
+      generation_seq: 2,
+      end_offset: 512,
+    }],
+  });
+
+  assert(parsed.streams.length === 1);
+  assert(parsed.streams[0].generation_seq === 2);
+  assert(parsed.streams[0].end_offset === 512);
+});
+
+Deno.test("coverage query rejects duplicate streams", () => {
+  const stream = {
+    source_kind: "rollout",
+    source_stream_key: "stream-test",
+    generation_key: "generation-test",
+    generation_seq: 0,
+    end_offset: 512,
+  };
+  try {
+    parseCoverageQuery({
+      coverage_version: COVERAGE_QUERY_VERSION,
+      streams: [stream, stream],
+    });
+    assert(false, "duplicate coverage streams should fail");
   } catch (error) {
     assert(error instanceof IngestError);
     assert(error.code === "invalid_request");

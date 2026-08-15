@@ -13,10 +13,10 @@ Handle the ZIP as sensitive data; do not attach it to tickets or commit it.
 
 ## 1. Export on the source device
 
-From a Sherlock checkout:
+After installing Sherlock, run the stable command printed by the installer:
 
 ```sh
-python3 plugins/sherlock/scripts/export_history.py \
+~/.codex/sherlock/bin/export-history \
   --output "$PWD/sherlock-codex-history.zip" \
   --workers 8 \
   --acknowledge-sensitive-data
@@ -32,9 +32,10 @@ summary to stdout:
 ```
 
 The command writes through a temporary file and publishes the ZIP atomically.
-It refuses to overwrite an existing path unless `--force` is present. If a
-live rollout changes during the snapshot, stop active Codex work and rerun;
-the incomplete temporary archive is removed.
+It refuses to overwrite an existing path unless `--force` is present. Active
+Codex work may append to a rollout during export: the archive keeps the stable
+prefix it verified. Replacement, truncation, or modification of that prefix is
+rejected and the incomplete temporary archive is removed.
 
 `--workers` controls parallel gzip compression from 1 to 32. If omitted, the
 exporter uses the available CPU count capped at 8. Compression is bounded to
@@ -51,7 +52,7 @@ the batches still reproduces the source rollout byte-for-byte.
 Use the collector configuration installed by Sherlock:
 
 ```sh
-python3 plugins/sherlock/scripts/upload_history.py \
+~/.codex/sherlock/bin/upload-history \
   ./sherlock-codex-history.zip \
   --workers 16
 ```
@@ -69,8 +70,12 @@ repetitive manifest metadata, and reuses one persistent HTTPS connection per
 worker. Rollout payloads are not recompressed. An in-place progress bar tracks
 completed sessions on a terminal; redirected logs receive compact periodic
 updates. It retries transient failures four times by default.
-Successful session checkpoints are written beside the archive, so rerunning
-the exact command continues efficiently:
+Before uploading, the client asks the server for already committed source-byte
+ranges and verifies every returned hash against the local archive. It uploads
+only uncovered ranges, even when a new export uses different batch boundaries.
+If the live collector wins a race during upload, coverage is refreshed and the
+session converges automatically. Successful session checkpoints are written
+beside the archive, so rerunning the exact command continues efficiently:
 
 ```text
 sherlock-codex-history.zip.upload-state.json

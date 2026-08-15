@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Sequence, cast
+from typing import BinaryIO, Callable, Mapping, Sequence, cast
 
 from .contract import (
     MAX_RECORDS,
@@ -45,6 +45,7 @@ ARCHIVE_MANIFEST_PATH = "manifest.json"
 MAX_ARCHIVE_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_BATCH_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_UPLOAD_WORKERS = 16
+MAX_COVERAGE_STREAMS = 128
 # Preserve cross-session request packing while letting short groups finish,
 # report progress, and checkpoint promptly under high worker counts.
 UPLOAD_SESSION_GROUP_SIZE = 8
@@ -96,6 +97,16 @@ class UploadResult:
     batches_skipped: int
     source_bytes_uploaded: int
     state_path: str | None
+
+
+@dataclass(frozen=True)
+class _CoverageRange:
+    source_stream_key: str
+    generation_key: str
+    generation_seq: int
+    start_offset: int
+    end_offset: int
+    source_sha256: str
 
 
 def discover_all_rollouts(codex_home: Path | str) -> tuple[RolloutFile, ...]:
@@ -533,12 +544,35 @@ def _export_rollout(
         if before.st_size == 0:
             empty_path = f"empty/{session_key}.jsonl"
             archive.writestr(_zip_info(empty_path, compressed=False), b"")
+        snapshot_sha256 = source_hash.hexdigest()
         after = os.fstat(handle.fileno())
-    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
-    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
-        raise BackfillError(
-            f"rollout changed during export: {rollout.scope}/{rollout.relative_path}"
-        )
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or after.st_size < before.st_size
+        ):
+            raise BackfillError(
+                f"rollout was replaced or truncated during export: "
+                f"{rollout.scope}/{rollout.relative_path}"
+            )
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            handle.seek(0)
+            verified = hashlib.sha256()
+            remaining = before.st_size
+            while remaining:
+                block = handle.read(min(1024 * 1024, remaining))
+                if not block:
+                    raise BackfillError(
+                        f"rollout was truncated during export: "
+                        f"{rollout.scope}/{rollout.relative_path}"
+                    )
+                verified.update(block)
+                remaining -= len(block)
+            if verified.hexdigest() != snapshot_sha256:
+                raise BackfillError(
+                    f"rollout prefix changed during export: "
+                    f"{rollout.scope}/{rollout.relative_path}"
+                )
     return {
         "session_key": session_key,
         "scope": rollout.scope,
@@ -548,7 +582,7 @@ def _export_rollout(
         "generation_seq": generation_seq,
         "generation_key": generation_key,
         "source_byte_count": before.st_size,
-        "source_sha256": source_hash.hexdigest(),
+        "source_sha256": snapshot_sha256,
         "stored_byte_count": stored_bytes,
         "batch_count": len(batch_keys),
         "batch_keys": batch_keys,
@@ -777,6 +811,146 @@ def _validate_completed_sessions(
         raise BackfillError(f"upload state contains unknown batch {sorted(unknown)[0]}")
 
 
+def _coverage_request(session: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "source_kind": "rollout",
+        "source_stream_key": _string(
+            session.get("source_stream_key"), "source_stream_key"
+        ),
+        "generation_key": _string(session.get("generation_key"), "generation_key"),
+        "generation_seq": _integer(
+            session.get("generation_seq"), "generation_seq"
+        ),
+        "end_offset": _integer(
+            session.get("source_byte_count"), "source_byte_count"
+        ),
+    }
+
+
+def _query_coverage(
+    transport: UploadTransport,
+    sessions: Sequence[Mapping[str, object]],
+    retries: int,
+) -> dict[str, tuple[_CoverageRange, ...]]:
+    coverage = getattr(transport, "coverage", None)
+    if not callable(coverage) or not sessions:
+        return {}
+    expected = {
+        str(session["source_stream_key"]): session for session in sessions
+    }
+    result: dict[str, list[_CoverageRange]] = {
+        stream_key: [] for stream_key in expected
+    }
+    requests = [_coverage_request(session) for session in sessions]
+    for index in range(0, len(requests), MAX_COVERAGE_STREAMS):
+        group = requests[index : index + MAX_COVERAGE_STREAMS]
+        for attempt in range(retries + 1):
+            try:
+                raw_ranges = coverage(group)
+                break
+            except TransientUploadError:
+                if attempt >= retries:
+                    raise
+                time.sleep(min(8.0, 0.5 * (2**attempt)))
+        if not isinstance(raw_ranges, list):
+            raise BackfillError("coverage response ranges must be an array")
+        for row_index, raw in enumerate(raw_ranges):
+            if not isinstance(raw, Mapping):
+                raise BackfillError(
+                    f"coverage range {row_index} must be an object"
+                )
+            if raw.get("source_kind") != "rollout":
+                raise BackfillError("coverage returned an unsupported source kind")
+            stream_key = _string(
+                raw.get("source_stream_key"), "coverage.source_stream_key"
+            )
+            session = expected.get(stream_key)
+            if session is None:
+                raise BackfillError("coverage returned an unrequested source stream")
+            generation_key = _string(
+                raw.get("generation_key"), "coverage.generation_key"
+            )
+            generation_seq = _integer(
+                raw.get("generation_seq"), "coverage.generation_seq"
+            )
+            if (
+                generation_key != session.get("generation_key")
+                or generation_seq != session.get("generation_seq")
+            ):
+                raise BackfillError(
+                    f"committed generation conflicts with archive stream {stream_key}"
+                )
+            start_offset = _integer(
+                raw.get("start_offset"), "coverage.start_offset"
+            )
+            end_offset = _integer(raw.get("end_offset"), "coverage.end_offset")
+            source_sha256 = _string(
+                raw.get("source_sha256"), "coverage.source_sha256"
+            )
+            if end_offset <= start_offset:
+                raise BackfillError("coverage byte range must be non-empty")
+            if not SHA256_RE.fullmatch(source_sha256):
+                raise BackfillError("coverage.source_sha256 is not a SHA-256")
+            result[stream_key].append(
+                _CoverageRange(
+                    stream_key,
+                    generation_key,
+                    generation_seq,
+                    start_offset,
+                    end_offset,
+                    source_sha256,
+                )
+            )
+    normalized: dict[str, tuple[_CoverageRange, ...]] = {}
+    for stream_key, rows in result.items():
+        rows.sort(key=lambda row: (row.start_offset, row.end_offset))
+        previous_end = -1
+        for row in rows:
+            if row.start_offset < previous_end:
+                raise BackfillError(
+                    f"committed coverage overlaps for stream {stream_key}"
+                )
+            previous_end = row.end_offset
+        normalized[stream_key] = tuple(rows)
+    return normalized
+
+
+def _clipped_coverage(
+    rows: Sequence[_CoverageRange], source_size: int
+) -> tuple[tuple[int, int], ...]:
+    intervals: list[tuple[int, int]] = []
+    for row in rows:
+        start = max(0, row.start_offset)
+        end = min(source_size, row.end_offset)
+        if start >= end:
+            continue
+        if intervals and start <= intervals[-1][1]:
+            intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
+        else:
+            intervals.append((start, end))
+    return tuple(intervals)
+
+
+def _uncovered_ranges(
+    start: int, end: int, coverage: Sequence[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    gaps: list[tuple[int, int]] = []
+    cursor = start
+    for covered_start, covered_end in coverage:
+        if covered_end <= cursor:
+            continue
+        if covered_start >= end:
+            break
+        if covered_start > cursor:
+            gaps.append((cursor, min(covered_start, end)))
+        cursor = max(cursor, covered_end)
+        if cursor >= end:
+            break
+    if cursor < end:
+        gaps.append((cursor, end))
+    return tuple(gaps)
+
+
 def _batch_item(
     archive: zipfile.ZipFile, key: str, session: Mapping[str, object]
 ) -> tuple[SpoolItem, bytes]:
@@ -862,6 +1036,14 @@ class _SessionUploadProgress:
     uploaded: set[str]
     source_bytes: int = 0
     skipped: int = 0
+
+
+@dataclass(frozen=True)
+class _SessionUploadResult:
+    completed: set[str]
+    uploaded: int
+    source_bytes: int
+    skipped: int
 
 
 class _BulkUploadBuffer:
@@ -1000,7 +1182,7 @@ def _upload_sessions(
     completed: set[str],
     transport: UploadTransport,
     retries: int,
-) -> tuple[tuple[set[str], int, int], ...]:
+) -> tuple[_SessionUploadResult, ...]:
     buffer = _BulkUploadBuffer(transport, retries)
     results = [
         _prepare_session_upload(archive, session, completed, buffer)
@@ -1008,7 +1190,12 @@ def _upload_sessions(
     ]
     buffer.flush()
     return tuple(
-        (result.uploaded, result.source_bytes, result.skipped)
+        _SessionUploadResult(
+            set(result.uploaded),
+            len(result.uploaded),
+            result.source_bytes,
+            result.skipped,
+        )
         for result in results
     )
 
@@ -1019,10 +1206,191 @@ def _upload_session(
     completed: set[str],
     transport: UploadTransport,
     retries: int,
-) -> tuple[set[str], int, int]:
+) -> _SessionUploadResult:
     return _upload_sessions(
         archive, [session], completed, transport, retries
     )[0]
+
+
+def _read_exact_range(handle, start: int, end: int) -> bytes:
+    handle.seek(start)
+    value = handle.read(end - start)
+    if len(value) != end - start:
+        raise BackfillError(f"could not read source byte range {start}-{end}")
+    return value
+
+
+def _reconcile_covered_sessions(
+    archive: zipfile.ZipFile,
+    sessions: Sequence[tuple[Mapping[str, object], Sequence[_CoverageRange]]],
+    transport: UploadTransport,
+    retries: int,
+    codex_home: Path | None,
+) -> tuple[_SessionUploadResult, ...]:
+    buffer = _BulkUploadBuffer(transport, retries)
+    planned: list[tuple[set[str], _SessionUploadProgress]] = []
+    for session, rows in sessions:
+        raw_keys = session["batch_keys"]
+        assert isinstance(raw_keys, list)
+        keys = [str(key) for key in raw_keys]
+        progress = _SessionUploadProgress(set())
+        manifests: list[tuple[str, BatchManifest]] = []
+        with tempfile.TemporaryFile() as source:
+            expected_offset = stored_bytes = 0
+            digest = hashlib.sha256()
+            for key in keys:
+                item, raw_source = _batch_item(archive, key, session)
+                if item.manifest.start_offset != expected_offset:
+                    raise BackfillError(
+                        f"session {session.get('relative_path')} has a byte-range gap"
+                    )
+                source.write(raw_source)
+                digest.update(raw_source)
+                expected_offset = item.manifest.end_offset
+                stored_bytes += item.manifest.stored_byte_count
+                manifests.append((key, item.manifest))
+            source_size = _integer(
+                session.get("source_byte_count"), "source_byte_count"
+            )
+            if expected_offset != source_size:
+                raise BackfillError(
+                    f"session {session.get('relative_path')} byte count does not match"
+                )
+            if stored_bytes != _integer(
+                session.get("stored_byte_count"), "stored_byte_count"
+            ):
+                raise BackfillError(
+                    f"session {session.get('relative_path')} stored byte count does not match"
+                )
+            if digest.hexdigest() != _string(
+                session.get("source_sha256"), "source_sha256"
+            ):
+                raise BackfillError(
+                    f"session {session.get('relative_path')} source hash does not match"
+                )
+
+            maximum_committed_end = max(row.end_offset for row in rows)
+            verification: BinaryIO = source
+            live_handle: BinaryIO | None = None
+            try:
+                if maximum_committed_end > source_size:
+                    if codex_home is None:
+                        raise BackfillError(
+                            "committed history extends beyond this archive; rerun with "
+                            "the Codex home directory available"
+                        )
+                    source_root = (codex_home / str(session["scope"])).resolve()
+                    live_path = (
+                        source_root / str(session["relative_path"])
+                    ).resolve()
+                    try:
+                        live_path.relative_to(source_root)
+                    except ValueError as error:
+                        raise BackfillError(
+                            "live rollout path escapes the Codex history root"
+                        ) from error
+                    if not live_path.is_file() or live_path.is_symlink():
+                        raise BackfillError(
+                            f"live rollout is unavailable for verification: {live_path}"
+                        )
+                    live_handle = live_path.open("rb")
+                    source.seek(0)
+                    remaining = source_size
+                    while remaining:
+                        archived = source.read(min(1024 * 1024, remaining))
+                        current = live_handle.read(len(archived))
+                        if current != archived:
+                            raise BackfillError(
+                                f"archive is not a prefix of live rollout: {live_path}"
+                            )
+                        remaining -= len(archived)
+                    verification = live_handle
+
+                for row in rows:
+                    verification.seek(row.start_offset)
+                    remaining = row.end_offset - row.start_offset
+                    committed_digest = hashlib.sha256()
+                    while remaining:
+                        block = verification.read(min(1024 * 1024, remaining))
+                        if not block:
+                            raise BackfillError(
+                                "committed coverage extends beyond the local source for "
+                                f"stream {row.source_stream_key}"
+                            )
+                        committed_digest.update(block)
+                        remaining -= len(block)
+                    if committed_digest.hexdigest() != row.source_sha256:
+                        raise BackfillError(
+                            "committed source hash conflicts with local history for "
+                            f"stream {row.source_stream_key} range "
+                            f"{row.start_offset}-{row.end_offset}"
+                        )
+            finally:
+                if live_handle is not None:
+                    live_handle.close()
+
+            coverage = _clipped_coverage(rows, source_size)
+            uploaded_originals = 0
+            for key, template in manifests:
+                gaps = _uncovered_ranges(
+                    template.start_offset, template.end_offset, coverage
+                )
+                if gaps == ((template.start_offset, template.end_offset),):
+                    original_item, _raw_source = _batch_item(
+                        archive, key, session
+                    )
+                    buffer.add(original_item, progress)
+                    uploaded_originals += 1
+                    continue
+                if not gaps:
+                    continue
+                if any(record.parse_status == "fragment" for record in template.records):
+                    raise BackfillError(
+                        "committed coverage splits an oversized native record for "
+                        f"stream {template.source_stream_key}; export a fresh archive"
+                    )
+                for start, end in gaps:
+                    raw_source = _read_exact_range(source, start, end)
+                    try:
+                        manifest, stored = build_rollout_batch(
+                            raw_source,
+                            source_stream_key=template.source_stream_key,
+                            generation_key=template.generation_key,
+                            generation_seq=template.generation_seq,
+                            start_offset=start,
+                            observed_native_session_id=(
+                                template.observed_native_session_id
+                            ),
+                            codex_version=template.codex_version,
+                            collector_version=template.collector_version,
+                        )
+                    except ContractError as error:
+                        raise BackfillError(
+                            f"cannot rebuild missing source range {start}-{end}: {error}"
+                        ) from error
+                    buffer.add(
+                        SpoolItem(
+                            manifest,
+                            stored,
+                            {
+                                "archive_version": ARCHIVE_VERSION,
+                                "session_key": session.get("session_key"),
+                            },
+                        ),
+                        progress,
+                    )
+            progress.skipped = len(keys) - uploaded_originals
+        planned.append((set(keys), progress))
+    buffer.flush()
+    return tuple(
+        _SessionUploadResult(
+            completed,
+            len(progress.uploaded),
+            progress.source_bytes,
+            progress.skipped,
+        )
+        for completed, progress in planned
+    )
 
 
 def upload_archive(
@@ -1033,6 +1401,7 @@ def upload_archive(
     retries: int = 4,
     state_path: Path | str | None = None,
     resume: bool = True,
+    codex_home: Path | str | None = None,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> UploadResult:
     if workers < 1 or workers > MAX_UPLOAD_WORKERS:
@@ -1056,38 +1425,128 @@ def upload_archive(
         )
         completed = _load_upload_state(checkpoint, manifest_hash) if resume else set()
         _validate_completed_sessions(completed, sessions)
+        local_codex_home = (
+            Path(codex_home).expanduser().resolve() if codex_home else None
+        )
         completed_lock = threading.Lock()
-        uploaded_total = skipped_total = source_total = finished = 0
+        uploaded_total = source_total = finished = 0
+        skipped_total = len(completed)
         dirty_sessions = 0
         last_checkpoint_at = time.monotonic()
 
-        session_groups = [
-            sessions[index : index + UPLOAD_SESSION_GROUP_SIZE]
-            for index in range(0, len(sessions), UPLOAD_SESSION_GROUP_SIZE)
-        ]
+        pending_sessions = []
+        for session in sessions:
+            raw_keys = session["batch_keys"]
+            assert isinstance(raw_keys, list)
+            if raw_keys and not all(str(key) in completed for key in raw_keys):
+                pending_sessions.append(session)
+        coverage_by_stream = _query_coverage(
+            transport, pending_sessions, retries
+        )
+        uncovered_sessions: list[Mapping[str, object]] = []
+        covered_sessions: list[
+            tuple[Mapping[str, object], Sequence[_CoverageRange]]
+        ] = []
+        for session in pending_sessions:
+            rows = coverage_by_stream.get(str(session["source_stream_key"]), ())
+            if rows:
+                covered_sessions.append((session, rows))
+            else:
+                uncovered_sessions.append(session)
+
+        work: list[
+            tuple[
+                Sequence[Mapping[str, object]],
+                Sequence[tuple[Mapping[str, object], Sequence[_CoverageRange]]]
+                | None,
+            ]
+        ] = []
+        for index in range(0, len(uncovered_sessions), UPLOAD_SESSION_GROUP_SIZE):
+            work.append(
+                (
+                    uncovered_sessions[index : index + UPLOAD_SESSION_GROUP_SIZE],
+                    None,
+                )
+            )
+        for index in range(0, len(covered_sessions), UPLOAD_SESSION_GROUP_SIZE):
+            covered_group = covered_sessions[
+                index : index + UPLOAD_SESSION_GROUP_SIZE
+            ]
+            work.append(([session for session, _rows in covered_group], covered_group))
 
         def run(
             group: Sequence[Mapping[str, object]],
-        ) -> tuple[tuple[set[str], int, int], ...]:
-            with completed_lock:
-                snapshot = set(completed)
-            return _upload_sessions(
-                archive_handle, group, snapshot, transport, retries
-            )
+            covered_group: Sequence[
+                tuple[Mapping[str, object], Sequence[_CoverageRange]]
+            ]
+            | None,
+        ) -> tuple[_SessionUploadResult, ...]:
+            def execute(
+                reconciliation: Sequence[
+                    tuple[Mapping[str, object], Sequence[_CoverageRange]]
+                ]
+                | None,
+            ) -> tuple[_SessionUploadResult, ...]:
+                if reconciliation is not None:
+                    return _reconcile_covered_sessions(
+                        archive_handle,
+                        reconciliation,
+                        transport,
+                        retries,
+                        local_codex_home,
+                    )
+                with completed_lock:
+                    snapshot = set(completed)
+                return _upload_sessions(
+                    archive_handle, group, snapshot, transport, retries
+                )
+
+            try:
+                return execute(covered_group)
+            except PermanentUploadError:
+                refreshed = _query_coverage(transport, group, retries)
+                if not any(refreshed.values()):
+                    raise
+                results: list[_SessionUploadResult] = []
+                for session in group:
+                    rows = refreshed.get(str(session["source_stream_key"]), ())
+                    if rows:
+                        results.extend(
+                            _reconcile_covered_sessions(
+                                archive_handle,
+                                [(session, rows)],
+                                transport,
+                                retries,
+                                local_codex_home,
+                            )
+                        )
+                    else:
+                        with completed_lock:
+                            snapshot = set(completed)
+                        results.extend(
+                            _upload_sessions(
+                                archive_handle,
+                                [session],
+                                snapshot,
+                                transport,
+                                retries,
+                            )
+                        )
+                return tuple(results)
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(run, group): group for group in session_groups
+                executor.submit(run, group, covered_group): group
+                for group, covered_group in work
             }
             try:
                 for future in as_completed(futures):
                     group = futures[future]
                     results = future.result()
                     for session, result in zip(group, results, strict=True):
-                        newly_completed, source_bytes, skipped = result
                         with completed_lock:
-                            completed.update(newly_completed)
-                            if newly_completed:
+                            completed.update(result.completed)
+                            if result.completed:
                                 dirty_sessions += 1
                             checkpoint_due = dirty_sessions >= 25 or (
                                 dirty_sessions > 0
@@ -1099,14 +1558,14 @@ def upload_archive(
                                 )
                                 dirty_sessions = 0
                                 last_checkpoint_at = time.monotonic()
-                        uploaded_total += len(newly_completed)
-                        skipped_total += skipped
-                        source_total += source_bytes
+                        uploaded_total += result.uploaded
+                        skipped_total += result.skipped
+                        source_total += result.source_bytes
                         finished += 1
                         if progress:
                             progress(
                                 finished,
-                                len(sessions),
+                                len(pending_sessions),
                                 str(session.get("relative_path")),
                             )
             except Exception:

@@ -34,6 +34,9 @@ from sherlock_collector.http import (
     BULK_CONTENT_TYPE,
     BULK_MAGIC,
     BULK_RECEIPT_VERSION,
+    COVERAGE_CONTENT_TYPE,
+    COVERAGE_QUERY_VERSION,
+    COVERAGE_RESPONSE_VERSION,
     HttpTransport,
     encode_bulk_request,
 )
@@ -115,6 +118,21 @@ class RecordingBulkTransport(RecordingTransport):
         return [committed_receipt(item.manifest) for item in items]
 
 
+class CoverageBulkTransport(RecordingBulkTransport):
+    def __init__(self, ranges):
+        super().__init__()
+        self.ranges = list(ranges)
+        self.coverage_requests = []
+
+    def coverage(self, streams):
+        self.coverage_requests.append(tuple(streams))
+        requested = {str(stream["source_stream_key"]) for stream in streams}
+        return [
+            row for row in self.ranges
+            if str(row["source_stream_key"]) in requested
+        ]
+
+
 class SelectivePermanentBulkTransport(RecordingBulkTransport):
     def __init__(self, rejected_key):
         super().__init__()
@@ -126,6 +144,33 @@ class SelectivePermanentBulkTransport(RecordingBulkTransport):
             raise PermanentUploadError("range overlap")
         self.items.extend(items)
         return [committed_receipt(item.manifest) for item in items]
+
+
+class RacingCoverageTransport(CoverageBulkTransport):
+    def __init__(self):
+        super().__init__([])
+        self.conflicting_key = None
+
+    def upload_many(self, items):
+        if self.conflicting_key is None:
+            committed = items[0].manifest
+            self.conflicting_key = committed.spool_key
+            self.ranges.append(
+                {
+                    "source_kind": "rollout",
+                    "source_stream_key": committed.source_stream_key,
+                    "generation_key": committed.generation_key,
+                    "generation_seq": committed.generation_seq,
+                    "start_offset": committed.start_offset,
+                    "end_offset": committed.end_offset,
+                    "source_sha256": committed.source_sha256,
+                }
+            )
+        if any(
+            item.manifest.spool_key == self.conflicting_key for item in items
+        ):
+            raise PermanentUploadError("range overlap")
+        return super().upload_many(items)
 
 
 def read_manifest(archive: Path) -> dict[str, object]:
@@ -262,6 +307,42 @@ class BackfillExportTests(unittest.TestCase):
                 reconstructed_sessions(parallel),
                 {("sessions", rollout.name): rollout.read_bytes()},
             )
+
+    def test_export_accepts_append_only_growth_during_snapshot(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            rollout = codex_home / "sessions" / "rollout-live.jsonl"
+            rollout.parent.mkdir(parents=True)
+            snapshot = b'{"type":"first"}\n'
+            appended = b'{"type":"second"}\n'
+            rollout.write_bytes(snapshot)
+            output = root / "history.zip"
+            from sherlock_collector import backfill
+
+            original_read_chunk = backfill._read_chunk
+            did_append = False
+
+            def read_then_append(*args, **kwargs):
+                nonlocal did_append
+                value = original_read_chunk(*args, **kwargs)
+                if not did_append:
+                    with rollout.open("ab") as handle:
+                        handle.write(appended)
+                    did_append = True
+                return value
+
+            with patch(
+                "sherlock_collector.backfill._read_chunk",
+                side_effect=read_then_append,
+            ):
+                export_archive(codex_home, output)
+
+            self.assertEqual(
+                reconstructed_sessions(output),
+                {("sessions", rollout.name): snapshot},
+            )
+            self.assertEqual(rollout.read_bytes(), snapshot + appended)
 
     def test_export_rejects_unbounded_worker_count(self):
         with TemporaryDirectory() as temporary:
@@ -499,6 +580,123 @@ class BackfillUploadTests(unittest.TestCase):
             )
             self.assertNotIn(b"stored_payload_base64", encoded)
 
+    def test_upload_reconciles_committed_prefix_with_different_boundaries(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self.make_archive(root)
+            top = read_manifest(archive)
+            session = top["sessions"][0]
+            source = reconstructed_sessions(archive)[
+                (session["scope"], session["relative_path"])
+            ]
+            committed_end = source.find(b"\n", 40) + 1
+            coverage = {
+                "source_kind": "rollout",
+                "source_stream_key": session["source_stream_key"],
+                "generation_key": session["generation_key"],
+                "generation_seq": session["generation_seq"],
+                "start_offset": 0,
+                "end_offset": committed_end,
+                "source_sha256": hashlib.sha256(source[:committed_end]).hexdigest(),
+            }
+            transport = CoverageBulkTransport([coverage])
+
+            result = upload_archive(
+                archive,
+                transport,
+                workers=1,
+                codex_home=root / "codex",
+            )
+
+            self.assertEqual(len(transport.coverage_requests), 1)
+            uploaded = sorted(
+                (
+                    item.manifest.start_offset,
+                    item.manifest.end_offset,
+                    validate_stored_payload(item.manifest, item.stored_payload),
+                )
+                for item in transport.items
+                if item.manifest.source_stream_key == session["source_stream_key"]
+            )
+            self.assertTrue(uploaded)
+            self.assertEqual(uploaded[0][0], committed_end)
+            self.assertEqual(
+                b"".join(raw for _start, _end, raw in uploaded),
+                source[committed_end:],
+            )
+            self.assertGreater(result.batches_skipped, 0)
+
+            second = upload_archive(
+                archive,
+                CoverageBulkTransport([]),
+                workers=1,
+                codex_home=root / "codex",
+            )
+            self.assertEqual(second.batches_uploaded, 0)
+
+    def test_upload_marks_fully_committed_archive_complete_without_uploading(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self.make_archive(root)
+            top = read_manifest(archive)
+            ranges = []
+            for session in top["sessions"]:
+                source = reconstructed_sessions(archive)[
+                    (session["scope"], session["relative_path"])
+                ]
+                ranges.append(
+                    {
+                        "source_kind": "rollout",
+                        "source_stream_key": session["source_stream_key"],
+                        "generation_key": session["generation_key"],
+                        "generation_seq": session["generation_seq"],
+                        "start_offset": 0,
+                        "end_offset": len(source),
+                        "source_sha256": hashlib.sha256(source).hexdigest(),
+                    }
+                )
+            transport = CoverageBulkTransport(ranges)
+
+            result = upload_archive(
+                archive, transport, workers=2, codex_home=root / "codex"
+            )
+
+            self.assertEqual(result.batches_uploaded, 0)
+            self.assertEqual(result.batches_skipped, top["batch_count"])
+            self.assertEqual(transport.items, [])
+
+    def test_upload_rejects_coverage_hash_mismatch_before_uploading(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self.make_archive(root)
+            session = read_manifest(archive)["sessions"][0]
+            transport = CoverageBulkTransport(
+                [
+                    {
+                        "source_kind": "rollout",
+                        "source_stream_key": session["source_stream_key"],
+                        "generation_key": session["generation_key"],
+                        "generation_seq": session["generation_seq"],
+                        "start_offset": 0,
+                        "end_offset": 10,
+                        "source_sha256": "0" * 64,
+                    }
+                ]
+            )
+
+            with self.assertRaisesRegex(BackfillError, "source hash conflicts"):
+                upload_archive(
+                    archive, transport, workers=1, codex_home=root / "codex"
+                )
+
+            self.assertFalse(
+                any(
+                    item.manifest.source_stream_key
+                    == session["source_stream_key"]
+                    for item in transport.items
+                )
+            )
+
     def test_upload_rejects_connection_saturating_worker_count(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -530,6 +728,30 @@ class BackfillUploadTests(unittest.TestCase):
 
             self.assertTrue(any(len(group) > 1 for group in transport.groups))
             self.assertIn((rejected_key,), transport.groups)
+
+    def test_upload_refreshes_coverage_after_a_live_ingest_race(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self.make_archive(root)
+            transport = RacingCoverageTransport()
+
+            result = upload_archive(
+                archive,
+                transport,
+                workers=1,
+                retries=0,
+                codex_home=root / "codex",
+            )
+
+            self.assertGreaterEqual(len(transport.coverage_requests), 2)
+            self.assertGreater(result.batches_uploaded, 0)
+            second = upload_archive(
+                archive,
+                CoverageBulkTransport([]),
+                workers=1,
+                codex_home=root / "codex",
+            )
+            self.assertEqual(second.batches_uploaded, 0)
 
     def test_http_transport_reuses_https_connection_for_binary_requests(self):
         manifest, stored = build_rollout_batch(
@@ -585,6 +807,57 @@ class BackfillUploadTests(unittest.TestCase):
         self.assertTrue(connection.requests[0][2].startswith(BULK_MAGIC))
         self.assertEqual(
             connection.requests[0][3]["Content-Type"], BULK_CONTENT_TYPE
+        )
+
+    def test_http_transport_sends_bounded_coverage_query(self):
+        class Response:
+            status = 200
+
+            def read(self, _maximum):
+                return json.dumps(
+                    {
+                        "coverage_version": COVERAGE_RESPONSE_VERSION,
+                        "ranges": [],
+                    }
+                ).encode()
+
+            def getheader(self, _name, default=""):
+                return default
+
+        class Connection:
+            def __init__(self):
+                self.requests = []
+
+            def request(self, method, target, *, body, headers):
+                self.requests.append((method, target, body, headers))
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        connection = Connection()
+        stream = {
+            "source_kind": "rollout",
+            "source_stream_key": "stream",
+            "generation_key": "generation",
+            "generation_seq": 0,
+            "end_offset": 10,
+        }
+        with patch(
+            "sherlock_collector.http.http.client.HTTPSConnection",
+            return_value=connection,
+        ):
+            transport = HttpTransport(
+                "https://project.supabase.co/functions/v1/ingest", "secret"
+            )
+            self.assertEqual(transport.coverage([stream]), [])
+
+        request = connection.requests[0]
+        self.assertEqual(request[3]["Content-Type"], COVERAGE_CONTENT_TYPE)
+        self.assertEqual(
+            json.loads(request[2])["coverage_version"], COVERAGE_QUERY_VERSION
         )
 
     def test_terminal_upload_progress_renders_one_in_place_bar(self):

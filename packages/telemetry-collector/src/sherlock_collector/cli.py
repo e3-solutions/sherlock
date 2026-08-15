@@ -232,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                 retries=args.retries,
                 state_path=args.state,
                 resume=not args.no_resume,
+                codex_home=codex_home,
                 progress=_ProgressPrinter("Uploading"),
             )
         except (

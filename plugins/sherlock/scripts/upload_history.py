@@ -7,11 +7,15 @@ import sys
 from pathlib import Path
 
 
-def collector_source() -> Path | None:
+def collector_source(codex_home_override: Path | None = None) -> Path | None:
     candidates: list[Path] = []
     if os.environ.get("SHERLOCK_COLLECTOR_SOURCE"):
         candidates.append(Path(os.environ["SHERLOCK_COLLECTOR_SOURCE"]))
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    codex_home = Path(
+        codex_home_override
+        or os.environ.get("CODEX_HOME")
+        or Path.home() / ".codex"
+    )
     candidates.append(
         Path(__file__).resolve().parents[3] / "packages" / "telemetry-collector" / "src"
     )
@@ -41,7 +45,7 @@ def main() -> int:
     parser.add_argument("--state", type=Path)
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
-    source = collector_source()
+    source = collector_source(args.codex_home)
     if source is None:
         print("Sherlock collector runtime is not installed", file=sys.stderr)
         return 78

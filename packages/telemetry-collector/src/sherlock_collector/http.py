@@ -17,6 +17,10 @@ from .spool import SpoolItem
 
 BULK_CONTENT_TYPE = "application/vnd.sherlock.rollout-bulk.v2"
 BULK_RECEIPT_VERSION = "sherlock.bulk-receipts.v1"
+COVERAGE_CONTENT_TYPE = "application/vnd.sherlock.rollout-coverage.v1+json"
+COVERAGE_QUERY_VERSION = "sherlock.coverage-query.v1"
+COVERAGE_RESPONSE_VERSION = "sherlock.coverage.v1"
+MAX_COVERAGE_STREAMS = 128
 BULK_MAGIC = b"SHRBULK2"
 MAX_BULK_ITEMS = 32
 MAX_BULK_REQUEST_BYTES = 12 * 1024 * 1024
@@ -24,6 +28,7 @@ MAX_BULK_SOURCE_BYTES = 20 * 1024 * 1024
 MAX_BULK_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_BULK_MANIFEST_TOTAL_BYTES = 20 * 1024 * 1024
 MAX_RECEIPT_BYTES = 512 * 1024
+MAX_COVERAGE_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -183,6 +188,36 @@ class HttpTransport:
             prepared.pop(item.manifest.spool_key, None)
         return receipts
 
+    def coverage(
+        self, streams: Sequence[Mapping[str, object]]
+    ) -> list[Mapping[str, object]]:
+        if not 1 <= len(streams) <= MAX_COVERAGE_STREAMS:
+            raise PermanentUploadError(
+                f"coverage query must contain 1-{MAX_COVERAGE_STREAMS} streams"
+            )
+        request: dict[str, object] = {
+            "coverage_version": COVERAGE_QUERY_VERSION,
+            "streams": list(streams),
+        }
+        if self.identity is not None:
+            request["collector"] = self.identity.to_dict()
+        body = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        value = self._post(
+            body,
+            content_type=COVERAGE_CONTENT_TYPE,
+            maximum_response_bytes=MAX_COVERAGE_RESPONSE_BYTES,
+        )
+        if value.get("coverage_version") != COVERAGE_RESPONSE_VERSION:
+            raise TransientUploadError(
+                "ingest returned an unsupported coverage response"
+            )
+        ranges = value.get("ranges")
+        if not isinstance(ranges, list) or any(
+            not isinstance(item, dict) for item in ranges
+        ):
+            raise TransientUploadError("ingest returned invalid coverage ranges")
+        return ranges
+
     def _connection(self) -> http.client.HTTPSConnection:
         connection = getattr(self._connections, "value", None)
         if connection is None:
@@ -200,10 +235,16 @@ class HttpTransport:
             connection.close()
             del self._connections.value
 
-    def _post(self, body: bytes) -> Mapping[str, object]:
+    def _post(
+        self,
+        body: bytes,
+        *,
+        content_type: str = BULK_CONTENT_TYPE,
+        maximum_response_bytes: int = MAX_RECEIPT_BYTES,
+    ) -> Mapping[str, object]:
         connection = self._connection()
         headers = {
-            "Content-Type": BULK_CONTENT_TYPE,
+            "Content-Type": content_type,
             "Accept": "application/json",
             "User-Agent": "sherlock-telemetry-collector/0.1.0",
         }
@@ -217,7 +258,7 @@ class HttpTransport:
                 headers=headers,
             )
             response = connection.getresponse()
-            raw = response.read(MAX_RECEIPT_BYTES + 1)
+            raw = response.read(maximum_response_bytes + 1)
             status = response.status
             if response.getheader("Connection", "").lower() == "close":
                 self._discard_connection()
@@ -229,9 +270,11 @@ class HttpTransport:
         ) as error:
             self._discard_connection()
             raise TransientUploadError(f"ingest transport failed: {error}") from error
-        if len(raw) > MAX_RECEIPT_BYTES:
+        if len(raw) > maximum_response_bytes:
             self._discard_connection()
-            raise TransientUploadError("ingest receipt exceeds 512 KiB")
+            raise TransientUploadError(
+                f"ingest response exceeds {maximum_response_bytes} bytes"
+            )
         if status < 200 or status >= 300:
             detail = raw[:4096].decode("utf-8", "replace")
             message = f"ingest returned HTTP {status}: {detail}"

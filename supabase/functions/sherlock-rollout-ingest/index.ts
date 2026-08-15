@@ -6,10 +6,13 @@ import {
   BULK_RECEIPT_VERSION,
   type CollectorIdentity,
   type CommittedReceipt,
+  COVERAGE_CONTENT_TYPE,
+  COVERAGE_RESPONSE_VERSION,
   type IngestEnvelope,
   IngestError,
   MAX_REQUEST_BYTES,
   parseBulkEnvelope,
+  parseCoverageQuery,
   parseEnvelope,
 } from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
@@ -58,6 +61,25 @@ async function handler(request: Request): Promise<Response> {
     const contentType = request.headers.get("content-type")?.split(";", 1)[0]
       .trim().toLowerCase();
     const current = ingestBackend();
+    if (contentType === COVERAGE_CONTENT_TYPE) {
+      const query = parseCoverageQuery(decodeJson(body));
+      const attribution = await resolveAttribution(
+        request,
+        current.batches,
+        [query.collector],
+      );
+      const ranges = await current.batches.coverage(
+        attribution,
+        query.streams,
+      );
+      return Response.json({
+        coverage_version: COVERAGE_RESPONSE_VERSION,
+        ranges,
+      }, {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
     if (contentType === BULK_CONTENT_TYPE) {
       const envelopes = await parseBulkEnvelope(body);
       const attribution = await resolveAttribution(

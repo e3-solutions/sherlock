@@ -5,6 +5,8 @@ import {
   type BatchManifest,
   type CollectorIdentity,
   type CommittedReceipt,
+  type CoverageRange,
+  type CoverageStreamQuery,
   IngestError,
   receiptFromRow,
   storagePath,
@@ -267,6 +269,55 @@ export class PostgresBatchRepository implements BatchRepository {
       await tx.unsafe("set local role sherlock_ingest");
       const row = await findExactBatch(tx, attribution, manifest);
       return row ? receiptFromRow(row) : null;
+    });
+  }
+
+  async coverage(
+    attribution: Attribution,
+    streams: readonly CoverageStreamQuery[],
+  ): Promise<CoverageRange[]> {
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_ingest");
+      const rows = await tx.unsafe(
+        `with requested as (
+           select source_kind, source_stream_key, generation_key,
+                  generation_seq, end_offset as query_end_offset
+             from jsonb_to_recordset($3::jsonb) as request(
+               source_kind text,
+               source_stream_key text,
+               generation_key text,
+               generation_seq bigint,
+               end_offset bigint
+             )
+         )
+         select batch.source_kind, batch.source_stream_key,
+                batch.generation_key, batch.generation_seq,
+                batch.start_offset, batch.end_offset, batch.source_sha256
+           from telemetry.ingest_batches as batch
+           join requested
+             on requested.source_kind = batch.source_kind
+            and requested.source_stream_key = batch.source_stream_key
+            and requested.generation_key = batch.generation_key
+            and requested.generation_seq = batch.generation_seq
+            and batch.start_offset < requested.query_end_offset
+          where batch.workspace_id = $1 and batch.collector_key = $2
+          order by batch.source_stream_key, batch.generation_seq,
+                   batch.start_offset`,
+        [
+          attribution.workspace_id,
+          attribution.collector_key,
+          JSON.stringify(streams),
+        ],
+      );
+      return rows.map((row): CoverageRange => ({
+        source_kind: "rollout",
+        source_stream_key: String(row.source_stream_key),
+        generation_key: String(row.generation_key),
+        generation_seq: Number(row.generation_seq),
+        start_offset: Number(row.start_offset),
+        end_offset: Number(row.end_offset),
+        source_sha256: String(row.source_sha256),
+      }));
     });
   }
 
