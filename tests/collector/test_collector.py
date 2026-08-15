@@ -309,6 +309,15 @@ class RolloutCaptureTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_capture_limits_reject_unbounded_inverse_configuration(self):
+        with self.assertRaises(ValueError):
+            RolloutCapturer(
+                self.root / "invalid-state",
+                self.spool,
+                chunk_bytes=2048,
+                max_object_bytes=1024,
+            )
+
     def test_offsets_advance_only_after_durable_enqueue(self):
         source = b'{"type":"one"}\n{"type":"two"}\n'
         self.rollout.write_bytes(source)

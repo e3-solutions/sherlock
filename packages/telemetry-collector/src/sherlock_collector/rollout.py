@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .contract import ContractError, MAX_RECORDS, build_rollout_batch
+from .contract import ContractError, MAX_RECORDS, MAX_SOURCE_BYTES, build_rollout_batch
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
@@ -66,6 +66,10 @@ class RolloutCapturer:
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
         collector_version: str = "0.1.0",
     ):
+        if not 0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES:
+            raise ValueError(
+                "chunk_bytes and max_object_bytes must be positive and within v1 limits"
+            )
         self.state_root = Path(state_root)
         self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.state_root, 0o700)

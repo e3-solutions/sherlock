@@ -3,22 +3,17 @@
 Codex session telemetry for team-wide activity analysis, starting with a
 correct, auditable Flame graph.
 
-The deliberately small v0 source-of-truth contract is documented in
-[docs/data-schema.md](docs/data-schema.md).
+The Supabase database foundation and rollout collector drain are implemented;
+normalization and product read paths are next.
 
-## Rollout collector slice
+- [Data architecture and drain contract](docs/data-schema.md)
+- [Canonical database migration](supabase/migrations/20260814225047_initial_sherlock_schema.sql)
+- [Database verification](supabase/tests/database/schema.test.sql)
 
-The first rollout-only delivery slice lives in
-`packages/telemetry-collector` and
-`supabase/functions/sherlock-rollout-ingest`. Capture atomically spools stable
-gzip bytes before launching a detached drain; the drain requires a versioned
-committed receipt before deleting an artifact.
-
-Run the focused checks from the repository root:
+Run the focused collector checks with:
 
 ```sh
-PYTHONPATH=packages/telemetry-collector/src \
-  python3 -m unittest discover -s tests/collector -v
+PYTHONPATH=packages/telemetry-collector/src python3 -m unittest discover -s tests/collector -v
 deno check supabase/functions/sherlock-rollout-ingest/index.ts
 deno test supabase/functions/sherlock-rollout-ingest/service_test.ts
 ```
