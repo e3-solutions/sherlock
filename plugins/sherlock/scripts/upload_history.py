@@ -31,7 +31,12 @@ def main() -> int:
     parser.add_argument("--codex-home", type=Path)
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Parallel upload workers (1-16; default: 16).",
+    )
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--state", type=Path)
     parser.add_argument("--no-resume", action="store_true")

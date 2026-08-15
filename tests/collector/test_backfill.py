@@ -486,6 +486,16 @@ class BackfillUploadTests(unittest.TestCase):
             )
             self.assertNotIn(b"stored_payload_base64", encoded)
 
+    def test_upload_rejects_connection_saturating_worker_count(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self.make_archive(root)
+
+            with self.assertRaisesRegex(
+                BackfillError, "upload workers must be between 1 and 16"
+            ):
+                upload_archive(archive, RecordingTransport(), workers=17)
+
     def test_http_transport_reuses_https_connection_for_binary_requests(self):
         manifest, stored = build_rollout_batch(
             b'{"type":"event"}\n',

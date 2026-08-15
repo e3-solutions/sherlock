@@ -44,6 +44,7 @@ UPLOAD_STATE_VERSION = "sherlock.backfill-upload-state.v1"
 ARCHIVE_MANIFEST_PATH = "manifest.json"
 MAX_ARCHIVE_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_BATCH_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_UPLOAD_WORKERS = 16
 # Preserve cross-session request packing while letting short groups finish,
 # report progress, and checkpoint promptly under high worker counts.
 UPLOAD_SESSION_GROUP_SIZE = 8
@@ -1015,14 +1016,16 @@ def upload_archive(
     archive: Path | str,
     transport: UploadTransport,
     *,
-    workers: int = 4,
+    workers: int = MAX_UPLOAD_WORKERS,
     retries: int = 4,
     state_path: Path | str | None = None,
     resume: bool = True,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> UploadResult:
-    if workers < 1 or workers > 32:
-        raise BackfillError("workers must be between 1 and 32")
+    if workers < 1 or workers > MAX_UPLOAD_WORKERS:
+        raise BackfillError(
+            f"upload workers must be between 1 and {MAX_UPLOAD_WORKERS}"
+        )
     if retries < 0 or retries > 10:
         raise BackfillError("retries must be between 0 and 10")
     archive_path = Path(archive).expanduser().resolve()

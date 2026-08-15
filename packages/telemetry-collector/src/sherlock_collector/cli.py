@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .backfill import (
     DEFAULT_EXPORT_WORKERS,
+    MAX_UPLOAD_WORKERS,
     BackfillError,
     export_archive,
     upload_archive,
@@ -106,7 +107,12 @@ def parser() -> argparse.ArgumentParser:
         help="Verify and upload a Sherlock backfill ZIP through the ingest API.",
     )
     backfill_upload.add_argument("archive", type=Path)
-    backfill_upload.add_argument("--workers", type=int, default=4)
+    backfill_upload.add_argument(
+        "--workers",
+        type=int,
+        default=MAX_UPLOAD_WORKERS,
+        help=f"Parallel upload workers (1-{MAX_UPLOAD_WORKERS}).",
+    )
     backfill_upload.add_argument("--retries", type=int, default=4)
     backfill_upload.add_argument("--state", type=Path)
     backfill_upload.add_argument(
