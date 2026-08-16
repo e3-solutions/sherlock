@@ -4,8 +4,9 @@ Codex session telemetry for team-wide activity analysis, starting with a
 correct, auditable Flame graph.
 
 The Supabase database foundation, rollout collector, ingest function,
-replay-safe Codex normalizer, versioned activity reducer, and repo-local Codex
-plugin are implemented. Product read APIs remain separate work.
+replay-safe Codex normalizer, generated message-search index, scheduled
+versioned activity reducer, and repo-local Codex plugin are implemented.
+Product read APIs remain separate and read-only work.
 
 - [Data architecture and drain contract](docs/data-schema.md)
 - [Database migrations](supabase/migrations)
@@ -95,7 +96,12 @@ deno test supabase/functions/sherlock-rollout-ingest
 deno test supabase/functions/sherlock-activity-reducer
 ```
 
-Run a bounded internal activity rebuild separately from ingest:
+Upload, normalization, search indexing, and activity reduction run
+automatically on the server. Supabase Cron invokes the reducer once per minute;
+the reducer captures one visible event cutoff and runs a bounded, retry-safe
+workspace sweep wholly separate from ingest and dashboard reads.
+
+Use the internal command only for bounded repair or backfill work:
 
 ```sh
 SUPABASE_DB_URL=... deno run --allow-env --allow-net \

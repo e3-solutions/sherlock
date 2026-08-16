@@ -35,8 +35,8 @@ Keeping one exact definition prevents the architecture notes from drifting.
   50 MiB.
 - Four no-login database roles separate ingest, normalization, reduction, and
   reads.
-- Fifty-eight database assertions cover the core schema, grants, bucket, and
-  representative integrity failures.
+- Sixty-four database assertions cover the core schema, grants, bucket,
+  scheduling contract, and representative integrity failures.
 - The rollout collector and ingest function implement the versioned immutable
   batch and committed-receipt contract described below.
 - The ingest request then projects every native record with the immutable
@@ -249,14 +249,34 @@ to the same person.
 
 ## Implemented activity reducer contract
 
-`scripts/reduce-activity.ts` is an internal database command, not an Edge
-Function or public API. It captures or accepts a fixed workspace event bound,
-pages sessions by UUID and each session's events by event ID, derives spans in
-memory, then appends changed revisions in one short transaction per session. The
-transaction assumes only `sherlock_reducer`, takes one transaction advisory lock
-keyed by workspace, activity version, and session, and verifies any conflict row
-byte-for-byte. Reducer failure cannot roll back or destabilize raw ingest or
-normalization.
+Supabase Cron invokes the private `sherlock-activity-reducer` Edge Function
+once per minute with a dedicated server-only token stored in Vault; only its
+SHA-256 digest is stored in the function's secret environment. The function
+captures one fixed workspace event bound, refuses work above its configured
+session cap, bounds events per session, and appends changed revisions in one
+transaction per session. Per-session failures are reported without preventing
+later bounded sessions from running; completed sessions are safe no-ops on
+retry. Reducer failure cannot roll back, delay, or destabilize raw ingest or
+normalization, and ordinary dashboard requests remain read-only.
+
+The full sweep deliberately fails before writing when the workspace exceeds
+`SHERLOCK_REDUCER_MAX_SESSIONS` (50 by default), so it cannot silently starve
+higher UUIDs. Monitor 503/error receipts and raise that operational bound only
+after confirming the 90-second job budget still has headroom. Reaching the cap
+or repeatedly reaching the deadline is the trigger for the deferred
+queue/cursor sharding design.
+
+Each write transaction assumes only `sherlock_reducer` and takes one
+nonblocking advisory lock keyed by workspace, activity version, and session. It
+rechecks the visible event count after acquiring the lock. If a lower-ID event
+becomes visible after a higher-ID event, the next sweep may append a corrected
+revision at the same maximum event cutoff; the higher span row ID is the later
+audited fact. Exact reruns still add nothing. An overlapping session returns a
+retryable busy result instead of waiting past the job deadline.
+
+`scripts/reduce-activity.ts` remains the parameterized internal repair and
+backfill command. It uses the same reducer core, can accept an explicit event
+bound, and is not a public API.
 
 For one pinned immutable normalizer version, canonical selection:
 
@@ -301,13 +321,14 @@ SUPABASE_DB_URL=... deno run --allow-env --allow-net \
 ```
 
 Omitting `--through-event-id` captures the greatest currently visible event ID
-once at command start. This is a rebuild bound, not a durable incremental
-watermark: global identity allocation does not prove commit order. Until
-contiguous publication cutoffs exist, rerun bounded sessions/workspaces to pick
-up a late commit. Algorithm changes use a new immutable activity version.
-Rollback means stop producing/reading the new version; prior version rows are
-untouched. Rebuild means rerun the desired scope and bound, never update or
-delete source facts.
+once at command start. The scheduled function does the same on every invocation.
+This is a rebuild bound, not a durable incremental watermark: global identity
+allocation does not prove commit order, so repeated bounded full sweeps recover
+late-visible commits. Algorithm changes use a new immutable activity version.
+Rollback means unschedule `sherlock-activity-reducer-every-minute`, disable the
+function, and rotate or remove its narrow token; existing span and source facts
+remain untouched. Rebuild means rerun the desired scope and bound, never update
+or delete source facts.
 
 ## Deferred application behavior
 
@@ -315,6 +336,7 @@ The current implementation does not yet provide:
 
 - activity-version activation;
 - signed snapshot tokens and contiguous publication cutoffs;
+- queue/cursor-based reducer sharding beyond the explicit current-scale caps;
 - transcript, usage, health, coverage, or Flame read APIs.
 
 Implement each behavior in service code with integration tests. Do not describe
@@ -344,7 +366,8 @@ actually enforces it.
 - editable project and repository catalogs;
 - incidents, alerts, transcript search, embeddings, and recommendations;
 - multi-provider normalization, warehouse export, and partitioning.
-- queues, cron scheduling, durable reducer cursors, and hosted job state;
+- queues, durable reducer cursors, and hosted job state beyond Cron and
+  pg_net's short-lived operational history;
 - native wall/monotonic-duration precedence, hook tails, and presence streams
   until normalized events actually provide that evidence.
 

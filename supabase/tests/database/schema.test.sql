@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(58);
+select plan(64);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -28,6 +28,48 @@ select ok(
       and indexname = 'events_message_search_idx'
   ),
   'normalized message search has a partial GIN index'
+);
+select has_extension('pg_cron', 'scheduled reduction has pg_cron');
+select has_extension('pg_net', 'scheduled reduction has async HTTP');
+select ok(
+  (select n.nspname = 'extensions'
+   from pg_extension e
+   join pg_namespace n on n.oid = e.extnamespace
+   where e.extname = 'pg_net'),
+  'pg_net extension metadata stays outside public'
+);
+select ok(
+  exists (
+    select 1
+    from pg_index i
+    join pg_class c on c.oid = i.indexrelid
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'analytics'
+      and c.relname = 'activity_spans_latest_version_idx'
+      and not i.indisunique
+  ),
+  'same-cutoff activity corrections remain appendable'
+);
+select ok(
+  (select count(*) = 1
+   from cron.job
+   where jobname = 'sherlock-activity-reducer-every-minute'
+     and schedule = '* * * * *'
+     and active),
+  'exactly one active minutely activity reducer job exists'
+);
+select ok(
+  exists (
+    select 1
+    from cron.job
+    where jobname = 'sherlock-activity-reducer-every-minute'
+      and command like '%/functions/v1/sherlock-activity-reducer%'
+      and command like '%sherlock_project_url%'
+      and command like '%sherlock_activity_reducer_token%'
+      and command not ilike '%service_role%'
+      and command not ilike '%supabase_db_url%'
+  ),
+  'Cron reads only the narrow invocation contract from Vault'
 );
 
 select ok(
@@ -444,7 +486,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 58,
+  'assertion_count', 64,
   'tables', 7,
   'private_bucket', 'telemetry-raw'
 ) as verification;

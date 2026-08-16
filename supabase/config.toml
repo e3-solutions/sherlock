@@ -351,3 +351,8 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 [functions.sherlock-rollout-ingest]
 verify_jwt = false
 entrypoint = "./functions/sherlock-rollout-ingest/index.ts"
+
+[functions.sherlock-activity-reducer]
+# Cron uses a dedicated server-only token checked by the function itself.
+verify_jwt = false
+entrypoint = "./functions/sherlock-activity-reducer/index.ts"
