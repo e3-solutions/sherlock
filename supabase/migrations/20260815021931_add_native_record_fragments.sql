@@ -4,7 +4,6 @@ alter table telemetry.native_records
   add column native_record_sha256 text,
   add column fragment_index integer,
   add column fragment_count integer;
-
 alter table telemetry.native_records
   drop constraint native_records_parse_status_check,
   add constraint native_records_parse_status_check check (

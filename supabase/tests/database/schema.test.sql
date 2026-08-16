@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(42);
+select plan(58);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -16,6 +16,19 @@ select has_table('telemetry', 'native_records', 'native_records table exists');
 select has_table('telemetry', 'events', 'events table exists');
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
 select has_column('telemetry', 'people', 'github_id', 'people records GitHub identity');
+select has_column(
+  'telemetry', 'events', 'message_search',
+  'normalized message excerpts have a generated search vector'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'telemetry'
+      and tablename = 'events'
+      and indexname = 'events_message_search_idx'
+  ),
+  'normalized message search has a partial GIN index'
+);
 
 select ok(
   exists (select 1 from pg_roles where rolname = 'sherlock_ingest'),
@@ -30,8 +43,20 @@ select ok(
   'reader role exists'
 );
 select ok(
+  exists (select 1 from pg_roles where rolname = 'sherlock_reducer'),
+  'activity reducer role exists'
+);
+select ok(
   pg_has_role('postgres', 'sherlock_ingest', 'member'),
   'Edge Function database login can assume the constrained ingest role'
+);
+select ok(
+  pg_has_role('postgres', 'sherlock_normalizer', 'member'),
+  'Edge Function database login can assume the constrained normalizer role'
+);
+select ok(
+  pg_has_role('postgres', 'sherlock_reducer', 'member'),
+  'internal command database login can assume the constrained reducer role'
 );
 
 select ok(
@@ -98,8 +123,44 @@ select ok(
   'normalizer can insert events'
 );
 select ok(
-  has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'insert'),
-  'normalizer can insert spans'
+  not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'insert'),
+  'normalizer cannot insert spans'
+);
+select ok(
+  has_table_privilege('sherlock_reducer', 'telemetry.sessions', 'select'),
+  'reducer can read session ownership'
+);
+select ok(
+  has_table_privilege('sherlock_reducer', 'telemetry.events', 'select'),
+  'reducer can read normalized events'
+);
+select ok(
+  not has_table_privilege('sherlock_reducer', 'telemetry.ingest_batches', 'select'),
+  'reducer cannot read raw receipt metadata'
+);
+select ok(
+  not has_table_privilege('sherlock_reducer', 'telemetry.native_records', 'select'),
+  'reducer cannot read native record locators'
+);
+select ok(
+  has_table_privilege('sherlock_reducer', 'analytics.activity_spans', 'insert'),
+  'reducer can append spans'
+);
+select ok(
+  not has_table_privilege('sherlock_reducer', 'analytics.activity_spans', 'update'),
+  'reducer cannot update spans'
+);
+select ok(
+  not has_table_privilege('sherlock_reducer', 'analytics.activity_spans', 'delete'),
+  'reducer cannot delete spans'
+);
+select ok(
+  not has_table_privilege('sherlock_reducer', 'telemetry.events', 'insert'),
+  'reducer cannot insert source events'
+);
+select ok(
+  not has_table_privilege('sherlock_reducer', 'telemetry.sessions', 'update'),
+  'reducer cannot update session caches'
 );
 select ok(
   not has_table_privilege('sherlock_reader', 'telemetry.events', 'insert'),
@@ -143,7 +204,89 @@ insert into telemetry.people (id, workspace_id, identity_key) values
     '00000000-0000-0000-0000-000000000101',
     '00000000-0000-0000-0000-000000000001',
     'test-person'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000102',
+    '00000000-0000-0000-0000-000000000001',
+    'other-test-person'
   );
+
+insert into telemetry.sessions (
+  id, workspace_id, person_id, collector_key, native_session_id,
+  actor_role, role_version, started_at
+) values
+  (
+    '00000000-0000-0000-0000-000000000201',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101',
+    'test-collector', 'test-session', 'primary', 'test-role-v1',
+    '2026-08-15T00:00:00Z'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000202',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101',
+    'test-collector', 'test-worker', 'worker', 'test-role-v1',
+    '2026-08-15T00:00:01Z'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000203',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101',
+    'test-collector', 'test-guardian', 'guardian', 'test-role-v1',
+    '2026-08-15T00:00:02Z'
+  );
+
+update telemetry.sessions
+set parent_session_id = '00000000-0000-0000-0000-000000000201',
+    parent_native_session_id = 'test-session'
+where id in (
+  '00000000-0000-0000-0000-000000000202',
+  '00000000-0000-0000-0000-000000000203'
+);
+
+select ok(
+  (
+    select count(*) = 2
+    from telemetry.sessions
+    where parent_session_id = '00000000-0000-0000-0000-000000000201'
+      and actor_role in ('worker', 'guardian')
+  ),
+  'synthetic worker and guardian sessions retain their parent and role'
+);
+
+insert into telemetry.ingest_batches (
+  id, workspace_id, person_id, collector_key, source_kind, source_stream_key,
+  generation_key, generation_seq, start_offset, end_offset,
+  source_byte_count, source_sha256, storage_path, storage_encoding,
+  stored_byte_count, stored_sha256, record_count, contract_version
+) values (
+  '00000000-0000-0000-0000-000000000301',
+  '00000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000101',
+  'test-collector', 'rollout', 'test-stream', 'test-generation', 0, 0, 1, 1,
+  repeat('a', 64), 'test-span-evidence', 'identity', 1, repeat('b', 64), 1,
+  'test-v1'
+);
+
+insert into telemetry.native_records (
+  workspace_id, batch_id, record_index, source_start_offset,
+  source_end_offset, record_sha256, parse_status
+) values (
+  '00000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000301', 0, 0, 1, repeat('c', 64), 'ok'
+);
+
+insert into telemetry.events (
+  workspace_id, session_id, source_record_id, normalizer_version,
+  projection_index, source_priority, event_kind, actor_role, server_received_at
+) select
+  '00000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000201', id, 'test-normalizer-v1',
+  0, 100, 'lifecycle', 'primary', '2026-08-15T00:00:00Z'
+from telemetry.native_records
+where workspace_id = '00000000-0000-0000-0000-000000000001'
+  and batch_id = '00000000-0000-0000-0000-000000000301';
 
 create temporary table constraint_results (
   test_name text primary key,
@@ -202,6 +345,27 @@ begin
   exception when check_violation then
     insert into constraint_results values ('invalid hash', true);
   end;
+
+  begin
+    insert into analytics.activity_spans (
+      workspace_id, session_id, person_id, span_key, activity_version,
+      valid_from_event_id, started_at, ended_at, span_state, activity_kind,
+      timing_basis, confidence, estimated_start, estimated_end, actor_role,
+      start_event_id
+    ) select
+      '00000000-0000-0000-0000-000000000001',
+      '00000000-0000-0000-0000-000000000201',
+      '00000000-0000-0000-0000-000000000102',
+      'wrong-person', 'test-activity-v1', id,
+      '2026-08-15T00:00:00Z', '2026-08-15T00:00:01Z',
+      'active', 'point', 'point', 'inferred', false, true, 'primary', id
+    from telemetry.events
+    where workspace_id = '00000000-0000-0000-0000-000000000001'
+      and session_id = '00000000-0000-0000-0000-000000000201';
+    insert into constraint_results values ('span ownership mismatch', false);
+  exception when foreign_key_violation then
+    insert into constraint_results values ('span ownership mismatch', true);
+  end;
 end
 $$;
 
@@ -211,6 +375,8 @@ select ok(passed, 'invalid byte ranges are rejected')
 from constraint_results where test_name = 'invalid range';
 select ok(passed, 'invalid hashes are rejected')
 from constraint_results where test_name = 'invalid hash';
+select ok(passed, 'spans cannot attribute a session to another workspace person')
+from constraint_results where test_name = 'span ownership mismatch';
 
 select * from finish();
 
@@ -226,10 +392,12 @@ begin
     to_regclass('telemetry.native_records') is not null and
     to_regclass('telemetry.events') is not null and
     to_regclass('analytics.activity_spans') is not null and
-    (select count(*) = 3 from pg_roles where rolname in (
-      'sherlock_ingest', 'sherlock_normalizer', 'sherlock_reader'
+    (select count(*) = 4 from pg_roles where rolname in (
+      'sherlock_ingest', 'sherlock_normalizer', 'sherlock_reducer', 'sherlock_reader'
     )) and
     pg_has_role('postgres', 'sherlock_ingest', 'member') and
+    pg_has_role('postgres', 'sherlock_normalizer', 'member') and
+    pg_has_role('postgres', 'sherlock_reducer', 'member') and
     exists (
       select 1 from storage.buckets
       where id = 'telemetry-raw' and public = false
@@ -249,7 +417,16 @@ begin
     not has_table_privilege('sherlock_ingest', 'telemetry.events', 'insert') and
     not has_table_privilege('sherlock_ingest', 'analytics.activity_spans', 'insert') and
     has_table_privilege('sherlock_normalizer', 'telemetry.events', 'insert') and
-    has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'insert') and
+    not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'insert') and
+    has_table_privilege('sherlock_reducer', 'telemetry.sessions', 'select') and
+    has_table_privilege('sherlock_reducer', 'telemetry.events', 'select') and
+    not has_table_privilege('sherlock_reducer', 'telemetry.ingest_batches', 'select') and
+    not has_table_privilege('sherlock_reducer', 'telemetry.native_records', 'select') and
+    has_table_privilege('sherlock_reducer', 'analytics.activity_spans', 'insert') and
+    not has_table_privilege('sherlock_reducer', 'analytics.activity_spans', 'update') and
+    not has_table_privilege('sherlock_reducer', 'analytics.activity_spans', 'delete') and
+    not has_table_privilege('sherlock_reducer', 'telemetry.events', 'insert') and
+    not has_table_privilege('sherlock_reducer', 'telemetry.sessions', 'update') and
     not has_table_privilege('sherlock_reader', 'telemetry.events', 'insert') and
     not has_table_privilege('sherlock_reader', 'telemetry.ingest_batches', 'insert') and
     not has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'update') and
@@ -267,7 +444,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 42,
+  'assertion_count', 58,
   'tables', 7,
   'private_bucket', 'telemetry-raw'
 ) as verification;

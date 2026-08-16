@@ -1,7 +1,8 @@
 # Sherlock v0 Data Architecture
 
-Status: the Supabase database foundation and rollout collector drain are
-implemented. The normalizer, snapshot resolver, and Flame read APIs are not.
+Status: the Supabase database foundation, rollout collector drain, first Codex
+normalizer, and first versioned activity reducer are implemented. The snapshot
+resolver, version activation, and Flame read APIs are not.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
 views separate from source data. The database is intentionally small: seven
@@ -32,11 +33,17 @@ Keeping one exact definition prevents the architecture notes from drifting.
   tables and sequences.
 - The private `telemetry-raw` bucket accepts gzip and binary objects up to
   50 MiB.
-- Three no-login database roles separate ingest, normalization, and reads.
-- Thirty-six database assertions cover the core schema, grants, bucket, and
+- Four no-login database roles separate ingest, normalization, reduction, and
+  reads.
+- Fifty-eight database assertions cover the core schema, grants, bucket, and
   representative integrity failures.
 - The rollout collector and ingest function implement the versioned immutable
   batch and committed-receipt contract described below.
+- The ingest request then projects every native record with the immutable
+  `sherlock.codex-rollout.v1` normalizer and indexes bounded user/assistant
+  message excerpts with PostgreSQL full-text search.
+- The explicit internal reducer command converts pinned, canonical normalized
+  events into append-only `sherlock.activity.v1` span revisions outside ingest.
 
 The migration does not create Storage object policies or a user-facing
 permission model. Future services must connect server-side and assume only the
@@ -71,7 +78,7 @@ database columns.
 | `telemetry.ingest_batches` | Receipt for one committed source byte range and Storage object | Ingest may insert only |
 | `telemetry.native_records` | Exact locator and parse status for each native record | Ingest may insert only |
 | `telemetry.events` | Versioned semantic projections of native records | Normalizer may insert only |
-| `analytics.activity_spans` | Versioned, rebuildable activity intervals | Normalizer may insert only |
+| `analytics.activity_spans` | Versioned, rebuildable activity intervals | Reducer may insert only |
 
 Append-only behavior is enforced for application roles through grants. A
 database owner can still perform administrative maintenance and therefore
@@ -95,8 +102,8 @@ erDiagram
 
 Repeated `workspace_id` values use composite foreign keys where facts cross
 tables. This prevents a child row from citing a person, session, batch, record,
-or event from another workspace. Span evidence is also constrained to the same
-session.
+or event from another workspace. A span's session and copied person must match
+one session row, and span evidence is constrained to that same session.
 
 ### Sessions are mutable caches
 
@@ -164,12 +171,14 @@ v0. A read response may be cached by immutable snapshot and query parameters.
 | Role | Access |
 | --- | --- |
 | `sherlock_ingest` | Read workspace, person, batch, and native-record metadata; insert batches and native records |
-| `sherlock_normalizer` | Read telemetry; insert/update session caches; insert events and activity spans |
+| `sherlock_normalizer` | Read telemetry; insert/update session caches; insert events |
+| `sherlock_reducer` | Read sessions and normalized events; select/insert activity spans |
 | `sherlock_reader` | Read telemetry and analytics; no writes |
 
-The ingest role cannot write events or spans. The normalizer cannot update or
-delete batches, native records, events, or spans. The reader cannot write any
-fact. These grants separate collection from interpretation and product reads.
+The ingest role cannot write events or spans. The normalizer cannot write spans.
+The reducer cannot read raw receipts or native locators, change session caches
+or events, or update/delete spans. The reader cannot write any fact. These
+grants separate collection, interpretation, reduction, and product reads.
 
 ## Implemented rollout drain contract
 
@@ -207,18 +216,104 @@ in both expected failure windows:
 An orphaned object from a rejected conflict is operational cleanup, not a
 queryable telemetry fact.
 
+## Implemented normalization contract
+
+Raw commit and normalization are deliberately two short database transactions
+inside one request. The immutable object, batch, and native locators commit
+first. The normalizer then reads the already-validated source bytes, upserts the
+session cache, and inserts one versioned event for every native record.
+
+If normalization fails after raw commit, the endpoint returns an error. The
+collector keeps its spool item. Its retry resolves the exact existing receipt
+without uploading or inserting raw data again, then retries the idempotent event
+projections. The unique source-record/version/projection key prevents duplicate
+events. A coverage check inside the normalizer transaction rejects any batch
+where a native record lacks a projection.
+
+The first version recognizes session metadata, turn context, user and assistant
+messages, cumulative token usage, reasoning, common tool calls/results,
+lifecycle records, native errors, and malformed/unknown records. Cumulative
+usage separates cached input and reasoning output from the inclusive native
+totals. Unknown records still produce observable `unknown` events.
+
+Only the bounded message excerpt is copied into PostgreSQL and indexed with a
+partial GIN full-text index. Full prompts, responses, reasoning, tool payloads,
+and native JSON remain solely in immutable Storage and are recoverable through
+their native-record locators.
+
 The endpoint is intentionally unauthenticated. Anyone who knows its URL can
 submit a valid batch and declare a name, GitHub login, and email; those values
 are not proof of identity or email control. Batch `person_id` remains immutable
 after commit, and two installations declaring the same normalized email resolve
 to the same person.
 
-## Planned application behavior
+## Implemented activity reducer contract
 
-The current migration does not implement these behaviors:
+`scripts/reduce-activity.ts` is an internal database command, not an Edge
+Function or public API. It captures or accepts a fixed workspace event bound,
+pages sessions by UUID and each session's events by event ID, derives spans in
+memory, then appends changed revisions in one short transaction per session. The
+transaction assumes only `sherlock_reducer`, takes one transaction advisory lock
+keyed by workspace, activity version, and session, and verifies any conflict row
+byte-for-byte. Reducer failure cannot roll back or destabilize raw ingest or
+normalization.
 
-- normalizer sealing, canonical event selection, or replay suppression;
-- activity reduction and version activation;
+For one pinned immutable normalizer version, canonical selection:
+
+1. excludes `is_replay = true`;
+2. partitions events with both keys by session, canonical scope, logical event
+   key, and event kind;
+3. chooses source priority descending, then `occurred_at` ascending with nulls
+   last, then event ID ascending; and
+4. keeps every event without both canonical keys. It never deduplicates by
+   content hash.
+
+`sherlock.activity.v1` implements only timing supported by current Codex events.
+Turn evidence with a `turn_id` uses lifecycle start/complete when available,
+otherwise the canonical human message and terminal final response. Unkeyed task
+lifecycle events pair FIFO. Tool calls/results pair by native call ID. A valid
+increasing pair becomes an interval. An unpaired completed signal or
+invalid-order pair becomes a one-second inferred point. An incomplete start
+becomes a one-second `detected_open` provisional observation, which is passive
+and must not be counted as exact active duration. Missing occurrence time falls
+back to observed time and then server receipt time with the boundary marked
+estimated; the reducer never uses `now()`.
+
+Even paired v1 intervals have `confidence = inferred`: source timestamps record
+boundary signals, not monotonic execution time or continuous attention.
+
+Primary, worker, guardian, and automation sessions use identical rules and
+remain separate sessions. Spans copy role and project from event evidence, copy
+person from the owning session, retain start/end/cutoff event foreign keys, and
+use session-namespaced logical keys. A later cutoff can append a corrected row
+under the same key; a vanished interval gets a tombstone. Unchanged rows add no
+revision, exact reruns are no-ops, and concurrent same-session attempts
+converge.
+
+The command supports a single-session bounded rebuild or a workspace rebuild:
+
+```sh
+SUPABASE_DB_URL=... deno run --allow-env --allow-net \
+  scripts/reduce-activity.ts --workspace <uuid> \
+  --normalizer-version sherlock.codex-rollout.v1 \
+  --activity-version sherlock.activity.v1 \
+  --through-event-id <id>
+```
+
+Omitting `--through-event-id` captures the greatest currently visible event ID
+once at command start. This is a rebuild bound, not a durable incremental
+watermark: global identity allocation does not prove commit order. Until
+contiguous publication cutoffs exist, rerun bounded sessions/workspaces to pick
+up a late commit. Algorithm changes use a new immutable activity version.
+Rollback means stop producing/reading the new version; prior version rows are
+untouched. Rebuild means rerun the desired scope and bound, never update or
+delete source facts.
+
+## Deferred application behavior
+
+The current implementation does not yet provide:
+
+- activity-version activation;
 - signed snapshot tokens and contiguous publication cutoffs;
 - transcript, usage, health, coverage, or Flame read APIs.
 
@@ -249,6 +344,9 @@ actually enforces it.
 - editable project and repository catalogs;
 - incidents, alerts, transcript search, embeddings, and recommendations;
 - multi-provider normalization, warehouse export, and partitioning.
+- queues, cron scheduling, durable reducer cursors, and hosted job state;
+- native wall/monotonic-duration precedence, hook tails, and presence streams
+  until normalized events actually provide that evidence.
 
 Deferring the user-facing permission model does not defer service
 authentication, immutable attribution, or write isolation.

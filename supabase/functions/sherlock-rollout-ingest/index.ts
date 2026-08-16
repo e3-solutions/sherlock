@@ -16,6 +16,7 @@ import {
   parseEnvelope,
 } from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
+import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
 import { IngestService } from "./service.ts";
 import { SupabaseImmutableStorage } from "./storage.ts";
 
@@ -36,7 +37,8 @@ function ingestBackend(): {
   batches: PostgresBatchRepository;
 } {
   if (backend) return backend;
-  const batches = PostgresBatchRepository.connect(required("SUPABASE_DB_URL"));
+  const databaseUrl = required("SUPABASE_DB_URL");
+  const batches = PostgresBatchRepository.connect(databaseUrl);
   backend = {
     batches,
     service: new IngestService(
@@ -45,6 +47,7 @@ function ingestBackend(): {
         required("SUPABASE_SERVICE_ROLE_KEY"),
       ),
       batches,
+      PostgresBatchNormalizer.connect(databaseUrl),
     ),
   };
   return backend;
