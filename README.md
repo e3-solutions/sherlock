@@ -4,8 +4,8 @@ Codex session telemetry for team-wide activity analysis, starting with a
 correct, auditable Flame graph.
 
 The Supabase database foundation, rollout collector, ingest function,
-replay-safe Codex normalizer, and repo-local Codex plugin are implemented.
-Activity reduction and product read APIs remain separate work.
+replay-safe Codex normalizer, versioned activity reducer, and repo-local Codex
+plugin are implemented. Product read APIs remain separate work.
 
 - [Data architecture and drain contract](docs/data-schema.md)
 - [Database migrations](supabase/migrations)
@@ -92,4 +92,14 @@ Run the focused collector checks with:
 PYTHONPATH=packages/telemetry-collector/src python3 -m unittest discover -s tests/collector -v
 deno check supabase/functions/sherlock-rollout-ingest/index.ts
 deno test supabase/functions/sherlock-rollout-ingest
+deno test supabase/functions/sherlock-activity-reducer
+```
+
+Run a bounded internal activity rebuild separately from ingest:
+
+```sh
+SUPABASE_DB_URL=... deno run --allow-env --allow-net \
+  scripts/reduce-activity.ts \
+  --workspace 00000000-0000-0000-0000-000000000000 \
+  --through-event-id 12345
 ```
