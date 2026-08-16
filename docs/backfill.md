@@ -1,6 +1,22 @@
 # Backfill Codex history
 
-Sherlock's backfill is deliberately split into two commands:
+Sherlock installation includes backfill by default:
+
+```sh
+./install.sh \
+  --name "Ada Lovelace" \
+  --github-id ada \
+  --email ada@example.com \
+  --acknowledge-sensitive-data
+```
+
+The installer snapshots history before enabling the plugin and prints the
+owner-only ZIP path for administrator handoff. Add `--upload-history` to upload
+the ZIP after installation, or `--skip-history` to install without exporting.
+Use `--history-output PATH`, `--history-workers N`, and `--upload-workers N` for
+explicit overrides.
+
+The underlying backfill remains deliberately split into two reusable commands:
 
 1. An authorized person exports the Codex history present on their device to
    one checksummed ZIP.
