@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import threading
@@ -23,7 +24,7 @@ from sherlock_collector.drain import (
     TransientUploadError,
 )
 from sherlock_collector.hook import capture_and_spawn_drain
-from sherlock_collector.http import HttpTransport
+from sherlock_collector.http import BULK_RECEIPT_VERSION, HttpTransport
 from sherlock_collector.rollout import RolloutCapturer
 from sherlock_collector.spool import DurableSpool, SpoolItem
 
@@ -100,19 +101,35 @@ class HttpTransportTests(unittest.TestCase):
         item = SpoolItem(manifest, stored, {})
 
         class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return None
+            status = 200
 
             def read(self, _limit):
-                return json.dumps(receipt(manifest)).encode()
+                return json.dumps({
+                    "receipt_version": BULK_RECEIPT_VERSION,
+                    "receipts": [receipt(manifest)],
+                }).encode()
 
+            def getheader(self, _name, default=""):
+                return default
+
+        class Connection:
+            def __init__(self):
+                self.requests = []
+
+            def request(self, method, target, *, body, headers):
+                self.requests.append((method, target, body, headers))
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        connection = Connection()
         with patch(
-            "sherlock_collector.http.urllib.request.urlopen",
-            return_value=Response(),
-        ) as urlopen:
+            "sherlock_collector.http.http.client.HTTPSConnection",
+            return_value=connection,
+        ):
             value = HttpTransport(
                 "https://example.test/ingest",
                 CollectorIdentity(
@@ -123,11 +140,12 @@ class HttpTransportTests(unittest.TestCase):
                 ),
             ).upload(item)
 
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data)
-        self.assertNotIn("Authorization", request.headers)
-        self.assertEqual(body["collector"]["email"], "test@example.com")
-        self.assertEqual(body["collector"]["github_id"], "test-user")
+        _method, _target, body, headers = connection.requests[0]
+        manifest_gzip_bytes = int.from_bytes(body[12:16], "big")
+        metadata = json.loads(gzip.decompress(body[24 : 24 + manifest_gzip_bytes]))
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(metadata["collector"]["email"], "test@example.com")
+        self.assertEqual(metadata["collector"]["github_id"], "test-user")
         self.assertEqual(value["status"], "committed")
 
 

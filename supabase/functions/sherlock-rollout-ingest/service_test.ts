@@ -1,9 +1,13 @@
 import {
   type Attribution,
   type BatchManifest,
+  BULK_RECEIPT_VERSION,
   type CommittedReceipt,
   CONTRACT_VERSION,
+  COVERAGE_QUERY_VERSION,
   IngestError,
+  parseBulkEnvelope,
+  parseCoverageQuery,
   parseEnvelope,
   RECEIPT_VERSION,
   sha256Hex,
@@ -27,6 +31,54 @@ function assert(
   message = "assertion failed",
 ): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+async function encodeBulk(
+  entries: Array<{
+    collector?: typeof COLLECTOR;
+    manifest: BatchManifest;
+    stored: Uint8Array;
+  }>,
+): Promise<Uint8Array> {
+  const encoder = new TextEncoder();
+  const magic = encoder.encode("SHRBULK2");
+  const encoded = await Promise.all(entries.map(async (entry) => {
+    const metadata = entry.collector
+      ? { collector: entry.collector, manifest: entry.manifest }
+      : entry.manifest;
+    const manifest = encoder.encode(JSON.stringify(metadata));
+    const compressed = new Blob([manifest])
+      .stream()
+      .pipeThrough(new CompressionStream("gzip"));
+    return {
+      manifest,
+      manifestGzip: new Uint8Array(
+        await new Response(compressed).arrayBuffer(),
+      ),
+      stored: entry.stored,
+    };
+  }));
+  const size = 12 + encoded.reduce(
+    (total, entry) =>
+      total + 12 + entry.manifestGzip.length + entry.stored.length,
+    0,
+  );
+  const body = new Uint8Array(size);
+  body.set(magic);
+  const view = new DataView(body.buffer);
+  view.setUint32(8, encoded.length);
+  let offset = 12;
+  for (const entry of encoded) {
+    view.setUint32(offset, entry.manifestGzip.length);
+    view.setUint32(offset + 4, entry.manifest.length);
+    view.setUint32(offset + 8, entry.stored.length);
+    offset += 12;
+    body.set(entry.manifestGzip, offset);
+    offset += entry.manifestGzip.length;
+    body.set(entry.stored, offset);
+    offset += entry.stored.length;
+  }
+  return body;
 }
 
 const COLLECTOR = {
@@ -76,6 +128,11 @@ async function fixture(): Promise<{
         native_payload_type: null,
         occurred_at: null,
         parse_status: "ok",
+        native_record_start_offset: null,
+        native_record_end_offset: null,
+        native_record_sha256: null,
+        fragment_index: null,
+        fragment_count: null,
       }],
       observed_native_session_id: null,
       first_occurred_at: null,
@@ -275,6 +332,128 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
   } catch (error) {
     assert(error instanceof IngestError);
     assert(error.status === 400);
+  }
+});
+
+Deno.test("oversized native record fragments retain their logical identity", async () => {
+  const { manifest, stored } = await fixture();
+  const nativeRecordHash = "a".repeat(64);
+  const parsed = parseEnvelope({
+    manifest: {
+      ...manifest,
+      records: [{
+        ...manifest.records[0],
+        native_type: null,
+        parse_status: "fragment",
+        native_record_start_offset: 0,
+        native_record_end_offset: 10,
+        native_record_sha256: nativeRecordHash,
+        fragment_index: 0,
+        fragment_count: 2,
+      }],
+    },
+    stored_payload_base64: btoa(String.fromCharCode(...stored)),
+  });
+
+  assert(parsed.manifest.records[0].parse_status === "fragment");
+  assert(
+    parsed.manifest.records[0].native_record_sha256 === nativeRecordHash,
+  );
+});
+
+Deno.test("compressed binary bulk envelope avoids base64 and preserves order", async () => {
+  const { manifest, stored } = await fixture();
+  const second = {
+    ...manifest,
+    start_offset: 5,
+    end_offset: 10,
+    records: [{
+      ...manifest.records[0],
+      source_start_offset: 5,
+      source_end_offset: 10,
+    }],
+  };
+
+  const parsed = await parseBulkEnvelope(
+    await encodeBulk([
+      { collector: COLLECTOR, manifest, stored },
+      { collector: COLLECTOR, manifest: second, stored },
+    ]),
+  );
+
+  assert(parsed.length === 2);
+  assert(parsed[0].manifest.start_offset === 0);
+  assert(parsed[1].manifest.start_offset === 5);
+  assert(parsed[0].collector?.email === "test@example.com");
+  assert(parsed[0].stored_payload.byteLength === stored.byteLength);
+  assert(BULK_RECEIPT_VERSION === "sherlock.bulk-receipts.v1");
+});
+
+Deno.test("binary bulk envelope rejects trailing bytes", async () => {
+  const { manifest, stored } = await fixture();
+  const encoded = await encodeBulk([{ manifest, stored }]);
+  const malformed = new Uint8Array(encoded.length + 1);
+  malformed.set(encoded);
+
+  try {
+    await parseBulkEnvelope(malformed);
+    assert(false, "trailing bytes should fail");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "invalid_request");
+  }
+});
+
+Deno.test("coverage query validates bounded immutable stream identities", () => {
+  const parsed = parseCoverageQuery({
+    coverage_version: COVERAGE_QUERY_VERSION,
+    collector: COLLECTOR,
+    streams: [{
+      source_kind: "rollout",
+      source_stream_key: "stream-test",
+      generation_key: "generation-test",
+      generation_seq: 2,
+      end_offset: 512,
+    }],
+  });
+
+  assert(parsed.streams.length === 1);
+  assert(parsed.streams[0].generation_seq === 2);
+  assert(parsed.streams[0].end_offset === 512);
+});
+
+Deno.test("coverage query rejects duplicate streams", () => {
+  const stream = {
+    source_kind: "rollout",
+    source_stream_key: "stream-test",
+    generation_key: "generation-test",
+    generation_seq: 0,
+    end_offset: 512,
+  };
+  try {
+    parseCoverageQuery({
+      coverage_version: COVERAGE_QUERY_VERSION,
+      streams: [stream, stream],
+    });
+    assert(false, "duplicate coverage streams should fail");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "invalid_request");
+  }
+});
+
+Deno.test("binary bulk envelope bounds decoded manifest expansion", async () => {
+  const { manifest, stored } = await fixture();
+  const encoded = await encodeBulk([{ manifest, stored }]);
+  const view = new DataView(encoded.buffer);
+  view.setUint32(16, view.getUint32(16) - 1);
+
+  try {
+    await parseBulkEnvelope(encoded);
+    assert(false, "manifest expansion beyond its declaration should fail");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "payload_too_large");
   }
 });
 

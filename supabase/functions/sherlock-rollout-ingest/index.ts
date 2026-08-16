@@ -1,5 +1,20 @@
+import { authenticate, parseCollectorConfigurations } from "./auth.ts";
 import { publicCollectorGrant } from "./attribution.ts";
-import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
+import {
+  type Attribution,
+  BULK_CONTENT_TYPE,
+  BULK_RECEIPT_VERSION,
+  type CollectorIdentity,
+  type CommittedReceipt,
+  COVERAGE_CONTENT_TYPE,
+  COVERAGE_RESPONSE_VERSION,
+  type IngestEnvelope,
+  IngestError,
+  MAX_REQUEST_BYTES,
+  parseBulkEnvelope,
+  parseCoverageQuery,
+  parseEnvelope,
+} from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
 import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
 import { IngestService } from "./service.ts";
@@ -45,13 +60,61 @@ async function handler(request: Request): Promise<Response> {
         status: 405,
       });
     }
-    const grant = publicCollectorGrant(required("SHERLOCK_WORKSPACE_ID"));
-    const body = await readJsonBounded(request);
-    const envelope = parseEnvelope(body);
+    const body = await readBodyBounded(request);
+    const contentType = request.headers.get("content-type")?.split(";", 1)[0]
+      .trim().toLowerCase();
     const current = ingestBackend();
-    const attribution = await current.batches.resolveAttribution(
-      grant,
-      envelope.collector,
+    if (contentType === COVERAGE_CONTENT_TYPE) {
+      const query = parseCoverageQuery(decodeJson(body));
+      const attribution = await resolveAttribution(
+        request,
+        current.batches,
+        [query.collector],
+      );
+      const ranges = await current.batches.coverage(
+        attribution,
+        query.streams,
+      );
+      return Response.json({
+        coverage_version: COVERAGE_RESPONSE_VERSION,
+        ranges,
+      }, {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    if (contentType === BULK_CONTENT_TYPE) {
+      const envelopes = await parseBulkEnvelope(body);
+      const attribution = await resolveAttribution(
+        request,
+        current.batches,
+        envelopes.map((envelope) => envelope.collector),
+      );
+      const receipts = await ingestMany(
+        current.service,
+        attribution,
+        envelopes,
+      );
+      return Response.json({
+        receipt_version: BULK_RECEIPT_VERSION,
+        receipts,
+      }, {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    if (contentType !== "application/json") {
+      throw new IngestError(
+        "unsupported_media_type",
+        "content-type must be JSON or Sherlock bulk v2",
+        415,
+      );
+    }
+    const envelope = parseEnvelope(decodeJson(body));
+    const attribution = await resolveAttribution(
+      request,
+      current.batches,
+      [envelope.collector],
     );
     const receipt = await current.service.ingest(
       attribution,
@@ -77,7 +140,62 @@ async function handler(request: Request): Promise<Response> {
   }
 }
 
-async function readJsonBounded(request: Request): Promise<unknown> {
+async function ingestMany(
+  service: IngestService,
+  attribution: Attribution,
+  envelopes: IngestEnvelope[],
+): Promise<CommittedReceipt[]> {
+  const receipts: CommittedReceipt[] = [];
+  for (const envelope of envelopes) {
+    receipts.push(
+      await service.ingest(
+        attribution,
+        envelope.manifest,
+        envelope.stored_payload,
+      ),
+    );
+  }
+  return receipts;
+}
+
+async function resolveAttribution(
+  request: Request,
+  batches: PostgresBatchRepository,
+  collectors: Array<CollectorIdentity | null>,
+): Promise<Attribution> {
+  const identified = collectors.filter(
+    (collector): collector is CollectorIdentity => collector !== null,
+  );
+  if (identified.length === collectors.length && identified.length > 0) {
+    const canonical = JSON.stringify(identified[0]);
+    if (
+      identified.some((collector) => JSON.stringify(collector) !== canonical)
+    ) {
+      throw new IngestError(
+        "invalid_identity",
+        "bulk request must use one collector identity",
+        400,
+      );
+    }
+    return await batches.resolveAttribution(
+      publicCollectorGrant(required("SHERLOCK_WORKSPACE_ID")),
+      identified[0],
+    );
+  }
+  if (identified.length !== 0 || collectors.length === 0) {
+    throw new IngestError(
+      "invalid_identity",
+      "bulk request cannot mix identified and legacy collectors",
+      400,
+    );
+  }
+  return await authenticate(
+    request.headers.get("authorization"),
+    parseCollectorConfigurations(required("SHERLOCK_COLLECTORS_JSON")),
+  );
+}
+
+async function readBodyBounded(request: Request): Promise<Uint8Array> {
   const declaredLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
     throw new IngestError(
@@ -112,6 +230,10 @@ async function readJsonBounded(request: Request): Promise<unknown> {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return bytes;
+}
+
+function decodeJson(bytes: Uint8Array): unknown {
   try {
     return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {

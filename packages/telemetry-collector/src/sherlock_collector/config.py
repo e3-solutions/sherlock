@@ -33,7 +33,8 @@ class CollectorIdentity:
 @dataclass(frozen=True)
 class CollectorConfig:
     endpoint: str
-    identity: CollectorIdentity
+    identity: CollectorIdentity | None
+    token: str | None
 
 
 GITHUB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
@@ -157,17 +158,30 @@ def load_config(
     file_values = _read_owner_only(
         Path(path or default_config_path(codex_home)).expanduser().resolve()
     )
-    endpoint = os.environ.get("SHERLOCK_INGEST_URL")
+    endpoint: object = os.environ.get("SHERLOCK_INGEST_URL")
     if endpoint is None:
         endpoint = file_values.get("endpoint")
-    identity = validate_identity(
-        name=os.environ.get("SHERLOCK_NAME", file_values.get("name")),
-        github_id=os.environ.get(
+    identity_values = {
+        "name": os.environ.get("SHERLOCK_NAME", file_values.get("name")),
+        "github_id": os.environ.get(
             "SHERLOCK_GITHUB_ID", file_values.get("github_id")
         ),
-        email=os.environ.get("SHERLOCK_EMAIL", file_values.get("email")),
-        installation_id=os.environ.get(
+        "email": os.environ.get("SHERLOCK_EMAIL", file_values.get("email")),
+        "installation_id": os.environ.get(
             "SHERLOCK_INSTALLATION_ID", file_values.get("installation_id")
         ),
-    )
-    return CollectorConfig(validate_endpoint(endpoint), identity)
+    }
+    if any(value is not None for value in identity_values.values()):
+        identity = validate_identity(**identity_values)
+        token = None
+    else:
+        identity = None
+        raw_token = os.environ.get(
+            "SHERLOCK_INGEST_TOKEN", file_values.get("token")
+        )
+        if not isinstance(raw_token, str) or not raw_token:
+            raise ConfigurationError(
+                "collector identity or SHERLOCK_INGEST_TOKEN is required"
+            )
+        token = raw_token
+    return CollectorConfig(validate_endpoint(endpoint), identity, token)

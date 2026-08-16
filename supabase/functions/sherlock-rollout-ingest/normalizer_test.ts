@@ -59,6 +59,11 @@ async function fixture(
       parse_status: decoded
         ? (typeof decoded.type === "string" ? "ok" : "unknown")
         : "malformed",
+      native_record_start_offset: null,
+      native_record_end_offset: null,
+      native_record_sha256: null,
+      fragment_index: null,
+      fragment_count: null,
     });
     offset += line.byteLength;
   }

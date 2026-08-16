@@ -65,20 +65,7 @@ export class IngestService {
         400,
       );
     }
-    for (const record of manifest.records) {
-      const relativeStart = record.source_start_offset - manifest.start_offset;
-      const relativeEnd = record.source_end_offset - manifest.start_offset;
-      if (
-        (await sha256Hex(source.slice(relativeStart, relativeEnd))) !==
-          record.record_sha256
-      ) {
-        throw new IngestError(
-          "record_integrity_mismatch",
-          `record ${record.record_index} hash does not match source bytes`,
-          400,
-        );
-      }
-    }
+    await validateRecordHashes(source, manifest);
     let receipt = await this.batches.findExact(attribution, manifest);
     if (!receipt) {
       const path = storagePath(attribution, manifest);
@@ -87,6 +74,32 @@ export class IngestService {
     }
     await this.normalizer?.normalize(receipt, manifest, source);
     return receipt;
+  }
+}
+
+async function validateRecordHashes(
+  source: Uint8Array,
+  manifest: BatchManifest,
+): Promise<void> {
+  const concurrency = 64;
+  for (let start = 0; start < manifest.records.length; start += concurrency) {
+    const records = manifest.records.slice(start, start + concurrency);
+    const hashes = await Promise.all(records.map((record) => {
+      const relativeStart = record.source_start_offset - manifest.start_offset;
+      const relativeEnd = record.source_end_offset - manifest.start_offset;
+      return sha256Hex(source.subarray(relativeStart, relativeEnd));
+    }));
+    for (let index = 0; index < records.length; index++) {
+      if (hashes[index] !== records[index].record_sha256) {
+        throw new IngestError(
+          "record_integrity_mismatch",
+          `record ${
+            records[index].record_index
+          } hash does not match source bytes`,
+          400,
+        );
+      }
+    }
   }
 }
 

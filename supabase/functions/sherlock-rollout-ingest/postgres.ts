@@ -5,6 +5,8 @@ import {
   type BatchManifest,
   type CollectorIdentity,
   type CommittedReceipt,
+  type CoverageRange,
+  type CoverageStreamQuery,
   IngestError,
   receiptFromRow,
   storagePath,
@@ -92,6 +94,11 @@ export function assertExactRecords(
       native_type: record.native_type,
       native_payload_type: record.native_payload_type,
       parse_status: record.parse_status,
+      native_record_start_offset: record.native_record_start_offset,
+      native_record_end_offset: record.native_record_end_offset,
+      native_record_sha256: record.native_record_sha256,
+      fragment_index: record.fragment_index,
+      fragment_count: record.fragment_count,
     };
     for (const [field, value] of Object.entries(expected)) {
       const actual = typeof value === "number"
@@ -130,7 +137,8 @@ async function assertCommittedRecords(
     `select record_index, source_start_offset, source_end_offset, record_sha256,
             native_type, native_payload_type,
             to_char(occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as occurred_at,
-            parse_status
+            parse_status, native_record_start_offset, native_record_end_offset,
+            native_record_sha256, fragment_index, fragment_count
        from telemetry.native_records
       where workspace_id = $1 and batch_id = $2
       order by record_index`,
@@ -176,7 +184,10 @@ export class PostgresBatchRepository implements BatchRepository {
 
   static connect(databaseUrl: string): PostgresBatchRepository {
     return new PostgresBatchRepository(
-      postgres(databaseUrl, { prepare: false, max: 2, idle_timeout: 20 }),
+      // Bulk ingestion is intentionally sequential within one request. A
+      // single connection per isolate preserves that throughput while keeping
+      // 32-worker backfills below small-project connection ceilings.
+      postgres(databaseUrl, { prepare: false, max: 1, idle_timeout: 20 }),
     );
   }
 
@@ -258,6 +269,55 @@ export class PostgresBatchRepository implements BatchRepository {
       await tx.unsafe("set local role sherlock_ingest");
       const row = await findExactBatch(tx, attribution, manifest);
       return row ? receiptFromRow(row) : null;
+    });
+  }
+
+  async coverage(
+    attribution: Attribution,
+    streams: readonly CoverageStreamQuery[],
+  ): Promise<CoverageRange[]> {
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_ingest");
+      const rows = await tx.unsafe(
+        `with requested as (
+           select source_kind, source_stream_key, generation_key,
+                  generation_seq, end_offset as query_end_offset
+             from jsonb_to_recordset($3::jsonb) as request(
+               source_kind text,
+               source_stream_key text,
+               generation_key text,
+               generation_seq bigint,
+               end_offset bigint
+             )
+         )
+         select batch.source_kind, batch.source_stream_key,
+                batch.generation_key, batch.generation_seq,
+                batch.start_offset, batch.end_offset, batch.source_sha256
+           from telemetry.ingest_batches as batch
+           join requested
+             on requested.source_kind = batch.source_kind
+            and requested.source_stream_key = batch.source_stream_key
+            and requested.generation_key = batch.generation_key
+            and requested.generation_seq = batch.generation_seq
+            and batch.start_offset < requested.query_end_offset
+          where batch.workspace_id = $1 and batch.collector_key = $2
+          order by batch.source_stream_key, batch.generation_seq,
+                   batch.start_offset`,
+        [
+          attribution.workspace_id,
+          attribution.collector_key,
+          JSON.stringify(streams),
+        ],
+      );
+      return rows.map((row): CoverageRange => ({
+        source_kind: "rollout",
+        source_stream_key: String(row.source_stream_key),
+        generation_key: String(row.generation_key),
+        generation_seq: Number(row.generation_seq),
+        start_offset: Number(row.start_offset),
+        end_offset: Number(row.end_offset),
+        source_sha256: String(row.source_sha256),
+      }));
     });
   }
 
@@ -380,6 +440,11 @@ export class PostgresBatchRepository implements BatchRepository {
         native_payload_type: record.native_payload_type,
         occurred_at: record.occurred_at,
         parse_status: record.parse_status,
+        native_record_start_offset: record.native_record_start_offset,
+        native_record_end_offset: record.native_record_end_offset,
+        native_record_sha256: record.native_record_sha256,
+        fragment_index: record.fragment_index,
+        fragment_count: record.fragment_count,
       }));
       for (let offset = 0; offset < records.length; offset += 1_000) {
         const locatorBatch = records.slice(offset, offset + 1_000);
@@ -396,6 +461,11 @@ export class PostgresBatchRepository implements BatchRepository {
             "native_payload_type",
             "occurred_at",
             "parse_status",
+            "native_record_start_offset",
+            "native_record_end_offset",
+            "native_record_sha256",
+            "fragment_index",
+            "fragment_count",
           )
         }`;
       }

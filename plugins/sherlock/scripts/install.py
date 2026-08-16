@@ -70,6 +70,17 @@ def install_runtime(source: Path, destination: Path) -> None:
         shutil.rmtree(backup)
 
 
+def install_command(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copyfile(source, temporary)
+        os.chmod(temporary, 0o700)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     args = arguments()
     codex_home = Path(
@@ -105,12 +116,17 @@ def main() -> int:
     except ConfigurationError as error:
         raise SystemExit(f"invalid collector identity: {error}") from error
     install_runtime(package, root / "runtime" / "sherlock_collector")
+    scripts = repo_root / "plugins" / "sherlock" / "scripts"
+    install_command(scripts / "export_history.py", root / "bin" / "export-history")
+    install_command(scripts / "upload_history.py", root / "bin" / "upload-history")
     atomic_json(
         config_path,
         {"endpoint": endpoint, **identity.to_dict()},
     )
     print(f"Installed collector runtime under {root}")
     print("Stored the endpoint and identity in owner-only collector.json")
+    print(f"Export command: {root / 'bin' / 'export-history'}")
+    print(f"Upload command: {root / 'bin' / 'upload-history'}")
     return 0
 
 

@@ -227,6 +227,8 @@ class ConfigurationTests(unittest.TestCase):
                 loaded.endpoint,
                 "https://example.test/functions/v1/ingest",
             )
+            self.assertIsNotNone(loaded.identity)
+            assert loaded.identity is not None
             self.assertEqual(loaded.identity.email, "test@example.com")
             path.chmod(0o640)
             with self.assertRaisesRegex(ConfigurationError, "owner-only"):
@@ -246,10 +248,27 @@ class ConfigurationTests(unittest.TestCase):
 
             self.assertEqual(loaded.endpoint, "https://example.test/ingest")
 
+    def test_legacy_token_config_remains_uploadable_during_upgrade(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "collector.json"
+            path.write_text(
+                json.dumps({
+                    "endpoint": "https://example.test/functions/v1/ingest",
+                    "token": "opaque-test-token",
+                }),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            loaded = load_config(path)
+
+            self.assertIsNone(loaded.identity)
+            self.assertEqual(loaded.token, "opaque-test-token")
+
     def test_installer_copies_runtime_and_writes_identity_only_config(self):
         with TemporaryDirectory() as temporary:
             codex_home = Path(temporary) / "codex"
-            completed = subprocess.run(
+            subprocess.run(
                 [
                     sys.executable,
                     str(INSTALLER),
@@ -278,6 +297,48 @@ class ConfigurationTests(unittest.TestCase):
                     / "runtime"
                     / "sherlock_collector"
                     / "cli.py"
+                ).is_file()
+            )
+            export_command = codex_home / "sherlock" / "bin" / "export-history"
+            upload_command = codex_home / "sherlock" / "bin" / "upload-history"
+            self.assertTrue(export_command.is_file())
+            self.assertTrue(upload_command.is_file())
+            self.assertEqual(export_command.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(upload_command.stat().st_mode & 0o777, 0o700)
+            help_result = subprocess.run(
+                [str(export_command), "--help"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "CODEX_HOME": str(codex_home)},
+            )
+            self.assertIn("Export all local Codex", help_result.stdout)
+            rollout = codex_home / "sessions" / "rollout-installed.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"type":"event"}\n', encoding="utf-8")
+            archive = Path(temporary) / "installed-history.zip"
+            subprocess.run(
+                [
+                    str(export_command),
+                    "--codex-home",
+                    str(codex_home),
+                    "--output",
+                    str(archive),
+                    "--acknowledge-sensitive-data",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={key: value for key, value in os.environ.items() if key != "CODEX_HOME"},
+            )
+            self.assertTrue(archive.is_file())
+            self.assertTrue(
+                (
+                    codex_home
+                    / "sherlock"
+                    / "runtime"
+                    / "sherlock_collector"
+                    / "backfill.py"
                 ).is_file()
             )
             installed = json.loads(config.read_text(encoding="utf-8"))

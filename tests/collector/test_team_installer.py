@@ -6,6 +6,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
+import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -91,13 +92,33 @@ for line in sys.stdin:
 '''
 
 
+FAKE_PYTHON = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+if len(sys.argv) > 1 and sys.argv[1].endswith("/upload-history"):
+    capture = Path(os.environ["SHERLOCK_FAKE_CAPTURE"])
+    with capture.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"upload_argv": sys.argv[1:]}) + "\n")
+    print(json.dumps({"archive": sys.argv[-1], "batches_uploaded": 1}))
+    raise SystemExit(0)
+
+python = os.environ["SHERLOCK_REAL_PYTHON"]
+os.execv(python, [python, *sys.argv[1:]])
+'''
+
+
 class TeamInstallerTests(unittest.TestCase):
     def test_one_command_installs_and_trusts_only_sherlock_hooks(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             codex_home = root / "codex"
             fake_codex = root / "fake-codex"
+            fake_python = root / "fake-python"
             capture = root / "calls.jsonl"
+            history = root / "sherlock-codex-history.zip"
             old_checkout = root / "old-checkout"
             old_manifest = old_checkout / ".agents" / "plugins" / "marketplace.json"
             old_manifest.parent.mkdir(parents=True)
@@ -112,12 +133,19 @@ class TeamInstallerTests(unittest.TestCase):
             )
             fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
             fake_codex.chmod(0o755)
+            fake_python.write_text(textwrap.dedent(FAKE_PYTHON), encoding="utf-8")
+            fake_python.chmod(0o755)
+            rollout = codex_home / "sessions" / "rollout-before-install.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"type":"event"}\n', encoding="utf-8")
             environment = os.environ.copy()
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
                     "CODEX_HOME": str(codex_home),
-                    "PYTHON_BIN": sys.executable,
+                    "HOME": str(root / "home"),
+                    "PYTHON_BIN": str(fake_python),
+                    "SHERLOCK_REAL_PYTHON": sys.executable,
                     "SHERLOCK_FAKE_CAPTURE": str(capture),
                     "SHERLOCK_FAKE_EXISTING_MARKETPLACE": str(old_checkout),
                     "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
@@ -134,6 +162,10 @@ class TeamInstallerTests(unittest.TestCase):
                     "test-user",
                     "--email",
                     "TEST@example.com",
+                    "--acknowledge-sensitive-data",
+                    "--upload-history",
+                    "--history-output",
+                    str(history),
                 ],
                 cwd=ROOT,
                 env=environment,
@@ -150,6 +182,11 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertEqual(configured["github_id"], "test-user")
             self.assertEqual(configured["email"], "test@example.com")
             self.assertNotIn("token", configured)
+            self.assertTrue(history.is_file())
+            self.assertEqual(history.stat().st_mode & 0o777, 0o600)
+            with zipfile.ZipFile(history) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest["session_count"], 1)
             self.assertIn("Trusted 4 Sherlock hooks", completed.stdout)
             calls = [json.loads(line) for line in capture.read_text().splitlines()]
             self.assertEqual(
@@ -175,6 +212,108 @@ class TeamInstallerTests(unittest.TestCase):
                 )
             )
             self.assertNotIn("other@market", json.dumps(edits))
+            self.assertEqual(calls[4]["upload_argv"][-1], str(history))
+            self.assertIn("history upload completed", completed.stdout.lower())
+
+            handoff_completed = subprocess.run(
+                [
+                    "sh",
+                    str(INSTALLER),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "test@example.com",
+                    "--acknowledge-sensitive-data",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(handoff_completed.returncode, 0, handoff_completed.stderr)
+            handoffs = list(
+                (root / "home" / "Downloads").glob(
+                    "sherlock-codex-history-*.zip"
+                )
+            )
+            self.assertEqual(len(handoffs), 1)
+            handoff = handoffs[0]
+            self.assertTrue(handoff.is_file())
+            self.assertIn(
+                f"archive ready for administrator handoff: {handoff}".lower(),
+                handoff_completed.stdout.lower(),
+            )
+            all_calls = [
+                json.loads(line) for line in capture.read_text().splitlines()
+            ]
+            self.assertEqual(sum("upload_argv" in call for call in all_calls), 1)
+
+    def test_history_export_requires_explicit_sensitive_data_consent(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(INSTALLER),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "test@example.com",
+                ],
+                cwd=ROOT,
+                env={**os.environ, "CODEX_HOME": str(codex_home)},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn(
+                "requires --acknowledge-sensitive-data", completed.stderr
+            )
+            self.assertFalse((codex_home / "sherlock" / "collector.json").exists())
+
+    def test_history_worker_counts_fail_before_export(self):
+        cases = (
+            (["--history-workers", "0"], "--history-workers"),
+            (
+                ["--upload-history", "--upload-workers", "17"],
+                "--upload-workers",
+            ),
+        )
+        for options, expected in cases:
+            with self.subTest(options=options), TemporaryDirectory() as temporary:
+                codex_home = Path(temporary) / "codex"
+                completed = subprocess.run(
+                    [
+                        "sh",
+                        str(INSTALLER),
+                        "--name",
+                        "Test User",
+                        "--github-id",
+                        "test-user",
+                        "--email",
+                        "test@example.com",
+                        "--acknowledge-sensitive-data",
+                        *options,
+                    ],
+                    cwd=ROOT,
+                    env={**os.environ, "CODEX_HOME": str(codex_home)},
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn(expected, completed.stderr)
+                self.assertFalse(codex_home.exists())
 
 
 if __name__ == "__main__":
