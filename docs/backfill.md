@@ -10,11 +10,11 @@ Sherlock installation includes backfill by default:
   --acknowledge-sensitive-data
 ```
 
-The installer snapshots history before enabling the plugin and prints the
-owner-only ZIP path for administrator handoff. Add `--upload-history` to upload
-the ZIP after installation, or `--skip-history` to install without exporting.
-Use `--history-output PATH`, `--history-workers N`, and `--upload-workers N` for
-explicit overrides.
+The installer snapshots history before enabling the plugin, saves the
+owner-only ZIP under `~/Downloads/`, and prints its path for administrator
+handoff. Add `--upload-history` to upload the ZIP after installation, or
+`--skip-history` to install without exporting. Use `--history-output PATH`,
+`--history-workers N`, and `--upload-workers N` for explicit overrides.
 
 The underlying backfill remains deliberately split into two reusable commands:
 

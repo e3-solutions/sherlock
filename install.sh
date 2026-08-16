@@ -21,7 +21,8 @@ Usage: ./install.sh --name NAME --github-id LOGIN --email EMAIL \
   [--acknowledge-sensitive-data] [--upload-history | --skip-history]
 
 By default, exports all Codex history to an owner-only ZIP, installs the
-Sherlock Codex plugin and collector, and leaves the ZIP for an administrator.
+Sherlock Codex plugin and collector, and leaves the ZIP in ~/Downloads for an
+administrator.
 Use --upload-history to upload it after installation or --skip-history to omit
 the history export. Exporting requires --acknowledge-sensitive-data.
 
@@ -166,9 +167,8 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
 
 if [ "$HISTORY_MODE" != "skip" ]; then
   if [ -z "$HISTORY_OUTPUT" ]; then
-    HISTORY_DIRECTORY="$CODEX_HOME/sherlock/backfills"
+    HISTORY_DIRECTORY="$HOME/Downloads"
     mkdir -p "$HISTORY_DIRECTORY"
-    chmod 700 "$HISTORY_DIRECTORY"
     HISTORY_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
     HISTORY_OUTPUT="$HISTORY_DIRECTORY/sherlock-codex-history-$HISTORY_TIMESTAMP.zip"
     HISTORY_SUFFIX=1

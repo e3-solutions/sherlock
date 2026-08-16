@@ -143,6 +143,7 @@ class TeamInstallerTests(unittest.TestCase):
                 {
                     "CODEX_BIN": str(fake_codex),
                     "CODEX_HOME": str(codex_home),
+                    "HOME": str(root / "home"),
                     "PYTHON_BIN": str(fake_python),
                     "SHERLOCK_REAL_PYTHON": sys.executable,
                     "SHERLOCK_FAKE_CAPTURE": str(capture),
@@ -214,7 +215,6 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertEqual(calls[4]["upload_argv"][-1], str(history))
             self.assertIn("history upload completed", completed.stdout.lower())
 
-            handoff = root / "admin-handoff.zip"
             handoff_completed = subprocess.run(
                 [
                     "sh",
@@ -226,8 +226,6 @@ class TeamInstallerTests(unittest.TestCase):
                     "--email",
                     "test@example.com",
                     "--acknowledge-sensitive-data",
-                    "--history-output",
-                    str(handoff),
                 ],
                 cwd=ROOT,
                 env=environment,
@@ -237,6 +235,13 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(handoff_completed.returncode, 0, handoff_completed.stderr)
+            handoffs = list(
+                (root / "home" / "Downloads").glob(
+                    "sherlock-codex-history-*.zip"
+                )
+            )
+            self.assertEqual(len(handoffs), 1)
+            handoff = handoffs[0]
             self.assertTrue(handoff.is_file())
             self.assertIn(
                 f"archive ready for administrator handoff: {handoff}".lower(),

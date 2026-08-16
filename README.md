@@ -64,7 +64,7 @@ cd sherlock
 Add `--upload-history` only when the user explicitly requests immediate
 upload. Use `--skip-history` when they decline history export. By default, the
 installer creates an owner-only, timestamped ZIP under
-`$CODEX_HOME/sherlock/backfills/`, installs and trusts Sherlock, then prints the
+`~/Downloads/`, installs and trusts Sherlock, then prints the
 exact archive path for administrator handoff. `--history-output PATH` overrides
 that location.
 
