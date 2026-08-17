@@ -397,8 +397,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
   );
 
   const select = (point) => {
-    const target = laneRef.current?.querySelector('[role="application"]');
-    onSelect(person, point, target);
+    onSelect(person, point);
   };
 
   const handleClick = (event) => {
@@ -554,7 +553,6 @@ function useSharedChartWidth(rootRef, requestedWidth) {
 export default function FlameGraph({ data, chartWidth, stale = false }) {
   const rootRef = useRef(null);
   const detailRef = useRef(null);
-  const selectionOriginRef = useRef(null);
   const detailClosingRef = useRef(false);
   const [selection, setSelection] = useState(null);
   const [detailClosing, setDetailClosing] = useState(false);
@@ -589,7 +587,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     detailClosingRef.current = false;
     setDetailClosing(false);
     setSelection(null);
-    requestAnimationFrame(() => selectionOriginRef.current?.focus());
+    requestAnimationFrame(() => rootRef.current?.focus());
   }, []);
 
   useEffect(() => {
@@ -656,10 +654,9 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     return () => controller.abort();
   }, [data.snapshot, promptRevision, selectedPerson, selectedPoint]);
 
-  const selectInterval = (person, point, origin) => {
+  const selectInterval = (person, point) => {
     detailClosingRef.current = false;
     setDetailClosing(false);
-    selectionOriginRef.current = origin;
     setSelection({ personId: person.id, startMs: point.startMs });
   };
 
@@ -669,6 +666,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       className="flame-graph"
       data-state={stale ? "stale" : "current"}
       aria-label="Code activity over the last 24 hours"
+      tabIndex={-1}
     >
       <div className="flame-graph-scroll">
         <div className="flame-meta-row">

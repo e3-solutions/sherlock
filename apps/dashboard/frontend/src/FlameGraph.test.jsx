@@ -375,8 +375,10 @@ describe("FlameGraph", () => {
     expect(screen.queryByText("prompts recorded in this interval")).not.toBeInTheDocument();
   });
 
-  it("keeps the drawer mounted until its close animation ends, then restores focus", async () => {
+  it("keeps the drawer mounted until close ends, then clears selection without refocusing a row", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
 
@@ -413,11 +415,16 @@ describe("FlameGraph", () => {
 
     fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(chart).toHaveFocus());
+    await waitFor(() => expect(graph).toHaveFocus());
+    expect(chart).not.toHaveFocus();
+    expect(person).not.toHaveAttribute("data-selected");
+    expect(lane).not.toHaveAttribute("data-selected-index");
   });
 
-  it("uses the same closing lifecycle for Escape", async () => {
+  it("uses the same selection-clearing focus lifecycle for Escape", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
 
@@ -433,7 +440,10 @@ describe("FlameGraph", () => {
 
     fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(chart).toHaveFocus());
+    await waitFor(() => expect(graph).toHaveFocus());
+    expect(chart).not.toHaveFocus();
+    expect(person).not.toHaveAttribute("data-selected");
+    expect(lane).not.toHaveAttribute("data-selected-index");
   });
 
   it("exposes stale state without replacing the last-good graph", () => {
