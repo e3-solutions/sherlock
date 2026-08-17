@@ -36,8 +36,9 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   `native_item_id` can bridge the paired Codex representation only when the two
   formats have the same session and content hash and timestamps within two
   seconds. The closest candidate wins with deterministic stable-ID tie breaking;
-  repeated matches to one native ID collapse to that stable prompt. Otherwise
-  the immutable Sherlock event ID remains distinct. Response-item-only runtime
+  repeated matches to one native ID collapse to that stable prompt for the
+  person even when copied across session histories. Otherwise the immutable
+  Sherlock event ID remains distinct. Response-item-only runtime
   context, plus worker and guardian parent messages, is not presented as human
   prompt input.
 - `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>&snapshot=<token>` lazily

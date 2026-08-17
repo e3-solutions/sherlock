@@ -291,6 +291,39 @@ describe("FlameGraph", () => {
     );
   });
 
+  it("rejects prompt details whose count disagrees with the selected snapshot", async () => {
+    vi.mocked(fetch).mockImplementationOnce((url) => {
+      const request = new URL(url, "http://dashboard.test");
+      const start = request.searchParams.get("start");
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          personId: request.searchParams.get("personId"),
+          start,
+          snapshot: request.searchParams.get("snapshot"),
+          prompts: [
+            { id: "p1", at: start, content: "Only one row", truncated: false },
+          ],
+        }),
+      });
+    });
+    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 68, height: 68, left: 0, right: 720, top: 0, width: 720,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Prompt evidence could not be loaded",
+      );
+    });
+    expect(screen.queryByText("1 prompt recorded in this interval.")).not.toBeInTheDocument();
+  });
+
   it("selects by keyboard and restores chart focus when details close", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
     const lane = container.querySelector(".flame-person .flame-lane");

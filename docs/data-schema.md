@@ -1,9 +1,9 @@
 # Sherlock v0 Data Architecture
 
 Status: the Supabase database foundation, rollout collector drain, asynchronous
-Codex normalizer worker, and targeted versioned activity reducer are
-implemented. The snapshot resolver, version activation, and Flame read APIs are
-not.
+Codex normalizer worker, targeted versioned activity reducer, and workspace-
+scoped dashboard Flame read API are implemented. The durable snapshot resolver
+and version activation are not.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
 views separate from source data. Seven source/product tables remain across two
@@ -64,7 +64,7 @@ flowchart LR
     N --> Q["processing.telemetry_jobs"]
     Q --> E["Railway → telemetry.events"]
     E --> A["analytics.activity_spans"]
-    A --> F["Future Flame API"]
+    E --> F["Dashboard Flame read API"]
     N --> T["Future transcript reader"]
 ```
 
@@ -324,8 +324,10 @@ delete source facts.
 The current implementation does not yet provide:
 
 - activity-version activation;
-- signed snapshot tokens and contiguous publication cutoffs;
-- transcript, usage, health, coverage, or Flame read APIs.
+- signed durable snapshot tokens and contiguous publication cutoffs (the
+  dashboard's bounded MVCC visibility receipt only pins append-only event rows
+  between its aggregate and prompt-detail reads);
+- transcript, usage, health, or coverage APIs.
 
 Implement each behavior in service code with integration tests. Do not describe
 it as a database guarantee until a constraint or verified transaction protocol

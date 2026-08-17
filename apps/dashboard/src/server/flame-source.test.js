@@ -126,14 +126,16 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("e.content_byte_size > 0");
     expect(FLAME_SQL).toContain("e.error_code is null");
     expect(FLAME_SQL).toContain("keyed_native_item_id");
-    expect(FLAME_SQL).toContain("partition by session_id, prompt_identity");
+    expect(FLAME_SQL).toContain("partition by person_id, prompt_identity");
     expect(PROMPT_DETAIL_SQL).toContain("content_excerpt");
     expect(PROMPT_DETAIL_SQL).toContain("$5::pg_snapshot snapshot");
     expect(PROMPT_DETAIL_SQL).toContain(
       "pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
     );
     expect(PROMPT_DETAIL_SQL).toContain("where person_id = $6::uuid");
-    expect(PROMPT_DETAIL_SQL).toContain("limit $7");
+    expect(PROMPT_DETAIL_SQL).toContain("$7::timestamptz bucket_start");
+    expect(PROMPT_DETAIL_SQL).toContain("observed_at >= (select bucket_start from p)");
+    expect(PROMPT_DETAIL_SQL).toContain("limit $9");
   });
 
   it("round-trips a bounded immutable aggregate snapshot receipt", () => {
@@ -197,10 +199,12 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[1][1]).toEqual([
       source.workspaceId,
       START.toISOString(),
-      new Date(START.getTime() + BUCKET_MS).toISOString(),
+      "2026-08-17T12:00:00.000Z",
       "sherlock.codex-rollout.v1",
       PG_SNAPSHOT,
       "22222222-2222-4222-8222-222222222222",
+      START.toISOString(),
+      new Date(START.getTime() + BUCKET_MS).toISOString(),
       501,
     ]);
     expect(detail).toMatchObject({
@@ -213,17 +217,24 @@ describe("Sherlock Flame payload", () => {
 
   it("uses stable prompt identifiers before a bounded unkeyed format bridge", () => {
     expect(UNKEYED_PROMPT_MATCH_SECONDS).toBe(2);
-    expect(FLAME_SQL).toContain("partition by session_id, native_item_id");
+    expect(FLAME_SQL).toContain("native_identity_candidates as materialized");
+    expect(FLAME_SQL).not.toContain("partition by session_id, native_item_id");
     expect(FLAME_SQL).toContain("'logical:' || canonical_scope_key || ':' || normalizer_version");
     expect(FLAME_SQL).toContain("'native:' || submitted.native_item_id");
     expect(FLAME_SQL).toContain("'native:' || paired.matched_native_item_id");
     expect(FLAME_SQL).toContain("'event:' || submitted.id::text");
     expect(FLAME_SQL).toContain("cross join lateral");
-    expect(FLAME_SQL).toContain("candidate.native_observed_at - submitted.source_observed_at");
+    expect(FLAME_SQL).toContain(
+      "candidate.native_source_observed_at - submitted.source_observed_at",
+    );
+    expect(FLAME_SQL).toContain("native.native_observed_at matched_native_observed_at");
     expect(FLAME_SQL).toContain("candidate.native_item_id, candidate.id");
     expect(FLAME_SQL).toContain("interval '2 seconds'");
     expect(FLAME_SQL).not.toContain("date_trunc(\n                          'second'");
     expect(FLAME_SQL).not.toContain("matching_native_item_id");
     expect(FLAME_SQL).not.toContain("has_submitted_user_message");
+    expect(FLAME_SQL).not.toContain(
+      "unkeyed_native_candidates as materialized",
+    );
   });
 });

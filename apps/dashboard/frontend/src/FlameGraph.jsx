@@ -695,6 +695,9 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
           startMs: selectedPoint.startMs,
           snapshot: data.snapshot,
         });
+        if (items.length !== selectedPoint.prompts) {
+          throw new Error("Prompt evidence count does not match the timeline snapshot");
+        }
         setPromptEvidence({ state: "ready", items });
       })
       .catch(() => {

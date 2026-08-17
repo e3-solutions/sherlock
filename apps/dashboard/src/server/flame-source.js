@@ -101,24 +101,16 @@ prompt_candidates as materialized (
          ) observed_at
     from canonical_prompt_candidates
    where canonical_scope_key is not null and logical_event_key is not null
-), unkeyed_native_candidates as materialized (
-  select ranked.*
-    from (
-      select canonical_prompt_candidates.*,
-             coalesce(
-               ${nativeItemTimestamp("native_item_id")},
-               source_observed_at
-             ) native_observed_at,
-             row_number() over (
-               partition by session_id, native_item_id
-               order by source_priority desc, source_observed_at asc nulls last, id
-             ) native_rank
-        from canonical_prompt_candidates
-       where (canonical_scope_key is null or logical_event_key is null)
-         and event_subtype = 'message'
-         and native_item_id is not null
-    ) ranked
-   where native_rank = 1
+), native_identity_candidates as materialized (
+  select canonical_prompt_candidates.*,
+         source_observed_at native_source_observed_at,
+         coalesce(
+           ${nativeItemTimestamp("native_item_id")},
+           source_observed_at
+         ) native_observed_at
+    from canonical_prompt_candidates
+   where event_subtype = 'message'
+     and native_item_id is not null
 ), unkeyed_submitted_prompts as materialized (
   select canonical_prompt_candidates.*
     from canonical_prompt_candidates
@@ -131,19 +123,19 @@ prompt_candidates as materialized (
     from unkeyed_submitted_prompts submitted
     cross join lateral (
       select candidate.native_item_id, candidate.native_observed_at
-        from unkeyed_native_candidates candidate
+        from native_identity_candidates candidate
        where candidate.session_id = submitted.session_id
          and candidate.content_sha256 = submitted.content_sha256
-         and candidate.native_observed_at
+         and candidate.native_source_observed_at
            >= submitted.source_observed_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-         and candidate.native_observed_at
+         and candidate.native_source_observed_at
            <= submitted.source_observed_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
        order by abs(extract(epoch from (
-                  candidate.native_observed_at - submitted.source_observed_at
+                  candidate.native_source_observed_at - submitted.source_observed_at
                 ))),
-                case when candidate.native_observed_at >= submitted.source_observed_at
+                case when candidate.native_source_observed_at >= submitted.source_observed_at
                      then 0 else 1 end,
-                candidate.native_observed_at, candidate.native_item_id, candidate.id
+                candidate.native_source_observed_at, candidate.native_item_id, candidate.id
        limit 1
     ) native
 ), unkeyed_prompt_sources as materialized (
@@ -170,7 +162,7 @@ prompt_candidates as materialized (
     from (
       select prompt_identities.*,
              row_number() over (
-               partition by session_id, prompt_identity
+               partition by person_id, prompt_identity
                order by observed_at asc, source_observed_at asc, id
              ) canonical_rank
         from prompt_identities
@@ -290,7 +282,8 @@ export const PROMPT_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text normalizer_version,
-         $5::pg_snapshot snapshot
+         $5::pg_snapshot snapshot, $7::timestamptz bucket_start,
+         $8::timestamptz bucket_end
 ), ${promptsCte(
   ", e.content_byte_size, e.content_excerpt",
   // Recreate the aggregate's event visibility without keeping its transaction open.
@@ -303,8 +296,10 @@ select id::text id, observed_at,
        octet_length(coalesce(content_excerpt, ''))::bigint excerpt_byte_size
   from prompts
  where person_id = $6::uuid
+   and observed_at >= (select bucket_start from p)
+   and observed_at < (select bucket_end from p)
  order by observed_at, id
- limit $7
+limit $9
 `;
 
 export class FlameSourceError extends Error {
@@ -543,14 +538,18 @@ export class DirectFlameSource {
         throw new FlameSourceError("flame_prompt_request_out_of_range");
       }
       const endAt = new Date(startAt.getTime() + BUCKET_MS);
+      const snapshotStartAt = new Date(snapshotStartMs);
+      const snapshotEndAt = new Date(snapshotEndMs);
       const limit = 501;
       const rows = await tx.unsafe(PROMPT_DETAIL_SQL, [
         this.workspaceId,
-        startAt.toISOString(),
-        endAt.toISOString(),
+        snapshotStartAt.toISOString(),
+        snapshotEndAt.toISOString(),
         NORMALIZER_VERSION,
         snapshotReceipt.snapshot,
         personId,
+        startAt.toISOString(),
+        endAt.toISOString(),
         limit,
       ]);
       if (rows.length === limit) {
