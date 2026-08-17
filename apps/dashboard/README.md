@@ -33,3 +33,8 @@ exceed 1000.
 
 Run corepack pnpm install --frozen-lockfile, then pnpm check, pnpm test, and
 pnpm build.
+
+## Railway deployment
+
+Deploy apps/dashboard as the service source root so its railway.json and
+Dockerfile are authoritative instead of the repository-level worker config.
