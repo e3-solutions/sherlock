@@ -24,8 +24,6 @@ import {
   getPersonActivityStatus,
 } from "./flame-data.js";
 
-const MIN_CHART_WIDTH = 1_008;
-const DEFAULT_CHART_WIDTH = 1_440;
 const LANE_HEIGHT = 82;
 const MIN_PROMPT_STEM_LENGTH = 4;
 const MAX_PROMPT_STEM_LENGTH = 14;
@@ -105,35 +103,6 @@ export function BucketTooltip({ active, coordinate, laneRef, payload, personName
   const [tooltipSize, setTooltipSize] = useState(DEFAULT_TOOLTIP_SIZE);
   const [, reposition] = useState(0);
   const point = payload?.find((entry) => entry?.payload)?.payload;
-
-  useLayoutEffect(() => {
-    if (!active || !Number.isFinite(coordinate?.x) || !laneRef?.current) return;
-    const lane = laneRef.current;
-    const scroller = lane.closest(".flame-graph-scroll");
-    if (!scroller) return;
-
-    const laneBox = lane.getBoundingClientRect();
-    const scrollerBox = scroller.getBoundingClientRect();
-    if (scrollerBox.width <= 0) return;
-    const rail = Number.parseFloat(getComputedStyle(scroller).getPropertyValue("--flame-rail")) || 0;
-    const anchorX = laneBox.left + coordinate.x;
-    const visibleLeft = Math.min(scrollerBox.right, scrollerBox.left + rail + TOOLTIP_EDGE_PADDING);
-    const visibleRight = scrollerBox.right - TOOLTIP_EDGE_PADDING;
-    let delta = 0;
-    if (anchorX < visibleLeft) delta = anchorX - visibleLeft;
-    if (anchorX > visibleRight) delta = anchorX - visibleRight;
-    if (delta !== 0) {
-      const nextScrollLeft = clamp(
-        scroller.scrollLeft + delta,
-        0,
-        scroller.scrollWidth - scroller.clientWidth,
-      );
-      if (nextScrollLeft !== scroller.scrollLeft) {
-        scroller.scrollLeft = nextScrollLeft;
-        reposition((revision) => revision + 1);
-      }
-    }
-  }, [active, coordinate?.x, laneRef]);
 
   useLayoutEffect(() => {
     if (!active || !point || !tooltipRef.current) return;
@@ -561,10 +530,14 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
   );
 }
 
-function useSharedChartWidth(rootRef, requestedWidth) {
-  const [measuredWidth, setMeasuredWidth] = useState(requestedWidth ?? DEFAULT_CHART_WIDTH);
+export function getAvailableChartWidth(containerWidth, railWidth) {
+  return Math.max(1, containerWidth - railWidth);
+}
 
-  useEffect(() => {
+function useSharedChartWidth(rootRef, requestedWidth) {
+  const [measuredWidth, setMeasuredWidth] = useState(requestedWidth ?? 1);
+
+  useLayoutEffect(() => {
     if (Number.isFinite(requestedWidth)) {
       setMeasuredWidth(requestedWidth);
       return undefined;
@@ -575,7 +548,7 @@ function useSharedChartWidth(rootRef, requestedWidth) {
 
     const update = () => {
       const rail = Number.parseFloat(getComputedStyle(root).getPropertyValue("--flame-rail")) || 260;
-      setMeasuredWidth(Math.max(MIN_CHART_WIDTH, root.clientWidth - rail));
+      setMeasuredWidth(getAvailableChartWidth(root.clientWidth, rail));
     };
     const observer = new ResizeObserver(update);
     observer.observe(root);
@@ -583,7 +556,7 @@ function useSharedChartWidth(rootRef, requestedWidth) {
     return () => observer.disconnect();
   }, [requestedWidth, rootRef]);
 
-  return Math.max(MIN_CHART_WIDTH, measuredWidth);
+  return Math.max(1, measuredWidth);
 }
 
 export default function FlameGraph({ data, chartWidth, stale = false }) {

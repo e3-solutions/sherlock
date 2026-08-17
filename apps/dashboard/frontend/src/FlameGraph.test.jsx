@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import FlameGraph, {
   BucketTooltip,
+  getAvailableChartWidth,
   getBucketTooltipPlacement,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
@@ -45,6 +46,17 @@ function model() {
     ],
   });
 }
+
+describe("getAvailableChartWidth", () => {
+  it("uses all viewport space beside the person rail without a desktop minimum", () => {
+    expect(getAvailableChartWidth(1_440, 260)).toBe(1_180);
+    expect(getAvailableChartWidth(320, 164)).toBe(156);
+  });
+
+  it("keeps the chart renderable when the rail consumes the measured width", () => {
+    expect(getAvailableChartWidth(160, 164)).toBe(1);
+  });
+});
 
 describe("FlameGraph", () => {
   beforeEach(() => {
@@ -234,6 +246,7 @@ describe("FlameGraph", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const wrapper = lane.querySelector(".recharts-wrapper");
+    const scroller = container.querySelector(".flame-graph-scroll");
     const bounds = {
       bottom: 82,
       height: 82,
@@ -247,6 +260,14 @@ describe("FlameGraph", () => {
     };
     vi.spyOn(lane, "getBoundingClientRect").mockReturnValue(bounds);
     vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(bounds);
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue({
+      ...bounds,
+      right: 320,
+      width: 320,
+    });
+    Object.defineProperty(scroller, "clientWidth", { configurable: true, value: 320 });
+    Object.defineProperty(scroller, "scrollWidth", { configurable: true, value: 1008 });
+    scroller.scrollLeft = 37;
 
     fireEvent.mouseMove(wrapper, { clientX: 3, clientY: 34 });
     await waitFor(() => {
@@ -259,6 +280,7 @@ describe("FlameGraph", () => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("1 observed session");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 0");
     });
+    expect(scroller.scrollLeft).toBe(37);
   });
 
   it("opens observed interval details for the exact clicked bucket", () => {

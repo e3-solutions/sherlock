@@ -70,8 +70,8 @@ input { font: inherit; }
 .flame-graph-scroll {
   height: 100%;
   min-width: 100%;
-  overflow: auto;
-  overscroll-behavior-x: contain;
+  overflow-x: hidden;
+  overflow-y: auto;
   scrollbar-color: var(--flame-rule) var(--flame-page);
 }
 
@@ -123,8 +123,8 @@ input { font: inherit; }
 .flame-meta-row,
 .flame-person {
   display: grid;
-  grid-template-columns: var(--flame-rail) minmax(1008px, 1fr);
-  width: max-content;
+  grid-template-columns: var(--flame-rail) minmax(0, 1fr);
+  width: 100%;
   min-width: 100%;
 }
 
@@ -211,7 +211,7 @@ input { font: inherit; }
 
 .flame-time-axis {
   position: relative;
-  min-width: 1008px;
+  min-width: 0;
   color: var(--flame-muted);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
@@ -293,9 +293,11 @@ input { font: inherit; }
 
 .flame-lane {
   position: relative;
-  min-width: 1008px;
+  min-width: 0;
   overflow: visible;
   background: var(--flame-surface);
+  cursor: pointer;
+  touch-action: pan-y;
 }
 
 .flame-lane:focus-within {
@@ -306,6 +308,7 @@ input { font: inherit; }
 .flame-lane .recharts-wrapper,
 .flame-lane .recharts-surface {
   display: block;
+  cursor: pointer;
 }
 
 .flame-lane .recharts-surface:focus-visible {
@@ -314,7 +317,7 @@ input { font: inherit; }
 }
 
 .flame-prompt-stem {
-  cursor: help;
+  cursor: pointer;
   outline: none;
 }
 
@@ -640,6 +643,7 @@ input { font: inherit; }
   .portal-header h1 { font-size: 20px; }
   .flame-legend { gap: 4px 8px; font-size: 9px; }
   .flame-legend li { gap: 4px; }
+  .flame-time-axis time:nth-child(even) { display: none; }
 }
 
 @media (max-width: 520px) {
@@ -649,6 +653,11 @@ input { font: inherit; }
   .portal-header h1 { font-size: 18px; }
   .flame-person-rail { padding: 0 10px; }
   .flame-person-rail h2 { font-size: 14px; }
+
+  .flame-time-axis time { display: none; }
+  .flame-time-axis time:first-child,
+  .flame-time-axis time:nth-child(7),
+  .flame-time-axis time:last-child { display: block; }
 
   .flame-detail {
     top: auto;
