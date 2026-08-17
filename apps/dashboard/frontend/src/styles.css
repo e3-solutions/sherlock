@@ -104,6 +104,7 @@ input { font: inherit; }
   min-width: 100%;
   overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
   scrollbar-gutter: stable;
   scrollbar-color: var(--flame-rule) var(--flame-page);
 }
