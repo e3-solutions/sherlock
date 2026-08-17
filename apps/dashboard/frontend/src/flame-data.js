@@ -52,6 +52,52 @@ function requireCount(value, path) {
   return value;
 }
 
+function requirePositiveCount(value, path) {
+  const result = requireCount(value, path);
+  if (result === 0) fail(path, "a positive safe integer");
+  return result;
+}
+
+function requireBoolean(value, path) {
+  if (typeof value !== "boolean") fail(path, "a boolean");
+  return value;
+}
+
+function requireNullableString(value, path) {
+  return value === null || value === undefined ? null : requireNonemptyString(value, path);
+}
+
+function requireEnum(value, allowed, path) {
+  const result = requireNonemptyString(value, path);
+  if (!allowed.includes(result)) fail(path, allowed.map((item) => `"${item}"`).join(" or "));
+  return result;
+}
+
+function requireEcho(payload, { personId, startMs, snapshot }, label) {
+  if (requireNonemptyString(payload.personId, `${label}.personId`) !== personId) {
+    fail(`${label}.personId`, "the selected person id");
+  }
+  if (requireDate(payload.start, `${label}.start`) !== startMs) {
+    fail(`${label}.start`, "the selected bucket start");
+  }
+  if (requireNonemptyString(payload.snapshot, `${label}.snapshot`) !== snapshot) {
+    fail(`${label}.snapshot`, "the timeline snapshot");
+  }
+}
+
+function requireBucketDate(value, path, startMs) {
+  const atMs = requireDate(value, path);
+  if (atMs < startMs || atMs >= startMs + BUCKET_MS) {
+    fail(path, "inside the selected bucket");
+  }
+  return atMs;
+}
+
+function requireChronological(previous, atMs, path) {
+  if (previous !== null && atMs < previous) fail(path, "chronological");
+  return atMs;
+}
+
 function requireFixedCounts(value, length, path) {
   if (!Array.isArray(value) || value.length !== length) {
     fail(path, `an array of exactly ${length} counts`);
@@ -266,4 +312,191 @@ export function adaptPromptEvidence(value, { personId, startMs, snapshot }) {
     if (typeof prompt.truncated !== "boolean") fail(`${path}.truncated`, "a boolean");
     return { id, atMs, content: prompt.content, truncated: prompt.truncated };
   });
+}
+
+const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
+const ACTOR_ROLES = ["primary", "worker", "guardian", "unknown"];
+const ROLE_BASES = ["normalized_event", "resolved_parent"];
+const DETAIL_KINDS = ["conversation", "tool", "context"];
+const CONVERSATION_ROLES = ["user", "assistant"];
+const TIME_BASES = ["native_item_uuidv7", "occurred_at", "observed_at", "server_received_at"];
+const EVENT_KINDS = [
+  "message", "reasoning", "tool_call", "tool_result", "agent_spawn", "agent_message",
+  "lifecycle", "error",
+];
+
+function adaptCoverage(value, path) {
+  const coverage = requireObject(value, path);
+  const evidence = requireEnum(coverage.evidence, ["observed_events"], `${path}.evidence`);
+  const state = requireEnum(coverage.state, ["partial"], `${path}.state`);
+  const reason = requireEnum(
+    coverage.reason,
+    ["event_presence_not_continuous_attention"],
+    `${path}.reason`,
+  );
+  const timing = requireEnum(
+    coverage.timing,
+    ["observed_evidence_window_not_duration"],
+    `${path}.timing`,
+  );
+  if (requireBoolean(coverage.filesAvailable, `${path}.filesAvailable`) !== false) {
+    fail(`${path}.filesAvailable`, "false for the current evidence contract");
+  }
+  const filesReason = requireEnum(
+    coverage.filesReason,
+    ["tool_payload_not_projected"],
+    `${path}.filesReason`,
+  );
+  return { evidence, state, reason, timing, filesAvailable: false, filesReason };
+}
+
+/** Validates the bounded, snapshot-pinned interval overview response. */
+export function adaptIntervalEvidence(value, expected) {
+  const payload = requireObject(value, "interval evidence");
+  requireEcho(payload, expected, "interval evidence");
+  const { startMs } = expected;
+  if (!Array.isArray(payload.prompts)) fail("interval evidence.prompts", "an array");
+  if (!Array.isArray(payload.work)) fail("interval evidence.work", "an array");
+
+  const promptIds = new Set();
+  let previousPromptAt = null;
+  const prompts = payload.prompts.map((value, index) => {
+    const path = `interval evidence.prompts[${index}]`;
+    const prompt = requireObject(value, path);
+    const id = requireNonemptyString(prompt.id, `${path}.id`);
+    if (promptIds.has(id)) fail(`${path}.id`, "unique");
+    promptIds.add(id);
+    const atMs = requireBucketDate(prompt.at, `${path}.at`, startMs);
+    previousPromptAt = requireChronological(previousPromptAt, atMs, `${path}.at`);
+    if (typeof prompt.content !== "string") fail(`${path}.content`, "a string");
+    return {
+      id,
+      atMs,
+      content: prompt.content,
+      truncated: requireBoolean(prompt.truncated, `${path}.truncated`),
+    };
+  });
+
+  const workIds = new Set();
+  let previousWorkAt = null;
+  const work = payload.work.map((value, index) => {
+    const path = `interval evidence.work[${index}]`;
+    const item = requireObject(value, path);
+    const id = requireNonemptyString(item.id, `${path}.id`);
+    const sessionId = requireNonemptyString(item.sessionId, `${path}.sessionId`);
+    if (workIds.has(id)) fail(`${path}.id`, "unique");
+    workIds.add(id);
+    const firstAtMs = requireBucketDate(item.firstAt, `${path}.firstAt`, startMs);
+    const lastAtMs = requireBucketDate(item.lastAt, `${path}.lastAt`, startMs);
+    if (lastAtMs < firstAtMs) fail(`${path}.lastAt`, "at or after firstAt");
+    previousWorkAt = requireChronological(previousWorkAt, firstAtMs, `${path}.firstAt`);
+    if (!Array.isArray(item.actorRoles) || item.actorRoles.length === 0) {
+      fail(`${path}.actorRoles`, "a nonempty array");
+    }
+    const actorRoles = item.actorRoles.map((role, roleIndex) => (
+      requireEnum(role, ACTOR_ROLES, `${path}.actorRoles[${roleIndex}]`)
+    ));
+    if (new Set(actorRoles).size !== actorRoles.length) fail(`${path}.actorRoles`, "unique");
+    const summary = requireNullableString(item.summary, `${path}.summary`);
+    return {
+      id,
+      sessionId,
+      firstAtMs,
+      lastAtMs,
+      eventCount: requirePositiveCount(item.eventCount, `${path}.eventCount`),
+      role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
+      actorRoles,
+      roleBasis: requireEnum(item.roleBasis, ROLE_BASES, `${path}.roleBasis`),
+      summary,
+      summaryTruncated: summary === null
+        ? false
+        : requireBoolean(item.summaryTruncated, `${path}.summaryTruncated`),
+      detailAvailable: requireBoolean(item.detailAvailable, `${path}.detailAvailable`),
+    };
+  });
+
+  return {
+    prompts,
+    work,
+    coverage: adaptCoverage(payload.coverage, "interval evidence.coverage"),
+  };
+}
+
+/** Validates one bounded page of chronological work/session evidence. */
+export function adaptWorkEvidence(value, expected) {
+  const payload = requireObject(value, "work evidence");
+  requireEcho(payload, expected, "work evidence");
+  if (requireNonemptyString(payload.sessionId, "work evidence.sessionId") !== expected.sessionId) {
+    fail("work evidence.sessionId", "the selected session id");
+  }
+  if (requireNonemptyString(payload.workId, "work evidence.workId") !== expected.workId) {
+    fail("work evidence.workId", "the selected work id");
+  }
+  const firstAtMs = requireBucketDate(payload.firstAt, "work evidence.firstAt", expected.startMs);
+  const lastAtMs = requireBucketDate(payload.lastAt, "work evidence.lastAt", expected.startMs);
+  if (lastAtMs < firstAtMs) fail("work evidence.lastAt", "at or after firstAt");
+  const taskSummary = requireNullableString(payload.taskSummary, "work evidence.taskSummary");
+  if (!Array.isArray(payload.items)) fail("work evidence.items", "an array");
+
+  const ids = new Set();
+  let previousAt = null;
+  const items = payload.items.map((value, index) => {
+    const path = `work evidence.items[${index}]`;
+    const item = requireObject(value, path);
+    const id = requireNonemptyString(item.id, `${path}.id`);
+    if (ids.has(id)) fail(`${path}.id`, "unique");
+    ids.add(id);
+    const atMs = requireBucketDate(item.at, `${path}.at`, expected.startMs);
+    previousAt = requireChronological(previousAt, atMs, `${path}.at`);
+    const kind = requireEnum(item.kind, DETAIL_KINDS, `${path}.kind`);
+    const role = kind === "conversation"
+      ? requireEnum(item.role, CONVERSATION_ROLES, `${path}.role`)
+      : item.role === null ? null : requireNonemptyString(item.role, `${path}.role`);
+    if (typeof item.content !== "string") fail(`${path}.content`, "a string");
+    return {
+      id,
+      atMs,
+      kind,
+      role,
+      label: requireNullableString(item.label, `${path}.label`),
+      content: item.content,
+      truncated: requireBoolean(item.truncated, `${path}.truncated`),
+      provenance: requireEnum(item.provenance, ["normalized_event"], `${path}.provenance`),
+      timeBasis: requireEnum(item.timeBasis, TIME_BASES, `${path}.timeBasis`),
+      eventKind: requireEnum(item.eventKind, EVENT_KINDS, `${path}.eventKind`),
+      eventSubtype: requireNullableString(item.eventSubtype, `${path}.eventSubtype`),
+      actorRole: requireNullableString(item.actorRole, `${path}.actorRole`),
+      origin: requireNullableString(item.origin, `${path}.origin`),
+      phase: requireNullableString(item.phase, `${path}.phase`),
+      toolName: requireNullableString(item.toolName, `${path}.toolName`),
+      toolStatus: requireNullableString(item.toolStatus, `${path}.toolStatus`),
+      toolCallId: requireNullableString(item.toolCallId, `${path}.toolCallId`),
+      model: requireNullableString(item.model, `${path}.model`),
+      projectKey: requireNullableString(item.projectKey, `${path}.projectKey`),
+      repoRemote: requireNullableString(item.repoRemote, `${path}.repoRemote`),
+      branch: requireNullableString(item.branch, `${path}.branch`),
+      cwd: requireNullableString(item.cwd, `${path}.cwd`),
+    };
+  });
+
+  return {
+    sessionId: expected.sessionId,
+    firstAtMs,
+    lastAtMs,
+    eventCount: requirePositiveCount(payload.eventCount, "work evidence.eventCount"),
+    role: (() => {
+      const role = requireEnum(payload.role, SEMANTIC_ROLES, "work evidence.role");
+      if (role !== expected.role) fail("work evidence.role", "the selected semantic role");
+      return role;
+    })(),
+    taskSummary,
+    taskSummaryTruncated: taskSummary === null
+      ? false
+      : requireBoolean(payload.taskSummaryTruncated, "work evidence.taskSummaryTruncated"),
+    items,
+    coverage: adaptCoverage(payload.coverage, "work evidence.coverage"),
+    nextCursor: payload.nextCursor === null
+      ? null
+      : requireNonemptyString(payload.nextCursor, "work evidence.nextCursor"),
+  };
 }

@@ -5,9 +5,18 @@ export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const DATABASE_ROLE = "sherlock_normalizer";
 const SNAPSHOT_TOKEN_VERSION = "v1";
+const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
+const MAX_WORK_CURSOR_LENGTH = 512;
 const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const UNKEYED_PROMPT_MATCH_SECONDS = 2;
+export const UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS = 100;
+export const ASSISTANT_REPRESENTATION_MATCH_SECONDS = 3;
+export const INTERVAL_PROMPT_LIMIT = 500;
+export const INTERVAL_WORK_LIMIT = 200;
+export const DEFAULT_WORK_DETAIL_LIMIT = 50;
+export const MAX_WORK_DETAIL_LIMIT = 100;
 
 function nativeItemTimestamp(column) {
   return `case
@@ -17,6 +26,71 @@ function nativeItemTimestamp(column) {
     ) / 1000.0)
     else null
   end`;
+}
+
+function activityCte({
+  candidateColumns = "",
+  candidatePredicate = "",
+  eventColumns = "",
+  joins = "",
+  visibilityPredicate = "",
+} = {}) {
+  return `
+activity_candidates as materialized (
+  select s.person_id, e.id, e.session_id,
+         s.started_at session_started_at,
+         case when e.actor_role = 'unknown' and s.parent_session_id is not null
+              then 'worker' else e.actor_role end actor_role,
+         e.event_kind, e.event_subtype,
+         coalesce(
+           ${nativeItemTimestamp("e.native_item_id")},
+           coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+         ) observed_at,
+         case when e.canonical_scope_key is not null and e.logical_event_key is not null
+              then row_number() over (
+                partition by e.session_id, e.canonical_scope_key,
+                             e.normalizer_version, e.logical_event_key, e.event_kind
+                order by e.source_priority desc, e.occurred_at asc nulls last, e.id
+              )
+              else 1 end canonical_rank${candidateColumns}
+    from telemetry.events e
+    join telemetry.sessions s
+      on s.workspace_id = e.workspace_id and s.id = e.session_id
+    ${joins}
+    cross join p
+   where e.workspace_id = p.workspace_id
+     and e.normalizer_version = p.normalizer_version
+     and not e.is_replay
+     and e.actor_role <> 'automation'
+     ${candidatePredicate}
+     and e.event_kind in (
+       'message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
+       'agent_message', 'lifecycle', 'error'
+     )
+     and (
+       e.event_kind <> 'message'
+       or e.native_item_id is not null
+       or e.event_subtype = 'user_message'
+     )
+     and (
+       e.event_kind <> 'lifecycle'
+       or e.event_subtype in ('task_started', 'task_complete', 'turn_started', 'turn_complete')
+     )
+     ${visibilityPredicate}
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) >= p.start_at
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) < p.read_at
+), activity_events as materialized (
+  select person_id, session_id, actor_role, observed_at${eventColumns}
+    from activity_candidates
+   where canonical_rank = 1
+     and observed_at >= date_trunc('milliseconds', session_started_at)
+)`;
 }
 
 export const PEOPLE_SQL = `
@@ -33,9 +107,16 @@ function promptsCte(contentColumns = "", visibilityPredicate = "") {
   return `
 prompt_candidates as materialized (
   select s.person_id, e.id, e.session_id, e.canonical_scope_key,
-         e.logical_event_key, e.normalizer_version, e.event_kind,
+         e.logical_event_key, e.turn_id, e.normalizer_version, e.event_kind,
          e.event_subtype, e.source_priority,
-         e.native_item_id, e.content_sha256${contentColumns},
+         e.native_item_id, e.content_sha256,
+         nr.batch_id source_batch_id, nr.record_index source_record_index,
+         nr.source_start_offset, nr.source_end_offset,
+         nr.native_type source_native_type,
+         nr.native_payload_type source_native_payload_type,
+         ib.collector_key source_collector_key,
+         ib.source_kind, ib.source_stream_key,
+         ib.generation_key, ib.generation_seq${contentColumns},
          e.occurred_at source_occurred_at,
          coalesce(e.occurred_at, e.observed_at, e.server_received_at) source_observed_at,
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
@@ -55,6 +136,10 @@ prompt_candidates as materialized (
     from telemetry.events e
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
+    join telemetry.native_records nr
+      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
+    join telemetry.ingest_batches ib
+      on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
     join telemetry.people pe
       on pe.workspace_id = s.workspace_id and pe.id = s.person_id
     cross join p
@@ -114,33 +199,69 @@ prompt_candidates as materialized (
     from prompt_candidates
    where event_subtype = 'message'
      and native_item_id is not null
+), prompt_representation_suppressed as materialized (
+  select distinct duplicate.id suppressed_id
+    from canonical_prompt_candidates duplicate
+    join canonical_prompt_candidates previous
+      on previous.session_id = duplicate.session_id
+     and previous.event_kind = duplicate.event_kind
+     and previous.event_subtype = duplicate.event_subtype
+     and previous.content_sha256 = duplicate.content_sha256
+     and previous.source_batch_id = duplicate.source_batch_id
+     and previous.source_record_index = duplicate.source_record_index - 1
+     and previous.source_end_offset = duplicate.source_start_offset
+     and previous.canonical_scope_key is not distinct from duplicate.canonical_scope_key
+   where duplicate.event_subtype = 'user_message'
+     and previous.source_native_type = 'event_msg'
+     and previous.source_native_payload_type = 'user_message'
+     and duplicate.source_native_type = 'event_msg'
+     and duplicate.source_native_payload_type = 'user_message'
+     and previous.native_item_id is null
+     and duplicate.native_item_id is null
+     and previous.logical_event_key is null
+     and duplicate.logical_event_key is null
+     and previous.turn_id is null
+     and duplicate.turn_id is null
+     and abs(extract(epoch from (
+           duplicate.source_observed_at - previous.source_observed_at
+         ))) <= ${UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS} / 1000.0
 ), unkeyed_submitted_prompts as materialized (
   select canonical_prompt_candidates.*
     from canonical_prompt_candidates
+    left join prompt_representation_suppressed
+      on prompt_representation_suppressed.suppressed_id = canonical_prompt_candidates.id
    where (canonical_scope_key is null or logical_event_key is null)
      and event_subtype = 'user_message'
-), unkeyed_prompt_pairs as materialized (
-  select submitted.id submitted_id,
+     and prompt_representation_suppressed.suppressed_id is null
+), unkeyed_prompt_pair_candidates as materialized (
+  select submitted.id submitted_id, native.id native_event_id,
          native.native_item_id matched_native_item_id,
          native.native_observed_at matched_native_observed_at
     from unkeyed_submitted_prompts submitted
-    cross join lateral (
-      select candidate.native_item_id, candidate.native_observed_at
-        from native_identity_candidates candidate
-       where candidate.session_id = submitted.session_id
-         and candidate.content_sha256 = submitted.content_sha256
-         and candidate.native_source_observed_at
-           >= submitted.source_observed_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-         and candidate.native_source_observed_at
-           <= submitted.source_observed_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-       order by abs(extract(epoch from (
-                  candidate.native_source_observed_at - submitted.source_observed_at
-                ))),
-                case when candidate.native_source_observed_at >= submitted.source_observed_at
-                     then 0 else 1 end,
-                candidate.native_source_observed_at, candidate.native_item_id, candidate.id
-       limit 1
-    ) native
+    join native_identity_candidates native
+      on native.session_id = submitted.session_id
+     and native.content_sha256 = submitted.content_sha256
+     and native.source_collector_key = submitted.source_collector_key
+     and native.source_kind = submitted.source_kind
+     and native.source_stream_key = submitted.source_stream_key
+     and native.generation_key = submitted.generation_key
+     and native.generation_seq = submitted.generation_seq
+   where submitted.logical_event_key is null
+     and submitted.turn_id is null
+     and native.logical_event_key is null
+     and native.turn_id is null
+     and abs(extract(epoch from (
+           native.native_source_observed_at - submitted.source_observed_at
+         ))) <= ${UNKEYED_PROMPT_MATCH_SECONDS}
+), unkeyed_prompt_pair_degrees as materialized (
+  select unkeyed_prompt_pair_candidates.*,
+         count(*) over (partition by submitted_id) submitted_degree,
+         count(*) over (partition by native_event_id) native_degree
+    from unkeyed_prompt_pair_candidates
+), unkeyed_prompt_pairs as materialized (
+  select submitted_id, matched_native_item_id, matched_native_observed_at
+    from unkeyed_prompt_pair_degrees
+   where submitted_degree = 1 and native_degree = 1
 ), unkeyed_prompt_sources as materialized (
   select submitted.*,
          coalesce(
@@ -192,59 +313,7 @@ with p as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start
     from p
-), activity_candidates as materialized (
-  select s.person_id, e.id, e.session_id,
-         s.started_at session_started_at,
-         case when e.actor_role = 'unknown' and s.parent_session_id is not null
-              then 'worker' else e.actor_role end actor_role,
-         e.event_kind, e.event_subtype,
-         coalesce(
-           ${nativeItemTimestamp("e.native_item_id")},
-           coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-         ) observed_at,
-         case when e.canonical_scope_key is not null and e.logical_event_key is not null
-              then row_number() over (
-                partition by e.session_id, e.canonical_scope_key,
-                             e.logical_event_key, e.event_kind
-                order by e.source_priority desc, e.occurred_at asc nulls last, e.id
-              )
-              else 1 end canonical_rank
-    from telemetry.events e
-    join telemetry.sessions s
-      on s.workspace_id = e.workspace_id and s.id = e.session_id
-    join roster r on r.person_id = s.person_id
-    cross join p
-   where e.workspace_id = p.workspace_id
-     and e.normalizer_version = p.normalizer_version
-     and not e.is_replay
-     and e.actor_role <> 'automation'
-     and e.event_kind in (
-       'message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
-       'agent_message', 'lifecycle', 'error'
-     )
-     and (
-       e.event_kind <> 'message'
-       or e.native_item_id is not null
-       or e.event_subtype = 'user_message'
-     )
-     and (
-       e.event_kind <> 'lifecycle'
-       or e.event_subtype in ('task_started', 'task_complete', 'turn_started', 'turn_complete')
-     )
-     and coalesce(
-       ${nativeItemTimestamp("e.native_item_id")},
-       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-     ) >= p.start_at
-     and coalesce(
-       ${nativeItemTimestamp("e.native_item_id")},
-       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-     ) < p.read_at
-), activity_events as materialized (
-  select person_id, session_id, actor_role, observed_at
-    from activity_candidates
-   where canonical_rank = 1
-     and observed_at >= date_trunc('milliseconds', session_started_at)
-), bucket_activity as materialized (
+), ${activityCte({ joins: "join roster r on r.person_id = s.person_id" })}, bucket_activity as materialized (
   select a.person_id,
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint agent,
@@ -326,6 +395,278 @@ select id::text id, observed_at,
 limit $9
 `;
 
+const DETAIL_ACTIVITY_COLUMNS = `,
+         e.actor_role stored_actor_role,
+         e.canonical_scope_key, e.logical_event_key, e.turn_id,
+         e.message_role, e.message_origin, e.phase,
+         e.native_item_id source_native_item_id,
+         e.content_sha256,
+         nr.batch_id source_batch_id, nr.record_index source_record_index,
+         nr.source_start_offset, nr.source_end_offset,
+         nr.native_type source_native_type,
+         nr.native_payload_type source_native_payload_type,
+         ib.collector_key source_collector_key,
+         ib.source_kind, ib.source_stream_key,
+         ib.generation_key, ib.generation_seq,
+         ib.start_offset source_batch_start_offset,
+         ib.end_offset source_batch_end_offset,
+         ib.record_count source_batch_record_count,
+         e.tool_call_id, e.tool_name, e.tool_status,
+         e.model, e.project_key, e.repo_remote, e.branch, e.cwd,
+         e.content_byte_size, e.content_excerpt,
+         case
+           when ${nativeItemTimestamp("e.native_item_id")} is not null
+             then 'native_item_uuidv7'
+           when e.occurred_at is not null then 'occurred_at'
+           when e.observed_at is not null then 'observed_at'
+           else 'server_received_at'
+         end time_basis`;
+
+const DETAIL_EVENT_COLUMNS = `, id, event_kind, event_subtype,
+         stored_actor_role, canonical_scope_key, logical_event_key, turn_id,
+         message_role, message_origin, phase,
+         source_native_item_id,
+         content_sha256, source_batch_id, source_record_index,
+         source_start_offset, source_end_offset,
+         source_native_type, source_native_payload_type,
+         source_collector_key, source_kind, source_stream_key,
+         generation_key, generation_seq,
+         source_batch_start_offset, source_batch_end_offset,
+         source_batch_record_count,
+         tool_call_id, tool_name, tool_status,
+         model, project_key, repo_remote, branch, cwd,
+         content_byte_size, content_excerpt, time_basis`;
+
+function canonicalActivityEvidenceCte() {
+  return `
+conversation_sources as materialized (
+  select *
+    from activity_events
+   where content_sha256 is not null
+     and logical_event_key is null
+     and turn_id is null
+     and (
+       event_kind = 'agent_message'
+       and event_subtype = 'agent_message'
+       and message_role = 'assistant'
+       and source_native_type = 'event_msg'
+       and source_native_payload_type = 'agent_message'
+       or event_kind = 'message'
+       and event_subtype in ('message', 'user_message')
+       and message_role in ('assistant', 'user')
+       and source_native_type in ('event_msg', 'response_item')
+       and source_native_payload_type in ('message', 'user_message')
+     )
+), cross_format_pair_candidates as materialized (
+  select legacy.id legacy_id, structured.id structured_id,
+         legacy.id suppressed_id
+    from conversation_sources legacy
+    join conversation_sources structured
+      on structured.person_id = legacy.person_id
+     and structured.session_id = legacy.session_id
+     and structured.actor_role = legacy.actor_role
+     and structured.stored_actor_role = legacy.stored_actor_role
+     and structured.content_sha256 = legacy.content_sha256
+     and structured.canonical_scope_key is not distinct from legacy.canonical_scope_key
+     and structured.source_collector_key = legacy.source_collector_key
+     and structured.source_kind = legacy.source_kind
+     and structured.source_stream_key = legacy.source_stream_key
+     and structured.generation_key = legacy.generation_key
+     and structured.generation_seq = legacy.generation_seq
+   where legacy.event_kind = 'agent_message'
+     and legacy.event_subtype = 'agent_message'
+     and legacy.message_role = 'assistant'
+     and legacy.source_native_type = 'event_msg'
+     and legacy.source_native_payload_type = 'agent_message'
+     and legacy.source_native_item_id is null
+     and structured.event_kind = 'message'
+     and structured.event_subtype = 'message'
+     and structured.message_role = 'assistant'
+     and structured.source_native_type = 'response_item'
+     and structured.source_native_payload_type = 'message'
+     and abs(extract(epoch from (structured.observed_at - legacy.observed_at)))
+       <= ${ASSISTANT_REPRESENTATION_MATCH_SECONDS}
+  union all
+  select submitted.id legacy_id, structured.id structured_id,
+         structured.id suppressed_id
+    from conversation_sources submitted
+    join conversation_sources structured
+      on structured.person_id = submitted.person_id
+     and structured.session_id = submitted.session_id
+     and structured.actor_role = submitted.actor_role
+     and structured.stored_actor_role = submitted.stored_actor_role
+     and structured.content_sha256 = submitted.content_sha256
+     and structured.canonical_scope_key is not distinct from submitted.canonical_scope_key
+     and structured.source_collector_key = submitted.source_collector_key
+     and structured.source_kind = submitted.source_kind
+     and structured.source_stream_key = submitted.source_stream_key
+     and structured.generation_key = submitted.generation_key
+     and structured.generation_seq = submitted.generation_seq
+   where submitted.event_kind = 'message'
+     and submitted.event_subtype = 'user_message'
+     and submitted.message_role = 'user'
+     and submitted.source_native_type = 'event_msg'
+     and submitted.source_native_payload_type = 'user_message'
+     and submitted.source_native_item_id is null
+     and structured.event_kind = 'message'
+     and structured.event_subtype = 'message'
+     and structured.message_role = 'user'
+     and structured.source_native_type = 'response_item'
+     and structured.source_native_payload_type = 'message'
+     and abs(extract(epoch from (structured.observed_at - submitted.observed_at)))
+       <= ${UNKEYED_PROMPT_MATCH_SECONDS}
+), cross_format_pair_degrees as materialized (
+  select cross_format_pair_candidates.*,
+         count(*) over (partition by legacy_id) legacy_degree,
+         count(*) over (partition by structured_id) structured_degree
+    from cross_format_pair_candidates
+), repeated_user_suppressed as materialized (
+  select distinct later.id suppressed_id
+    from conversation_sources earlier
+    join conversation_sources later
+      on later.person_id = earlier.person_id
+     and later.session_id = earlier.session_id
+     and later.actor_role = earlier.actor_role
+     and later.stored_actor_role = earlier.stored_actor_role
+     and later.content_sha256 = earlier.content_sha256
+     and later.canonical_scope_key is not distinct from earlier.canonical_scope_key
+     and later.source_batch_id = earlier.source_batch_id
+     and later.source_record_index = earlier.source_record_index + 1
+     and later.source_start_offset = earlier.source_end_offset
+   where earlier.event_kind = 'message'
+     and earlier.event_subtype = 'user_message'
+     and earlier.message_role = 'user'
+     and earlier.source_native_type = 'event_msg'
+     and earlier.source_native_payload_type = 'user_message'
+     and earlier.source_native_item_id is null
+     and later.event_kind = 'message'
+     and later.event_subtype = 'user_message'
+     and later.message_role = 'user'
+     and later.source_native_type = 'event_msg'
+     and later.source_native_payload_type = 'user_message'
+     and later.source_native_item_id is null
+     and abs(extract(epoch from (later.observed_at - earlier.observed_at)))
+       <= ${UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS} / 1000.0
+), representation_suppressed as materialized (
+  select suppressed_id
+    from cross_format_pair_degrees
+   where legacy_degree = 1 and structured_degree = 1
+  union
+  select suppressed_id from repeated_user_suppressed
+), canonical_activity_events as materialized (
+  select activity_events.*
+    from activity_events
+    left join representation_suppressed
+      on representation_suppressed.suppressed_id = activity_events.id
+   where representation_suppressed.suppressed_id is null
+)`;
+}
+
+export const INTERVAL_WORK_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::timestamptz start_at,
+         $3::timestamptz end_at, $4::text normalizer_version,
+         $5::timestamptz read_at, $6::pg_snapshot snapshot,
+         $7::uuid person_id, $8::timestamptz bucket_start,
+         $9::timestamptz bucket_end
+), ${activityCte({
+  candidateColumns: DETAIL_ACTIVITY_COLUMNS,
+  candidatePredicate: "and s.person_id = p.person_id",
+  eventColumns: DETAIL_EVENT_COLUMNS,
+  joins: `join telemetry.native_records nr
+      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
+    join telemetry.ingest_batches ib
+      on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id`,
+  visibilityPredicate: `and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
+     and pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)`,
+})}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
+  select candidate.*,
+         case when actor_role = 'primary' then 'agent'
+              when actor_role in ('worker', 'guardian') then 'subagent'
+              else 'unclassified' end semantic_role
+    from canonical_activity_events candidate cross join p
+   where candidate.person_id = p.person_id
+     and candidate.observed_at >= p.bucket_start
+     and candidate.observed_at < p.bucket_end
+), grouped as (
+  select session_id, semantic_role,
+         min(observed_at) first_at, max(observed_at) last_at,
+         count(*)::bigint event_count,
+         array_agg(distinct stored_actor_role order by stored_actor_role) actor_roles,
+         case when bool_or(stored_actor_role = 'unknown' and actor_role = 'worker')
+              then 'resolved_parent' else 'normalized_event' end role_basis,
+         (array_agg(content_excerpt order by observed_at, id) filter (
+           where event_subtype = 'user_message'
+             and message_role = 'user' and content_excerpt is not null
+         ))[1] summary,
+         (array_agg(content_byte_size order by observed_at, id) filter (
+           where event_subtype = 'user_message'
+             and message_role = 'user' and content_excerpt is not null
+         ))[1] summary_byte_size
+    from bucket_events
+   group by session_id, semantic_role
+)
+select session_id::text session_id, semantic_role, first_at, last_at,
+       event_count, actor_roles, role_basis, summary,
+       summary_byte_size,
+       octet_length(coalesce(summary, ''))::bigint summary_excerpt_byte_size
+  from grouped
+ order by first_at, session_id, semantic_role
+ limit $10
+`;
+
+export const WORK_DETAIL_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::timestamptz start_at,
+         $3::timestamptz end_at, $4::text normalizer_version,
+         $5::timestamptz read_at, $6::pg_snapshot snapshot,
+         $7::uuid person_id, $8::timestamptz bucket_start,
+         $9::timestamptz bucket_end, $10::uuid session_id,
+         $11::text semantic_role, $12::bigint cursor_at_microseconds,
+         $13::bigint cursor_id
+), ${activityCte({
+  candidateColumns: DETAIL_ACTIVITY_COLUMNS,
+  candidatePredicate: `and s.person_id = p.person_id
+     and e.session_id = p.session_id`,
+  eventColumns: DETAIL_EVENT_COLUMNS,
+  joins: `join telemetry.native_records nr
+      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
+    join telemetry.ingest_batches ib
+      on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id`,
+  visibilityPredicate: `and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
+     and pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)`,
+})}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
+  select candidate.*,
+         case when actor_role = 'primary' then 'agent'
+              when actor_role in ('worker', 'guardian') then 'subagent'
+              else 'unclassified' end semantic_role
+    from canonical_activity_events candidate cross join p
+   where candidate.person_id = p.person_id
+     and candidate.session_id = p.session_id
+     and candidate.observed_at >= p.bucket_start
+     and candidate.observed_at < p.bucket_end
+), selected as (
+  select bucket_events.*,
+         (extract(epoch from bucket_events.observed_at) * 1000000)::bigint observed_at_microseconds
+    from bucket_events cross join p
+   where bucket_events.semantic_role = p.semantic_role
+     and (
+       (extract(epoch from bucket_events.observed_at) * 1000000)::bigint,
+       bucket_events.id
+     ) > (p.cursor_at_microseconds, p.cursor_id)
+   order by bucket_events.observed_at, bucket_events.id
+   limit $14
+)
+select selected.id::text id, selected.observed_at,
+       selected.observed_at_microseconds, selected.event_kind,
+       selected.event_subtype, selected.stored_actor_role, message_role,
+       message_origin, phase, tool_call_id, tool_name, tool_status, model,
+       project_key, repo_remote, branch, cwd, content_byte_size, content_excerpt,
+       time_basis
+  from selected
+ order by selected.observed_at, selected.id
+`;
+
 export class FlameSourceError extends Error {
   constructor(code) {
     super(code);
@@ -402,6 +743,197 @@ export function decodeSnapshotToken(token) {
   } catch {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
+}
+
+const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
+
+function cursorInteger(value, { positive = false } = {}) {
+  const text = String(value);
+  if (!/^-?\d+$/.test(text)) throw new FlameSourceError("flame_work_cursor_invalid");
+  const parsed = BigInt(text);
+  if ((positive && parsed < 1n) || parsed < -MAX_SIGNED_BIGINT - 1n ||
+      parsed > MAX_SIGNED_BIGINT) {
+    throw new FlameSourceError("flame_work_cursor_invalid");
+  }
+  return parsed.toString();
+}
+
+export function encodeWorkCursor({ atMicroseconds, id }) {
+  const timestamp = cursorInteger(atMicroseconds);
+  const eventId = cursorInteger(id, { positive: true });
+  const body = Buffer.from(JSON.stringify([timestamp, eventId]), "utf8").toString("base64url");
+  const cursor = `${WORK_CURSOR_VERSION}.${body}`;
+  if (cursor.length > MAX_WORK_CURSOR_LENGTH) {
+    throw new FlameSourceError("flame_work_cursor_invalid");
+  }
+  return cursor;
+}
+
+export function decodeWorkCursor(cursor) {
+  if (cursor === null || cursor === undefined || cursor === "") return null;
+  if (typeof cursor !== "string" || cursor.length > MAX_WORK_CURSOR_LENGTH) {
+    throw new FlameSourceError("flame_work_cursor_invalid");
+  }
+  const [version, body, extra] = cursor.split(".");
+  if (version !== WORK_CURSOR_VERSION || !body || extra !== undefined ||
+      !/^[A-Za-z0-9_-]+$/.test(body)) {
+    throw new FlameSourceError("flame_work_cursor_invalid");
+  }
+  try {
+    const decoded = Buffer.from(body, "base64url").toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== body) {
+      throw new Error("noncanonical_cursor");
+    }
+    const value = JSON.parse(decoded);
+    if (!Array.isArray(value) || value.length !== 2) {
+      throw new Error("invalid_cursor");
+    }
+    return {
+      atMicroseconds: cursorInteger(value[0]),
+      id: cursorInteger(value[1], { positive: true }),
+    };
+  } catch {
+    throw new FlameSourceError("flame_work_cursor_invalid");
+  }
+}
+
+function detailCoverage() {
+  return {
+    evidence: "observed_events",
+    state: "partial",
+    reason: "event_presence_not_continuous_attention",
+    timing: "observed_evidence_window_not_duration",
+    filesAvailable: false,
+    filesReason: "tool_payload_not_projected",
+  };
+}
+
+function parseWorkLimit(value) {
+  if (value === null || value === undefined || value === "") {
+    return DEFAULT_WORK_DETAIL_LIMIT;
+  }
+  const text = String(value);
+  if (!/^\d+$/.test(text)) throw new FlameSourceError("flame_work_request_invalid");
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_WORK_DETAIL_LIMIT) {
+    throw new FlameSourceError("flame_work_request_invalid");
+  }
+  return parsed;
+}
+
+function validateIntervalIdentity(personId, startAt, prefix) {
+  if (!UUID_PATTERN.test(personId) || startAt.getTime() % BUCKET_MS !== 0) {
+    throw new FlameSourceError(`flame_${prefix}_request_invalid`);
+  }
+}
+
+function requestStart(value, prefix) {
+  try {
+    return asDate(value);
+  } catch {
+    throw new FlameSourceError(`flame_${prefix}_request_invalid`);
+  }
+}
+
+function requestSnapshot(value, prefix) {
+  try {
+    return decodeSnapshotToken(value);
+  } catch {
+    throw new FlameSourceError(`flame_${prefix}_request_invalid`);
+  }
+}
+
+function snapshotBounds(snapshotReceipt, startAt, read, prefix) {
+  const oldest = read.getTime() - 25 * 60 * 60 * 1000;
+  const snapshotEndMs = Math.floor(snapshotReceipt.read.getTime() / BUCKET_MS) * BUCKET_MS;
+  const snapshotStartMs = snapshotEndMs - 24 * 60 * 60 * 1000;
+  if (snapshotReceipt.read.getTime() < oldest ||
+      startAt.getTime() < snapshotStartMs || startAt.getTime() >= snapshotEndMs) {
+    throw new FlameSourceError(`flame_${prefix}_request_out_of_range`);
+  }
+  return {
+    bucketEnd: new Date(startAt.getTime() + BUCKET_MS),
+    snapshotStart: new Date(snapshotStartMs),
+    snapshotEnd: new Date(snapshotEndMs),
+  };
+}
+
+function promptFromRow(row) {
+  return {
+    id: String(row.id),
+    at: asDate(row.observed_at).toISOString(),
+    content: String(row.content),
+    truncated: count(row.content_byte_size) > count(row.excerpt_byte_size),
+  };
+}
+
+function workFromRow(row) {
+  const role = String(row.semantic_role);
+  const sessionId = String(row.session_id);
+  const summary = row.summary === null || row.summary === undefined
+    ? null
+    : String(row.summary);
+  return {
+    id: `${sessionId}:${role}`,
+    sessionId,
+    role,
+    firstAt: asDate(row.first_at).toISOString(),
+    lastAt: asDate(row.last_at).toISOString(),
+    eventCount: count(row.event_count),
+    summary,
+    summaryTruncated: summary === null
+      ? false
+      : count(row.summary_byte_size) > count(row.summary_excerpt_byte_size),
+    actorRoles: Array.isArray(row.actor_roles)
+      ? row.actor_roles.map(String)
+      : [],
+    roleBasis: String(row.role_basis),
+    detailAvailable: count(row.event_count) > 0,
+  };
+}
+
+function detailItemFromRow(row) {
+  const eventKind = String(row.event_kind);
+  const kind = eventKind === "message" || eventKind === "agent_message"
+    ? "conversation"
+    : eventKind === "tool_call" || eventKind === "tool_result"
+    ? "tool"
+    : "context";
+  const content = row.content_excerpt === null || row.content_excerpt === undefined
+    ? ""
+    : String(row.content_excerpt);
+  const contentBytes = row.content_byte_size === null || row.content_byte_size === undefined
+    ? 0
+    : count(row.content_byte_size);
+  const label = kind === "tool"
+    ? String(row.tool_name ?? row.event_subtype ?? eventKind)
+    : String(row.event_subtype ?? eventKind);
+  return {
+    id: String(row.id),
+    at: asDate(row.observed_at).toISOString(),
+    kind,
+    eventKind,
+    eventSubtype: row.event_subtype === null ? null : String(row.event_subtype),
+    timeBasis: String(row.time_basis),
+    role: kind === "conversation" && row.message_role !== null
+      ? String(row.message_role)
+      : null,
+    actorRole: row.stored_actor_role === null ? null : String(row.stored_actor_role),
+    origin: row.message_origin === null ? null : String(row.message_origin),
+    phase: row.phase === null ? null : String(row.phase),
+    label,
+    content,
+    truncated: contentBytes > Buffer.byteLength(content, "utf8"),
+    toolName: row.tool_name === null ? null : String(row.tool_name),
+    toolStatus: row.tool_status === null ? null : String(row.tool_status),
+    toolCallId: row.tool_call_id === null ? null : String(row.tool_call_id),
+    model: row.model === null ? null : String(row.model),
+    projectKey: row.project_key === null ? null : String(row.project_key),
+    repoRemote: row.repo_remote === null ? null : String(row.repo_remote),
+    branch: row.branch === null ? null : String(row.branch),
+    cwd: row.cwd === null ? null : String(row.cwd),
+    provenance: "normalized_event",
+  };
 }
 
 export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
@@ -554,37 +1086,23 @@ export class DirectFlameSource {
   }
 
   async fetchPrompts({ personId, start, snapshot }) {
-    const startAt = asDate(start);
-    const snapshotReceipt = decodeSnapshotToken(snapshot);
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(personId)) {
-      throw new FlameSourceError("flame_prompt_request_invalid");
-    }
-    if (startAt.getTime() % BUCKET_MS !== 0) {
-      throw new FlameSourceError("flame_prompt_request_invalid");
-    }
+    const startAt = requestStart(start, "prompt");
+    const snapshotReceipt = requestSnapshot(snapshot, "prompt");
+    validateIntervalIdentity(personId, startAt, "prompt");
 
     return await this.transaction(async (tx) => {
       const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
-      const oldest = read.getTime() - 25 * 60 * 60 * 1000;
-      const snapshotEndMs = Math.floor(snapshotReceipt.read.getTime() / BUCKET_MS) * BUCKET_MS;
-      const snapshotStartMs = snapshotEndMs - 24 * 60 * 60 * 1000;
-      if (snapshotReceipt.read.getTime() < oldest ||
-          startAt.getTime() < snapshotStartMs || startAt.getTime() >= snapshotEndMs) {
-        throw new FlameSourceError("flame_prompt_request_out_of_range");
-      }
-      const endAt = new Date(startAt.getTime() + BUCKET_MS);
-      const snapshotStartAt = new Date(snapshotStartMs);
-      const snapshotEndAt = new Date(snapshotEndMs);
-      const limit = 501;
+      const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
+      const limit = INTERVAL_PROMPT_LIMIT + 1;
       const rows = await tx.unsafe(PROMPT_DETAIL_SQL, [
         this.workspaceId,
-        snapshotStartAt.toISOString(),
-        snapshotEndAt.toISOString(),
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
         NORMALIZER_VERSION,
         snapshotReceipt.snapshot,
         personId,
         startAt.toISOString(),
-        endAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
         limit,
       ]);
       if (rows.length === limit) {
@@ -594,12 +1112,147 @@ export class DirectFlameSource {
         personId,
         start: startAt.toISOString(),
         snapshot,
-        prompts: rows.map((row) => ({
-          id: String(row.id),
-          at: asDate(row.observed_at).toISOString(),
-          content: String(row.content),
-          truncated: count(row.content_byte_size) > count(row.excerpt_byte_size),
-        })),
+        prompts: rows.map(promptFromRow),
+      };
+    });
+  }
+
+  async fetchInterval({ personId, start, snapshot }) {
+    const startAt = requestStart(start, "interval");
+    const snapshotReceipt = requestSnapshot(snapshot, "interval");
+    validateIntervalIdentity(personId, startAt, "interval");
+
+    return await this.transaction(async (tx) => {
+      const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
+      const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
+      const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
+      const prompts = await tx.unsafe(PROMPT_DETAIL_SQL, [
+        this.workspaceId,
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
+        NORMALIZER_VERSION,
+        snapshotReceipt.snapshot,
+        personId,
+        startAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
+        promptLimit,
+      ]);
+      if (prompts.length === promptLimit) {
+        throw new FlameSourceError("flame_interval_prompt_result_too_large");
+      }
+      const workLimit = INTERVAL_WORK_LIMIT + 1;
+      const work = await tx.unsafe(INTERVAL_WORK_SQL, [
+        this.workspaceId,
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
+        NORMALIZER_VERSION,
+        snapshotReceipt.read.toISOString(),
+        snapshotReceipt.snapshot,
+        personId,
+        startAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
+        workLimit,
+      ]);
+      if (work.length === workLimit) {
+        throw new FlameSourceError("flame_interval_work_result_too_large");
+      }
+      return {
+        personId,
+        start: startAt.toISOString(),
+        snapshot,
+        prompts: prompts.map(promptFromRow),
+        work: work.map(workFromRow),
+        coverage: detailCoverage(),
+      };
+    });
+  }
+
+  async fetchWork({ personId, start, sessionId, role, snapshot, cursor, limit }) {
+    const startAt = requestStart(start, "work");
+    const snapshotReceipt = requestSnapshot(snapshot, "work");
+    validateIntervalIdentity(personId, startAt, "work");
+    if (!UUID_PATTERN.test(sessionId) ||
+        !["agent", "subagent", "unclassified"].includes(role)) {
+      throw new FlameSourceError("flame_work_request_invalid");
+    }
+    const decodedCursor = decodeWorkCursor(cursor);
+    const pageSize = parseWorkLimit(limit);
+
+    return await this.transaction(async (tx) => {
+      const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
+      const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
+      const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
+      const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
+      if (decodedCursor) {
+        const cursorMicroseconds = BigInt(decodedCursor.atMicroseconds);
+        if (cursorMicroseconds < bucketStartMicroseconds ||
+            cursorMicroseconds >= bucketEndMicroseconds) {
+          throw new FlameSourceError("flame_work_cursor_invalid");
+        }
+      }
+      const workLimit = INTERVAL_WORK_LIMIT + 1;
+      const workRows = await tx.unsafe(INTERVAL_WORK_SQL, [
+        this.workspaceId,
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
+        NORMALIZER_VERSION,
+        snapshotReceipt.read.toISOString(),
+        snapshotReceipt.snapshot,
+        personId,
+        startAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
+        workLimit,
+      ]);
+      if (workRows.length === workLimit) {
+        throw new FlameSourceError("flame_work_result_too_large");
+      }
+      const headerRow = workRows.find((row) =>
+        String(row.session_id) === sessionId && String(row.semantic_role) === role
+      );
+      if (!headerRow) throw new FlameSourceError("flame_work_request_not_found");
+      const header = workFromRow(headerRow);
+      const cursorAtMicroseconds = decodedCursor?.atMicroseconds ??
+        bucketStartMicroseconds.toString();
+      const cursorId = decodedCursor?.id ?? "0";
+      const itemRows = await tx.unsafe(WORK_DETAIL_SQL, [
+        this.workspaceId,
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
+        NORMALIZER_VERSION,
+        snapshotReceipt.read.toISOString(),
+        snapshotReceipt.snapshot,
+        personId,
+        startAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
+        sessionId,
+        role,
+        cursorAtMicroseconds,
+        cursorId,
+        pageSize + 1,
+      ]);
+      const hasMore = itemRows.length > pageSize;
+      const pageRows = hasMore ? itemRows.slice(0, pageSize) : itemRows;
+      const nextCursor = hasMore
+        ? encodeWorkCursor({
+          atMicroseconds: pageRows.at(-1).observed_at_microseconds,
+          id: pageRows.at(-1).id,
+        })
+        : null;
+      return {
+        personId,
+        start: startAt.toISOString(),
+        snapshot,
+        workId: header.id,
+        sessionId,
+        role,
+        firstAt: header.firstAt,
+        lastAt: header.lastAt,
+        eventCount: header.eventCount,
+        taskSummary: header.summary,
+        taskSummaryTruncated: header.summaryTruncated,
+        items: pageRows.map(detailItemFromRow),
+        nextCursor,
+        coverage: detailCoverage(),
       };
     });
   }

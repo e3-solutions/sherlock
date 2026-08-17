@@ -109,6 +109,45 @@ describe("FlameGraph", () => {
       const start = request.searchParams.get("start");
       const personId = request.searchParams.get("personId");
       const snapshot = request.searchParams.get("snapshot");
+      const coverage = {
+        evidence: "observed_events",
+        state: "partial",
+        reason: "event_presence_not_continuous_attention",
+        timing: "observed_evidence_window_not_duration",
+        filesAvailable: false,
+        filesReason: "tool_payload_not_projected",
+      };
+      if (request.pathname === "/api/flame/work") {
+        const sessionId = request.searchParams.get("sessionId");
+        const role = request.searchParams.get("role");
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            personId, start, snapshot, workId: `${sessionId}:${role}`, sessionId, role,
+            firstAt: start,
+            lastAt: new Date(Date.parse(start) + 3000).toISOString(),
+            eventCount: 2,
+            taskSummary: "First exact prompt",
+            taskSummaryTruncated: false,
+            items: [
+              {
+                id: "event-1", at: start, kind: "conversation", role: "user",
+                eventKind: "message", eventSubtype: "user_message",
+                label: null, content: "First exact prompt", truncated: false,
+                provenance: "normalized_event", timeBasis: "occurred_at",
+              },
+              {
+                id: "event-2", at: new Date(Date.parse(start) + 3000).toISOString(),
+                kind: "tool", role: null, label: "exec_command", content: "Tests passed",
+                eventKind: "tool_result", eventSubtype: "tool_result",
+                truncated: false, provenance: "normalized_event", timeBasis: "observed_at",
+              },
+            ],
+            nextCursor: null,
+            coverage,
+          }),
+        });
+      }
       return Promise.resolve({
         ok: true,
         json: () => Promise.resolve({
@@ -120,6 +159,37 @@ describe("FlameGraph", () => {
             { id: "p2", at: new Date(Date.parse(start) + 1000).toISOString(), content: "Second prompt excerpt", truncated: true },
             { id: "p3", at: new Date(Date.parse(start) + 2000).toISOString(), content: "Third exact prompt", truncated: false },
           ],
+          work: [
+            {
+              id: "session-1:agent", sessionId: "session-1", role: "agent",
+              actorRoles: ["primary"], roleBasis: "normalized_event",
+              firstAt: start, lastAt: new Date(Date.parse(start) + 3000).toISOString(),
+              eventCount: 2, summary: "First exact prompt", summaryTruncated: false,
+              detailAvailable: true,
+            },
+            {
+              id: "session-2:subagent", sessionId: "session-2", role: "subagent",
+              actorRoles: ["worker"], roleBasis: "normalized_event",
+              firstAt: new Date(Date.parse(start) + 4000).toISOString(),
+              lastAt: new Date(Date.parse(start) + 5000).toISOString(),
+              eventCount: 1, summary: null, detailAvailable: false,
+            },
+            {
+              id: "session-3:agent", sessionId: "session-3", role: "agent",
+              actorRoles: ["primary"], roleBasis: "normalized_event",
+              firstAt: new Date(Date.parse(start) + 6000).toISOString(),
+              lastAt: new Date(Date.parse(start) + 6000).toISOString(),
+              eventCount: 1, summary: null, detailAvailable: false,
+            },
+            {
+              id: "session-4:unclassified", sessionId: "session-4", role: "unclassified",
+              actorRoles: ["unknown"], roleBasis: "normalized_event",
+              firstAt: new Date(Date.parse(start) + 7000).toISOString(),
+              lastAt: new Date(Date.parse(start) + 7000).toISOString(),
+              eventCount: 1, summary: null, detailAvailable: false,
+            },
+          ],
+          coverage,
         }),
       });
     }));
@@ -499,13 +569,9 @@ describe("FlameGraph", () => {
 
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
     expect(detail).toHaveTextContent(/Ada Lovelace.*\d{1,2}:\d{2}.*–.*\d{1,2}:\d{2}/);
-    expect(detail).toHaveTextContent("4 sessions");
+    expect(detail).toHaveTextContent("4 observed sessions");
     expect(detail).toHaveTextContent("3 prompts");
-    expect(detail).toHaveTextContent("Agent2 observed sessions");
-    expect(detail).toHaveTextContent("Subagent1 observed session");
-    expect(detail).toHaveTextContent("Unclassified1 observed session");
-    expect(detail).toHaveTextContent("What happened");
-    expect(detail).toHaveTextContent("Sessions");
+    expect(detail).toHaveTextContent("Loading frame evidence");
     expect(detail).not.toHaveTextContent("Canonical observed evidence");
     expect(detail).not.toHaveTextContent("Latest API read");
     expect(lane).toHaveAttribute("data-selected-index", "0");
@@ -522,18 +588,131 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    expect(screen.getByText("Loading prompts…")).toBeInTheDocument();
+    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
 
-    await waitFor(() => expect(screen.getByText("First exact prompt")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByText("First exact prompt")).toHaveLength(2));
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
     expect(detail).not.toHaveTextContent("prompts recorded in this interval");
-    expect(within(detail).getAllByRole("listitem")).toHaveLength(6);
+    expect(within(detail).getAllByRole("listitem")).toHaveLength(7);
     expect(detail).toHaveTextContent("Second prompt excerpt");
     expect(detail).toHaveTextContent("Stored excerpt");
+    expect(detail).toHaveTextContent("Active work");
+    expect(screen.getByRole("button", { name: /Open Agent session evidence/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Subagent session evidence/ })).not.toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining("snapshot=v1.snapshot-token"),
+      expect.stringContaining("/api/flame/interval?"),
       expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
     );
+  });
+
+  it("keeps busy interval overviews concise until more prompts are requested", async () => {
+    const busyModel = model();
+    busyModel.people[0].buckets[0].prompts = 7;
+    Object.assign(busyModel.people[0].buckets[1], {
+      activity: 4,
+      agent: 2,
+      subagent: 1,
+      unclassified: 1,
+      prompts: 7,
+    });
+    vi.mocked(fetch).mockImplementation((url) => {
+      const request = new URL(url, "http://dashboard.test");
+      const start = request.searchParams.get("start");
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          personId: request.searchParams.get("personId"),
+          start,
+          snapshot: request.searchParams.get("snapshot"),
+          prompts: Array.from({ length: 7 }, (_, index) => ({
+            id: `prompt-${index + 1}`,
+            at: new Date(Date.parse(start) + index).toISOString(),
+            content: `Prompt ${index + 1}`,
+            truncated: false,
+          })),
+          work: Array.from({ length: 4 }, (_, index) => ({
+            id: `session-${index + 1}:agent`,
+            sessionId: `session-${index + 1}`,
+            role: "agent",
+            actorRoles: ["primary"],
+            roleBasis: "normalized_event",
+            firstAt: new Date(Date.parse(start) + index).toISOString(),
+            lastAt: new Date(Date.parse(start) + index).toISOString(),
+            eventCount: 1,
+            summary: null,
+            detailAvailable: false,
+          })),
+          coverage: {
+            evidence: "observed_events",
+            state: "partial",
+            reason: "event_presence_not_continuous_attention",
+            timing: "observed_evidence_window_not_duration",
+            filesAvailable: false,
+            filesReason: "tool_payload_not_projected",
+          },
+        }),
+      });
+    });
+    const { container } = render(<FlameGraph data={busyModel} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    const expander = await screen.findByRole("button", { name: "Show 4 more prompts" });
+    expect(screen.getByText("Prompt 3")).toBeInTheDocument();
+    expect(screen.queryByText("Prompt 4")).not.toBeInTheDocument();
+
+    fireEvent.click(expander);
+    expect(screen.getByText("Prompt 6")).toBeInTheDocument();
+    expect(screen.getByText("Prompt 7")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /more prompts/ })).not.toBeInTheDocument();
+
+    const chart = screen.getByRole("application", { name: "Ada Lovelace activity timeline" });
+    fireEvent.keyDown(chart, { key: "ArrowRight" });
+    fireEvent.keyDown(chart, { key: "Enter" });
+    expect(await screen.findByRole("button", { name: "Show 4 more prompts" })).toBeInTheDocument();
+    expect(screen.queryByText("Prompt 4")).not.toBeInTheDocument();
+  });
+
+  it("drills into real session evidence, returns focus to the row, and keeps Escape for close", async () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    const chart = container.querySelector('.flame-person [role="application"]');
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    const row = await screen.findByRole("button", { name: /Open Agent session evidence/ });
+    fireEvent.click(row);
+
+    expect(screen.getByText("Loading session evidence…")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Conversation")).toBeInTheDocument());
+    expect(screen.getByText("Implementation evidence")).toBeInTheDocument();
+    expect(screen.getByText("Tests passed")).toBeInTheDocument();
+    expect(screen.getByText(/Verified file-touch evidence is unavailable/)).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/api\/flame\/work\?.*sessionId=session-1.*role=agent/),
+      expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
+    const restored = await screen.findByRole("button", { name: /Open Agent session evidence/ });
+    await waitFor(() => expect(restored).toHaveFocus());
+
+    fireEvent.click(restored);
+    await screen.findByText("Conversation");
+    const detail = screen.getByRole("complementary", { name: "Agent session" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(detail).toHaveClass("flame-detail--closing");
+    expect(detail).toBeInTheDocument();
+    fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitFor(() => expect(chart).toHaveFocus());
   });
 
   it("rejects prompt details whose count disagrees with the selected snapshot", async () => {
@@ -562,16 +741,13 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
 
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "Prompts could not be loaded",
-      );
+      expect(screen.getByRole("alert")).toHaveTextContent("Frame evidence could not be loaded");
     });
     expect(screen.queryByText("prompts recorded in this interval")).not.toBeInTheDocument();
   });
 
-  it("keeps the drawer mounted until close ends, then clears selection without refocusing a row", async () => {
+  it("keeps selection mounted through close, then restores exact chart focus", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
     const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
@@ -581,7 +757,7 @@ describe("FlameGraph", () => {
     fireEvent.keyDown(chart, { key: "Enter" });
 
     expect(screen.getByRole("complementary", { name: "Ada Lovelace" })).toHaveTextContent(
-      "0 sessions",
+      "0 observed sessions",
     );
     expect(lane).toHaveAttribute("data-selected-index", "1");
 
@@ -595,6 +771,8 @@ describe("FlameGraph", () => {
     expect(detail).toHaveClass("flame-detail--closing");
     expect(closeButton).toBeDisabled();
     expect(detail).toBeInTheDocument();
+    expect(person).toHaveAttribute("data-selected", "true");
+    expect(lane).toHaveAttribute("data-selected-index", "1");
     expect(chart).not.toHaveFocus();
 
     fireEvent.keyDown(window, { key: "Escape" });
@@ -609,33 +787,7 @@ describe("FlameGraph", () => {
 
     fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(roster).toHaveFocus());
-    expect(chart).not.toHaveFocus();
-    expect(person).not.toHaveAttribute("data-selected");
-    expect(lane).not.toHaveAttribute("data-selected-index");
-  });
-
-  it("uses the same selection-clearing focus lifecycle for Escape", async () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
-    const person = container.querySelector(".flame-person");
-    const lane = container.querySelector(".flame-person .flame-lane");
-    const chart = lane.querySelector('[role="application"]');
-
-    fireEvent.focus(chart);
-    fireEvent.keyDown(chart, { key: "Enter" });
-
-    const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
-    fireEvent.keyDown(window, { key: "Escape" });
-
-    expect(detail).toHaveClass("flame-detail--closing");
-    expect(detail).toBeInTheDocument();
-    expect(chart).not.toHaveFocus();
-
-    fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
-    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(roster).toHaveFocus());
-    expect(chart).not.toHaveFocus();
+    await waitFor(() => expect(chart).toHaveFocus());
     expect(person).not.toHaveAttribute("data-selected");
     expect(lane).not.toHaveAttribute("data-selected-index");
   });

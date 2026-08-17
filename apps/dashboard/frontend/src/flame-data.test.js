@@ -5,7 +5,9 @@ import {
   BUCKET_MS,
   FlameDataError,
   adaptFlamePayload,
+  adaptIntervalEvidence,
   adaptPromptEvidence,
+  adaptWorkEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
   getPersonActivityStatus,
@@ -339,6 +341,102 @@ describe("adaptPromptEvidence", () => {
   ])("rejects %s", (_label, value) => {
     expect(() => adaptPromptEvidence(value, { personId: "person-1", startMs, snapshot }))
       .toThrow(FlameDataError);
+  });
+});
+
+describe("interval and work evidence adapters", () => {
+  const startMs = Date.parse("2026-08-17T16:10:00.000Z");
+  const expected = { personId: "person-1", startMs, snapshot: "v1.snapshot-token" };
+  const coverage = {
+    evidence: "observed_events",
+    state: "partial",
+    reason: "event_presence_not_continuous_attention",
+    timing: "observed_evidence_window_not_duration",
+    filesAvailable: false,
+    filesReason: "tool_payload_not_projected",
+  };
+
+  it("validates chronological prompts and source-backed work rows", () => {
+    const result = adaptIntervalEvidence({
+      personId: expected.personId,
+      start: new Date(startMs).toISOString(),
+      snapshot: expected.snapshot,
+      prompts: [{
+        id: "p1", at: new Date(startMs + 1000).toISOString(),
+        content: "Investigate the cursor", truncated: false,
+      }],
+      work: [{
+        id: "s1:agent", sessionId: "s1", role: "agent", actorRoles: ["primary"],
+        roleBasis: "normalized_event", firstAt: new Date(startMs + 1000).toISOString(),
+        lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
+        summary: "Investigate the cursor", summaryTruncated: false, detailAvailable: true,
+      }],
+      coverage,
+    }, expected);
+
+    expect(result.work[0]).toMatchObject({
+      id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2,
+      detailAvailable: true,
+    });
+    expect(result.coverage).toMatchObject({ filesAvailable: false });
+  });
+
+  it("preserves equal conversation text under distinct source event ids", () => {
+    const result = adaptWorkEvidence({
+      personId: expected.personId,
+      start: new Date(startMs).toISOString(),
+      snapshot: expected.snapshot,
+      workId: "s1:agent",
+      sessionId: "s1",
+      role: "agent",
+      firstAt: new Date(startMs + 1000).toISOString(),
+      lastAt: new Date(startMs + 5000).toISOString(),
+      eventCount: 2,
+      taskSummary: "Investigate the cursor",
+      taskSummaryTruncated: true,
+      items: [{
+        id: "e1", at: new Date(startMs + 2000).toISOString(), kind: "conversation",
+        eventKind: "message", eventSubtype: "assistant_message",
+        role: "assistant", label: null, content: "Tracing it now", truncated: false,
+        provenance: "normalized_event", timeBasis: "native_item_uuidv7",
+      }, {
+        id: "e2", at: new Date(startMs + 3000).toISOString(), kind: "conversation",
+        eventKind: "message", eventSubtype: "assistant_message",
+        role: "assistant", label: null, content: "Tracing it now", truncated: false,
+        provenance: "normalized_event", timeBasis: "native_item_uuidv7",
+      }],
+      nextCursor: "cursor-2",
+      coverage,
+    }, { ...expected, workId: "s1:agent", sessionId: "s1", role: "agent" });
+
+    expect(result.items[0]).toMatchObject({
+      kind: "conversation", role: "assistant", provenance: "normalized_event",
+      timeBasis: "native_item_uuidv7",
+    });
+    expect(result.items).toHaveLength(2);
+    expect(result.items.map((item) => item.id)).toEqual(["e1", "e2"]);
+    expect(result.nextCursor).toBe("cursor-2");
+  });
+
+  it.each([
+    ["unsupported semantic role", { role: "supervisor" }],
+    ["unavailable files claimed available", { coverage: { ...coverage, filesAvailable: true } }],
+    ["unsupported role basis", { workRoleBasis: "inferred" }],
+  ])("rejects %s", (_label, mutation) => {
+    const work = {
+      id: "s1:agent", sessionId: "s1", role: "agent", actorRoles: ["primary"],
+      roleBasis: mutation.workRoleBasis ?? "normalized_event",
+      firstAt: new Date(startMs + 1000).toISOString(),
+      lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
+      summary: null, detailAvailable: true,
+    };
+    const source = {
+      personId: expected.personId,
+      start: new Date(startMs).toISOString(),
+      snapshot: expected.snapshot,
+      prompts: [], work: [{ ...work, ...mutation }], coverage: mutation.coverage ?? coverage,
+    };
+    expect(() => adaptIntervalEvidence(source, expected)).toThrow(FlameDataError);
   });
 });
 

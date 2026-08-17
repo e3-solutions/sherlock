@@ -19,7 +19,8 @@ import {
 import {
   BUCKET_COUNT,
   BUCKET_MS,
-  adaptPromptEvidence,
+  adaptIntervalEvidence,
+  adaptWorkEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
   getPersonActivityStatus,
@@ -32,6 +33,7 @@ const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
 const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;
 const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
+const PROMPT_PREVIEW_COUNT = 3;
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
@@ -302,37 +304,62 @@ function PromptStem({ cx, cy, payload, personName, promptPeak }) {
   );
 }
 
-function IntervalDetail({
+function roleLabel(role) {
+  return role === "agent" ? "Agent" : role === "subagent" ? "Subagent" : "Unclassified";
+}
+
+function EvidenceCoverage({ coverage }) {
+  if (!coverage) return null;
+  return (
+    <div className="flame-detail__disclosure">
+      <strong>Evidence limits</strong>
+      <p>Times mark the first and last observed source events, not continuous activity.</p>
+      {!coverage.filesAvailable && (
+        <p>
+          Verified file-touch evidence is unavailable because tool payloads are not projected as
+          structured canonical fields. Paths in message excerpts are conversation text, not proof
+          of file access or change.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DrawerCloseButton({ closing, onClose }) {
+  return (
+    <button
+      type="button"
+      className="flame-detail__close"
+      disabled={closing}
+      onClick={onClose}
+    >
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+        <path d="M6 6 18 18M18 6 6 18" />
+      </svg>
+      <span className="visually-hidden">Close interval details</span>
+    </button>
+  );
+}
+
+function IntervalOverview({
   person,
   point,
-  closing,
   onClose,
-  onCloseAnimationEnd,
-  detailRef,
-  promptEvidence,
-  onRetryPrompts,
+  evidence,
+  onRetry,
+  onOpenWork,
+  stale,
+  closing,
 }) {
-  const roles = [
-    { key: "agent", label: "Agent", value: point.agent },
-    { key: "subagent", label: "Subagent", value: point.subagent },
-    { key: "unclassified", label: "Unclassified", value: point.unclassified },
-  ];
-  const activeRoles = roles.filter(({ value }) => value > 0);
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const handleAnimationEnd = (event) => {
-    if (event.target === event.currentTarget) {
-      onCloseAnimationEnd();
-    }
-  };
+  const [showAllPrompts, setShowAllPrompts] = useState(false);
+  const visiblePrompts = showAllPrompts
+    ? evidence.prompts
+    : evidence.prompts.slice(0, PROMPT_PREVIEW_COUNT);
+  const hiddenPromptCount = evidence.prompts.length - visiblePrompts.length;
 
   return (
-    <aside
-      ref={detailRef}
-      className={`flame-detail${closing ? " flame-detail--closing" : ""}`}
-      aria-labelledby={headingId}
-      onAnimationEnd={handleAnimationEnd}
-      tabIndex={-1}
-    >
+    <div className="flame-detail__view" data-view="overview">
       <header className="flame-detail__header">
         <div>
           <p className="flame-detail__eyebrow">Frame evidence</p>
@@ -346,74 +373,240 @@ function IntervalDetail({
             </span>
           </h2>
           <p className="flame-detail__totals">
-            {point.activity} {point.activity === 1 ? "session" : "sessions"}
+            {formatSessionCount(point.activity)}
             <span aria-hidden="true"> · </span>
             {formatPromptCount(point.prompts)}
           </p>
+          {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
         </div>
-        <button
-          type="button"
-          className="flame-detail__close"
-          disabled={closing}
-          onClick={onClose}
-        >
-          <svg
-            aria-hidden="true"
-            focusable="false"
-            viewBox="0 0 24 24"
-          >
-            <path d="M6 6 18 18M18 6 6 18" />
-          </svg>
-          <span className="visually-hidden">Close interval details</span>
-        </button>
+        <DrawerCloseButton closing={closing} onClose={onClose} />
       </header>
 
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
-        <h3 id={`${headingId}-prompts`}>What happened</h3>
-        {point.prompts === 0 ? (
-          <p className="flame-detail__empty">No prompts in this interval.</p>
-        ) : promptEvidence.state === "loading" ? (
-          <p className="flame-detail__empty" role="status">Loading prompts…</p>
-        ) : promptEvidence.state === "error" ? (
-          <div className="flame-detail__prompt-error" role="alert">
-            <p>Prompts could not be loaded.</p>
-            <button type="button" onClick={onRetryPrompts}>Retry</button>
-          </div>
-        ) : (
-          <ol className="flame-detail__prompts">
-            {promptEvidence.items.map((prompt) => (
-              <li key={prompt.id}>
-                <header>
-                  <strong>User</strong>
-                  <time dateTime={new Date(prompt.atMs).toISOString()}>
-                    {formatTime(prompt.atMs)}
-                  </time>
-                  {prompt.truncated && <span>Stored excerpt</span>}
-                </header>
-                <p>{prompt.content || "Prompt text was empty."}</p>
-              </li>
-            ))}
-          </ol>
-        )}
-      </section>
+      {evidence.state === "loading" ? (
+        <p className="flame-detail__state" role="status">Loading frame evidence…</p>
+      ) : evidence.state === "error" ? (
+        <div className="flame-detail__state flame-detail__error" role="alert">
+          <p>Frame evidence could not be loaded from this timeline snapshot.</p>
+          <button type="button" onClick={onRetry}>Retry</button>
+        </div>
+      ) : evidence.state === "ready" && (
+        <div className="flame-detail__body">
+          <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
+            <h3 id={`${headingId}-prompts`}>What happened</h3>
+            {evidence.prompts.length === 0 ? (
+              <p className="flame-detail__empty">No user prompts observed in this interval.</p>
+            ) : (
+              <>
+                <ol className="flame-detail__prompts">
+                  {visiblePrompts.map((prompt) => (
+                    <li key={prompt.id}>
+                      <header>
+                        <strong>User</strong>
+                        <time dateTime={new Date(prompt.atMs).toISOString()}>
+                          {formatTime(prompt.atMs)}
+                        </time>
+                        {prompt.truncated && <span>Stored excerpt</span>}
+                      </header>
+                      <p>{prompt.content || "Prompt text was empty."}</p>
+                    </li>
+                  ))}
+                </ol>
+                {hiddenPromptCount > 0 && (
+                  <button
+                    type="button"
+                    className="flame-detail__prompt-expander"
+                    aria-expanded={showAllPrompts}
+                    onClick={() => setShowAllPrompts(true)}
+                  >
+                    Show {hiddenPromptCount} more {hiddenPromptCount === 1 ? "prompt" : "prompts"}
+                  </button>
+                )}
+              </>
+            )}
+          </section>
 
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-sessions`}>
-        <h3 id={`${headingId}-sessions`}>Sessions</h3>
-        {activeRoles.length > 0 ? (
-          <ul className="flame-detail__roles">
-            {activeRoles.map(({ key, label, value }) => (
-              <li key={key}>
-                <i className={`flame-key flame-key--${key}`} aria-hidden="true" />
-                <span>{label}</span>
-                <strong>{formatSessionCount(value)}</strong>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="flame-detail__empty">No sessions in this interval.</p>
-        )}
-      </section>
-    </aside>
+          <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
+            <h3 id={`${headingId}-work`}>Active work</h3>
+            {evidence.work.length === 0 ? (
+              <p className="flame-detail__empty">No work-session evidence observed in this interval.</p>
+            ) : (
+              <ul className="flame-detail__work">
+                {evidence.work.map((work) => {
+                  const contents = (
+                    <>
+                      <i className={`flame-key flame-key--${work.role}`} aria-hidden="true" />
+                      <span className="flame-detail__work-copy">
+                        <span>
+                          <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
+                          <span aria-hidden="true">–</span>
+                          <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
+                          <b>{roleLabel(work.role)}</b>
+                        </span>
+                        <strong>{work.summary ?? "No submitted user message"}</strong>
+                        <small>
+                          {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
+                          {work.summaryTruncated ? " · Stored excerpt" : ""}
+                        </small>
+                      </span>
+                      {work.detailAvailable && <span className="flame-detail__chevron" aria-hidden="true">›</span>}
+                    </>
+                  );
+                  return (
+                    <li key={work.id}>
+                      {work.detailAvailable ? (
+                        <button
+                          type="button"
+                          data-work-id={work.id}
+                          aria-label={`Open ${roleLabel(work.role)} session evidence from ${formatTime(work.firstAtMs)} to ${formatTime(work.lastAtMs)}`}
+                          onClick={() => onOpenWork(work)}
+                        >
+                          {contents}
+                        </button>
+                      ) : (
+                        <div>{contents}</div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+          <EvidenceCoverage coverage={evidence.coverage} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WorkDetail({
+  work,
+  evidence,
+  onBack,
+  onClose,
+  onRetry,
+  onLoadMore,
+  stale,
+  closing,
+}) {
+  const headingId = `flame-work-${work.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const conversation = evidence.items.filter(({ kind }) => kind === "conversation");
+  const implementation = evidence.items.filter(({ kind }) => kind !== "conversation");
+  return (
+    <div className="flame-detail__view" data-view="work">
+      <header className="flame-detail__header flame-detail__header--work">
+        <button type="button" className="flame-detail__back" onClick={onBack}>
+          <span aria-hidden="true">‹</span>
+          <span>Back to frame</span>
+        </button>
+        <DrawerCloseButton closing={closing} onClose={onClose} />
+      </header>
+      <div className="flame-detail__work-heading">
+        <p className="flame-detail__eyebrow">Session evidence</p>
+        <h2 id={headingId}>{roleLabel(work.role)} session</h2>
+        <p>
+          <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
+          <span aria-hidden="true">–</span>
+          <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
+          <span aria-hidden="true"> · </span>
+          {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
+        </p>
+        {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
+      </div>
+
+      {evidence.state === "loading" ? (
+        <p className="flame-detail__state" role="status">Loading session evidence…</p>
+      ) : evidence.state === "error" ? (
+        <div className="flame-detail__state flame-detail__error" role="alert">
+          <p>Session evidence could not be loaded from this timeline snapshot.</p>
+          <button type="button" onClick={onRetry}>Retry</button>
+        </div>
+      ) : evidence.state === "ready" && (
+        <div className="flame-detail__body">
+          <section className="flame-detail__section" aria-labelledby={`${headingId}-task`}>
+            <h3 id={`${headingId}-task`}>Task prompt evidence</h3>
+            <p className="flame-detail__task">
+              {evidence.taskSummary ?? "No submitted user message was observed for this work row."}
+            </p>
+            {evidence.taskSummary && (
+              <p className="flame-detail__provenance">First submitted user-message excerpt in this frame</p>
+            )}
+            {evidence.taskSummaryTruncated && <p className="flame-detail__provenance">Stored excerpt</p>}
+          </section>
+          <section className="flame-detail__section" aria-labelledby={`${headingId}-conversation`}>
+            <h3 id={`${headingId}-conversation`}>Conversation</h3>
+            {conversation.length === 0 ? (
+              <p className="flame-detail__empty">No stored conversation turns were observed for this work row.</p>
+            ) : (
+              <ol className="flame-detail__items">
+                {conversation.map((item) => (
+                  <li key={item.id} data-kind={item.kind}>
+                    <header>
+                      <strong>{item.role}</strong>
+                      <time dateTime={new Date(item.atMs).toISOString()}>{formatTime(item.atMs)}</time>
+                      {item.truncated && <span>Stored excerpt</span>}
+                    </header>
+                    <p>{item.content || "Stored event content was empty."}</p>
+                    <small>{item.provenance} · {item.timeBasis.replaceAll("_", " ")}</small>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </section>
+          <section className="flame-detail__section" aria-labelledby={`${headingId}-implementation`}>
+            <h3 id={`${headingId}-implementation`}>Implementation evidence</h3>
+            {implementation.length === 0 ? (
+              <p className="flame-detail__empty">No tool or implementation events were observed for this work row.</p>
+            ) : (
+              <ol className="flame-detail__items">
+                {implementation.map((item) => {
+                  const metadata = [
+                    ["Tool", item.toolName], ["Status", item.toolStatus], ["Phase", item.phase],
+                    ["Model", item.model], ["Project", item.projectKey], ["Repository", item.repoRemote],
+                    ["Branch", item.branch], ["Working directory", item.cwd],
+                    ["Tool call", item.toolCallId], ["Actor role", item.actorRole],
+                  ].filter(([, value]) => value);
+                  return (
+                    <li key={item.id} data-kind={item.kind}>
+                      <header>
+                        <strong>{item.label ?? item.kind}</strong>
+                        <time dateTime={new Date(item.atMs).toISOString()}>{formatTime(item.atMs)}</time>
+                        {item.truncated && <span>Stored excerpt</span>}
+                      </header>
+                      {item.content && <p>{item.content}</p>}
+                      {metadata.length > 0 && (
+                        <dl className="flame-detail__metadata">
+                          {metadata.map(([label, value]) => (
+                            <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+                          ))}
+                        </dl>
+                      )}
+                      <small>
+                        {item.eventKind}{item.eventSubtype ? ` / ${item.eventSubtype}` : ""}
+                        {` · ${item.provenance} · ${item.timeBasis.replaceAll("_", " ")}`}
+                      </small>
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+            {evidence.nextCursor && (
+              <button
+                type="button"
+                className="flame-detail__more"
+                onClick={onLoadMore}
+                disabled={evidence.loadingMore}
+              >
+                {evidence.loadingMore ? "Loading more…" : "Show more"}
+              </button>
+            )}
+            {evidence.moreError && (
+              <p className="flame-detail__more-error" role="alert">More evidence could not be loaded. Try again.</p>
+            )}
+          </section>
+          <EvidenceCoverage coverage={evidence.coverage} />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -485,7 +678,7 @@ function PersonLane({
   );
 
   const select = (point) => {
-    onSelect(person, point);
+    onSelect(person, point, laneRef.current?.querySelector('[role="application"]'));
   };
 
   const handleClick = (event) => {
@@ -670,11 +863,21 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
+  const selectionOriginRef = useRef(null);
+  const returnWorkIdRef = useRef(null);
+  const workRequestRef = useRef(null);
   const [selection, setSelection] = useState(null);
   const [activeTooltipPersonId, setActiveTooltipPersonId] = useState(null);
   const [detailClosing, setDetailClosing] = useState(false);
-  const [promptRevision, setPromptRevision] = useState(0);
-  const [promptEvidence, setPromptEvidence] = useState({ state: "idle", items: [] });
+  const [drawerView, setDrawerView] = useState({ screen: "overview" });
+  const [intervalRevision, setIntervalRevision] = useState(0);
+  const [workRevision, setWorkRevision] = useState(0);
+  const [intervalEvidence, setIntervalEvidence] = useState({
+    state: "idle", prompts: [], work: [], coverage: null,
+  });
+  const [workEvidence, setWorkEvidence] = useState({
+    state: "idle", items: [], coverage: null, nextCursor: null,
+  });
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
   const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
   const promptPeak = data.people.reduce(
@@ -695,10 +898,14 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const selectedPoint = selectedPerson
     ? selectedPerson.buckets.find(({ startMs }) => startMs === selection.startMs)
     : null;
+  const selectionKey = selectedPerson && selectedPoint
+    ? `${selectedPerson.id}:${selectedPoint.startMs}`
+    : null;
 
   const beginCloseDetail = useCallback(() => {
     if (!selection || detailClosingRef.current) return;
     detailClosingRef.current = true;
+    workRequestRef.current?.abort();
     setDetailClosing(true);
   }, [selection]);
 
@@ -707,13 +914,24 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     detailClosingRef.current = false;
     setDetailClosing(false);
     setSelection(null);
-    requestAnimationFrame(() => peopleScrollRef.current?.focus());
+    setDrawerView({ screen: "overview" });
+    requestAnimationFrame(() => {
+      const target = selectionOriginRef.current;
+      if (target?.isConnected) target.focus();
+      else peopleScrollRef.current?.focus();
+    });
   }, []);
+
+  const handleDetailAnimationEnd = (event) => {
+    if (event.target === event.currentTarget) finalizeCloseDetail();
+  };
 
   useEffect(() => {
     if (selection && (!selectedPerson || !selectedPoint)) {
       detailClosingRef.current = false;
+      workRequestRef.current?.abort();
       setDetailClosing(false);
+      setDrawerView({ screen: "overview" });
       setSelection(null);
     }
   }, [selection, selectedPerson, selectedPoint]);
@@ -722,61 +940,119 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     if (!selectedPoint) return undefined;
     detailRef.current?.focus();
     const closeOnEscape = (event) => {
-      if (event.key === "Escape") {
-        beginCloseDetail();
-      }
+      if (event.key === "Escape") beginCloseDetail();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [beginCloseDetail, selectedPoint]);
+  }, [beginCloseDetail, selectionKey]);
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
-      setPromptEvidence({ state: "idle", items: [] });
-      return undefined;
-    }
-    if (selectedPoint.prompts === 0) {
-      setPromptEvidence({ state: "ready", items: [] });
+      setIntervalEvidence({ state: "idle", prompts: [], work: [], coverage: null });
       return undefined;
     }
 
     const controller = new AbortController();
-    setPromptEvidence({ state: "loading", items: [] });
+    setIntervalEvidence({ state: "loading", prompts: [], work: [], coverage: null });
     const query = new URLSearchParams({
       personId: selectedPerson.id,
       start: new Date(selectedPoint.startMs).toISOString(),
       snapshot: data.snapshot,
     });
-    fetch(`/api/flame/prompts?${query}`, {
+    fetch(`/api/flame/interval?${query}`, {
       headers: { Accept: "application/json" },
       cache: "no-store",
       signal: controller.signal,
     })
       .then(async (response) => {
-        if (!response.ok) throw new Error(`Prompt request failed with HTTP ${response.status}`);
+        if (!response.ok) throw new Error(`Interval request failed with HTTP ${response.status}`);
         return response.json();
       })
       .then((value) => {
         if (controller.signal.aborted) return;
-        const items = adaptPromptEvidence(value, {
+        const evidence = adaptIntervalEvidence(value, {
           personId: selectedPerson.id,
           startMs: selectedPoint.startMs,
           snapshot: data.snapshot,
         });
-        if (items.length !== selectedPoint.prompts) {
+        if (evidence.prompts.length !== selectedPoint.prompts) {
           throw new Error("Prompt evidence count does not match the timeline snapshot");
         }
-        setPromptEvidence({ state: "ready", items });
+        if (evidence.work.length !== selectedPoint.activity) {
+          throw new Error("Work evidence count does not match the timeline snapshot");
+        }
+        setIntervalEvidence({ state: "ready", ...evidence });
       })
       .catch(() => {
-        if (!controller.signal.aborted) setPromptEvidence({ state: "error", items: [] });
+        if (!controller.signal.aborted) {
+          setIntervalEvidence({ state: "error", prompts: [], work: [], coverage: null });
+        }
       });
     return () => controller.abort();
-  }, [data.snapshot, promptRevision, selectedPerson, selectedPoint]);
+  }, [data.snapshot, intervalRevision, selectedPerson?.id, selectedPoint?.startMs, selectedPoint?.prompts]);
 
-  const selectInterval = (person, point) => {
+  useEffect(() => {
+    if (!selectedPerson || !selectedPoint || drawerView.screen !== "work") {
+      workRequestRef.current?.abort();
+      setWorkEvidence({ state: "idle", items: [], coverage: null, nextCursor: null });
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    workRequestRef.current?.abort();
+    workRequestRef.current = controller;
+    setWorkEvidence({ state: "loading", items: [], coverage: null, nextCursor: null });
+    const query = new URLSearchParams({
+      personId: selectedPerson.id,
+      start: new Date(selectedPoint.startMs).toISOString(),
+      snapshot: data.snapshot,
+      sessionId: drawerView.sessionId,
+      role: drawerView.role,
+    });
+    fetch(`/api/flame/work?${query}`, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Work request failed with HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        const evidence = adaptWorkEvidence(value, {
+          personId: selectedPerson.id,
+          startMs: selectedPoint.startMs,
+          snapshot: data.snapshot,
+          workId: drawerView.workId,
+          sessionId: drawerView.sessionId,
+          role: drawerView.role,
+        });
+        setWorkEvidence({ state: "ready", ...evidence, loadingMore: false, moreError: false });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setWorkEvidence({ state: "error", items: [], coverage: null, nextCursor: null });
+        }
+      });
+    return () => controller.abort();
+  }, [
+    data.snapshot,
+    drawerView.role,
+    drawerView.screen,
+    drawerView.sessionId,
+    drawerView.workId,
+    selectedPerson?.id,
+    selectedPoint?.startMs,
+    workRevision,
+  ]);
+
+  const selectInterval = (person, point, origin) => {
     detailClosingRef.current = false;
     setDetailClosing(false);
+    selectionOriginRef.current = origin;
+    returnWorkIdRef.current = null;
+    setDrawerView({ screen: "overview" });
     setSelection({ personId: person.id, startMs: point.startMs });
   };
 
@@ -786,6 +1062,81 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     ));
   }, []);
 
+  const closeDetail = () => {
+    beginCloseDetail();
+  };
+
+  const openWork = (work) => {
+    setDrawerView({
+      screen: "work",
+      workId: work.id,
+      sessionId: work.sessionId,
+      role: work.role,
+      firstAtMs: work.firstAtMs,
+      lastAtMs: work.lastAtMs,
+      eventCount: work.eventCount,
+    });
+    requestAnimationFrame(() => detailRef.current?.focus());
+  };
+
+  const backToOverview = () => {
+    returnWorkIdRef.current = drawerView.workId;
+    setDrawerView({ screen: "overview" });
+    requestAnimationFrame(() => {
+      const buttons = detailRef.current?.querySelectorAll("[data-work-id]") ?? [];
+      const target = [...buttons].find(({ dataset }) => dataset.workId === returnWorkIdRef.current);
+      target?.focus();
+      returnWorkIdRef.current = null;
+    });
+  };
+
+  const loadMoreWork = async () => {
+    if (drawerView.screen !== "work" || workEvidence.state !== "ready" ||
+        !workEvidence.nextCursor || workEvidence.loadingMore || !selectedPerson || !selectedPoint) return;
+    const controller = new AbortController();
+    workRequestRef.current?.abort();
+    workRequestRef.current = controller;
+    setWorkEvidence((current) => ({ ...current, loadingMore: true, moreError: false }));
+    const query = new URLSearchParams({
+      personId: selectedPerson.id,
+      start: new Date(selectedPoint.startMs).toISOString(),
+      snapshot: data.snapshot,
+      sessionId: drawerView.sessionId,
+      role: drawerView.role,
+      cursor: workEvidence.nextCursor,
+    });
+    try {
+      const response = await fetch(`/api/flame/work?${query}`, {
+        headers: { Accept: "application/json" }, cache: "no-store", signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`Work request failed with HTTP ${response.status}`);
+      const page = adaptWorkEvidence(await response.json(), {
+        personId: selectedPerson.id,
+        startMs: selectedPoint.startMs,
+        snapshot: data.snapshot,
+        workId: drawerView.workId,
+        sessionId: drawerView.sessionId,
+        role: drawerView.role,
+      });
+      const existingIds = new Set(workEvidence.items.map(({ id }) => id));
+      if (page.items.some(({ id }) => existingIds.has(id)) ||
+          (page.items[0] && workEvidence.items.at(-1) &&
+            page.items[0].atMs < workEvidence.items.at(-1).atMs)) {
+        throw new Error("Work evidence pages overlap or are out of order");
+      }
+      setWorkEvidence((current) => ({
+        ...current,
+        items: [...current.items, ...page.items],
+        nextCursor: page.nextCursor,
+        loadingMore: false,
+        moreError: false,
+      }));
+    } catch {
+      if (!controller.signal.aborted) {
+        setWorkEvidence((current) => ({ ...current, loadingMore: false, moreError: true }));
+      }
+    }
+  };
   return (
     <section
       className="flame-graph"
@@ -838,16 +1189,43 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
         ))}
       </div>
       {selectedPerson && selectedPoint && (
-        <IntervalDetail
-          person={selectedPerson}
-          point={selectedPoint}
-          closing={detailClosing}
-          onClose={beginCloseDetail}
-          onCloseAnimationEnd={finalizeCloseDetail}
-          detailRef={detailRef}
-          promptEvidence={promptEvidence}
-          onRetryPrompts={() => setPromptRevision((revision) => revision + 1)}
-        />
+        <aside
+          ref={detailRef}
+          className={`flame-detail${detailClosing ? " flame-detail--closing" : ""}`}
+          aria-busy={drawerView.screen === "work"
+            ? workEvidence.state === "loading" || workEvidence.loadingMore === true
+            : intervalEvidence.state === "loading"}
+          aria-labelledby={drawerView.screen === "work"
+            ? `flame-work-${drawerView.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`
+            : `flame-detail-${selectedPerson.id.replace(/[^a-zA-Z0-9_-]/g, "")}`}
+          onAnimationEnd={handleDetailAnimationEnd}
+          tabIndex={-1}
+        >
+          {drawerView.screen === "work" ? (
+            <WorkDetail
+              work={drawerView}
+              evidence={workEvidence}
+              stale={stale}
+              closing={detailClosing}
+              onBack={backToOverview}
+              onClose={closeDetail}
+              onRetry={() => setWorkRevision((revision) => revision + 1)}
+              onLoadMore={loadMoreWork}
+            />
+          ) : (
+            <IntervalOverview
+              key={`${selectedPerson.id}:${selectedPoint.startMs}`}
+              person={selectedPerson}
+              point={selectedPoint}
+              evidence={intervalEvidence}
+              stale={stale}
+              closing={detailClosing}
+              onClose={closeDetail}
+              onRetry={() => setIntervalRevision((revision) => revision + 1)}
+              onOpenWork={openWork}
+            />
+          )}
+        </aside>
       )}
     </section>
   );

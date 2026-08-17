@@ -3,14 +3,22 @@ import { describe, expect, it, vi } from "vitest";
 import {
   BUCKET_COUNT,
   BUCKET_MS,
+  DEFAULT_WORK_DETAIL_LIMIT,
   FLAME_SQL,
+  INTERVAL_WORK_SQL,
+  MAX_WORK_DETAIL_LIMIT,
   PEOPLE_SQL,
   PROMPT_DETAIL_SQL,
+  WORK_DETAIL_SQL,
+  ASSISTANT_REPRESENTATION_MATCH_SECONDS,
   DirectFlameSource,
+  UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS,
   UNKEYED_PROMPT_MATCH_SECONDS,
   FlameSourceError,
   buildFlamePayload,
+  decodeWorkCursor,
   decodeSnapshotToken,
+  encodeWorkCursor,
   encodeSnapshotToken,
 } from "./flame-source.js";
 
@@ -331,7 +339,7 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
-  it("uses stable prompt identifiers before a bounded unkeyed format bridge", () => {
+  it("uses stable prompt identifiers before a mutually unique source-stream bridge", () => {
     expect(UNKEYED_PROMPT_MATCH_SECONDS).toBe(2);
     expect(FLAME_SQL).toContain("native_identity_candidates as materialized");
     expect(FLAME_SQL).not.toContain("partition by session_id, native_item_id");
@@ -339,12 +347,16 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("'native:' || submitted.native_item_id");
     expect(FLAME_SQL).toContain("'native:' || paired.matched_native_item_id");
     expect(FLAME_SQL).toContain("'event:' || submitted.id::text");
-    expect(FLAME_SQL).toContain("cross join lateral");
+    expect(FLAME_SQL).toContain("unkeyed_prompt_pair_candidates as materialized");
+    expect(FLAME_SQL).toContain("native.source_stream_key = submitted.source_stream_key");
+    expect(FLAME_SQL).toContain("native.generation_seq = submitted.generation_seq");
+    expect(FLAME_SQL).toContain("count(*) over (partition by submitted_id)");
+    expect(FLAME_SQL).toContain("submitted_degree = 1 and native_degree = 1");
     expect(FLAME_SQL).toContain(
-      "candidate.native_source_observed_at - submitted.source_observed_at",
+      "native.native_source_observed_at - submitted.source_observed_at",
     );
     expect(FLAME_SQL).toContain("native.native_observed_at matched_native_observed_at");
-    expect(FLAME_SQL).toContain("candidate.native_item_id, candidate.id");
+    expect(FLAME_SQL).not.toContain("cross join lateral");
     expect(FLAME_SQL).toContain("interval '2 seconds'");
     expect(FLAME_SQL).not.toContain("date_trunc(\n                          'second'");
     expect(FLAME_SQL).not.toContain("matching_native_item_id");
@@ -352,6 +364,27 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).not.toContain(
       "unkeyed_native_candidates as materialized",
     );
+  });
+
+  it("collapses only adjacent native-ID-less copies of one submitted prompt", () => {
+    expect(UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS).toBe(100);
+    for (const sql of [FLAME_SQL, PROMPT_DETAIL_SQL]) {
+      expect(sql).toContain("join telemetry.native_records nr");
+      expect(sql).toContain(
+        "previous.source_record_index = duplicate.source_record_index - 1",
+      );
+      expect(sql).toContain(
+        "previous.source_end_offset = duplicate.source_start_offset",
+      );
+      expect(sql).toContain("previous.content_sha256 = duplicate.content_sha256");
+      expect(sql).toContain("previous.source_native_type = 'event_msg'");
+      expect(sql).toContain("previous.source_native_payload_type = 'user_message'");
+      expect(sql).toContain("previous.native_item_id is null");
+      expect(sql).toContain("duplicate.native_item_id is null");
+      expect(sql).toContain("previous.turn_id is null");
+      expect(sql).toContain("duplicate.turn_id is null");
+      expect(sql).toContain("<= 100 / 1000.0");
+    }
   });
 
   it("cannot let response-only evidence suppress a submitted prompt identity", () => {
@@ -379,5 +412,247 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain(
       "native_observed_at\n    from prompt_candidates",
     );
+  });
+
+  it("uses the same snapshot-pinned canonical activity universe for interval work and detail", () => {
+    for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
+      expect(sql).toContain("e.workspace_id = p.workspace_id");
+      expect(sql).toContain("e.normalizer_version = p.normalizer_version");
+      expect(sql).toContain("not e.is_replay");
+      expect(sql).toContain("e.actor_role <> 'automation'");
+      expect(sql).toContain("partition by e.session_id, e.canonical_scope_key");
+      expect(sql).toContain("e.normalizer_version, e.logical_event_key, e.event_kind");
+      expect(sql).toContain("order by e.source_priority desc, e.occurred_at asc nulls last, e.id");
+      expect(sql).toContain("where canonical_rank = 1");
+      expect(sql).toContain("pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)");
+      expect(sql).toContain("e.actor_role = 'unknown' and s.parent_session_id is not null");
+      expect(sql).toContain("pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)");
+      expect(sql).not.toContain("analytics.activity_spans");
+    }
+    expect(INTERVAL_WORK_SQL).toContain("group by session_id, semantic_role");
+    expect(INTERVAL_WORK_SQL).toContain("and s.person_id = p.person_id");
+    expect(INTERVAL_WORK_SQL).toContain("limit $10");
+    expect(WORK_DETAIL_SQL).toContain("and e.session_id = p.session_id");
+    expect(WORK_DETAIL_SQL).toContain(") > (p.cursor_at_microseconds, p.cursor_id)");
+    expect(WORK_DETAIL_SQL).toContain("order by selected.observed_at, selected.id");
+    expect(WORK_DETAIL_SQL).toContain("limit $14");
+  });
+
+  it("bridges only mutually unique immutable-stream representations in work evidence", () => {
+    expect(ASSISTANT_REPRESENTATION_MATCH_SECONDS).toBe(3);
+    for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
+      expect(sql).toContain("join telemetry.native_records nr");
+      expect(sql).toContain("cross_format_pair_candidates as materialized");
+      expect(sql).toContain("legacy.source_native_type = 'event_msg'");
+      expect(sql).toContain("legacy.source_native_payload_type = 'agent_message'");
+      expect(sql).toContain("legacy.source_native_item_id is null");
+      expect(sql).toContain("structured.source_native_type = 'response_item'");
+      expect(sql).toContain("structured.source_native_payload_type = 'message'");
+      expect(sql).toContain("structured.content_sha256 = legacy.content_sha256");
+      expect(sql).toContain("structured.actor_role = legacy.actor_role");
+      expect(sql).toContain("structured.source_stream_key = legacy.source_stream_key");
+      expect(sql).toContain("structured.generation_seq = legacy.generation_seq");
+      expect(sql).toContain("<= 3");
+      expect(sql).toContain("submitted.event_subtype = 'user_message'");
+      expect(sql).toContain("submitted.source_native_type = 'event_msg'");
+      expect(sql).toContain("submitted.source_native_payload_type = 'user_message'");
+      expect(sql).toContain("submitted.source_native_item_id is null");
+      expect(sql).toContain("count(*) over (partition by legacy_id)");
+      expect(sql).toContain("count(*) over (partition by structured_id)");
+      expect(sql).toContain("legacy_degree = 1 and structured_degree = 1");
+      expect(sql).toContain("later.source_record_index = earlier.source_record_index + 1");
+      expect(sql).toContain("later.source_start_offset = earlier.source_end_offset");
+      expect(sql).toContain("left join representation_suppressed");
+      expect(sql).not.toContain("partition by content_sha256");
+    }
+  });
+
+  it("returns bounded prompts and semantic-role work rows for one interval", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([{
+        id: "17",
+        observed_at: new Date("2026-08-16T12:00:08.000Z"),
+        content: "First exact prompt",
+        content_byte_size: 18,
+        excerpt_byte_size: 18,
+      }])
+      .mockResolvedValueOnce([{
+        session_id: sessionId,
+        semantic_role: "subagent",
+        first_at: new Date("2026-08-16T12:00:09.000Z"),
+        last_at: new Date("2026-08-16T12:04:00.000Z"),
+        event_count: 4,
+        actor_roles: ["unknown", "worker"],
+        role_basis: "resolved_parent",
+        summary: "Inspect the query",
+        summary_byte_size: 17,
+        summary_excerpt_byte_size: 17,
+      }]);
+    source.transaction = (callback) => callback({ unsafe });
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+    const interval = await source.fetchInterval({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROMPT_DETAIL_SQL);
+    expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[2][1].at(-1)).toBe(201);
+    expect(interval).toMatchObject({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+      prompts: [{ id: "17", content: "First exact prompt", truncated: false }],
+      work: [{
+        id: `${sessionId}:subagent`,
+        sessionId,
+        role: "subagent",
+        eventCount: 4,
+        actorRoles: ["unknown", "worker"],
+        roleBasis: "resolved_parent",
+        summary: "Inspect the query",
+        detailAvailable: true,
+      }],
+      coverage: {
+        timing: "observed_evidence_window_not_duration",
+        filesAvailable: false,
+        filesReason: "tool_payload_not_projected",
+      },
+    });
+  });
+
+  it("pages canonical work evidence with an opaque timestamp/event cursor", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const header = {
+      session_id: sessionId,
+      semantic_role: "agent",
+      first_at: new Date("2026-08-16T12:00:00.000Z"),
+      last_at: new Date("2026-08-16T12:00:03.000Z"),
+      event_count: 2,
+      actor_roles: ["primary"],
+      role_basis: "normalized_event",
+      summary: "Build it",
+      summary_byte_size: 8,
+      summary_excerpt_byte_size: 8,
+    };
+    const items = [{
+      id: "41",
+      observed_at: new Date("2026-08-16T12:00:01.000Z"),
+      observed_at_microseconds: "1786881601000000",
+      event_kind: "message",
+      event_subtype: "user_message",
+      stored_actor_role: "primary",
+      message_role: "user",
+      message_origin: "human",
+      phase: null,
+      tool_call_id: null,
+      tool_name: null,
+      tool_status: null,
+      model: "gpt-5",
+      project_key: "sherlock",
+      repo_remote: null,
+      branch: null,
+      cwd: "/repo",
+      content_byte_size: 8,
+      content_excerpt: "Build it",
+      time_basis: "occurred_at",
+    }, {
+      id: "42",
+      observed_at: new Date("2026-08-16T12:00:02.000Z"),
+      observed_at_microseconds: "1786881602000000",
+      event_kind: "tool_call",
+      event_subtype: "function_call",
+      stored_actor_role: "primary",
+      message_role: null,
+      message_origin: null,
+      phase: null,
+      tool_call_id: "call-1",
+      tool_name: "apply_patch",
+      tool_status: "completed",
+      model: "gpt-5",
+      project_key: "sherlock",
+      repo_remote: null,
+      branch: null,
+      cwd: "/repo",
+      content_byte_size: null,
+      content_excerpt: null,
+      time_basis: "native_item_uuidv7",
+    }];
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([header])
+      .mockResolvedValueOnce(items);
+    source.transaction = (callback) => callback({ unsafe });
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+    const detail = await source.fetchWork({
+      personId,
+      start: START.toISOString(),
+      sessionId,
+      role: "agent",
+      snapshot,
+      limit: "1",
+    });
+
+    expect(unsafe.mock.calls[2][0]).toBe(WORK_DETAIL_SQL);
+    expect(unsafe.mock.calls[2][1].at(-1)).toBe(2);
+    expect(detail.items).toEqual([expect.objectContaining({
+      id: "41",
+      kind: "conversation",
+      role: "user",
+      content: "Build it",
+      truncated: false,
+      timeBasis: "occurred_at",
+      provenance: "normalized_event",
+    })]);
+    expect(detail.nextCursor).toMatch(/^v1\./);
+    expect(decodeWorkCursor(detail.nextCursor)).toEqual({
+      atMicroseconds: "1786881601000000",
+      id: "41",
+    });
+    expect(detail).toMatchObject({
+      workId: `${sessionId}:agent`,
+      eventCount: 2,
+      taskSummary: "Build it",
+      coverage: { filesAvailable: false },
+    });
+  });
+
+  it("round-trips work cursors and enforces page bounds", async () => {
+    const cursor = encodeWorkCursor({ atMicroseconds: "1786881600123456", id: "99" });
+    expect(decodeWorkCursor(cursor)).toEqual({
+      atMicroseconds: "1786881600123456",
+      id: "99",
+    });
+    expect(() => decodeWorkCursor("v1.not+base64")).toThrow(FlameSourceError);
+    const overflowing = Buffer.from(JSON.stringify([
+      "1786881600123456", "9223372036854775808",
+    ])).toString("base64url");
+    expect(() => decodeWorkCursor(`v1.${overflowing}`)).toThrow(FlameSourceError);
+    expect(DEFAULT_WORK_DETAIL_LIMIT).toBe(50);
+    expect(MAX_WORK_DETAIL_LIMIT).toBe(100);
+
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.transaction = vi.fn();
+    await expect(source.fetchWork({
+      personId: "22222222-2222-4222-8222-222222222222",
+      start: START.toISOString(),
+      sessionId: "33333333-3333-4333-8333-333333333333",
+      role: "agent",
+      snapshot: encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ }),
+      limit: "101",
+    })).rejects.toMatchObject({ code: "flame_work_request_invalid" });
+    expect(source.transaction).not.toHaveBeenCalled();
   });
 });
