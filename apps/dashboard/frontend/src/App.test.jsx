@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { adaptMock } = vi.hoisted(() => ({
@@ -75,6 +75,30 @@ describe("App", () => {
       headers: { Accept: "application/json" },
       signal: expect.any(AbortSignal),
     }));
+  });
+
+  it("keeps the full activity and recency legends in a distinct header utility area", () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    const { container } = render(<App />);
+    const header = container.querySelector(".portal-header");
+    const legendRegion = within(header).getByLabelText("Timeline legend");
+    const activityLegend = within(legendRegion).getByRole("list", { name: "Activity legend" });
+    const statusLegend = within(legendRegion).getByRole("list", {
+      name: "Activity recency legend",
+    });
+
+    expect(header.querySelector(".portal-header__brand")).toHaveTextContent("Bonaparte");
+    for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
+      expect(within(activityLegend).getByText(label)).toBeInTheDocument();
+    }
+    expect(within(statusLegend).getByLabelText("Green: activity 10 minutes ago or less"))
+      .toHaveTextContent("≤10m");
+    expect(within(statusLegend).getByLabelText(
+      "Yellow: activity more than 10 and up to 30 minutes ago",
+    )).toHaveTextContent(">10m–≤30m");
+    expect(within(statusLegend).getByLabelText(
+      "Red: activity more than 30 minutes ago or no activity",
+    )).toHaveTextContent(">30m / none");
   });
 
   it("offers an immediate retry after the initial request fails", async () => {

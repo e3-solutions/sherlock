@@ -48,8 +48,16 @@ input { font: inherit; }
   min-height: 56px;
   flex: 0 0 auto;
   align-items: center;
-  gap: 11px;
+  justify-content: space-between;
+  gap: 24px;
   margin-bottom: 6px;
+}
+
+.portal-header__brand {
+  display: flex;
+  min-width: max-content;
+  align-items: center;
+  gap: 11px;
 }
 
 .portal-header__logo {
@@ -70,23 +78,36 @@ input { font: inherit; }
   text-transform: uppercase;
 }
 
+.portal-header__legend {
+  min-width: 0;
+  margin-left: auto;
+  padding-left: 24px;
+  border-left: 1px solid var(--flame-rule);
+}
+
 .flame-graph {
   position: relative;
+  display: flex;
   flex: 1;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
 }
 
-.flame-graph:focus {
-  outline: none;
-}
-
-.flame-graph-scroll {
-  height: 100%;
+.flame-people-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   min-width: 100%;
   overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
   scrollbar-color: var(--flame-rule) var(--flame-page);
+}
+
+.flame-people-scroll:focus-visible {
+  outline: 1px solid var(--flame-selected);
+  outline-offset: -1px;
 }
 
 .load-state {
@@ -143,17 +164,14 @@ input { font: inherit; }
 }
 
 .flame-meta-row {
-  position: sticky;
-  top: 0;
   z-index: 6;
+  flex: 0 0 auto;
   height: 62px;
   background: var(--flame-page);
 }
 
 .flame-meta-rail,
 .flame-person-rail {
-  position: sticky;
-  left: 0;
   z-index: 4;
   background: var(--flame-surface);
 }
@@ -167,16 +185,18 @@ input { font: inherit; }
 }
 
 .flame-legends {
-  display: grid;
-  gap: 7px;
-  width: 100%;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 18px;
 }
 
 .flame-legend {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px 14px;
-  width: 100%;
   margin: 0;
   padding: 0;
   color: var(--flame-muted);
@@ -195,11 +215,10 @@ input { font: inherit; }
 .flame-status-legend {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
   margin: 0;
-  padding: 5px 0 0;
-  border-top: 1px solid var(--flame-rule);
+  padding: 0 0 0 18px;
+  border-left: 1px solid var(--flame-rule);
   color: var(--flame-muted);
   font-size: 9px;
   font-variant-numeric: tabular-nums;
@@ -729,32 +748,54 @@ input { font: inherit; }
     --flame-rail: 214px;
   }
   #root { padding: 24px; }
-  .portal-header { min-height: 48px; }
+  .portal-header {
+    min-height: 0;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    padding-bottom: 10px;
+  }
   .portal-header__logo { width: 34px; height: 42px; }
   .portal-header h1 { font-size: 20px; }
+  .portal-header__legend {
+    width: 100%;
+    margin-left: 0;
+    padding: 8px 0 0;
+    border-top: 1px solid var(--flame-rule);
+    border-left: 0;
+  }
+  .flame-legends { justify-content: space-between; gap: 14px; }
   .flame-legend { gap: 4px 8px; font-size: 9px; }
   .flame-legend li { gap: 4px; }
+  .flame-status-legend { padding-left: 14px; font-size: 8px; }
   .flame-time-axis time:nth-child(even) { display: none; }
 }
 
 @media (max-width: 520px) {
   :root { --flame-rail: 164px; }
   #root { padding: 16px; }
-  .portal-header { min-height: 44px; gap: 9px; }
+  .portal-header { gap: 7px; padding-bottom: 8px; }
+  .portal-header__brand { gap: 9px; }
   .portal-header__logo { width: 31px; height: 38px; }
   .portal-header h1 { font-size: 18px; }
   .flame-person-rail { padding: 0 10px; }
   .flame-person-rail h2 { font-size: 14px; }
 
-  .flame-meta-row { height: 74px; }
-  .flame-meta-rail { padding: 0 10px; }
-  .flame-legends { gap: 5px; }
+  .flame-legends {
+    display: grid;
+    gap: 6px;
+  }
+  .flame-legend {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-content: stretch;
+  }
   .flame-status-legend {
-    justify-content: flex-start;
-    gap: 3px 8px;
-    padding-top: 4px;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 5px 0 0;
+    border-top: 1px solid var(--flame-rule);
+    border-left: 0;
     font-size: 8px;
-    flex-wrap: wrap;
   }
 
   .flame-time-axis time { display: none; }

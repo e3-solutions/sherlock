@@ -374,33 +374,6 @@ function IntervalDetail({
   );
 }
 
-function SemanticLegend() {
-  return (
-    <div className="flame-legends">
-      <ul className="flame-legend" aria-label="Activity legend">
-        <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
-        <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
-        <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
-        <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
-      </ul>
-      <ul className="flame-status-legend" aria-label="Activity recency legend">
-        <li aria-label="Green: activity 10 minutes ago or less">
-          <i className="flame-status-key flame-person-status--active" aria-hidden="true" />
-          ≤10m
-        </li>
-        <li aria-label="Yellow: activity more than 10 and up to 30 minutes ago">
-          <i className="flame-status-key flame-person-status--recent" aria-hidden="true" />
-          &gt;10m–≤30m
-        </li>
-        <li aria-label="Red: activity more than 30 minutes ago or no activity">
-          <i className="flame-status-key flame-person-status--inactive" aria-hidden="true" />
-          &gt;30m / none
-        </li>
-      </ul>
-    </div>
-  );
-}
-
 const ACTIVITY_STATUS = {
   active: {
     label: "Active",
@@ -466,18 +439,22 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
 
   const handleKeyDown = (event) => {
     if (event.key === "ArrowRight") {
+      event.preventDefault();
       setKeyboardIndex((index) => Math.min(points.length - 1, index + 1));
       return;
     }
     if (event.key === "ArrowLeft") {
+      event.preventDefault();
       setKeyboardIndex((index) => Math.max(0, index - 1));
       return;
     }
     if (event.key === "Home") {
+      event.preventDefault();
       setKeyboardIndex(0);
       return;
     }
     if (event.key === "End") {
+      event.preventDefault();
       setKeyboardIndex(points.length - 1);
       return;
     }
@@ -572,11 +549,11 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
   );
 }
 
-export function getAvailableChartWidth(containerWidth, railWidth) {
-  return Math.max(1, containerWidth - railWidth);
+export function getAvailableChartWidth(scrollportClientWidth, railWidth) {
+  return Math.max(1, scrollportClientWidth - railWidth);
 }
 
-function useSharedChartWidth(rootRef, requestedWidth) {
+function useSharedChartWidth(scrollportRef, requestedWidth) {
   const [measuredWidth, setMeasuredWidth] = useState(requestedWidth ?? 1);
 
   useLayoutEffect(() => {
@@ -585,31 +562,33 @@ function useSharedChartWidth(rootRef, requestedWidth) {
       return undefined;
     }
 
-    const root = rootRef.current;
-    if (!root || typeof ResizeObserver === "undefined") return undefined;
+    const scrollport = scrollportRef.current;
+    if (!scrollport || typeof ResizeObserver === "undefined") return undefined;
 
     const update = () => {
-      const rail = Number.parseFloat(getComputedStyle(root).getPropertyValue("--flame-rail")) || 260;
-      setMeasuredWidth(getAvailableChartWidth(root.clientWidth, rail));
+      const rail = Number.parseFloat(
+        getComputedStyle(scrollport).getPropertyValue("--flame-rail"),
+      ) || 260;
+      setMeasuredWidth(getAvailableChartWidth(scrollport.clientWidth, rail));
     };
     const observer = new ResizeObserver(update);
-    observer.observe(root);
+    observer.observe(scrollport);
     update();
     return () => observer.disconnect();
-  }, [requestedWidth, rootRef]);
+  }, [requestedWidth, scrollportRef]);
 
   return Math.max(1, measuredWidth);
 }
 
 export default function FlameGraph({ data, chartWidth, stale = false }) {
-  const rootRef = useRef(null);
+  const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
   const [selection, setSelection] = useState(null);
   const [detailClosing, setDetailClosing] = useState(false);
   const [promptRevision, setPromptRevision] = useState(0);
   const [promptEvidence, setPromptEvidence] = useState({ state: "idle", items: [] });
-  const width = useSharedChartWidth(rootRef, chartWidth);
+  const width = useSharedChartWidth(peopleScrollRef, chartWidth);
   const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
   const promptPeak = data.people.reduce(
     (peoplePeak, person) => person.buckets.reduce(
@@ -638,7 +617,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     detailClosingRef.current = false;
     setDetailClosing(false);
     setSelection(null);
-    requestAnimationFrame(() => rootRef.current?.focus());
+    requestAnimationFrame(() => peopleScrollRef.current?.focus());
   }, []);
 
   useEffect(() => {
@@ -713,36 +692,38 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
 
   return (
     <section
-      ref={rootRef}
       className="flame-graph"
       data-state={stale ? "stale" : "current"}
       aria-label="Code activity over the last 24 hours"
-      tabIndex={-1}
     >
-      <div className="flame-graph-scroll">
-        <div className="flame-meta-row">
-          <div className="flame-meta-rail">
-            <SemanticLegend />
-          </div>
-          <div
-            className="flame-time-axis"
-            style={{ width }}
-            aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
-          >
-            {ticks.map((tick, index) => {
-              const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
-              return (
-                <time
-                  key={at}
-                  dateTime={new Date(at).toISOString()}
-                  style={{ left: `${(index / (ticks.length - 1)) * 100}%` }}
-                >
-                  {formatTime(at)}
-                </time>
-              );
-            })}
-          </div>
+      <div className="flame-meta-row">
+        <div className="flame-meta-rail" aria-hidden="true" />
+        <div
+          className="flame-time-axis"
+          style={{ width }}
+          aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
+        >
+          {ticks.map((tick, index) => {
+            const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
+            return (
+              <time
+                key={at}
+                dateTime={new Date(at).toISOString()}
+                style={{ left: `${(index / (ticks.length - 1)) * 100}%` }}
+              >
+                {formatTime(at)}
+              </time>
+            );
+          })}
         </div>
+      </div>
+      <div
+        ref={peopleScrollRef}
+        className="flame-people-scroll"
+        role="region"
+        aria-label={`People activity timelines, ${data.people.length} people`}
+        tabIndex={0}
+      >
         {data.people.map((person) => (
           <PersonLane
             key={person.id}

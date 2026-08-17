@@ -110,14 +110,46 @@ export default function App() {
 function PortalHeader() {
   return (
     <header className="portal-header">
-      <img
-        className="portal-header__logo"
-        src={bonaparteLogo}
-        alt=""
-        aria-hidden="true"
-      />
-      <h1>Bonaparte</h1>
+      <div className="portal-header__brand">
+        <img
+          className="portal-header__logo"
+          src={bonaparteLogo}
+          alt=""
+          aria-hidden="true"
+        />
+        <h1>Bonaparte</h1>
+      </div>
+      <aside className="portal-header__legend" aria-label="Timeline legend">
+        <SemanticLegend />
+      </aside>
     </header>
+  );
+}
+
+function SemanticLegend() {
+  return (
+    <div className="flame-legends">
+      <ul className="flame-legend" aria-label="Activity legend">
+        <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
+        <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
+        <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
+        <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
+      </ul>
+      <ul className="flame-status-legend" aria-label="Activity recency legend">
+        <li aria-label="Green: activity 10 minutes ago or less">
+          <i className="flame-status-key flame-person-status--active" aria-hidden="true" />
+          ≤10m
+        </li>
+        <li aria-label="Yellow: activity more than 10 and up to 30 minutes ago">
+          <i className="flame-status-key flame-person-status--recent" aria-hidden="true" />
+          &gt;10m–≤30m
+        </li>
+        <li aria-label="Red: activity more than 30 minutes ago or no activity">
+          <i className="flame-status-key flame-person-status--inactive" aria-hidden="true" />
+          &gt;30m / none
+        </li>
+      </ul>
+    </div>
   );
 }
 

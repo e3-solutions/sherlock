@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import FlameGraph, {
@@ -50,8 +50,9 @@ function model() {
 }
 
 describe("getAvailableChartWidth", () => {
-  it("uses all viewport space beside the person rail without a desktop minimum", () => {
+  it("uses scrollbar-adjusted scrollport space beside the person rail", () => {
     expect(getAvailableChartWidth(1_440, 260)).toBe(1_180);
+    expect(getAvailableChartWidth(1_425, 260)).toBe(1_165);
     expect(getAvailableChartWidth(320, 164)).toBe(156);
   });
 
@@ -124,6 +125,53 @@ describe("FlameGraph", () => {
       "aria-label",
       "Zero Activity activity timeline, 144 ten-minute buckets",
     );
+
+    const axis = container.querySelector(".flame-time-axis");
+    const peopleScroll = container.querySelector(".flame-people-scroll");
+    expect(peopleScroll).toHaveAttribute("role", "region");
+    expect(peopleScroll).toHaveAttribute("aria-label", "People activity timelines, 2 people");
+    expect(peopleScroll).toHaveAttribute("tabindex", "0");
+    expect(axis.parentElement).toHaveClass("flame-meta-row");
+    expect(peopleScroll.previousElementSibling).toBe(axis.parentElement);
+    expect(peopleScroll).not.toContainElement(axis);
+    expect(peopleScroll.querySelectorAll(".flame-person")).toHaveLength(2);
+  });
+
+  it("sizes both fixed axis and rows from the scrollbar-adjusted people scrollport", async () => {
+    const observations = [];
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback) {
+        this.callback = callback;
+      }
+
+      observe = (target) => {
+        observe(target);
+        observations.push({ callback: this.callback, target });
+      };
+      disconnect = disconnect;
+    });
+
+    const { container } = render(<FlameGraph data={model()} />);
+    const peopleScroll = container.querySelector(".flame-people-scroll");
+    Object.defineProperty(peopleScroll, "clientWidth", {
+      configurable: true,
+      value: 1_425,
+    });
+
+    const peopleObserver = observations.find(({ target }) => target === peopleScroll);
+    expect(peopleObserver).toBeDefined();
+    act(() => peopleObserver.callback());
+
+    await waitFor(() => {
+      expect(container.querySelector(".flame-time-axis")).toHaveStyle({ width: "1165px" });
+      for (const lane of container.querySelectorAll(".flame-lane")) {
+        expect(lane).toHaveStyle({ width: "1165px" });
+      }
+    });
+    expect(observe).toHaveBeenCalledWith(peopleScroll);
+    expect(disconnect).not.toHaveBeenCalled();
   });
 
   it("replaces role totals with accessible read-relative activity dots", () => {
@@ -146,33 +194,14 @@ describe("FlameGraph", () => {
     expect(screen.queryByLabelText("Ada Lovelace totals")).not.toBeInTheDocument();
   });
 
-  it("uses named legend entries and distinct solid role colors", () => {
+  it("uses distinct solid role colors", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const legend = screen.getByRole("list", { name: "Activity legend" });
 
     expect(screen.queryByText(/24H · 10M/)).not.toBeInTheDocument();
-    for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
-      expect(within(legend).getByText(label)).toBeInTheDocument();
-    }
     expect(container.querySelectorAll("pattern")).toHaveLength(0);
-    expect(container.querySelector(".flame-key--subagent")).toHaveClass("flame-key--subagent");
-    expect(container.querySelector(".flame-key--unclassified"))
-      .toHaveClass("flame-key--unclassified");
+    expect(container.querySelector('[fill="var(--flame-subagent)"]')).toBeInTheDocument();
+    expect(container.querySelector('[fill="var(--flame-unclassified)"]')).toBeInTheDocument();
     expect(container.querySelectorAll(".flame-prompt-stem")).toHaveLength(2);
-  });
-
-  it("explains the exact green, yellow, and red activity recency boundaries", () => {
-    render(<FlameGraph data={model()} chartWidth={1008} />);
-    const legend = screen.getByRole("list", { name: "Activity recency legend" });
-
-    expect(within(legend).getByLabelText("Green: activity 10 minutes ago or less"))
-      .toHaveTextContent("≤10m");
-    expect(within(legend).getByLabelText(
-      "Yellow: activity more than 10 and up to 30 minutes ago",
-    )).toHaveTextContent(">10m–≤30m");
-    expect(within(legend).getByLabelText(
-      "Red: activity more than 30 minutes ago or no activity",
-    )).toHaveTextContent(">30m / none");
   });
 
   it("renders bucket-aligned prompt stems with globally consistent magnitude", () => {
@@ -312,11 +341,25 @@ describe("FlameGraph", () => {
     });
   });
 
+  it("keeps chart navigation keys from scrolling the people roster", () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
+    const chart = container.querySelector('.flame-person [role="application"]');
+    roster.scrollTop = 42;
+
+    for (const key of ["ArrowLeft", "ArrowRight", "Home", "End"]) {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      fireEvent(chart, event);
+      expect(event.defaultPrevented).toBe(true);
+      expect(roster.scrollTop).toBe(42);
+    }
+  });
+
   it("keeps pointer hover tied to the first and last bucket payloads", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const wrapper = lane.querySelector(".recharts-wrapper");
-    const scroller = container.querySelector(".flame-graph-scroll");
+    const scroller = container.querySelector(".flame-people-scroll");
     const bounds = {
       bottom: 82,
       height: 82,
@@ -448,7 +491,7 @@ describe("FlameGraph", () => {
 
   it("keeps the drawer mounted until close ends, then clears selection without refocusing a row", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
     const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
@@ -486,7 +529,7 @@ describe("FlameGraph", () => {
 
     fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(graph).toHaveFocus());
+    await waitFor(() => expect(roster).toHaveFocus());
     expect(chart).not.toHaveFocus();
     expect(person).not.toHaveAttribute("data-selected");
     expect(lane).not.toHaveAttribute("data-selected-index");
@@ -494,7 +537,7 @@ describe("FlameGraph", () => {
 
   it("uses the same selection-clearing focus lifecycle for Escape", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
     const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
@@ -511,7 +554,7 @@ describe("FlameGraph", () => {
 
     fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(graph).toHaveFocus());
+    await waitFor(() => expect(roster).toHaveFocus());
     expect(chart).not.toHaveFocus();
     expect(person).not.toHaveAttribute("data-selected");
     expect(lane).not.toHaveAttribute("data-selected-index");
