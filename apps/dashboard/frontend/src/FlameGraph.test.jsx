@@ -114,8 +114,7 @@ describe("FlameGraph", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const legend = screen.getByRole("list", { name: "Activity legend" });
 
-    expect(screen.getByText(/24H · 10M · PARTIAL · READ .* · LATEST/))
-      .toBeInTheDocument();
+    expect(screen.queryByText(/24H · 10M/)).not.toBeInTheDocument();
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(legend).getByText(label)).toBeInTheDocument();
     }
@@ -282,12 +281,16 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
 
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
-    expect(detail).toHaveTextContent("4 observed sessions");
+    expect(detail).toHaveTextContent(/Ada Lovelace.*\d{1,2}:\d{2}.*–.*\d{1,2}:\d{2}/);
+    expect(detail).toHaveTextContent("4 sessions");
     expect(detail).toHaveTextContent("3 prompts");
     expect(detail).toHaveTextContent("Agent2 observed sessions");
     expect(detail).toHaveTextContent("Subagent1 observed session");
     expect(detail).toHaveTextContent("Unclassified1 observed session");
-    expect(detail).toHaveTextContent("Canonical observed evidence");
+    expect(detail).toHaveTextContent("What happened");
+    expect(detail).toHaveTextContent("Sessions");
+    expect(detail).not.toHaveTextContent("Canonical observed evidence");
+    expect(detail).not.toHaveTextContent("Latest API read");
     expect(lane).toHaveAttribute("data-selected-index", "0");
     expect(lane.querySelector(".flame-bucket-selected")).toBeInTheDocument();
   });
@@ -301,11 +304,11 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    expect(screen.getByText("Loading prompt evidence…")).toBeInTheDocument();
+    expect(screen.getByText("Loading prompts…")).toBeInTheDocument();
 
     await waitFor(() => expect(screen.getByText("First exact prompt")).toBeInTheDocument());
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
-    expect(detail).toHaveTextContent("3 prompts recorded in this interval");
+    expect(detail).not.toHaveTextContent("prompts recorded in this interval");
     expect(within(detail).getAllByRole("listitem")).toHaveLength(6);
     expect(detail).toHaveTextContent("Second prompt excerpt");
     expect(detail).toHaveTextContent("Stored excerpt");
@@ -342,10 +345,10 @@ describe("FlameGraph", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "Prompt evidence could not be loaded",
+        "Prompts could not be loaded",
       );
     });
-    expect(screen.queryByText("1 prompt recorded in this interval.")).not.toBeInTheDocument();
+    expect(screen.queryByText("prompts recorded in this interval")).not.toBeInTheDocument();
   });
 
   it("selects by keyboard and restores chart focus when details close", async () => {
@@ -358,7 +361,7 @@ describe("FlameGraph", () => {
     fireEvent.keyDown(chart, { key: "Enter" });
 
     expect(screen.getByRole("complementary", { name: "Ada Lovelace" })).toHaveTextContent(
-      "0 observed sessions",
+      "0 sessions",
     );
     expect(lane).toHaveAttribute("data-selected-index", "1");
 

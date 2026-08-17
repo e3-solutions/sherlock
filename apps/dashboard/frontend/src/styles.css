@@ -43,6 +43,23 @@ body {
 button,
 input { font: inherit; }
 
+.portal-header {
+  display: flex;
+  min-height: 48px;
+  flex: 0 0 auto;
+  align-items: flex-start;
+}
+
+.portal-header h1 {
+  margin: 0;
+  color: var(--flame-ink);
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
 .flame-graph {
   position: relative;
   flex: 1;
@@ -79,8 +96,7 @@ input { font: inherit; }
   cursor: pointer;
 }
 
-.refresh-warning,
-.coverage-warning {
+.refresh-warning {
   flex: 0 0 auto;
   width: max-content;
   max-width: 100%;
@@ -134,23 +150,6 @@ input { font: inherit; }
   align-items: center;
   padding: 0 16px;
   background: var(--flame-page);
-}
-
-.flame-meta-copy {
-  display: grid;
-  width: 100%;
-  gap: 6px;
-}
-
-.flame-receipt {
-  margin: 0;
-  overflow: hidden;
-  color: var(--flame-muted);
-  font-size: 9px;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: .035em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .flame-legend {
@@ -482,8 +481,7 @@ input { font: inherit; }
 }
 
 .flame-detail__eyebrow,
-.flame-detail__section h3,
-.flame-detail__coverage strong {
+.flame-detail__section h3 {
   margin: 0;
   color: var(--flame-agent);
   font-size: 11px;
@@ -492,22 +490,25 @@ input { font: inherit; }
   text-transform: uppercase;
 }
 
-.coverage-warning {
-  border-color: var(--flame-partial);
-  color: var(--flame-partial);
-}
-
 .flame-detail__header h2 {
   margin: 8px 0 3px;
   font-size: 20px;
   font-weight: 600;
+  letter-spacing: -.015em;
+  line-height: 1.25;
 }
 
 .flame-detail__range {
-  display: flex;
-  gap: 5px;
-  margin: 0;
+  white-space: nowrap;
   color: var(--flame-muted);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.flame-detail__totals {
+  margin: 8px 0 0;
+  color: var(--flame-muted);
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -532,18 +533,6 @@ input { font: inherit; }
   outline: none;
 }
 
-.flame-detail__receipt {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 14px;
-  padding: 10px 24px;
-  border-bottom: 1px solid var(--flame-rule);
-  color: var(--flame-muted);
-  font-size: 10px;
-  letter-spacing: .05em;
-  text-transform: uppercase;
-}
-
 .flame-detail__section {
   padding: 22px 24px;
   border-bottom: 1px solid var(--flame-rule);
@@ -551,35 +540,6 @@ input { font: inherit; }
 
 .flame-detail__section h3 {
   color: var(--flame-muted);
-}
-
-.flame-detail__summary {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1px;
-  margin: 14px 0 0;
-  background: var(--flame-rule);
-  border: 1px solid var(--flame-rule);
-}
-
-.flame-detail__summary div {
-  min-width: 0;
-  padding: 14px;
-  background: var(--flame-surface);
-}
-
-.flame-detail__summary dt {
-  margin-bottom: 5px;
-  color: var(--flame-muted);
-  font-size: 10px;
-  letter-spacing: .05em;
-  text-transform: uppercase;
-}
-
-.flame-detail__summary dd {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
 }
 
 .flame-detail__roles {
@@ -609,11 +569,6 @@ input { font: inherit; }
 }
 
 .flame-detail__empty {
-  margin: 12px 0 0;
-  color: var(--flame-muted);
-}
-
-.flame-detail__prompt-count {
   margin: 12px 0 0;
   color: var(--flame-muted);
 }
@@ -675,27 +630,14 @@ input { font: inherit; }
   cursor: pointer;
 }
 
-.flame-detail__coverage {
-  margin-top: auto;
-  padding: 22px 24px 26px;
-  background: var(--flame-surface);
-}
-
-.flame-detail__coverage strong { color: var(--flame-partial); }
-
-.flame-detail__coverage p {
-  margin: 9px 0 0;
-  color: var(--flame-muted);
-  font-size: 12px;
-  line-height: 1.55;
-}
-
 @media (max-width: 800px) {
   :root {
     font-size: 13px;
     --flame-rail: 214px;
   }
   #root { padding: 24px; }
+  .portal-header { min-height: 42px; }
+  .portal-header h1 { font-size: 20px; }
   .flame-legend { gap: 4px 8px; font-size: 9px; }
   .flame-legend li { gap: 4px; }
 }
@@ -703,6 +645,8 @@ input { font: inherit; }
 @media (max-width: 520px) {
   :root { --flame-rail: 164px; }
   #root { padding: 16px; }
+  .portal-header { min-height: 38px; }
+  .portal-header h1 { font-size: 18px; }
   .flame-person-rail { padding: 0 10px; }
   .flame-person-rail h2 { font-size: 14px; }
 
@@ -718,10 +662,7 @@ input { font: inherit; }
   }
 
   .flame-detail__header,
-  .flame-detail__section,
-  .flame-detail__coverage { padding-right: 18px; padding-left: 18px; }
-
-  .flame-detail__receipt { padding-right: 18px; padding-left: 18px; }
+  .flame-detail__section { padding-right: 18px; padding-left: 18px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

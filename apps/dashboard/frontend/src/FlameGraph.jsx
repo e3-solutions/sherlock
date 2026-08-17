@@ -273,10 +273,8 @@ function PromptStem({ cx, cy, payload, personName, promptPeak }) {
 }
 
 function IntervalDetail({
-  data,
   person,
   point,
-  stale,
   onClose,
   detailRef,
   promptEvidence,
@@ -299,12 +297,20 @@ function IntervalDetail({
     >
       <header className="flame-detail__header">
         <div>
-          <p className="flame-detail__eyebrow">10 minute interval</p>
-          <h2 id={headingId}>{person.name}</h2>
-          <p className="flame-detail__range">
-            <time dateTime={new Date(point.startMs).toISOString()}>{formatTime(point.startMs)}</time>
-            <span aria-hidden="true">—</span>
-            <time dateTime={new Date(point.endMs).toISOString()}>{formatTime(point.endMs)}</time>
+          <p className="flame-detail__eyebrow">Frame evidence</p>
+          <h2>
+            <span id={headingId}>{person.name}</span>
+            <span aria-hidden="true"> · </span>
+            <span className="flame-detail__range">
+              <time dateTime={new Date(point.startMs).toISOString()}>{formatTime(point.startMs)}</time>
+              <span aria-hidden="true">–</span>
+              <time dateTime={new Date(point.endMs).toISOString()}>{formatTime(point.endMs)}</time>
+            </span>
+          </h2>
+          <p className="flame-detail__totals">
+            {point.activity} {point.activity === 1 ? "session" : "sessions"}
+            <span aria-hidden="true"> · </span>
+            {formatPromptCount(point.prompts)}
           </p>
         </div>
         <button type="button" className="flame-detail__close" onClick={onClose}>
@@ -313,29 +319,37 @@ function IntervalDetail({
         </button>
       </header>
 
-      <div className="flame-detail__receipt" role="status">
-        <span>{stale ? "Last successful API read" : "Latest API read"}</span>
-        <span>{data.coverage.state === "partial" ? "Partial coverage" : "Complete coverage"}</span>
-        <span>Read {formatTime(data.readMs)}</span>
-        <span>Latest {data.latestMs === null ? "none" : formatTime(data.latestMs)}</span>
-      </div>
-
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-summary`}>
-        <h3 id={`${headingId}-summary`}>What happened</h3>
-        <dl className="flame-detail__summary">
-          <div>
-            <dt>Observed sessions</dt>
-            <dd>{formatSessionCount(point.activity)}</dd>
+      <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
+        <h3 id={`${headingId}-prompts`}>What happened</h3>
+        {point.prompts === 0 ? (
+          <p className="flame-detail__empty">No prompts in this interval.</p>
+        ) : promptEvidence.state === "loading" ? (
+          <p className="flame-detail__empty" role="status">Loading prompts…</p>
+        ) : promptEvidence.state === "error" ? (
+          <div className="flame-detail__prompt-error" role="alert">
+            <p>Prompts could not be loaded.</p>
+            <button type="button" onClick={onRetryPrompts}>Retry</button>
           </div>
-          <div>
-            <dt>Prompt activity</dt>
-            <dd>{formatPromptCount(point.prompts)}</dd>
-          </div>
-        </dl>
+        ) : (
+          <ol className="flame-detail__prompts">
+            {promptEvidence.items.map((prompt) => (
+              <li key={prompt.id}>
+                <header>
+                  <strong>User</strong>
+                  <time dateTime={new Date(prompt.atMs).toISOString()}>
+                    {formatTime(prompt.atMs)}
+                  </time>
+                  {prompt.truncated && <span>Stored excerpt</span>}
+                </header>
+                <p>{prompt.content || "Prompt text was empty."}</p>
+              </li>
+            ))}
+          </ol>
+        )}
       </section>
 
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
-        <h3 id={`${headingId}-work`}>Observed sessions</h3>
+      <section className="flame-detail__section" aria-labelledby={`${headingId}-sessions`}>
+        <h3 id={`${headingId}-sessions`}>Sessions</h3>
         {activeRoles.length > 0 ? (
           <ul className="flame-detail__roles">
             {activeRoles.map(({ key, label, value }) => (
@@ -347,69 +361,21 @@ function IntervalDetail({
             ))}
           </ul>
         ) : (
-          <p className="flame-detail__empty">No session evidence was recorded in this interval.</p>
+          <p className="flame-detail__empty">No sessions in this interval.</p>
         )}
       </section>
-
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
-        <h3 id={`${headingId}-prompts`}>Prompts</h3>
-        {point.prompts === 0 ? (
-          <p className="flame-detail__empty">No prompts were recorded in this interval.</p>
-        ) : promptEvidence.state === "loading" ? (
-          <p className="flame-detail__empty" role="status">Loading prompt evidence…</p>
-        ) : promptEvidence.state === "error" ? (
-          <div className="flame-detail__prompt-error" role="alert">
-            <p>Prompt evidence could not be loaded.</p>
-            <button type="button" onClick={onRetryPrompts}>Retry</button>
-          </div>
-        ) : (
-          <>
-            <p className="flame-detail__prompt-count">
-              {formatPromptCount(promptEvidence.items.length)} recorded in this interval.
-            </p>
-            <ol className="flame-detail__prompts">
-              {promptEvidence.items.map((prompt) => (
-                <li key={prompt.id}>
-                  <header>
-                    <strong>User</strong>
-                    <time dateTime={new Date(prompt.atMs).toISOString()}>
-                      {formatTime(prompt.atMs)}
-                    </time>
-                    {prompt.truncated && <span>Stored excerpt</span>}
-                  </header>
-                  <p>{prompt.content || "Prompt text was empty."}</p>
-                </li>
-              ))}
-            </ol>
-          </>
-        )}
-      </section>
-
-      <footer className="flame-detail__coverage">
-        <strong>Canonical observed evidence</strong>
-        <p>
-          Activity means a Sherlock event was observed in this interval; it does not claim
-          continuous attention between lifecycle boundaries. Prompt rows are deduplicated
-          primary-session user messages. Long content is shown as its stored database excerpt.
-        </p>
-      </footer>
     </aside>
   );
 }
 
-function SemanticLegend({ data }) {
+function SemanticLegend() {
   return (
-    <div className="flame-meta-copy">
-      <p className="flame-receipt">
-        24H · 10M · {data.coverage.state.toUpperCase()} · READ {formatTime(data.readMs)} · LATEST {data.latestMs === null ? "NONE" : formatTime(data.latestMs)}
-      </p>
-      <ul className="flame-legend" aria-label="Activity legend">
-        <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
-        <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
-        <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
-        <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
-      </ul>
-    </div>
+    <ul className="flame-legend" aria-label="Activity legend">
+      <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
+      <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
+      <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
+      <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
+    </ul>
   );
 }
 
@@ -726,7 +692,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       <div className="flame-graph-scroll">
         <div className="flame-meta-row">
           <div className="flame-meta-rail">
-            <SemanticLegend data={data} />
+            <SemanticLegend />
           </div>
           <div
             className="flame-time-axis"
@@ -762,10 +728,8 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       </div>
       {selectedPerson && selectedPoint && (
         <IntervalDetail
-          data={data}
           person={selectedPerson}
           point={selectedPoint}
-          stale={stale}
           onClose={closeDetail}
           detailRef={detailRef}
           promptEvidence={promptEvidence}
