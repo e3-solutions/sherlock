@@ -3,12 +3,12 @@
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
 uses SHERLOCK_WORKSPACE_ID, every database transaction is repeatable-read and
-read-only, and the server must successfully assume sherlock_reader.
+read-only, and the server assumes Sherlock's existing sherlock_normalizer role.
 
 The browser never receives database credentials. The page and aggregate API
-are public; every database query remains pinned to one configured workspace and
-runs through a dedicated read-only login. The API does not return prompt text,
-conversation content, or transcript evidence.
+are public; every database query remains pinned to one configured workspace.
+The API does not return prompt text, conversation content, or transcript
+evidence.
 
 ## Data contract
 
@@ -24,9 +24,10 @@ conversation content, or transcript evidence.
 
 ## Environment
 
-SHERLOCK_READER_DATABASE_URL and SHERLOCK_WORKSPACE_ID are required. The
-database login should be NOINHERIT and a member only of sherlock_reader.
-SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not exceed 1000.
+SUPABASE_DB_URL and SHERLOCK_WORKSPACE_ID are required. SUPABASE_DB_URL reuses
+the existing Sherlock worker login contract, which can assume
+sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
+exceed 1000.
 
 ## Local verification
 

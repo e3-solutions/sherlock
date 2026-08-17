@@ -4,6 +4,7 @@ export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const ACTIVITY_VERSION = "sherlock.activity.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const DATABASE_ROLE = "sherlock_normalizer";
 
 export const PEOPLE_SQL = `
 select id::text as person_id,
@@ -227,7 +228,7 @@ export class DirectFlameSource {
       return await this.sql.begin(async (tx) => {
         await tx.unsafe("set transaction isolation level repeatable read, read only");
         await tx.unsafe("select set_config('statement_timeout', '20000', true)");
-        await tx.unsafe("set local role sherlock_reader");
+        await tx.unsafe(`set local role ${DATABASE_ROLE}`);
         return await callback(tx);
       });
     } catch (error) {
@@ -240,21 +241,17 @@ export class DirectFlameSource {
     try {
       return await this.transaction(async (tx) => {
         const rows = await tx.unsafe(`
-          select current_role = 'sherlock_reader' as reader_role,
+          select current_role = 'sherlock_normalizer' as backend_role,
                  current_setting('transaction_read_only') = 'on' as read_only,
-                 not rolsuper as not_superuser,
-                 not rolbypassrls as not_bypassrls,
                  has_table_privilege(current_role, 'telemetry.people', 'select') as can_read_people,
                  has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events,
-                 has_table_privilege(current_role, 'analytics.activity_spans', 'select') as can_read_spans,
-                 not has_table_privilege(current_role, 'telemetry.people', 'insert,update,delete,truncate') as cannot_write_people,
-                 not has_table_privilege(current_role, 'analytics.activity_spans', 'insert,update,delete,truncate') as cannot_write_spans
+                 has_table_privilege(current_role, 'analytics.activity_spans', 'select') as can_read_spans
             from pg_roles where rolname = current_role
         `);
         if (!rows[0] || Object.values(rows[0]).some((value) => value !== true)) {
           throw new FlameSourceError("flame_database_reader_unsafe");
         }
-        return { status: "ok", mode: "sherlock_reader_aggregate" };
+        return { status: "ok", mode: "sherlock_backend_aggregate" };
       });
     } catch (error) {
       const code = error instanceof FlameSourceError

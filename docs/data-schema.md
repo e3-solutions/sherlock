@@ -181,12 +181,6 @@ v0. A read response may be cached by immutable snapshot and query parameters.
 | `sherlock_reducer` | Read sessions and normalized events; select/insert activity spans |
 | `sherlock_reader` | Read telemetry and analytics; no writes |
 
-The Railway dashboard connects with a dedicated
-`sherlock_dashboard_login` role. It is `NOINHERIT`, can assume only
-`sherlock_reader`, and every dashboard transaction explicitly sets that role
-after becoming repeatable-read and read-only. Its password is set out of band
-and stored only as a sealed Railway variable.
-
 The ingest role cannot write events or spans. The normalizer cannot write spans.
 The reducer cannot read raw receipts or native locators, change session caches
 or events, or update/delete spans. The reader cannot write any fact. These

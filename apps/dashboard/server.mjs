@@ -10,7 +10,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
 const PORT = Number.parseInt(process.env.PORT ?? "8000", 10);
 const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
-const databaseUrl = process.env.SHERLOCK_READER_DATABASE_URL ?? "";
+const databaseUrl = process.env.SUPABASE_DB_URL ?? "";
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
 const validWorkspaceId =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -68,7 +68,7 @@ async function sendFile(response, filePath, cacheControl) {
 
 function configurationStatus() {
   const missing = [];
-  if (!databaseUrl) missing.push("SHERLOCK_READER_DATABASE_URL");
+  if (!databaseUrl) missing.push("SUPABASE_DB_URL");
   if (!validWorkspaceId) missing.push("SHERLOCK_WORKSPACE_ID");
   if (!validMaxPeople) missing.push("SHERLOCK_DASHBOARD_MAX_PEOPLE");
   return missing.length === 0
