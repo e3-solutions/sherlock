@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import bonaparteLogo from "./assets/bonaparte-logo.png";
 import FlameGraph from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_MS } from "./flame-data.js";
 
@@ -109,6 +110,12 @@ export default function App() {
 function PortalHeader() {
   return (
     <header className="portal-header">
+      <img
+        className="portal-header__logo"
+        src={bonaparteLogo}
+        alt=""
+        aria-hidden="true"
+      />
       <h1>Bonaparte</h1>
     </header>
   );
