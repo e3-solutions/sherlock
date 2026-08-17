@@ -381,6 +381,14 @@ input { font: inherit; }
   stroke-width: 2px;
 }
 
+.flame-bucket-hover {
+  stroke: var(--flame-ink);
+  stroke-dasharray: 2 3;
+  stroke-linecap: round;
+  stroke-opacity: .8;
+  stroke-width: 1px;
+}
+
 .flame-tooltip {
   position: fixed;
   display: grid;

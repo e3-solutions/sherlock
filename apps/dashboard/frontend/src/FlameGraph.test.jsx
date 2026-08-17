@@ -2,8 +2,10 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import FlameGraph, {
+  BucketCursor,
   BucketTooltip,
   getAvailableChartWidth,
+  getBucketCenterX,
   getBucketTooltipPlacement,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
@@ -55,6 +57,28 @@ describe("getAvailableChartWidth", () => {
 
   it("keeps the chart renderable when the rail consumes the measured width", () => {
     expect(getAvailableChartWidth(160, 164)).toBe(1);
+  });
+});
+
+describe("bucket hover geometry", () => {
+  it("resolves exact bucket centers across the complete timeline", () => {
+    expect(getBucketCenterX(0, 1008)).toBe(3.5);
+    expect(getBucketCenterX(72, 1008)).toBe(507.5);
+    expect(getBucketCenterX(143, 1008)).toBe(1004.5);
+  });
+
+  it("draws the guide through the indexed bucket center", () => {
+    const { container } = render(
+      <svg>
+        <BucketCursor payloadIndex="72" left={0} top={10} width={1008} height={50} />
+      </svg>,
+    );
+    const guide = container.querySelector(".flame-bucket-hover");
+
+    expect(guide).toHaveAttribute("x1", "507.5");
+    expect(guide).toHaveAttribute("x2", "507.5");
+    expect(guide).toHaveAttribute("y1", "10");
+    expect(guide).toHaveAttribute("y2", "60");
   });
 });
 
@@ -207,6 +231,38 @@ describe("FlameGraph", () => {
     );
   });
 
+  it("anchors the tooltip to the same indexed bucket center as the hover guide", () => {
+    vi.stubGlobal("innerWidth", 2_000);
+    vi.stubGlobal("innerHeight", 1_000);
+    const point = model().people[0].buckets[72];
+    const laneRef = {
+      current: {
+        getBoundingClientRect: () => ({
+          bottom: 182,
+          height: 82,
+          left: 100,
+          right: 1108,
+          top: 100,
+          width: 1008,
+          x: 100,
+          y: 100,
+          toJSON: () => ({}),
+        }),
+      },
+    };
+    render(
+      <BucketTooltip
+        active
+        coordinate={{ x: 3.5 }}
+        laneRef={laneRef}
+        personName="Ada Lovelace"
+        payload={[{ payload: point }]}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveStyle({ left: "590px" });
+  });
+
   it("places the first bucket tooltip inside the top-left viewport edges", () => {
     const placement = getBucketTooltipPlacement({
       anchor: { x: 4, y: 4 },
@@ -288,13 +344,14 @@ describe("FlameGraph", () => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 observed sessions");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 3");
     });
-    expect(container.querySelector(".flame-bucket-hover")).not.toBeInTheDocument();
+    expect(container.querySelector(".flame-bucket-hover")).toHaveAttribute("x1", "3.5");
 
     fireEvent.mouseMove(wrapper, { clientX: 1005, clientY: 41 });
     await waitFor(() => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("1 observed session");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 0");
     });
+    expect(container.querySelector(".flame-bucket-hover")).toHaveAttribute("x1", "1004.5");
     expect(scroller.scrollLeft).toBe(37);
   });
 

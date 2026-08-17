@@ -30,6 +30,7 @@ const MIN_PROMPT_STEM_LENGTH = 4;
 const MAX_PROMPT_STEM_LENGTH = 14;
 const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
+const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;
 const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -62,8 +63,8 @@ export function getBucketTooltipPlacement({
 }) {
   const maxLeft = Math.max(padding, viewport.width - padding - tooltip.width);
   const maxTop = Math.max(padding, viewport.height - padding - tooltip.height);
-  const right = anchor.x + gap;
-  const left = anchor.x - gap - tooltip.width;
+  const right = anchor.x - TOOLTIP_ARROW_CENTER_OFFSET;
+  const left = anchor.x - tooltip.width + TOOLTIP_ARROW_CENTER_OFFSET;
   const above = anchor.y - gap - tooltip.height;
   const below = anchor.y + gap;
 
@@ -99,7 +100,12 @@ export function getBucketTooltipPlacement({
   };
 }
 
-export function BucketTooltip({ active, coordinate, laneRef, payload, personName }) {
+export function getBucketCenterX(index, chartWidth) {
+  const boundedIndex = clamp(index, 0, BUCKET_COUNT - 1);
+  return ((boundedIndex + 0.5) / BUCKET_COUNT) * chartWidth;
+}
+
+export function BucketTooltip({ active, laneRef, payload, personName }) {
   const tooltipRef = useRef(null);
   const [tooltipSize, setTooltipSize] = useState(DEFAULT_TOOLTIP_SIZE);
   const [, reposition] = useState(0);
@@ -131,11 +137,11 @@ export function BucketTooltip({ active, coordinate, laneRef, payload, personName
   if (!active || !point) return null;
 
   const laneBox = laneRef?.current?.getBoundingClientRect();
-  const hasAnchor = laneBox && Number.isFinite(coordinate?.x);
+  const hasAnchor = laneBox && Number.isInteger(point.index) && laneBox.width > 0;
   const placement = hasAnchor && typeof window !== "undefined"
     ? getBucketTooltipPlacement({
         anchor: {
-          x: laneBox.left + coordinate.x,
+          x: laneBox.left + getBucketCenterX(point.index, laneBox.width),
           y: laneBox.top + laneBox.height / 2,
         },
         tooltip: tooltipSize,
@@ -169,6 +175,35 @@ export function BucketTooltip({ active, coordinate, laneRef, payload, personName
       <span className="flame-tooltip-count"><span>Unclassified</span> {point.unclassified}</span>
       <span className="flame-tooltip-count"><span>Prompts</span> {point.prompts}</span>
     </output>
+  );
+}
+
+export function BucketCursor({ payloadIndex, left, top, width, height }) {
+  const index = Number(payloadIndex);
+  if (
+    payloadIndex == null
+    || !Number.isInteger(index)
+    || !Number.isFinite(left)
+    || !Number.isFinite(top)
+    || !Number.isFinite(width)
+    || !Number.isFinite(height)
+    || width <= 0
+  ) {
+    return null;
+  }
+
+  const x = left + getBucketCenterX(index, width);
+  return (
+    <line
+      className="flame-bucket-hover"
+      x1={x}
+      x2={x}
+      y1={top}
+      y2={top + height}
+      aria-hidden="true"
+      pointerEvents="none"
+      vectorEffect="non-scaling-stroke"
+    />
   );
 }
 
@@ -483,7 +518,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
           <YAxis yAxisId="prompts" hide domain={[0, 1]} />
           <Tooltip
             content={<BucketTooltip laneRef={laneRef} personName={person.name} />}
-            cursor={false}
+            cursor={<BucketCursor />}
             isAnimationActive={false}
             portal={typeof document === "undefined" ? null : document.body}
             wrapperStyle={{
