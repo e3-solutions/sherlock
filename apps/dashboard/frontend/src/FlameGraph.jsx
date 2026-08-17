@@ -21,6 +21,7 @@ import {
   adaptPromptEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
+  getPersonActivityStatus,
 } from "./flame-data.js";
 
 const MIN_CHART_WIDTH = 720;
@@ -412,17 +413,34 @@ function SemanticLegend({ data }) {
   );
 }
 
+const ACTIVITY_STATUS = {
+  active: {
+    label: "Active",
+    description: "observed session evidence in the latest completed 10-minute interval",
+  },
+  recent: {
+    label: "Recently active",
+    description: "observed session evidence in the preceding 20 minutes",
+  },
+  inactive: {
+    label: "Inactive",
+    description: "no observed session evidence in the trailing 30 minutes",
+  },
+};
+
 function PersonRail({ person, headingId }) {
-  const [agent, subagent, unclassified] = person.total;
+  const status = getPersonActivityStatus(person);
+  const { label, description } = ACTIVITY_STATUS[status];
 
   return (
     <header className="flame-person-rail">
       <h2 id={headingId} title={person.name}>{person.name}</h2>
-      <output className="flame-totals" aria-label={`${person.name} totals`}>
-        <span className="flame-total--agent">A {agent}</span>
-        <span className="flame-total--subagent">S {subagent}</span>
-        {unclassified > 0 && <span>U {unclassified}</span>}
-      </output>
+      <span
+        className={`flame-person-status flame-person-status--${status}`}
+        role="img"
+        aria-label={`${person.name}: ${label}; ${description}`}
+        title={`${label} — ${description}`}
+      />
     </header>
   );
 }

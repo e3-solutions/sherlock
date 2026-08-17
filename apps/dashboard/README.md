@@ -28,6 +28,11 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   fallback for event types without a stable native item ID.
 - primary is Agent; worker and guardian are Subagent; unknown is Unclassified.
   automation is excluded.
+- The person rail shows snapshot-relative recency rather than daily role totals:
+  green means observed Agent/Subagent/Unclassified session evidence in the latest
+  completed ten-minute bucket; yellow means none in that bucket but evidence in
+  either of the preceding two buckets; red means no such evidence in the trailing
+  thirty minutes. Prompt-only buckets do not imply that an agent is running.
 - Canonically selected, non-replay primary-role submitted user messages with
   valid stored content supply prompt counts. Keyed records follow Sherlock's
   documented source-priority selection exactly, including the pinned normalizer

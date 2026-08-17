@@ -102,6 +102,27 @@ export function getGlobalPeak(people) {
 }
 
 /**
+ * Classifies recent observed session evidence relative to the aggregate window.
+ * Prompt-only buckets intentionally do not imply a running agent.
+ */
+export function getPersonActivityStatus(person) {
+  if (!person || !Array.isArray(person.buckets) || person.buckets.length < 3) {
+    fail("person", "an adapted person with at least three buckets");
+  }
+
+  const recentBuckets = person.buckets.slice(-3);
+  for (const bucket of recentBuckets) {
+    if (!bucket || !Number.isSafeInteger(bucket.activity) || bucket.activity < 0) {
+      fail("person", "an adapted person with valid activity buckets");
+    }
+  }
+
+  if (recentBuckets[2].activity > 0) return "active";
+  if (recentBuckets[0].activity > 0 || recentBuckets[1].activity > 0) return "recent";
+  return "inactive";
+}
+
+/**
  * Validates and expands the compact /api/flame response into chart-ready points.
  * The operation is one-to-one: it never sorts, rebuckets, or derives daily totals.
  */

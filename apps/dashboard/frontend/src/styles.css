@@ -290,18 +290,17 @@ input { font: inherit; }
   white-space: nowrap;
 }
 
-.flame-totals {
-  display: flex;
+.flame-person-status {
+  width: 8px;
+  height: 8px;
   flex: 0 0 auto;
-  gap: 6px;
-  color: var(--flame-muted);
-  font-size: 9px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 12%);
 }
 
-.flame-total--agent { color: var(--flame-agent); }
-.flame-total--subagent { color: var(--flame-subagent); }
+.flame-person-status--active { background: #45d483; }
+.flame-person-status--recent { background: #e2bd45; }
+.flame-person-status--inactive { background: #ef5552; }
 
 .flame-lane {
   position: relative;
@@ -709,7 +708,6 @@ input { font: inherit; }
   :root { --flame-rail: 144px; }
   #root { padding: 16px; }
   .flame-person-rail { padding: 0 10px; }
-  .flame-totals { display: none; }
 
   .flame-detail {
     top: auto;

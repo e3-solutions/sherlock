@@ -8,6 +8,7 @@ import {
   adaptPromptEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
+  getPersonActivityStatus,
 } from "./flame-data.js";
 
 function buckets() {
@@ -237,6 +238,45 @@ describe("adaptFlamePayload", () => {
     expect(() => adaptFlamePayload(payload({
       coverage: { evidence: "aggregate", state: "partial", reason: "legacy" },
     }))).toThrow(FlameDataError);
+  });
+});
+
+describe("getPersonActivityStatus", () => {
+  function adaptedPersonWithRecentBuckets({
+    oldest = [0, 0, 0, 0],
+    middle = [0, 0, 0, 0],
+    latest = [0, 0, 0, 0],
+  } = {}) {
+    const values = buckets();
+    values[141] = oldest;
+    values[142] = middle;
+    values[143] = latest;
+    return adaptFlamePayload(payload({
+      people: [person({ total: [4, 4, 4], buckets: values })],
+    })).people[0];
+  }
+
+  it("is active only when the latest completed bucket has session evidence", () => {
+    const adapted = adaptedPersonWithRecentBuckets({ latest: [0, 1, 0, 0] });
+
+    expect(getPersonActivityStatus(adapted)).toBe("active");
+  });
+
+  it("is recent when session evidence exists only in the preceding twenty minutes", () => {
+    const adapted = adaptedPersonWithRecentBuckets({ oldest: [0, 0, 1, 0] });
+
+    expect(getPersonActivityStatus(adapted)).toBe("recent");
+  });
+
+  it("is inactive when only prompts or older session evidence exists", () => {
+    const values = buckets();
+    values[140] = [1, 0, 0, 0];
+    values[143] = [0, 0, 0, 12];
+    const adapted = adaptFlamePayload(payload({
+      people: [person({ total: [1, 0, 0], buckets: values })],
+    })).people[0];
+
+    expect(getPersonActivityStatus(adapted)).toBe("inactive");
   });
 });
 

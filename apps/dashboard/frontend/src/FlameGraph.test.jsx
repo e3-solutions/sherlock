@@ -88,6 +88,26 @@ describe("FlameGraph", () => {
     );
   });
 
+  it("replaces role totals with accessible snapshot-relative activity dots", () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+
+    const active = screen.getByRole("img", {
+      name: "Ada Lovelace: Active; observed session evidence in the latest completed 10-minute interval",
+    });
+    const inactive = screen.getByRole("img", {
+      name: "Zero Activity: Inactive; no observed session evidence in the trailing 30 minutes",
+    });
+
+    expect(active).toHaveClass("flame-person-status--active");
+    expect(active).toHaveAttribute(
+      "title",
+      expect.stringContaining("latest completed 10-minute interval"),
+    );
+    expect(inactive).toHaveClass("flame-person-status--inactive");
+    expect(container.querySelector(".flame-totals")).toBeNull();
+    expect(screen.queryByLabelText("Ada Lovelace totals")).not.toBeInTheDocument();
+  });
+
   it("uses named legend entries and non-color-only SVG patterns", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
     const legend = screen.getByRole("list", { name: "Activity legend" });
