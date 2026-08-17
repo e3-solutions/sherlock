@@ -36,16 +36,16 @@ objects.
   evidence must be at or after its owning Sherlock session's millisecond-aligned
   start. Copied pre-start source facts remain immutable in telemetry, but they do
   not make the later session active in an earlier dashboard bucket.
-- primary is Agent; worker and guardian are Subagent; unknown is Unclassified.
+- primary is Agent; worker and guardian are Subagent; unknown is Unclassified;
   automation is excluded. When a v1 event is `unknown` but its Sherlock session
   has a resolved parent, the dashboard presents it as Subagent: parent topology
   is resolved source-backed session evidence that it is child work even when an
   older Codex payload encoded `source.subagent` as a string the v1 normalizer did
-  not classify.
-  Unknown root sessions remain Unclassified; stored event roles are not changed.
-  Detail queries require both the event row and the current session-row version
-  to have been visible to the aggregate snapshot. If parent metadata changes
-  after that snapshot, detail fails stale instead of silently changing the role.
+  not classify. Detail queries require the current session-row version to have
+  been visible to the aggregate snapshot only when an unknown event needs that
+  mutable parent fallback. Known event roles remain snapshot-stable when
+  unrelated session metadata changes. Ambiguous unknown-role rows are omitted
+  with an explicit partial-evidence notice instead of failing the whole frame.
 - The person rail shows bucket-derived 24-hour active time alongside read-relative
   recency rather than daily role totals. The API supplies each person's latest
   canonical activity timestamp, including the current partial interval: green
@@ -101,9 +101,10 @@ objects.
   reasoning, and error evidence. The default page size is 50 and the maximum
   is 100. Cursors are opaque and keyset pagination is ordered by effective
   event timestamp and immutable event ID.
-- Every interval/work event and its joined session-row version is filtered with
-  the aggregate's PostgreSQL MVCC snapshot token. Queries are workspace scoped
-  and parameterized, and no endpoint performs per-row database or Storage reads.
+- Every interval/work event is filtered with the aggregate's PostgreSQL MVCC
+  snapshot token. Session-row visibility is additionally required for the
+  unknown-role parent fallback. Queries are workspace scoped and parameterized,
+  and no endpoint performs per-row database or Storage reads.
 - Normalized tool facts include tool name, call ID, status, timestamp, and
   stored repository/context labels. Tool arguments, outputs, and file paths
   are not projected as structured tool fields, so the API explicitly reports

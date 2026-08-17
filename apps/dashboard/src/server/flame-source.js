@@ -578,7 +578,10 @@ with p as materialized (
     join telemetry.ingest_batches ib
       on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id`,
   visibilityPredicate: `and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
-     and pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)`,
+     and (
+       e.actor_role <> 'unknown'
+       or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)
+     )`,
 })}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
@@ -634,7 +637,10 @@ with p as materialized (
     join telemetry.ingest_batches ib
       on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id`,
   visibilityPredicate: `and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
-     and pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)`,
+     and (
+       e.actor_role <> 'unknown'
+       or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)
+     )`,
 })}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'

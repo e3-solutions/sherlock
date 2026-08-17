@@ -427,6 +427,12 @@ function IntervalOverview({
 
           <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
             <h3 id={`${headingId}-work`}>Active work</h3>
+            {evidence.workIncomplete && (
+              <p className="flame-detail__partial" role="status">
+                Some session-role evidence changed after this timeline snapshot and is omitted
+                until the next timeline refresh.
+              </p>
+            )}
             {evidence.work.length === 0 ? (
               <p className="flame-detail__empty">No work-session evidence observed in this interval.</p>
             ) : (
@@ -873,7 +879,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const [intervalRevision, setIntervalRevision] = useState(0);
   const [workRevision, setWorkRevision] = useState(0);
   const [intervalEvidence, setIntervalEvidence] = useState({
-    state: "idle", prompts: [], work: [], coverage: null,
+    state: "idle", prompts: [], work: [], coverage: null, workIncomplete: false,
   });
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], coverage: null, nextCursor: null,
@@ -948,12 +954,16 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
-      setIntervalEvidence({ state: "idle", prompts: [], work: [], coverage: null });
+      setIntervalEvidence({
+        state: "idle", prompts: [], work: [], coverage: null, workIncomplete: false,
+      });
       return undefined;
     }
 
     const controller = new AbortController();
-    setIntervalEvidence({ state: "loading", prompts: [], work: [], coverage: null });
+    setIntervalEvidence({
+      state: "loading", prompts: [], work: [], coverage: null, workIncomplete: false,
+    });
     const query = new URLSearchParams({
       personId: selectedPerson.id,
       start: new Date(selectedPoint.startMs).toISOString(),
@@ -978,14 +988,20 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
         if (evidence.prompts.length !== selectedPoint.prompts) {
           throw new Error("Prompt evidence count does not match the timeline snapshot");
         }
-        if (evidence.work.length !== selectedPoint.activity) {
+        if (evidence.work.length > selectedPoint.activity) {
           throw new Error("Work evidence count does not match the timeline snapshot");
         }
-        setIntervalEvidence({ state: "ready", ...evidence });
+        setIntervalEvidence({
+          state: "ready",
+          ...evidence,
+          workIncomplete: evidence.work.length < selectedPoint.activity,
+        });
       })
       .catch(() => {
         if (!controller.signal.aborted) {
-          setIntervalEvidence({ state: "error", prompts: [], work: [], coverage: null });
+          setIntervalEvidence({
+            state: "error", prompts: [], work: [], coverage: null, workIncomplete: false,
+          });
         }
       });
     return () => controller.abort();

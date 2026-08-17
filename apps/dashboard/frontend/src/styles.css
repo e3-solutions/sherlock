@@ -784,6 +784,13 @@ input { font: inherit; }
   font-size: 11px;
 }
 
+.flame-detail__partial {
+  margin: 12px 0 0;
+  color: var(--flame-stale);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .flame-detail__prompts {
   display: grid;
   gap: 0;

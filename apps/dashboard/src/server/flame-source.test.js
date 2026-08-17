@@ -340,6 +340,10 @@ describe("Sherlock Flame payload", () => {
   });
 
   it("uses stable prompt identifiers before a mutually unique source-stream bridge", () => {
+    const promptSql = FLAME_SQL.slice(
+      FLAME_SQL.indexOf("prompt_candidates as materialized"),
+      FLAME_SQL.indexOf("prompt_counts as materialized"),
+    );
     expect(UNKEYED_PROMPT_MATCH_SECONDS).toBe(2);
     expect(FLAME_SQL).toContain("native_identity_candidates as materialized");
     expect(FLAME_SQL).not.toContain("partition by session_id, native_item_id");
@@ -356,7 +360,7 @@ describe("Sherlock Flame payload", () => {
       "native.native_source_observed_at - submitted.source_observed_at",
     );
     expect(FLAME_SQL).toContain("native.native_observed_at matched_native_observed_at");
-    expect(FLAME_SQL).not.toContain("cross join lateral");
+    expect(promptSql).not.toContain("cross join lateral");
     expect(FLAME_SQL).toContain("interval '2 seconds'");
     expect(FLAME_SQL).not.toContain("date_trunc(\n                          'second'");
     expect(FLAME_SQL).not.toContain("matching_native_item_id");
@@ -426,6 +430,8 @@ describe("Sherlock Flame payload", () => {
       expect(sql).toContain("where canonical_rank = 1");
       expect(sql).toContain("pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)");
       expect(sql).toContain("e.actor_role = 'unknown' and s.parent_session_id is not null");
+      expect(sql).toContain("e.actor_role <> 'unknown'");
+      expect(sql).toContain("or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)");
       expect(sql).toContain("pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)");
       expect(sql).not.toContain("analytics.activity_spans");
     }

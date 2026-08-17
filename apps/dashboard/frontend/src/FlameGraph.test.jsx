@@ -605,6 +605,26 @@ describe("FlameGraph", () => {
     );
   });
 
+  it("keeps prompt and stable work evidence visible when mutable role metadata is partial", async () => {
+    const partialModel = model();
+    partialModel.people[0].buckets[0].activity = 5;
+    partialModel.people[0].buckets[0].agent = 3;
+    const { container } = render(<FlameGraph data={partialModel} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+
+    expect(await screen.findByText(
+      /Some session-role evidence changed after this timeline snapshot/,
+    )).toHaveAttribute("role", "status");
+    expect(screen.getByText("What happened")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("keeps busy interval overviews concise until more prompts are requested", async () => {
     const busyModel = model();
     busyModel.people[0].buckets[0].prompts = 7;
