@@ -146,33 +146,14 @@ describe("FlameGraph", () => {
     expect(screen.queryByLabelText("Ada Lovelace totals")).not.toBeInTheDocument();
   });
 
-  it("uses named legend entries and distinct solid role colors", () => {
+  it("uses distinct solid role colors", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const legend = screen.getByRole("list", { name: "Activity legend" });
 
     expect(screen.queryByText(/24H · 10M/)).not.toBeInTheDocument();
-    for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
-      expect(within(legend).getByText(label)).toBeInTheDocument();
-    }
     expect(container.querySelectorAll("pattern")).toHaveLength(0);
-    expect(container.querySelector(".flame-key--subagent")).toHaveClass("flame-key--subagent");
-    expect(container.querySelector(".flame-key--unclassified"))
-      .toHaveClass("flame-key--unclassified");
+    expect(container.querySelector('[fill="var(--flame-subagent)"]')).toBeInTheDocument();
+    expect(container.querySelector('[fill="var(--flame-unclassified)"]')).toBeInTheDocument();
     expect(container.querySelectorAll(".flame-prompt-stem")).toHaveLength(2);
-  });
-
-  it("explains the exact green, yellow, and red activity recency boundaries", () => {
-    render(<FlameGraph data={model()} chartWidth={1008} />);
-    const legend = screen.getByRole("list", { name: "Activity recency legend" });
-
-    expect(within(legend).getByLabelText("Green: activity 10 minutes ago or less"))
-      .toHaveTextContent("≤10m");
-    expect(within(legend).getByLabelText(
-      "Yellow: activity more than 10 and up to 30 minutes ago",
-    )).toHaveTextContent(">10m–≤30m");
-    expect(within(legend).getByLabelText(
-      "Red: activity more than 30 minutes ago or no activity",
-    )).toHaveTextContent(">30m / none");
   });
 
   it("renders bucket-aligned prompt stems with globally consistent magnitude", () => {
