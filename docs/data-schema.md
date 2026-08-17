@@ -1,12 +1,14 @@
 # Sherlock v0 Data Architecture
 
-Status: the Supabase database foundation, rollout collector drain, first Codex
-normalizer, and first versioned activity reducer are implemented. The snapshot
-resolver, version activation, and Flame read APIs are not.
+Status: the Supabase database foundation, rollout collector drain, asynchronous
+Codex normalizer worker, and targeted versioned activity reducer are
+implemented. The snapshot resolver, version activation, and Flame read APIs are
+not.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
-views separate from source data. The database is intentionally small: seven
-tables across two private schemas and one private Storage bucket.
+views separate from source data. Seven source/product tables remain across two
+private schemas, with one private operational queue table in `processing` and
+one private Storage bucket.
 
 ## Sources of truth
 
@@ -39,11 +41,13 @@ Keeping one exact definition prevents the architecture notes from drifting.
   representative integrity failures.
 - The rollout collector and ingest function implement the versioned immutable
   batch and committed-receipt contract described below.
-- The ingest request then projects every native record with the immutable
-  `sherlock.codex-rollout.v1` normalizer and indexes bounded user/assistant
-  message excerpts with PostgreSQL full-text search.
-- The explicit internal reducer command converts pinned, canonical normalized
-  events into append-only `sherlock.activity.v1` span revisions outside ingest.
+- The ingest request durably enqueues work and returns its existing receipt
+  without waiting for normalization.
+- Railway projects every native record with the immutable
+  `sherlock.codex-rollout.v1` normalizer, then reduces only affected sessions
+  into append-only `sherlock.activity.v1` span revisions.
+- PostgreSQL automatically indexes bounded message excerpts as normalized
+  event rows are inserted.
 
 The migration does not create Storage object policies or a user-facing
 permission model. Future services must connect server-side and assume only the
@@ -57,7 +61,8 @@ flowchart LR
     C["Collector"] --> O["Private source object"]
     O --> B["telemetry.ingest_batches"]
     B --> N["telemetry.native_records"]
-    N --> E["telemetry.events"]
+    N --> Q["processing.telemetry_jobs"]
+    Q --> E["Railway → telemetry.events"]
     E --> A["analytics.activity_spans"]
     A --> F["Future Flame API"]
     N --> T["Future transcript reader"]
@@ -68,7 +73,7 @@ immutable receipts and locators plus versioned interpretations. Complete
 prompts, messages, reasoning, tool payloads, and native JSON do not belong in
 database columns.
 
-## The seven tables
+## Source, product, and operational tables
 
 | Table | Responsibility | Writer behavior |
 | --- | --- | --- |
@@ -79,6 +84,7 @@ database columns.
 | `telemetry.native_records` | Exact locator and parse status for each native record | Ingest may insert only |
 | `telemetry.events` | Versioned semantic projections of native records | Normalizer may insert only |
 | `analytics.activity_spans` | Versioned, rebuildable activity intervals | Reducer may insert only |
+| `processing.telemetry_jobs` | Mutable leases, retries, workload class, and terminal outcomes | Ingest trigger inserts; Railway transitions with fencing |
 
 Append-only behavior is enforced for application roles through grants. A
 database owner can still perform administrative maintenance and therefore
@@ -216,19 +222,21 @@ in both expected failure windows:
 An orphaned object from a rejected conflict is operational cleanup, not a
 queryable telemetry fact.
 
-## Implemented normalization contract
+## Implemented asynchronous normalization contract
 
-Raw commit and normalization are deliberately two short database transactions
-inside one request. The immutable object, batch, and native locators commit
-first. The normalizer then reads the already-validated source bytes, upserts the
-session cache, and inserts one versioned event for every native record.
+The immutable object is written first. One database transaction then inserts
+the batch, native locators, and an `AFTER INSERT` queue row. The existing receipt
+returns after that durable acceptance. Railway re-downloads and revalidates the
+object, upserts the session cache, and inserts one versioned event for every
+native record. It then coalesces the latest event cutoff into one targeted
+reduction job per affected session. The unique source-record/version/projection
+key prevents duplicate events, and a coverage check rejects incomplete
+projections.
 
-If normalization fails after raw commit, the endpoint returns an error. The
-collector keeps its spool item. Its retry resolves the exact existing receipt
-without uploading or inserting raw data again, then retries the idempotent event
-projections. The unique source-record/version/projection key prevents duplicate
-events. A coverage check inside the normalizer transaction rejects any batch
-where a native record lacks a projection.
+Queue claims use `FOR UPDATE SKIP LOCKED`, visibility deadlines, heartbeats,
+and fencing tokens. Caught failures retry with capped exponential backoff;
+exhausted attempts remain inspectable as `failed`. Separate live/backfill
+capacity prevents historical work from starving current ingestion.
 
 The first version recognizes session metadata, turn context, user and assistant
 messages, cumulative token usage, reasoning, common tool calls/results,
@@ -249,10 +257,12 @@ to the same person.
 
 ## Implemented activity reducer contract
 
-`scripts/reduce-activity.ts` is an internal database command, not an Edge
-Function or public API. It captures or accepts a fixed workspace event bound,
-pages sessions by UUID and each session's events by event ID, derives spans in
-memory, then appends changed revisions in one short transaction per session. The
+The Railway worker calls the reducer only for coalesced session IDs affected by
+normalized batches.
+`scripts/reduce-activity.ts` remains an explicit repair command, not a scheduler
+or public API. It can capture a workspace event bound for manual rebuilds. The
+targeted path pages a session's events by event ID, derives spans in memory,
+then appends changed revisions in one short transaction per session. The
 transaction assumes only `sherlock_reducer`, takes one transaction advisory lock
 keyed by workspace, activity version, and session, and verifies any conflict row
 byte-for-byte. Reducer failure cannot roll back or destabilize raw ingest or
@@ -344,7 +354,7 @@ actually enforces it.
 - editable project and repository catalogs;
 - incidents, alerts, transcript search, embeddings, and recommendations;
 - multi-provider normalization, warehouse export, and partitioning.
-- queues, cron scheduling, durable reducer cursors, and hosted job state;
+- durable product snapshot cursors and generalized job orchestration;
 - native wall/monotonic-duration precedence, hook tails, and presence streams
   until normalized events actually provide that evidence.
 

@@ -10,7 +10,7 @@ import {
   storagePath,
   timestampMicros,
 } from "./contract.ts";
-import type { BatchRepository } from "./service.ts";
+import type { BatchRepository, WorkloadClassHint } from "./service.ts";
 
 type Sql = ReturnType<typeof postgres>;
 type Queryable = Pick<Sql, "unsafe">;
@@ -265,6 +265,7 @@ export class PostgresBatchRepository implements BatchRepository {
     attribution: Attribution,
     manifest: BatchManifest,
     path: string,
+    workloadClassHint: WorkloadClassHint,
   ): Promise<CommittedReceipt> {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_ingest");
@@ -337,10 +338,10 @@ export class PostgresBatchRepository implements BatchRepository {
            start_offset, end_offset, source_byte_count, source_sha256,
            storage_path, storage_encoding, stored_byte_count, stored_sha256,
            record_count, first_occurred_at, last_occurred_at, codex_version,
-           collector_version, contract_version
+           collector_version, contract_version, processing_class_hint
          ) values (
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-           $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+           $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
          ) returning ${RECEIPT_COLUMNS}`,
         [
           batchId,
@@ -366,6 +367,7 @@ export class PostgresBatchRepository implements BatchRepository {
           manifest.codex_version,
           manifest.collector_version,
           manifest.contract_version,
+          workloadClassHint,
         ],
       );
 

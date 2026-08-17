@@ -1,0 +1,12 @@
+.git
+.codex
+.env
+.env.*
+!.env.example
+**/.DS_Store
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/node_modules
+supabase/.branches
+supabase/.temp

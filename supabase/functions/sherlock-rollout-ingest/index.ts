@@ -1,8 +1,7 @@
 import { publicCollectorGrant } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
-import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
-import { IngestService } from "./service.ts";
+import { IngestService, type WorkloadClassHint } from "./service.ts";
 import { SupabaseImmutableStorage } from "./storage.ts";
 
 function required(name: string): string {
@@ -32,7 +31,6 @@ function ingestBackend(): {
         required("SUPABASE_SERVICE_ROLE_KEY"),
       ),
       batches,
-      PostgresBatchNormalizer.connect(databaseUrl),
     ),
   };
   return backend;
@@ -57,6 +55,7 @@ async function handler(request: Request): Promise<Response> {
       attribution,
       envelope.manifest,
       envelope.stored_payload,
+      parseWorkloadClassHint(request.headers.get("x-sherlock-workload-class")),
     );
     return Response.json(receipt, {
       status: 200,
@@ -75,6 +74,18 @@ async function handler(request: Request): Promise<Response> {
       { status: 500, headers: { "Cache-Control": "no-store" } },
     );
   }
+}
+
+export function parseWorkloadClassHint(
+  value: string | null,
+): WorkloadClassHint {
+  if (value === null || value === "") return null;
+  if (value === "live" || value === "backfill") return value;
+  throw new IngestError(
+    "invalid_workload_class",
+    "x-sherlock-workload-class must be live or backfill",
+    400,
+  );
 }
 
 async function readJsonBounded(request: Request): Promise<unknown> {

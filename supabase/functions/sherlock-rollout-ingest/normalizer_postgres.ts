@@ -11,6 +11,7 @@ import {
   type SessionProjection,
 } from "./normalizer.ts";
 import type { BatchNormalizer } from "./service.ts";
+import type { NormalizationResult } from "./service.ts";
 
 type Sql = ReturnType<typeof postgres>;
 type TransactionSql = postgres.TransactionSql;
@@ -72,13 +73,17 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
     );
   }
 
+  async close(): Promise<void> {
+    await this.sql.end();
+  }
+
   async normalize(
     receipt: CommittedReceipt,
     manifest: BatchManifest,
     source: Uint8Array,
-  ): Promise<void> {
+  ): Promise<NormalizationResult> {
     const projection = await projectBatch(manifest, source);
-    await this.sql.begin(async (tx) => {
+    return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_normalizer");
       const sourceRecords = await tx.unsafe(
         `select id, record_index
@@ -175,6 +180,9 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
           500,
         );
       }
+      return {
+        session_ids: normalizedSession ? [normalizedSession.id] : [],
+      };
     });
   }
 }
