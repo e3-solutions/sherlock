@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   BUCKET_COUNT,
@@ -6,11 +6,16 @@ import {
   FLAME_SQL,
   PEOPLE_SQL,
   PROMPT_DETAIL_SQL,
+  DirectFlameSource,
   FlameSourceError,
   buildFlamePayload,
+  decodeSnapshotToken,
+  encodeSnapshotToken,
 } from "./flame-source.js";
 
 const START = new Date("2026-08-16T12:00:00.000Z");
+const READ = new Date("2026-08-17T12:00:01.000Z");
+const PG_SNAPSHOT = "730:741:733,739";
 
 function rowsFor(personId, overrides = {}) {
   return Array.from({ length: BUCKET_COUNT }, (_, index) => ({
@@ -56,7 +61,8 @@ describe("Sherlock Flame payload", () => {
         { person_id: "zero", display_name: "Zero Activity" },
       ],
       start: START,
-      read: new Date("2026-08-17T12:00:01.000Z"),
+      read: READ,
+      snapshot: PG_SNAPSHOT,
     });
 
     expect(payload.people).toHaveLength(2);
@@ -74,6 +80,10 @@ describe("Sherlock Flame payload", () => {
       state: "partial",
       reason: "event_presence_not_continuous_attention",
     });
+    expect(decodeSnapshotToken(payload.snapshot)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+    });
   });
 
   it("rejects incomplete result grids", () => {
@@ -82,6 +92,7 @@ describe("Sherlock Flame payload", () => {
       roster: [{ person_id: "ada", display_name: "Ada" }],
       start: START,
       read: START,
+      snapshot: PG_SNAPSHOT,
     })).toThrow(FlameSourceError);
   });
 
@@ -114,7 +125,86 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("matching_native_item_id");
     expect(FLAME_SQL).toContain("partition by session_id, prompt_identity");
     expect(PROMPT_DETAIL_SQL).toContain("content_excerpt");
-    expect(PROMPT_DETAIL_SQL).toContain("where person_id = $5::uuid");
-    expect(PROMPT_DETAIL_SQL).toContain("limit $6");
+    expect(PROMPT_DETAIL_SQL).toContain("$5::pg_snapshot snapshot");
+    expect(PROMPT_DETAIL_SQL).toContain(
+      "pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
+    );
+    expect(PROMPT_DETAIL_SQL).toContain("where person_id = $6::uuid");
+    expect(PROMPT_DETAIL_SQL).toContain("limit $7");
+  });
+
+  it("round-trips a bounded immutable aggregate snapshot receipt", () => {
+    const token = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+    expect(token).toMatch(/^v1\.[A-Za-z0-9_-]+$/);
+    expect(decodeSnapshotToken(token)).toEqual({ snapshot: PG_SNAPSHOT, read: READ });
+  });
+
+  it.each([
+    "",
+    "v2.Zm9v",
+    "v1.not+base64url",
+    "v1.WyIxOjI6MyIsIjIwMjYtMDgtMTdUMTI6MDA6MDEuMDAwWiJd",
+  ])("rejects invalid prompt snapshot token %s", (token) => {
+    expect(() => decodeSnapshotToken(token)).toThrow(FlameSourceError);
+  });
+
+  it("captures the aggregate snapshot in the same transaction as its rows", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.maxPeople = 5;
+    const roster = [{ person_id: "ada", display_name: "Ada" }];
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: READ, snapshot: PG_SNAPSHOT }])
+      .mockResolvedValueOnce(roster)
+      .mockResolvedValueOnce(rowsFor("ada"));
+    source.transaction = (callback) => callback({ unsafe });
+
+    const payload = await source.fetchDay();
+
+    expect(unsafe.mock.calls[0][0]).toContain("pg_current_snapshot()::text as snapshot");
+    expect(decodeSnapshotToken(payload.snapshot)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+    });
+  });
+
+  it("pins prompt details to the aggregate snapshot and echoes its receipt", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([{
+        id: "17",
+        observed_at: new Date("2026-08-16T12:00:08.000Z"),
+        content: "Stable snapshot prompt",
+        content_byte_size: 22,
+        excerpt_byte_size: 22,
+      }]);
+    source.transaction = (callback) => callback({ unsafe });
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+    const detail = await source.fetchPrompts({
+      personId: "22222222-2222-4222-8222-222222222222",
+      start: START.toISOString(),
+      snapshot,
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROMPT_DETAIL_SQL);
+    expect(unsafe.mock.calls[1][1]).toEqual([
+      source.workspaceId,
+      START.toISOString(),
+      new Date(START.getTime() + BUCKET_MS).toISOString(),
+      "sherlock.codex-rollout.v1",
+      PG_SNAPSHOT,
+      "22222222-2222-4222-8222-222222222222",
+      501,
+    ]);
+    expect(detail).toMatchObject({
+      personId: "22222222-2222-4222-8222-222222222222",
+      start: START.toISOString(),
+      snapshot,
+      prompts: [{ id: "17", content: "Stable snapshot prompt" }],
+    });
   });
 });

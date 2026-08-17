@@ -4,6 +4,9 @@ export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const DATABASE_ROLE = "sherlock_normalizer";
+const SNAPSHOT_TOKEN_VERSION = "v1";
+const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
+const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
 
 function nativeItemTimestamp(column) {
   return `case
@@ -25,7 +28,7 @@ select id::text as person_id,
  limit $2
 `;
 
-function promptsCte(contentColumns = "") {
+function promptsCte(contentColumns = "", visibilityPredicate = "") {
   return `
 prompt_candidates as materialized (
   select s.person_id, e.id, e.session_id, e.canonical_scope_key,
@@ -75,6 +78,7 @@ prompt_candidates as materialized (
      and e.content_sha256 is not null and e.content_byte_size > 0
      and e.error_code is null and not e.is_replay and e.actor_role = 'primary'
      and pe.github_id is distinct from 'sherlock-smoke'
+     ${visibilityPredicate}
      and (
        coalesce(e.occurred_at, e.observed_at, e.server_received_at) >= p.start_at
        and coalesce(e.occurred_at, e.observed_at, e.server_received_at) < p.end_at
@@ -233,16 +237,22 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
 export const PROMPT_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version
-), ${promptsCte(", e.content_byte_size, e.content_excerpt")}
+         $3::timestamptz end_at, $4::text normalizer_version,
+         $5::pg_snapshot snapshot
+), ${promptsCte(
+  ", e.content_byte_size, e.content_excerpt",
+  // Recreate the aggregate's event visibility without keeping its transaction open.
+  // telemetry.events is append-only, so filtering each row's creator is sufficient.
+  "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
+)}
 select id::text id, observed_at,
        coalesce(content_excerpt, '') content,
        coalesce(content_byte_size, 0)::bigint content_byte_size,
        octet_length(coalesce(content_excerpt, ''))::bigint excerpt_byte_size
   from prompts
- where person_id = $5::uuid
+ where person_id = $6::uuid
  order by observed_at, id
- limit $6
+ limit $7
 `;
 
 export class FlameSourceError extends Error {
@@ -272,7 +282,58 @@ function count(value) {
   return result;
 }
 
-export function buildFlamePayload({ rows, roster, start, read }) {
+function parsePgSnapshot(value) {
+  if (typeof value !== "string" || value.length > MAX_SNAPSHOT_TOKEN_LENGTH ||
+      !PG_SNAPSHOT_PATTERN.test(value)) {
+    throw new FlameSourceError("flame_snapshot_invalid");
+  }
+  const [xminValue, xmaxValue, xipValue] = value.split(":");
+  const xmin = BigInt(xminValue);
+  const xmax = BigInt(xmaxValue);
+  const xips = xipValue ? xipValue.split(",").map((item) => BigInt(item)) : [];
+  if (xmin > xmax || xips.some((xid) => xid < xmin || xid >= xmax)) {
+    throw new FlameSourceError("flame_snapshot_invalid");
+  }
+  return value;
+}
+
+export function encodeSnapshotToken({ snapshot, read }) {
+  const readAt = asDate(read).toISOString();
+  const pgSnapshot = parsePgSnapshot(snapshot);
+  const body = Buffer.from(JSON.stringify([pgSnapshot, readAt]), "utf8").toString("base64url");
+  const token = `${SNAPSHOT_TOKEN_VERSION}.${body}`;
+  if (token.length > MAX_SNAPSHOT_TOKEN_LENGTH) {
+    throw new FlameSourceError("flame_snapshot_too_large");
+  }
+  return token;
+}
+
+export function decodeSnapshotToken(token) {
+  if (typeof token !== "string" || token.length > MAX_SNAPSHOT_TOKEN_LENGTH) {
+    throw new FlameSourceError("flame_prompt_request_invalid");
+  }
+  const [version, body, extra] = token.split(".");
+  if (version !== SNAPSHOT_TOKEN_VERSION || !body || extra !== undefined ||
+      !/^[A-Za-z0-9_-]+$/.test(body)) {
+    throw new FlameSourceError("flame_prompt_request_invalid");
+  }
+  try {
+    const decoded = Buffer.from(body, "base64url").toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== body) {
+      throw new Error("noncanonical_token");
+    }
+    const value = JSON.parse(decoded);
+    if (!Array.isArray(value) || value.length !== 2) throw new Error("invalid_payload");
+    const [snapshot, rawRead] = value;
+    const read = asDate(rawRead);
+    if (read.toISOString() !== rawRead) throw new Error("noncanonical_read");
+    return { snapshot: parsePgSnapshot(snapshot), read };
+  } catch {
+    throw new FlameSourceError("flame_prompt_request_invalid");
+  }
+}
+
+export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   if (roster.length === 0) throw new FlameSourceError("flame_database_roster_empty");
   if (rows.length !== roster.length * BUCKET_COUNT) {
     throw new FlameSourceError("flame_database_result_incomplete");
@@ -320,6 +381,7 @@ export function buildFlamePayload({ rows, roster, start, read }) {
   return {
     start: asDate(start).toISOString(),
     read: asDate(read).toISOString(),
+    snapshot: encodeSnapshotToken({ snapshot, read }),
     latest: latest?.toISOString() ?? null,
     coverage: {
       evidence: "observed_events",
@@ -385,9 +447,10 @@ export class DirectFlameSource {
 
   async fetchDay({ now } = {}) {
     return await this.transaction(async (tx) => {
-      const read = now
-        ? asDate(now)
-        : asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
+      const receipt = (await tx.unsafe(
+        "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
+      ))[0];
+      const read = now ? asDate(now) : asDate(receipt.now);
       const endMs = Math.floor(read.getTime() / BUCKET_MS) * BUCKET_MS;
       const start = new Date(endMs - 24 * 60 * 60 * 1000);
       const end = new Date(endMs);
@@ -404,12 +467,13 @@ export class DirectFlameSource {
         end.toISOString(),
         NORMALIZER_VERSION,
       ]);
-      return buildFlamePayload({ rows, roster, start, read });
+      return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
     });
   }
 
-  async fetchPrompts({ personId, start }) {
+  async fetchPrompts({ personId, start, snapshot }) {
     const startAt = asDate(start);
+    const snapshotReceipt = decodeSnapshotToken(snapshot);
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(personId)) {
       throw new FlameSourceError("flame_prompt_request_invalid");
     }
@@ -420,7 +484,10 @@ export class DirectFlameSource {
     return await this.transaction(async (tx) => {
       const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
       const oldest = read.getTime() - 25 * 60 * 60 * 1000;
-      if (startAt.getTime() < oldest || startAt.getTime() > read.getTime()) {
+      const snapshotEndMs = Math.floor(snapshotReceipt.read.getTime() / BUCKET_MS) * BUCKET_MS;
+      const snapshotStartMs = snapshotEndMs - 24 * 60 * 60 * 1000;
+      if (snapshotReceipt.read.getTime() < oldest ||
+          startAt.getTime() < snapshotStartMs || startAt.getTime() >= snapshotEndMs) {
         throw new FlameSourceError("flame_prompt_request_out_of_range");
       }
       const endAt = new Date(startAt.getTime() + BUCKET_MS);
@@ -430,6 +497,7 @@ export class DirectFlameSource {
         startAt.toISOString(),
         endAt.toISOString(),
         NORMALIZER_VERSION,
+        snapshotReceipt.snapshot,
         personId,
         limit,
       ]);
@@ -439,6 +507,7 @@ export class DirectFlameSource {
       return {
         personId,
         start: startAt.toISOString(),
+        snapshot,
         prompts: rows.map((row) => ({
           id: String(row.id),
           at: asDate(row.observed_at).toISOString(),

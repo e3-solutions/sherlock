@@ -677,6 +677,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     const query = new URLSearchParams({
       personId: selectedPerson.id,
       start: new Date(selectedPoint.startMs).toISOString(),
+      snapshot: data.snapshot,
     });
     fetch(`/api/flame/prompts?${query}`, {
       headers: { Accept: "application/json" },
@@ -692,6 +693,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
         const items = adaptPromptEvidence(value, {
           personId: selectedPerson.id,
           startMs: selectedPoint.startMs,
+          snapshot: data.snapshot,
         });
         setPromptEvidence({ state: "ready", items });
       })
@@ -699,7 +701,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
         if (!controller.signal.aborted) setPromptEvidence({ state: "error", items: [] });
       });
     return () => controller.abort();
-  }, [promptRevision, selectedPerson, selectedPoint]);
+  }, [data.snapshot, promptRevision, selectedPerson, selectedPoint]);
 
   const selectInterval = (person, point, origin) => {
     selectionOriginRef.current = origin;

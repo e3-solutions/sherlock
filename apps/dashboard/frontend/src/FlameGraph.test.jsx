@@ -20,6 +20,7 @@ function model() {
   return adaptFlamePayload({
     start: "2026-08-14T07:00:00.000Z",
     read: "2026-08-15T07:01:00.000Z",
+    snapshot: "v1.snapshot-token",
     latest: "2026-08-15T06:50:00.000Z",
     coverage: {
       evidence: "observed_events",
@@ -49,11 +50,13 @@ describe("FlameGraph", () => {
       const request = new URL(url, "http://dashboard.test");
       const start = request.searchParams.get("start");
       const personId = request.searchParams.get("personId");
+      const snapshot = request.searchParams.get("snapshot");
       return Promise.resolve({
         ok: true,
         json: () => Promise.resolve({
           personId,
           start,
+          snapshot,
           prompts: [
             { id: "p1", at: start, content: "First exact prompt", truncated: false },
             { id: "p2", at: new Date(Date.parse(start) + 1000).toISOString(), content: "Second prompt excerpt", truncated: true },
@@ -283,7 +286,7 @@ describe("FlameGraph", () => {
     expect(detail).toHaveTextContent("Second prompt excerpt");
     expect(detail).toHaveTextContent("Stored excerpt");
     expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining("/api/flame/prompts?"),
+      expect.stringContaining("snapshot=v1.snapshot-token"),
       expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
     );
   });

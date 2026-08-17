@@ -109,6 +109,7 @@ export function adaptFlamePayload(value) {
   const payload = requireObject(value, "payload");
   const startMs = requireDate(payload.start, "start");
   const readMs = requireDate(payload.read, "read");
+  const snapshot = requireNonemptyString(payload.snapshot, "snapshot");
   const latestMs = requireDate(payload.latest, "latest", true);
   const rawCoverage = requireObject(payload.coverage, "coverage");
   const coverage = {
@@ -180,6 +181,7 @@ export function adaptFlamePayload(value) {
   return {
     start: payload.start,
     read: payload.read,
+    snapshot,
     latest: payload.latest,
     startMs,
     readMs,
@@ -191,13 +193,16 @@ export function adaptFlamePayload(value) {
   };
 }
 
-export function adaptPromptEvidence(value, { personId, startMs }) {
+export function adaptPromptEvidence(value, { personId, startMs, snapshot }) {
   const payload = requireObject(value, "prompt evidence");
   if (requireNonemptyString(payload.personId, "prompt evidence.personId") !== personId) {
     fail("prompt evidence.personId", "the selected person id");
   }
   if (requireDate(payload.start, "prompt evidence.start") !== startMs) {
     fail("prompt evidence.start", "the selected bucket start");
+  }
+  if (requireNonemptyString(payload.snapshot, "prompt evidence.snapshot") !== snapshot) {
+    fail("prompt evidence.snapshot", "the timeline snapshot");
   }
   if (!Array.isArray(payload.prompts)) {
     fail("prompt evidence.prompts", "an array");

@@ -115,6 +115,7 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, await source.fetchPrompts({
         personId: url.searchParams.get("personId") ?? "",
         start: url.searchParams.get("start") ?? "",
+        snapshot: url.searchParams.get("snapshot") ?? "",
       }));
     } catch (error) {
       const code = error instanceof FlameSourceError
