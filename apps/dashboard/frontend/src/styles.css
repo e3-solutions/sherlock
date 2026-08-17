@@ -49,6 +49,7 @@ input { font: inherit; }
   flex: 0 0 auto;
   align-items: center;
   gap: 11px;
+  margin-bottom: 6px;
 }
 
 .portal-header__logo {
