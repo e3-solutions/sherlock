@@ -76,6 +76,13 @@ jobs:
           deno test --allow-env --allow-net
           supabase/functions/sherlock-activity-reducer/postgres_integration_test.ts
 
+      - name: Run rollout normalizer database integration test
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: >-
+          deno test --allow-env --allow-net
+          supabase/functions/sherlock-rollout-ingest/normalizer_postgres_integration_test.ts
+
       - name: Run queue database integration test
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres

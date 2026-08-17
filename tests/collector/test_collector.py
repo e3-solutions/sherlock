@@ -24,7 +24,10 @@ from sherlock_collector.drain import (
 )
 from sherlock_collector.hook import capture_and_spawn_drain
 from sherlock_collector.http import HttpTransport
-from sherlock_collector.rollout import RolloutCapturer
+from sherlock_collector.rollout import (
+    DEFAULT_MAX_FILES,
+    RolloutCapturer,
+)
 from sherlock_collector.spool import DurableSpool, SpoolItem
 
 
@@ -533,6 +536,57 @@ class RolloutCaptureTests(unittest.TestCase):
             str(current.resolve()),
             {value["path"] for value in state["streams"].values()},
         )
+
+    def test_default_capture_advances_large_backlog_with_priority_and_fairness(self):
+        current = self.root / "z-current.jsonl"
+        backlog = [
+            self.root / f"a-backlog-{index:02d}.jsonl"
+            for index in range(DEFAULT_MAX_FILES + 1)
+        ]
+        record = b'{"type":"event","padding":"' + b"x" * (20 * 1024) + b'"}\n'
+        for path in [current, *backlog]:
+            path.write_bytes(record)
+        capturer = RolloutCapturer(self.root / "catch-up-state", self.spool)
+
+        first = capturer.capture([current, *backlog], priority_count=1)
+
+        state_path = self.root / "catch-up-state" / "rollout-state.json"
+        first_state = json.loads(state_path.read_text())
+        first_paths = {
+            value["path"] for value in first_state["streams"].values()
+        }
+        self.assertEqual(first.enqueued, DEFAULT_MAX_FILES)
+        self.assertGreater(first.captured_bytes, 1024 * 1024)
+        self.assertEqual(len(first_paths), DEFAULT_MAX_FILES)
+        self.assertIn(str(current.resolve()), first_paths)
+
+        second = capturer.capture([current, *backlog], priority_count=1)
+
+        second_state = json.loads(state_path.read_text())
+        second_paths = {
+            value["path"] for value in second_state["streams"].values()
+        }
+        self.assertEqual(second.enqueued, 2)
+        self.assertEqual(
+            second_paths,
+            {str(path.resolve()) for path in [current, *backlog]},
+        )
+
+    def test_configured_byte_limit_bounds_ordinary_records(self):
+        record = b'{"type":"event"}\n'
+        source = record * 10
+        self.rollout.write_bytes(source)
+        byte_limit = len(record) * 3
+
+        result = self.capturer.capture(
+            [self.rollout],
+            max_sync_bytes=byte_limit,
+        )
+
+        self.assertEqual(result.captured_bytes, byte_limit)
+        state = json.loads((self.root / "state" / "rollout-state.json").read_text())
+        only = next(iter(state["streams"].values()))
+        self.assertEqual(only["offset"], byte_limit)
 
     def test_best_effort_capture_does_not_let_bad_file_starve_good_file(self):
         bad = self.root / "bad.jsonl"
