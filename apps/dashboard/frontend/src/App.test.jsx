@@ -111,9 +111,9 @@ describe("App", () => {
     adaptMock.mockReturnValueOnce({
       marker: "partial timeline",
       coverage: {
-        evidence: "aggregate",
+        evidence: "observed_events",
         state: "partial",
-        reason: "workspace_snapshot_activation_unavailable",
+        reason: "event_presence_not_continuous_attention",
       },
     });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response()));
@@ -121,8 +121,8 @@ describe("App", () => {
     render(<App />);
     await settle();
 
-    expect(screen.getByText(/Partial aggregate snapshot/)).toHaveTextContent(
-      "Partial aggregate snapshot",
+    expect(screen.getByText(/Observed event evidence/)).toHaveTextContent(
+      "Observed event evidence",
     );
   });
 

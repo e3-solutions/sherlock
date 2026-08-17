@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import FlameGraph, {
   BucketTooltip,
@@ -39,6 +39,28 @@ function model() {
 }
 
 describe("FlameGraph", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn((url) => {
+      const request = new URL(url, "http://dashboard.test");
+      const start = request.searchParams.get("start");
+      const personId = request.searchParams.get("personId");
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          personId,
+          start,
+          prompts: [
+            { id: "p1", at: start, content: "First exact prompt", truncated: false },
+            { id: "p2", at: new Date(Date.parse(start) + 1000).toISOString(), content: "Second prompt excerpt", truncated: true },
+            { id: "p3", at: new Date(Date.parse(start) + 2000).toISOString(), content: "Third exact prompt", truncated: false },
+          ],
+        }),
+      });
+    }));
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
   it("renders every ordered bucket on a shared semantic time axis", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
 
@@ -208,7 +230,7 @@ describe("FlameGraph", () => {
     });
   });
 
-  it("opens aggregate interval details for the exact clicked bucket", () => {
+  it("opens observed interval details for the exact clicked bucket", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const wrapper = lane.querySelector(".recharts-wrapper");
@@ -233,9 +255,32 @@ describe("FlameGraph", () => {
     expect(detail).toHaveTextContent("Agent2 work threads");
     expect(detail).toHaveTextContent("Subagent1 work thread");
     expect(detail).toHaveTextContent("Unclassified1 work thread");
-    expect(detail).toHaveTextContent("Aggregate evidence only");
+    expect(detail).toHaveTextContent("Canonical observed evidence");
     expect(lane).toHaveAttribute("data-selected-index", "0");
     expect(lane.querySelector(".flame-bucket-selected")).toBeInTheDocument();
+  });
+
+  it("loads and lists every canonical prompt underneath the interval count", async () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 68, height: 68, left: 0, right: 720, top: 0, width: 720,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    expect(screen.getByText("Loading prompt evidence…")).toBeInTheDocument();
+
+    await waitFor(() => expect(screen.getByText("First exact prompt")).toBeInTheDocument());
+    const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
+    expect(detail).toHaveTextContent("3 prompts recorded in this interval");
+    expect(within(detail).getAllByRole("listitem")).toHaveLength(6);
+    expect(detail).toHaveTextContent("Second prompt excerpt");
+    expect(detail).toHaveTextContent("Stored excerpt");
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/api/flame/prompts?"),
+      expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("selects by keyboard and restores chart focus when details close", async () => {

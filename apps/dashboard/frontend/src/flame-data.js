@@ -120,8 +120,8 @@ export function adaptFlamePayload(value) {
       ? null
       : requireNonemptyString(rawCoverage.reason, "coverage.reason"),
   };
-  if (coverage.evidence !== "aggregate") {
-    fail("coverage.evidence", '"aggregate"');
+  if (!["aggregate", "observed_events"].includes(coverage.evidence)) {
+    fail("coverage.evidence", '"aggregate" or "observed_events"');
   }
   if (!["complete", "partial"].includes(coverage.state)) {
     fail("coverage.state", '"complete" or "partial"');
@@ -191,4 +191,32 @@ export function adaptFlamePayload(value) {
     globalPeak: getGlobalPeak(people),
     people,
   };
+}
+
+export function adaptPromptEvidence(value, { personId, startMs }) {
+  const payload = requireObject(value, "prompt evidence");
+  if (requireNonemptyString(payload.personId, "prompt evidence.personId") !== personId) {
+    fail("prompt evidence.personId", "the selected person id");
+  }
+  if (requireDate(payload.start, "prompt evidence.start") !== startMs) {
+    fail("prompt evidence.start", "the selected bucket start");
+  }
+  if (!Array.isArray(payload.prompts)) {
+    fail("prompt evidence.prompts", "an array");
+  }
+  const ids = new Set();
+  return payload.prompts.map((value, index) => {
+    const path = `prompt evidence.prompts[${index}]`;
+    const prompt = requireObject(value, path);
+    const id = requireNonemptyString(prompt.id, `${path}.id`);
+    if (ids.has(id)) fail(`${path}.id`, "unique");
+    ids.add(id);
+    const atMs = requireDate(prompt.at, `${path}.at`);
+    if (atMs < startMs || atMs >= startMs + BUCKET_MS) {
+      fail(`${path}.at`, "inside the selected bucket");
+    }
+    if (typeof prompt.content !== "string") fail(`${path}.content`, "a string");
+    if (typeof prompt.truncated !== "boolean") fail(`${path}.truncated`, "a boolean");
+    return { id, atMs, content: prompt.content, truncated: prompt.truncated };
+  });
 }

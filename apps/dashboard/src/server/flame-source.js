@@ -2,99 +2,150 @@ import postgres from "postgres";
 
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
-export const ACTIVITY_VERSION = "sherlock.activity.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const DATABASE_ROLE = "sherlock_normalizer";
+
+function nativeItemTimestamp(column) {
+  return `case
+    when ${column} ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    then to_timestamp((
+      ('x' || replace(substring(${column} from '[0-9a-f]{8}-[0-9a-f]{4}'), '-', ''))::bit(48)::bigint
+    ) / 1000.0)
+    else null
+  end`;
+}
 
 export const PEOPLE_SQL = `
 select id::text as person_id,
        coalesce(nullif(btrim(display_name), ''), identity_key) as display_name
   from telemetry.people
  where workspace_id = $1
+   and github_id is distinct from 'sherlock-smoke'
  order by lower(coalesce(nullif(btrim(display_name), ''), identity_key)), id
  limit $2
 `;
 
+function promptsCte(contentColumns = "") {
+  return `
+prompt_candidates as materialized (
+  select s.person_id, e.id, e.session_id, e.canonical_scope_key,
+         e.logical_event_key, e.event_kind, e.event_subtype, e.source_priority,
+         e.native_item_id, e.content_sha256${contentColumns},
+         coalesce(e.occurred_at, e.observed_at, e.server_received_at) source_observed_at,
+         max(e.native_item_id) filter (
+           where e.event_subtype = 'message' and e.native_item_id is not null
+         ) over (
+           partition by e.session_id, e.content_sha256,
+                        date_trunc(
+                          'second',
+                          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+                        )
+         ) matching_native_item_id
+    from telemetry.events e
+    join telemetry.sessions s
+      on s.workspace_id = e.workspace_id and s.id = e.session_id
+    join telemetry.people pe
+      on pe.workspace_id = s.workspace_id and pe.id = s.person_id
+    cross join p
+   where e.workspace_id = p.workspace_id
+     and e.normalizer_version = p.normalizer_version
+     and e.event_kind = 'message' and e.message_origin = 'human'
+     and not e.is_replay and s.actor_role = 'primary'
+     and pe.github_id is distinct from 'sherlock-smoke'
+     and (
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at) >= p.start_at
+       and coalesce(e.occurred_at, e.observed_at, e.server_received_at) < p.end_at
+       or ${nativeItemTimestamp("e.native_item_id")} >= p.start_at
+       and ${nativeItemTimestamp("e.native_item_id")} < p.end_at
+     )
+), prompt_identities as materialized (
+  select prompt_candidates.*,
+         coalesce(
+           'native:' || coalesce(matching_native_item_id, native_item_id),
+           case when canonical_scope_key is not null and logical_event_key is not null
+                then 'logical:' || canonical_scope_key || ':' || logical_event_key || ':' || event_kind
+                else null end,
+           'observed:' || coalesce(content_sha256, id::text) || ':' || source_observed_at::text
+         ) prompt_identity,
+         coalesce(
+           ${nativeItemTimestamp("coalesce(matching_native_item_id, native_item_id)")},
+           source_observed_at
+         ) observed_at
+    from prompt_candidates
+), prompts as materialized (
+  select ranked.*
+    from (
+      select prompt_identities.*,
+             row_number() over (
+               partition by session_id, prompt_identity
+               order by observed_at asc, source_observed_at asc, source_priority desc, id
+             ) canonical_rank
+        from prompt_identities
+    ) ranked
+   where canonical_rank = 1
+     and observed_at >= (select start_at from p)
+     and observed_at < (select end_at from p)
+ )`;
+}
+
 export const FLAME_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text activity_version,
-         $5::text normalizer_version
+         $3::timestamptz end_at, $4::text normalizer_version
 ), roster as materialized (
   select pe.id person_id,
          coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) display_name
-    from telemetry.people pe cross join p
+   from telemetry.people pe cross join p
    where pe.workspace_id = p.workspace_id
+     and pe.github_id is distinct from 'sherlock-smoke'
 ), buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start
     from p
-), candidate_span_keys as materialized (
-  select distinct a.span_key
-    from analytics.activity_spans a cross join p
-   where a.workspace_id = p.workspace_id
-     and a.activity_version = p.activity_version
-     and not a.is_tombstone
-     and a.started_at < p.end_at and a.ended_at > p.start_at
-), latest_spans as materialized (
-  select latest.*
-    from candidate_span_keys candidate cross join p
-    cross join lateral (
-      select a.session_id, a.person_id, a.span_key, a.started_at, a.ended_at,
-             a.actor_role, a.created_at, a.is_tombstone
-        from analytics.activity_spans a
-       where a.workspace_id = p.workspace_id
-         and a.activity_version = p.activity_version
-         and a.span_key = candidate.span_key
-       order by a.valid_from_event_id desc, a.id desc
-       limit 1
-    ) latest
-), active_spans as materialized (
-  select latest.*
-    from latest_spans latest cross join p
-   where not latest.is_tombstone
-     and latest.started_at is not null and latest.ended_at is not null
-     and latest.actor_role <> 'automation'
-     and latest.started_at < p.end_at and latest.ended_at > p.start_at
+), activity_events as materialized (
+  select s.person_id, e.session_id, s.actor_role,
+         coalesce(
+           ${nativeItemTimestamp("e.native_item_id")},
+           coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+         ) observed_at
+    from telemetry.events e
+    join telemetry.sessions s
+      on s.workspace_id = e.workspace_id and s.id = e.session_id
+    join roster r on r.person_id = s.person_id
+    cross join p
+   where e.workspace_id = p.workspace_id
+     and e.normalizer_version = p.normalizer_version
+     and not e.is_replay
+     and s.actor_role <> 'automation'
+     and e.event_kind in (
+       'message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
+       'agent_message', 'lifecycle', 'error'
+     )
+     and (e.event_kind <> 'message' or e.native_item_id is not null)
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) >= p.start_at
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) < p.end_at
 ), bucket_activity as materialized (
-  select a.person_id, b.bucket_start,
+  select a.person_id,
+         date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint agent,
          count(distinct a.session_id) filter (where a.actor_role in ('worker', 'guardian'))::bigint subagent,
          count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other
-    from buckets b join active_spans a
-      on a.started_at < b.bucket_start + interval '10 minutes'
-     and a.ended_at > b.bucket_start
-   group by a.person_id, b.bucket_start
+    from activity_events a cross join p
+   group by a.person_id, bucket_start
 ), day_activity as materialized (
   select r.person_id,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint day_agent,
          count(distinct a.session_id) filter (where a.actor_role in ('worker', 'guardian'))::bigint day_subagent,
          count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint day_other
-    from roster r left join active_spans a using (person_id)
+    from roster r left join activity_events a using (person_id)
    group by r.person_id
-), prompt_candidates as materialized (
-  select s.person_id, e.id, e.session_id, e.canonical_scope_key,
-         e.logical_event_key, e.event_kind,
-         coalesce(e.occurred_at, e.observed_at, e.server_received_at) observed_at,
-         case when e.canonical_scope_key is null or e.logical_event_key is null then 1
-              else row_number() over (
-                partition by e.session_id, e.canonical_scope_key,
-                             e.logical_event_key, e.event_kind
-                order by e.source_priority desc, e.occurred_at asc nulls last, e.id
-              ) end canonical_rank
-    from telemetry.events e
-    join telemetry.sessions s
-      on s.workspace_id = e.workspace_id and s.id = e.session_id
-    cross join p
-   where e.workspace_id = p.workspace_id
-     and e.normalizer_version = p.normalizer_version
-     and e.event_kind = 'message' and e.message_origin = 'human'
-     and not e.is_replay and s.actor_role <> 'automation'
-     and coalesce(e.occurred_at, e.observed_at, e.server_received_at) >= p.start_at
-     and coalesce(e.occurred_at, e.observed_at, e.server_received_at) < p.end_at
-), prompts as materialized (
-  select * from prompt_candidates where canonical_rank = 1
-), prompt_counts as materialized (
+), ${promptsCte()}, prompt_counts as materialized (
   select prompts.person_id,
          date_bin(interval '10 minutes', prompts.observed_at, p.start_at) bucket_start,
          count(*)::bigint prompts
@@ -102,7 +153,7 @@ with p as materialized (
    group by prompts.person_id, bucket_start
 ), latest_observation as materialized (
   select greatest(
-           (select max(ended_at) from active_spans),
+           (select max(observed_at) from activity_events),
            (select max(observed_at) from prompts)
          ) latest
 )
@@ -120,6 +171,21 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
   left join prompt_counts pc
     on pc.person_id = r.person_id and pc.bucket_start = b.bucket_start
  order by lower(r.display_name), r.person_id, b.bucket_start
+`;
+
+export const PROMPT_DETAIL_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::timestamptz start_at,
+         $3::timestamptz end_at, $4::text normalizer_version
+), ${promptsCte(", e.content_byte_size, e.content_excerpt")}
+select id::text id, observed_at,
+       coalesce(content_excerpt, '') content,
+       coalesce(content_byte_size, 0)::bigint content_byte_size,
+       octet_length(coalesce(content_excerpt, ''))::bigint excerpt_byte_size
+  from prompts
+ where person_id = $5::uuid
+ order by observed_at, id
+ limit $6
 `;
 
 export class FlameSourceError extends Error {
@@ -199,9 +265,9 @@ export function buildFlamePayload({ rows, roster, start, read }) {
     read: asDate(read).toISOString(),
     latest: latest?.toISOString() ?? null,
     coverage: {
-      evidence: "aggregate",
+      evidence: "observed_events",
       state: "partial",
-      reason: "workspace_snapshot_activation_unavailable",
+      reason: "event_presence_not_continuous_attention",
     },
     people,
   };
@@ -244,8 +310,7 @@ export class DirectFlameSource {
           select current_role = 'sherlock_normalizer' as backend_role,
                  current_setting('transaction_read_only') = 'on' as read_only,
                  has_table_privilege(current_role, 'telemetry.people', 'select') as can_read_people,
-                 has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events,
-                 has_table_privilege(current_role, 'analytics.activity_spans', 'select') as can_read_spans
+                 has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events
             from pg_roles where rolname = current_role
         `);
         if (!rows[0] || Object.values(rows[0]).some((value) => value !== true)) {
@@ -280,10 +345,50 @@ export class DirectFlameSource {
         this.workspaceId,
         start.toISOString(),
         end.toISOString(),
-        ACTIVITY_VERSION,
         NORMALIZER_VERSION,
       ]);
       return buildFlamePayload({ rows, roster, start, read });
+    });
+  }
+
+  async fetchPrompts({ personId, start }) {
+    const startAt = asDate(start);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(personId)) {
+      throw new FlameSourceError("flame_prompt_request_invalid");
+    }
+    if (startAt.getTime() % BUCKET_MS !== 0) {
+      throw new FlameSourceError("flame_prompt_request_invalid");
+    }
+
+    return await this.transaction(async (tx) => {
+      const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
+      const oldest = read.getTime() - 25 * 60 * 60 * 1000;
+      if (startAt.getTime() < oldest || startAt.getTime() > read.getTime()) {
+        throw new FlameSourceError("flame_prompt_request_out_of_range");
+      }
+      const endAt = new Date(startAt.getTime() + BUCKET_MS);
+      const limit = 501;
+      const rows = await tx.unsafe(PROMPT_DETAIL_SQL, [
+        this.workspaceId,
+        startAt.toISOString(),
+        endAt.toISOString(),
+        NORMALIZER_VERSION,
+        personId,
+        limit,
+      ]);
+      if (rows.length === limit) {
+        throw new FlameSourceError("flame_prompt_result_too_large");
+      }
+      return {
+        personId,
+        start: startAt.toISOString(),
+        prompts: rows.map((row) => ({
+          id: String(row.id),
+          at: asDate(row.observed_at).toISOString(),
+          content: String(row.content),
+          truncated: count(row.content_byte_size) > count(row.excerpt_byte_size),
+        })),
+      };
     });
   }
 }

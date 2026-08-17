@@ -5,6 +5,7 @@ import {
   BUCKET_MS,
   FlameDataError,
   adaptFlamePayload,
+  adaptPromptEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
 } from "./flame-data.js";
@@ -211,6 +212,70 @@ describe("adaptFlamePayload", () => {
 
     expect(result.coverage.state).toBe("partial");
     expect(result.coverage.reason).toBe("workspace_snapshot_activation_unavailable");
+  });
+
+  it("preserves explicit observed-event coverage", () => {
+    const result = adaptFlamePayload(payload({
+      coverage: {
+        evidence: "observed_events",
+        state: "partial",
+        reason: "event_presence_not_continuous_attention",
+      },
+    }));
+
+    expect(result.coverage.evidence).toBe("observed_events");
+    expect(result.coverage.reason).toBe("event_presence_not_continuous_attention");
+  });
+});
+
+describe("adaptPromptEvidence", () => {
+  const startMs = Date.parse("2026-08-17T16:10:00.000Z");
+
+  it("validates and expands every prompt in the selected bucket", () => {
+    expect(adaptPromptEvidence({
+      personId: "person-1",
+      start: new Date(startMs).toISOString(),
+      prompts: [
+        {
+          id: "10",
+          at: "2026-08-17T16:10:08.631Z",
+          content: "Investigate the dashboard counts",
+          truncated: false,
+        },
+        {
+          id: "11",
+          at: "2026-08-17T16:19:59.999Z",
+          content: "A long stored excerpt",
+          truncated: true,
+        },
+      ],
+    }, { personId: "person-1", startMs })).toEqual([
+      {
+        id: "10",
+        atMs: Date.parse("2026-08-17T16:10:08.631Z"),
+        content: "Investigate the dashboard counts",
+        truncated: false,
+      },
+      {
+        id: "11",
+        atMs: Date.parse("2026-08-17T16:19:59.999Z"),
+        content: "A long stored excerpt",
+        truncated: true,
+      },
+    ]);
+  });
+
+  it.each([
+    ["wrong person", { personId: "other", start: new Date(startMs).toISOString(), prompts: [] }],
+    ["wrong bucket", { personId: "person-1", start: new Date(startMs + BUCKET_MS).toISOString(), prompts: [] }],
+    ["prompt outside bucket", {
+      personId: "person-1",
+      start: new Date(startMs).toISOString(),
+      prompts: [{ id: "10", at: new Date(startMs + BUCKET_MS).toISOString(), content: "x", truncated: false }],
+    }],
+  ])("rejects %s", (_label, value) => {
+    expect(() => adaptPromptEvidence(value, { personId: "person-1", startMs }))
+      .toThrow(FlameDataError);
   });
 });
 

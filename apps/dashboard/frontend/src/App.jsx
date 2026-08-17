@@ -88,8 +88,8 @@ export default function App() {
     <>
       {data.coverage.state === "partial" && (
         <p className="coverage-warning" role="status">
-          Partial aggregate snapshot. Activity is current per session; workspace-wide
-          snapshot activation is not available yet.
+          Observed event evidence. Buckets show recorded events, not continuous attention
+          between inferred lifecycle boundaries.
         </p>
       )}
       {state === "stale" && (

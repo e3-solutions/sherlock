@@ -18,6 +18,7 @@ import {
 import {
   BUCKET_COUNT,
   BUCKET_MS,
+  adaptPromptEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
 } from "./flame-data.js";
@@ -270,7 +271,16 @@ function PromptStem({ cx, cy, payload, personName, promptPeak }) {
   );
 }
 
-function IntervalDetail({ data, person, point, stale, onClose, detailRef }) {
+function IntervalDetail({
+  data,
+  person,
+  point,
+  stale,
+  onClose,
+  detailRef,
+  promptEvidence,
+  onRetryPrompts,
+}) {
   const roles = [
     { key: "agent", label: "Agent", value: point.agent },
     { key: "subagent", label: "Subagent", value: point.subagent },
@@ -342,18 +352,44 @@ function IntervalDetail({ data, person, point, stale, onClose, detailRef }) {
 
       <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
         <h3 id={`${headingId}-prompts`}>Prompts</h3>
-        <p className="flame-detail__empty">
-          {point.prompts > 0
-            ? `${formatPromptCount(point.prompts)} recorded in this interval.`
-            : "No prompts were recorded in this interval."}
-        </p>
+        {point.prompts === 0 ? (
+          <p className="flame-detail__empty">No prompts were recorded in this interval.</p>
+        ) : promptEvidence.state === "loading" ? (
+          <p className="flame-detail__empty" role="status">Loading prompt evidence…</p>
+        ) : promptEvidence.state === "error" ? (
+          <div className="flame-detail__prompt-error" role="alert">
+            <p>Prompt evidence could not be loaded.</p>
+            <button type="button" onClick={onRetryPrompts}>Retry</button>
+          </div>
+        ) : (
+          <>
+            <p className="flame-detail__prompt-count">
+              {formatPromptCount(promptEvidence.items.length)} recorded in this interval.
+            </p>
+            <ol className="flame-detail__prompts">
+              {promptEvidence.items.map((prompt) => (
+                <li key={prompt.id}>
+                  <header>
+                    <strong>User</strong>
+                    <time dateTime={new Date(prompt.atMs).toISOString()}>
+                      {formatTime(prompt.atMs)}
+                    </time>
+                    {prompt.truncated && <span>Stored excerpt</span>}
+                  </header>
+                  <p>{prompt.content || "Prompt text was empty."}</p>
+                </li>
+              ))}
+            </ol>
+          </>
+        )}
       </section>
 
       <footer className="flame-detail__coverage">
-        <strong>Aggregate evidence only</strong>
+        <strong>Canonical observed evidence</strong>
         <p>
-          The current feed does not include prompt text, session metadata, or conversation
-          messages. This view shows only the exact counts already published by /api/flame.
+          Activity means a Sherlock event was observed in this interval; it does not claim
+          continuous attention between lifecycle boundaries. Prompt rows are deduplicated
+          primary-session user messages. Long content is shown as its stored database excerpt.
         </p>
       </footer>
     </aside>
@@ -589,6 +625,8 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const detailRef = useRef(null);
   const selectionOriginRef = useRef(null);
   const [selection, setSelection] = useState(null);
+  const [promptRevision, setPromptRevision] = useState(0);
+  const [promptEvidence, setPromptEvidence] = useState({ state: "idle", items: [] });
   const width = useSharedChartWidth(rootRef, chartWidth);
   const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
   const promptPeak = data.people.reduce(
@@ -623,6 +661,45 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [selectedPoint]);
+
+  useEffect(() => {
+    if (!selectedPerson || !selectedPoint) {
+      setPromptEvidence({ state: "idle", items: [] });
+      return undefined;
+    }
+    if (selectedPoint.prompts === 0) {
+      setPromptEvidence({ state: "ready", items: [] });
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    setPromptEvidence({ state: "loading", items: [] });
+    const query = new URLSearchParams({
+      personId: selectedPerson.id,
+      start: new Date(selectedPoint.startMs).toISOString(),
+    });
+    fetch(`/api/flame/prompts?${query}`, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Prompt request failed with HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        const items = adaptPromptEvidence(value, {
+          personId: selectedPerson.id,
+          startMs: selectedPoint.startMs,
+        });
+        setPromptEvidence({ state: "ready", items });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setPromptEvidence({ state: "error", items: [] });
+      });
+    return () => controller.abort();
+  }, [promptRevision, selectedPerson, selectedPoint]);
 
   const selectInterval = (person, point, origin) => {
     selectionOriginRef.current = origin;
@@ -685,6 +762,8 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
           stale={stale}
           onClose={closeDetail}
           detailRef={detailRef}
+          promptEvidence={promptEvidence}
+          onRetryPrompts={() => setPromptRevision((revision) => revision + 1)}
         />
       )}
     </section>

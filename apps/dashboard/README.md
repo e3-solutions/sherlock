@@ -7,20 +7,34 @@ read-only, and the server assumes Sherlock's existing sherlock_normalizer role.
 
 The browser never receives database credentials. The page and aggregate API
 are public; every database query remains pinned to one configured workspace.
-The API does not return prompt text, conversation content, or transcript
-evidence.
+The aggregate API does not return prompt text. The interval prompt endpoint
+returns only the canonical `telemetry.events.content_excerpt` rows for one
+person and one ten-minute bucket; it never reads full raw Storage objects.
 
 ## Data contract
 
-- telemetry.people is the roster, so people with zero activity remain visible.
-- Latest non-tombstoned sherlock.activity.v1 spans are intersected with 144
+- `telemetry.people` is the roster, so real people with zero activity remain
+  visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
+  excluded; display names are never used as the filter.
+- Canonical `sherlock.codex-rollout.v1` event presence is grouped into 144
   ten-minute UTC buckets. Distinct sessions are counted per role and bucket.
+  The dashboard intentionally does not intersect `analytics.activity_spans`:
+  those spans are inferred lifecycle boundaries and can cross days, so treating
+  them as continuous attention overclaims what Sherlock observed.
+- UUIDv7 `native_item_id` values provide the original creation timestamp for
+  response items copied into a later rollout. Envelope timestamps remain the
+  fallback for event types without a stable native item ID.
 - primary is Agent; worker and guardian are Subagent; unknown is Unclassified.
   automation is excluded.
-- Canonical, non-replay sherlock.codex-rollout.v1 human message events supply
-  prompt counts. Prompt text and conversation content are never selected.
-- The response declares partial aggregate coverage because Sherlock does not yet
-  implement workspace snapshot activation or detailed conversation read APIs.
+- Canonical, non-replay primary-session human messages supply prompt counts.
+  The response-item `native_item_id` deduplicates copied history and the paired
+  event-message form. Worker and guardian parent messages are not human prompts.
+- `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>` lazily
+  returns every stored prompt excerpt for the selected bucket, ordered by its
+  canonical timestamp. `truncated: true` distinguishes the 1,024-byte database
+  excerpt from full raw content retained in private Storage.
+- The response declares partial observed-event coverage because event presence
+  is exact evidence for a bucket but is not proof of continuous attention.
 
 ## Environment
 

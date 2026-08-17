@@ -4,6 +4,8 @@ import {
   BUCKET_COUNT,
   BUCKET_MS,
   FLAME_SQL,
+  PEOPLE_SQL,
+  PROMPT_DETAIL_SQL,
   FlameSourceError,
   buildFlamePayload,
 } from "./flame-source.js";
@@ -68,9 +70,9 @@ describe("Sherlock Flame payload", () => {
       bucket.every((value) => value === 0)
     )).toBe(true);
     expect(payload.coverage).toEqual({
-      evidence: "aggregate",
+      evidence: "observed_events",
       state: "partial",
-      reason: "workspace_snapshot_activation_unavailable",
+      reason: "event_presence_not_continuous_attention",
     });
   });
 
@@ -83,11 +85,26 @@ describe("Sherlock Flame payload", () => {
     })).toThrow(FlameSourceError);
   });
 
-  it("keeps the SQL tenant-scoped, bounded, content-free, and parameterized", () => {
+  it("uses observed event evidence instead of inferred continuous spans", () => {
     expect(FLAME_SQL).toContain("e.workspace_id = p.workspace_id");
-    expect(FLAME_SQL).toContain("a.started_at < p.end_at");
+    expect(FLAME_SQL).toContain("date_bin(interval '10 minutes', a.observed_at");
+    expect(FLAME_SQL).toContain("s.actor_role = 'primary'");
+    expect(FLAME_SQL).not.toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
     expect(FLAME_SQL).not.toContain("content_excerpt");
     expect(FLAME_SQL).not.toContain("email");
+  });
+
+  it("excludes stable smoke identities from the complete roster", () => {
+    expect(PEOPLE_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
+    expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
+  });
+
+  it("deduplicates primary prompts by stable native item before returning details", () => {
+    expect(FLAME_SQL).toContain("matching_native_item_id");
+    expect(FLAME_SQL).toContain("partition by session_id, prompt_identity");
+    expect(PROMPT_DETAIL_SQL).toContain("content_excerpt");
+    expect(PROMPT_DETAIL_SQL).toContain("where person_id = $5::uuid");
+    expect(PROMPT_DETAIL_SQL).toContain("limit $6");
   });
 });
