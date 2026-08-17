@@ -102,6 +102,25 @@ export function getGlobalPeak(people) {
 }
 
 /**
+ * Classifies recent observed session evidence relative to the exact API read.
+ */
+export function getPersonActivityStatus(person, readMs) {
+  if (!person || !(person.lastActivityMs === null ||
+      Number.isSafeInteger(person.lastActivityMs))) {
+    fail("person", "an adapted person with a nullable activity timestamp");
+  }
+  if (!Number.isSafeInteger(readMs)) {
+    fail("readMs", "a safe integer timestamp");
+  }
+  if (person.lastActivityMs === null) return "inactive";
+  const elapsed = readMs - person.lastActivityMs;
+  if (elapsed < 0) fail("person.lastActivityMs", "at or before readMs");
+  if (elapsed <= BUCKET_MS) return "active";
+  if (elapsed <= 3 * BUCKET_MS) return "recent";
+  return "inactive";
+}
+
+/**
  * Validates and expands the compact /api/flame response into chart-ready points.
  * The operation is one-to-one: it never sorts, rebuckets, or derives daily totals.
  */
@@ -141,6 +160,14 @@ export function adaptFlamePayload(value) {
     ids.add(id);
 
     const name = requireNonemptyString(person.name, `${path}.name`);
+    const lastActivityMs = requireDate(
+      person.lastActivity,
+      `${path}.lastActivity`,
+      true,
+    );
+    if (lastActivityMs !== null && (lastActivityMs < startMs || lastActivityMs > readMs)) {
+      fail(`${path}.lastActivity`, "inside the dashboard read window");
+    }
     const total = requireFixedCounts(person.total, TOTAL_COUNT, `${path}.total`);
     if (!Array.isArray(person.buckets) || person.buckets.length !== BUCKET_COUNT) {
       fail(`${path}.buckets`, `an array of exactly ${BUCKET_COUNT} buckets`);
@@ -175,7 +202,7 @@ export function adaptFlamePayload(value) {
       };
     });
 
-    return { id, name, total, buckets };
+    return { id, name, lastActivityMs, total, buckets };
   });
 
   return {

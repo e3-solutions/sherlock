@@ -8,6 +8,7 @@ import {
   adaptPromptEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
+  getPersonActivityStatus,
 } from "./flame-data.js";
 
 function buckets() {
@@ -18,6 +19,7 @@ function person(overrides = {}) {
   return {
     id: "person-1",
     name: "Ada",
+    lastActivity: null,
     total: [3, 2, 1],
     buckets: buckets(),
     ...overrides,
@@ -66,6 +68,10 @@ describe("adaptFlamePayload", () => {
     const startMs = Date.parse(source.start);
 
     expect(result.people.map(({ id }) => id)).toEqual(["z", "a"]);
+    expect(result.people.map(({ lastActivityMs }) => lastActivityMs)).toEqual([
+      null,
+      null,
+    ]);
     expect(result.coverage).toEqual({
       evidence: "observed_events",
       state: "partial",
@@ -152,6 +158,10 @@ describe("adaptFlamePayload", () => {
     ["non-string id", payload({ people: [person({ id: 17 })] })],
     ["blank id", payload({ people: [person({ id: "  " })] })],
     ["blank name", payload({ people: [person({ name: "" })] })],
+    ["missing last activity", payload({ people: [person({ lastActivity: undefined })] })],
+    ["future last activity", payload({
+      people: [person({ lastActivity: "2026-03-09T08:00:02.000Z" })],
+    })],
     ["short total", payload({ people: [person({ total: [1, 2] })] })],
     ["negative total", payload({ people: [person({ total: [-1, 2, 3] })] })],
     ["fractional total", payload({ people: [person({ total: [1.5, 2, 3] })] })],
@@ -228,6 +238,36 @@ describe("adaptFlamePayload", () => {
     expect(() => adaptFlamePayload(payload({
       coverage: { evidence: "aggregate", state: "partial", reason: "legacy" },
     }))).toThrow(FlameDataError);
+  });
+});
+
+describe("getPersonActivityStatus", () => {
+  const readMs = Date.parse("2026-03-09T08:00:01.000Z");
+
+  function adaptedPerson(lastActivity) {
+    return adaptFlamePayload(payload({
+      people: [person({ lastActivity })],
+    })).people[0];
+  }
+
+  it("is active when canonical activity was observed in the last ten minutes", () => {
+    const adapted = adaptedPerson("2026-03-09T07:50:01.000Z");
+
+    expect(getPersonActivityStatus(adapted, readMs)).toBe("active");
+  });
+
+  it("is recent when canonical activity was observed ten to thirty minutes ago", () => {
+    const adapted = adaptedPerson("2026-03-09T07:30:01.000Z");
+
+    expect(getPersonActivityStatus(adapted, readMs)).toBe("recent");
+  });
+
+  it("is inactive when activity is older than thirty minutes or absent", () => {
+    const old = adaptedPerson("2026-03-09T07:30:00.000Z");
+    const absent = adaptedPerson(null);
+
+    expect(getPersonActivityStatus(old, readMs)).toBe("inactive");
+    expect(getPersonActivityStatus(absent, readMs)).toBe("inactive");
   });
 });
 
