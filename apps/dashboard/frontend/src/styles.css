@@ -434,6 +434,9 @@ input { font: inherit; }
 .flame-tooltip-count span { color: rgb(9 12 10 / 65%); }
 
 .flame-detail {
+  --flame-detail-motion-duration: 260ms;
+  --flame-detail-motion-easing: cubic-bezier(.22, 1, .36, 1);
+
   position: fixed;
   top: 0;
   right: 0;
@@ -450,15 +453,15 @@ input { font: inherit; }
   background: var(--flame-page);
   box-shadow: -18px 0 44px rgb(0 0 0 / 38%);
   outline: none;
-  animation: flame-detail-enter-x 260ms cubic-bezier(.22, 1, .36, 1) both;
+  animation: flame-detail-enter-x var(--flame-detail-motion-duration) var(--flame-detail-motion-easing) both;
   will-change: transform, opacity;
 }
 
 .flame-detail--closing {
   pointer-events: none;
   animation-name: flame-detail-exit-x;
-  animation-duration: 220ms;
-  animation-timing-function: cubic-bezier(.4, 0, 1, 1);
+  animation-duration: var(--flame-detail-motion-duration);
+  animation-timing-function: var(--flame-detail-motion-easing);
 }
 
 @keyframes flame-detail-enter-x {
