@@ -45,9 +45,18 @@ input { font: inherit; }
 
 .portal-header {
   display: flex;
-  min-height: 48px;
+  min-height: 56px;
   flex: 0 0 auto;
-  align-items: flex-start;
+  align-items: center;
+  gap: 11px;
+}
+
+.portal-header__logo {
+  display: block;
+  width: 40px;
+  height: 48px;
+  flex: 0 0 auto;
+  object-fit: contain;
 }
 
 .portal-header h1 {
@@ -719,7 +728,8 @@ input { font: inherit; }
     --flame-rail: 214px;
   }
   #root { padding: 24px; }
-  .portal-header { min-height: 42px; }
+  .portal-header { min-height: 48px; }
+  .portal-header__logo { width: 34px; height: 42px; }
   .portal-header h1 { font-size: 20px; }
   .flame-legend { gap: 4px 8px; font-size: 9px; }
   .flame-legend li { gap: 4px; }
@@ -729,7 +739,8 @@ input { font: inherit; }
 @media (max-width: 520px) {
   :root { --flame-rail: 164px; }
   #root { padding: 16px; }
-  .portal-header { min-height: 38px; }
+  .portal-header { min-height: 44px; gap: 9px; }
+  .portal-header__logo { width: 31px; height: 38px; }
   .portal-header h1 { font-size: 18px; }
   .flame-person-rail { padding: 0 10px; }
   .flame-person-rail h2 { font-size: 14px; }

@@ -61,7 +61,9 @@ describe("App", () => {
     const fetchMock = vi.fn().mockResolvedValue(response());
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<App />);
+    const { container } = render(<App />);
+    expect(container.querySelector(".portal-header__logo")).toHaveAttribute("src");
+    expect(container.querySelector(".portal-header__logo")).toHaveAttribute("alt", "");
     expect(screen.getByText("Bonaparte")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Loading timeline");
     await settle();
