@@ -135,13 +135,17 @@ Deno.test({
 
       const lateVisible = await seedLateVisibleCorrection(sql, fixture);
       const lateVersion = "test.activity.late-visible";
-      await reducer.reduceSession({
+      const initialLate = await reducer.reduceSession({
         workspaceId: fixture.workspaceId,
         sessionId: fixture.primarySessionId,
         normalizerVersion: fixture.normalizerVersion,
         activityVersion: lateVersion,
         throughEventId: lateVisible.highEventId,
       });
+      assert(
+        initialLate.cutoff_event_id === lateVisible.highEventId,
+        "event pagination must order bigint IDs numerically across digit boundaries",
+      );
       await lateVisible.commitLowerEvent();
       const immutableBefore = await immutableCounts(sql, fixture.workspaceId);
       await reducer.reduceSession({

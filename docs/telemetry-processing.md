@@ -84,7 +84,11 @@ locks and every completion/retry is fenced by the active lease token.
 `postgres` owner. The login has `NOINHERIT` and can assume only
 `sherlock_processor`, `sherlock_normalizer`, and `sherlock_reducer`; each
 transaction explicitly selects the narrow role it needs. Set or rotate its
-password out of band and store it only as a sealed Railway variable.
+password out of band and store it only as a sealed Railway variable. Prefer
+Supabase's session pooler on port 5432 so Railway does not depend on the direct
+database host's IPv6-only DNS record. Store a current Supabase secret key in
+`SUPABASE_SERVICE_ROLE_KEY`; the variable name is retained for compatibility,
+but a legacy service-role JWT is not required.
 
 ## Inspect and recover
 

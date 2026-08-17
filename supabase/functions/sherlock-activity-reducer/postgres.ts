@@ -399,7 +399,7 @@ export class PostgresActivityReducer {
              from telemetry.events
             where workspace_id = $1 and session_id = $2
               and normalizer_version = $3 and id > $4 and id <= $5
-            order by id
+            order by telemetry.events.id
             limit $6`,
           [
             options.workspaceId,
