@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -24,13 +25,12 @@ import {
   getPersonActivityStatus,
 } from "./flame-data.js";
 
-const MIN_CHART_WIDTH = 1_008;
-const DEFAULT_CHART_WIDTH = 1_440;
 const LANE_HEIGHT = 82;
 const MIN_PROMPT_STEM_LENGTH = 4;
 const MAX_PROMPT_STEM_LENGTH = 14;
 const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
+const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;
 const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -63,8 +63,8 @@ export function getBucketTooltipPlacement({
 }) {
   const maxLeft = Math.max(padding, viewport.width - padding - tooltip.width);
   const maxTop = Math.max(padding, viewport.height - padding - tooltip.height);
-  const right = anchor.x + gap;
-  const left = anchor.x - gap - tooltip.width;
+  const right = anchor.x - TOOLTIP_ARROW_CENTER_OFFSET;
+  const left = anchor.x - tooltip.width + TOOLTIP_ARROW_CENTER_OFFSET;
   const above = anchor.y - gap - tooltip.height;
   const below = anchor.y + gap;
 
@@ -100,40 +100,16 @@ export function getBucketTooltipPlacement({
   };
 }
 
-export function BucketTooltip({ active, coordinate, laneRef, payload, personName }) {
+export function getBucketCenterX(index, chartWidth) {
+  const boundedIndex = clamp(index, 0, BUCKET_COUNT - 1);
+  return ((boundedIndex + 0.5) / BUCKET_COUNT) * chartWidth;
+}
+
+export function BucketTooltip({ active, laneRef, payload, personName }) {
   const tooltipRef = useRef(null);
   const [tooltipSize, setTooltipSize] = useState(DEFAULT_TOOLTIP_SIZE);
   const [, reposition] = useState(0);
   const point = payload?.find((entry) => entry?.payload)?.payload;
-
-  useLayoutEffect(() => {
-    if (!active || !Number.isFinite(coordinate?.x) || !laneRef?.current) return;
-    const lane = laneRef.current;
-    const scroller = lane.closest(".flame-graph-scroll");
-    if (!scroller) return;
-
-    const laneBox = lane.getBoundingClientRect();
-    const scrollerBox = scroller.getBoundingClientRect();
-    if (scrollerBox.width <= 0) return;
-    const rail = Number.parseFloat(getComputedStyle(scroller).getPropertyValue("--flame-rail")) || 0;
-    const anchorX = laneBox.left + coordinate.x;
-    const visibleLeft = Math.min(scrollerBox.right, scrollerBox.left + rail + TOOLTIP_EDGE_PADDING);
-    const visibleRight = scrollerBox.right - TOOLTIP_EDGE_PADDING;
-    let delta = 0;
-    if (anchorX < visibleLeft) delta = anchorX - visibleLeft;
-    if (anchorX > visibleRight) delta = anchorX - visibleRight;
-    if (delta !== 0) {
-      const nextScrollLeft = clamp(
-        scroller.scrollLeft + delta,
-        0,
-        scroller.scrollWidth - scroller.clientWidth,
-      );
-      if (nextScrollLeft !== scroller.scrollLeft) {
-        scroller.scrollLeft = nextScrollLeft;
-        reposition((revision) => revision + 1);
-      }
-    }
-  }, [active, coordinate?.x, laneRef]);
 
   useLayoutEffect(() => {
     if (!active || !point || !tooltipRef.current) return;
@@ -161,11 +137,11 @@ export function BucketTooltip({ active, coordinate, laneRef, payload, personName
   if (!active || !point) return null;
 
   const laneBox = laneRef?.current?.getBoundingClientRect();
-  const hasAnchor = laneBox && Number.isFinite(coordinate?.x);
+  const hasAnchor = laneBox && Number.isInteger(point.index) && laneBox.width > 0;
   const placement = hasAnchor && typeof window !== "undefined"
     ? getBucketTooltipPlacement({
         anchor: {
-          x: laneBox.left + coordinate.x,
+          x: laneBox.left + getBucketCenterX(point.index, laneBox.width),
           y: laneBox.top + laneBox.height / 2,
         },
         tooltip: tooltipSize,
@@ -202,28 +178,39 @@ export function BucketTooltip({ active, coordinate, laneRef, payload, personName
   );
 }
 
+export function BucketCursor({ payloadIndex, left, top, width, height }) {
+  const index = Number(payloadIndex);
+  if (
+    payloadIndex == null
+    || !Number.isInteger(index)
+    || !Number.isFinite(left)
+    || !Number.isFinite(top)
+    || !Number.isFinite(width)
+    || !Number.isFinite(height)
+    || width <= 0
+  ) {
+    return null;
+  }
+
+  const x = left + getBucketCenterX(index, width);
+  return (
+    <line
+      className="flame-bucket-hover"
+      x1={x}
+      x2={x}
+      y1={top}
+      y2={top + height}
+      aria-hidden="true"
+      pointerEvents="none"
+      vectorEffect="non-scaling-stroke"
+    />
+  );
+}
+
 function promptStemLength(prompts, promptPeak) {
   const magnitude = Math.log1p(prompts) / Math.log1p(Math.max(1, promptPeak));
   return MIN_PROMPT_STEM_LENGTH
     + magnitude * (MAX_PROMPT_STEM_LENGTH - MIN_PROMPT_STEM_LENGTH);
-}
-
-function BucketCursor({ points }) {
-  const [start, end] = points ?? [];
-  if (!Number.isFinite(start?.x) || !Number.isFinite(start?.y) || !Number.isFinite(end?.y)) {
-    return null;
-  }
-
-  return (
-    <line
-      className="flame-bucket-hover"
-      x1={start.x}
-      x2={start.x}
-      y1={start.y}
-      y2={end.y}
-      vectorEffect="non-scaling-stroke"
-    />
-  );
 }
 
 function PromptStem({ cx, cy, payload, personName, promptPeak }) {
@@ -273,11 +260,11 @@ function PromptStem({ cx, cy, payload, personName, promptPeak }) {
 }
 
 function IntervalDetail({
-  data,
   person,
   point,
-  stale,
+  closing,
   onClose,
+  onCloseAnimationEnd,
   detailRef,
   promptEvidence,
   onRetryPrompts,
@@ -289,53 +276,86 @@ function IntervalDetail({
   ];
   const activeRoles = roles.filter(({ value }) => value > 0);
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const handleAnimationEnd = (event) => {
+    if (event.target === event.currentTarget) {
+      onCloseAnimationEnd();
+    }
+  };
 
   return (
     <aside
       ref={detailRef}
-      className="flame-detail"
+      className={`flame-detail${closing ? " flame-detail--closing" : ""}`}
       aria-labelledby={headingId}
+      onAnimationEnd={handleAnimationEnd}
       tabIndex={-1}
     >
       <header className="flame-detail__header">
         <div>
-          <p className="flame-detail__eyebrow">10 minute interval</p>
-          <h2 id={headingId}>{person.name}</h2>
-          <p className="flame-detail__range">
-            <time dateTime={new Date(point.startMs).toISOString()}>{formatTime(point.startMs)}</time>
-            <span aria-hidden="true">—</span>
-            <time dateTime={new Date(point.endMs).toISOString()}>{formatTime(point.endMs)}</time>
+          <p className="flame-detail__eyebrow">Frame evidence</p>
+          <h2>
+            <span id={headingId}>{person.name}</span>
+            <span aria-hidden="true"> · </span>
+            <span className="flame-detail__range">
+              <time dateTime={new Date(point.startMs).toISOString()}>{formatTime(point.startMs)}</time>
+              <span aria-hidden="true">–</span>
+              <time dateTime={new Date(point.endMs).toISOString()}>{formatTime(point.endMs)}</time>
+            </span>
+          </h2>
+          <p className="flame-detail__totals">
+            {point.activity} {point.activity === 1 ? "session" : "sessions"}
+            <span aria-hidden="true"> · </span>
+            {formatPromptCount(point.prompts)}
           </p>
         </div>
-        <button type="button" className="flame-detail__close" onClick={onClose}>
-          <span aria-hidden="true">×</span>
+        <button
+          type="button"
+          className="flame-detail__close"
+          disabled={closing}
+          onClick={onClose}
+        >
+          <svg
+            aria-hidden="true"
+            focusable="false"
+            viewBox="0 0 24 24"
+          >
+            <path d="M6 6 18 18M18 6 6 18" />
+          </svg>
           <span className="visually-hidden">Close interval details</span>
         </button>
       </header>
 
-      <div className="flame-detail__receipt" role="status">
-        <span>{stale ? "Last successful API read" : "Latest API read"}</span>
-        <span>{data.coverage.state === "partial" ? "Partial coverage" : "Complete coverage"}</span>
-        <span>Read {formatTime(data.readMs)}</span>
-        <span>Latest {data.latestMs === null ? "none" : formatTime(data.latestMs)}</span>
-      </div>
-
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-summary`}>
-        <h3 id={`${headingId}-summary`}>What happened</h3>
-        <dl className="flame-detail__summary">
-          <div>
-            <dt>Observed sessions</dt>
-            <dd>{formatSessionCount(point.activity)}</dd>
+      <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
+        <h3 id={`${headingId}-prompts`}>What happened</h3>
+        {point.prompts === 0 ? (
+          <p className="flame-detail__empty">No prompts in this interval.</p>
+        ) : promptEvidence.state === "loading" ? (
+          <p className="flame-detail__empty" role="status">Loading prompts…</p>
+        ) : promptEvidence.state === "error" ? (
+          <div className="flame-detail__prompt-error" role="alert">
+            <p>Prompts could not be loaded.</p>
+            <button type="button" onClick={onRetryPrompts}>Retry</button>
           </div>
-          <div>
-            <dt>Prompt activity</dt>
-            <dd>{formatPromptCount(point.prompts)}</dd>
-          </div>
-        </dl>
+        ) : (
+          <ol className="flame-detail__prompts">
+            {promptEvidence.items.map((prompt) => (
+              <li key={prompt.id}>
+                <header>
+                  <strong>User</strong>
+                  <time dateTime={new Date(prompt.atMs).toISOString()}>
+                    {formatTime(prompt.atMs)}
+                  </time>
+                  {prompt.truncated && <span>Stored excerpt</span>}
+                </header>
+                <p>{prompt.content || "Prompt text was empty."}</p>
+              </li>
+            ))}
+          </ol>
+        )}
       </section>
 
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
-        <h3 id={`${headingId}-work`}>Observed sessions</h3>
+      <section className="flame-detail__section" aria-labelledby={`${headingId}-sessions`}>
+        <h3 id={`${headingId}-sessions`}>Sessions</h3>
         {activeRoles.length > 0 ? (
           <ul className="flame-detail__roles">
             {activeRoles.map(({ key, label, value }) => (
@@ -347,67 +367,35 @@ function IntervalDetail({
             ))}
           </ul>
         ) : (
-          <p className="flame-detail__empty">No session evidence was recorded in this interval.</p>
+          <p className="flame-detail__empty">No sessions in this interval.</p>
         )}
       </section>
-
-      <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
-        <h3 id={`${headingId}-prompts`}>Prompts</h3>
-        {point.prompts === 0 ? (
-          <p className="flame-detail__empty">No prompts were recorded in this interval.</p>
-        ) : promptEvidence.state === "loading" ? (
-          <p className="flame-detail__empty" role="status">Loading prompt evidence…</p>
-        ) : promptEvidence.state === "error" ? (
-          <div className="flame-detail__prompt-error" role="alert">
-            <p>Prompt evidence could not be loaded.</p>
-            <button type="button" onClick={onRetryPrompts}>Retry</button>
-          </div>
-        ) : (
-          <>
-            <p className="flame-detail__prompt-count">
-              {formatPromptCount(promptEvidence.items.length)} recorded in this interval.
-            </p>
-            <ol className="flame-detail__prompts">
-              {promptEvidence.items.map((prompt) => (
-                <li key={prompt.id}>
-                  <header>
-                    <strong>User</strong>
-                    <time dateTime={new Date(prompt.atMs).toISOString()}>
-                      {formatTime(prompt.atMs)}
-                    </time>
-                    {prompt.truncated && <span>Stored excerpt</span>}
-                  </header>
-                  <p>{prompt.content || "Prompt text was empty."}</p>
-                </li>
-              ))}
-            </ol>
-          </>
-        )}
-      </section>
-
-      <footer className="flame-detail__coverage">
-        <strong>Canonical observed evidence</strong>
-        <p>
-          Activity means a Sherlock event was observed in this interval; it does not claim
-          continuous attention between lifecycle boundaries. Prompt rows are deduplicated
-          primary-session user messages. Long content is shown as its stored database excerpt.
-        </p>
-      </footer>
     </aside>
   );
 }
 
-function SemanticLegend({ data }) {
+function SemanticLegend() {
   return (
-    <div className="flame-meta-copy">
-      <p className="flame-receipt">
-        24H · 10M · {data.coverage.state.toUpperCase()} · READ {formatTime(data.readMs)} · LATEST {data.latestMs === null ? "NONE" : formatTime(data.latestMs)}
-      </p>
+    <div className="flame-legends">
       <ul className="flame-legend" aria-label="Activity legend">
         <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
         <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
         <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
         <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
+      </ul>
+      <ul className="flame-status-legend" aria-label="Activity recency legend">
+        <li aria-label="Green: activity 10 minutes ago or less">
+          <i className="flame-status-key flame-person-status--active" aria-hidden="true" />
+          ≤10m
+        </li>
+        <li aria-label="Yellow: activity more than 10 and up to 30 minutes ago">
+          <i className="flame-status-key flame-person-status--recent" aria-hidden="true" />
+          &gt;10m–≤30m
+        </li>
+        <li aria-label="Red: activity more than 30 minutes ago or no activity">
+          <i className="flame-status-key flame-person-status--inactive" aria-hidden="true" />
+          &gt;30m / none
+        </li>
       </ul>
     </div>
   );
@@ -460,8 +448,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
   );
 
   const select = (point) => {
-    const target = laneRef.current?.querySelector('[role="application"]');
-    onSelect(person, point, target);
+    onSelect(person, point);
   };
 
   const handleClick = (event) => {
@@ -580,25 +567,19 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
             isAnimationActive={false}
           />
         </ComposedChart>
-        {selectedIndex !== undefined && (
-          <i
-            className="flame-bucket-selected"
-            style={{
-              left: `${(selectedIndex / BUCKET_COUNT) * 100}%`,
-              width: `${100 / BUCKET_COUNT}%`,
-            }}
-            aria-hidden="true"
-          />
-        )}
       </div>
     </section>
   );
 }
 
-function useSharedChartWidth(rootRef, requestedWidth) {
-  const [measuredWidth, setMeasuredWidth] = useState(requestedWidth ?? DEFAULT_CHART_WIDTH);
+export function getAvailableChartWidth(containerWidth, railWidth) {
+  return Math.max(1, containerWidth - railWidth);
+}
 
-  useEffect(() => {
+function useSharedChartWidth(rootRef, requestedWidth) {
+  const [measuredWidth, setMeasuredWidth] = useState(requestedWidth ?? 1);
+
+  useLayoutEffect(() => {
     if (Number.isFinite(requestedWidth)) {
       setMeasuredWidth(requestedWidth);
       return undefined;
@@ -609,7 +590,7 @@ function useSharedChartWidth(rootRef, requestedWidth) {
 
     const update = () => {
       const rail = Number.parseFloat(getComputedStyle(root).getPropertyValue("--flame-rail")) || 260;
-      setMeasuredWidth(Math.max(MIN_CHART_WIDTH, root.clientWidth - rail));
+      setMeasuredWidth(getAvailableChartWidth(root.clientWidth, rail));
     };
     const observer = new ResizeObserver(update);
     observer.observe(root);
@@ -617,14 +598,15 @@ function useSharedChartWidth(rootRef, requestedWidth) {
     return () => observer.disconnect();
   }, [requestedWidth, rootRef]);
 
-  return Math.max(MIN_CHART_WIDTH, measuredWidth);
+  return Math.max(1, measuredWidth);
 }
 
 export default function FlameGraph({ data, chartWidth, stale = false }) {
   const rootRef = useRef(null);
   const detailRef = useRef(null);
-  const selectionOriginRef = useRef(null);
+  const detailClosingRef = useRef(false);
   const [selection, setSelection] = useState(null);
+  const [detailClosing, setDetailClosing] = useState(false);
   const [promptRevision, setPromptRevision] = useState(0);
   const [promptEvidence, setPromptEvidence] = useState({ state: "idle", items: [] });
   const width = useSharedChartWidth(rootRef, chartWidth);
@@ -645,8 +627,26 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     ? selectedPerson.buckets.find(({ startMs }) => startMs === selection.startMs)
     : null;
 
+  const beginCloseDetail = useCallback(() => {
+    if (!selection || detailClosingRef.current) return;
+    detailClosingRef.current = true;
+    setDetailClosing(true);
+  }, [selection]);
+
+  const finalizeCloseDetail = useCallback(() => {
+    if (!detailClosingRef.current) return;
+    detailClosingRef.current = false;
+    setDetailClosing(false);
+    setSelection(null);
+    requestAnimationFrame(() => rootRef.current?.focus());
+  }, []);
+
   useEffect(() => {
-    if (selection && (!selectedPerson || !selectedPoint)) setSelection(null);
+    if (selection && (!selectedPerson || !selectedPoint)) {
+      detailClosingRef.current = false;
+      setDetailClosing(false);
+      setSelection(null);
+    }
   }, [selection, selectedPerson, selectedPoint]);
 
   useEffect(() => {
@@ -654,13 +654,12 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     detailRef.current?.focus();
     const closeOnEscape = (event) => {
       if (event.key === "Escape") {
-        setSelection(null);
-        requestAnimationFrame(() => selectionOriginRef.current?.focus());
+        beginCloseDetail();
       }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [selectedPoint]);
+  }, [beginCloseDetail, selectedPoint]);
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
@@ -706,14 +705,10 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     return () => controller.abort();
   }, [data.snapshot, promptRevision, selectedPerson, selectedPoint]);
 
-  const selectInterval = (person, point, origin) => {
-    selectionOriginRef.current = origin;
+  const selectInterval = (person, point) => {
+    detailClosingRef.current = false;
+    setDetailClosing(false);
     setSelection({ personId: person.id, startMs: point.startMs });
-  };
-
-  const closeDetail = () => {
-    setSelection(null);
-    requestAnimationFrame(() => selectionOriginRef.current?.focus());
   };
 
   return (
@@ -722,11 +717,12 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       className="flame-graph"
       data-state={stale ? "stale" : "current"}
       aria-label="Code activity over the last 24 hours"
+      tabIndex={-1}
     >
       <div className="flame-graph-scroll">
         <div className="flame-meta-row">
           <div className="flame-meta-rail">
-            <SemanticLegend data={data} />
+            <SemanticLegend />
           </div>
           <div
             className="flame-time-axis"
@@ -762,11 +758,11 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       </div>
       {selectedPerson && selectedPoint && (
         <IntervalDetail
-          data={data}
           person={selectedPerson}
           point={selectedPoint}
-          stale={stale}
-          onClose={closeDetail}
+          closing={detailClosing}
+          onClose={beginCloseDetail}
+          onCloseAnimationEnd={finalizeCloseDetail}
           detailRef={detailRef}
           promptEvidence={promptEvidence}
           onRetryPrompts={() => setPromptRevision((revision) => revision + 1)}

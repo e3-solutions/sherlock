@@ -72,26 +72,29 @@ export default function App() {
   }, [load]);
 
   if (!data && state === "loading") {
-    return <div className="load-state" role="status">Loading timeline</div>;
+    return (
+      <>
+        <PortalHeader />
+        <div className="load-state" role="status">Loading timeline</div>
+      </>
+    );
   }
 
   if (!data) {
     return (
-      <div className="load-state" role="alert">
-        <span>Timeline unavailable</span>
-        <button type="button" onClick={load}>Retry</button>
-      </div>
+      <>
+        <PortalHeader />
+        <div className="load-state" role="alert">
+          <span>Timeline unavailable</span>
+          <button type="button" onClick={load}>Retry</button>
+        </div>
+      </>
     );
   }
 
   return (
     <>
-      {data.coverage.state === "partial" && (
-        <p className="coverage-warning" role="status">
-          Observed event evidence. Buckets show recorded events, not continuous attention
-          between inferred lifecycle boundaries.
-        </p>
-      )}
+      <PortalHeader />
       {state === "stale" && (
         <p className="refresh-warning" role="status">
           Refresh failed. Showing the last successful read.
@@ -100,6 +103,14 @@ export default function App() {
       )}
       <FlameGraph data={data} stale={state === "stale"} />
     </>
+  );
+}
+
+function PortalHeader() {
+  return (
+    <header className="portal-header">
+      <h1>Bonaparte</h1>
+    </header>
   );
 }
 

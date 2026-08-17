@@ -62,6 +62,7 @@ describe("App", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
+    expect(screen.getByText("Bonaparte")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Loading timeline");
     await settle();
 
@@ -111,7 +112,7 @@ describe("App", () => {
     expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
   });
 
-  it("announces partial workspace snapshot coverage", async () => {
+  it("keeps partial coverage chrome out of the visible timeline", async () => {
     adaptMock.mockReturnValueOnce({
       marker: "partial timeline",
       coverage: {
@@ -125,9 +126,9 @@ describe("App", () => {
     render(<App />);
     await settle();
 
-    expect(screen.getByText(/Observed event evidence/)).toHaveTextContent(
-      "Observed event evidence",
-    );
+    expect(screen.getByText("Bonaparte")).toBeInTheDocument();
+    expect(screen.queryByText(/Observed event evidence/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("flame-graph")).toHaveTextContent("partial timeline");
   });
 
   it("clears the stale state after a later refresh succeeds", async () => {

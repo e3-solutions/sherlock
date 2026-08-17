@@ -2,7 +2,10 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import FlameGraph, {
+  BucketCursor,
   BucketTooltip,
+  getAvailableChartWidth,
+  getBucketCenterX,
   getBucketTooltipPlacement,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
@@ -45,6 +48,39 @@ function model() {
     ],
   });
 }
+
+describe("getAvailableChartWidth", () => {
+  it("uses all viewport space beside the person rail without a desktop minimum", () => {
+    expect(getAvailableChartWidth(1_440, 260)).toBe(1_180);
+    expect(getAvailableChartWidth(320, 164)).toBe(156);
+  });
+
+  it("keeps the chart renderable when the rail consumes the measured width", () => {
+    expect(getAvailableChartWidth(160, 164)).toBe(1);
+  });
+});
+
+describe("bucket hover geometry", () => {
+  it("resolves exact bucket centers across the complete timeline", () => {
+    expect(getBucketCenterX(0, 1008)).toBe(3.5);
+    expect(getBucketCenterX(72, 1008)).toBe(507.5);
+    expect(getBucketCenterX(143, 1008)).toBe(1004.5);
+  });
+
+  it("draws the guide through the indexed bucket center", () => {
+    const { container } = render(
+      <svg>
+        <BucketCursor payloadIndex="72" left={0} top={10} width={1008} height={50} />
+      </svg>,
+    );
+    const guide = container.querySelector(".flame-bucket-hover");
+
+    expect(guide).toHaveAttribute("x1", "507.5");
+    expect(guide).toHaveAttribute("x2", "507.5");
+    expect(guide).toHaveAttribute("y1", "10");
+    expect(guide).toHaveAttribute("y2", "60");
+  });
+});
 
 describe("FlameGraph", () => {
   beforeEach(() => {
@@ -114,8 +150,7 @@ describe("FlameGraph", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const legend = screen.getByRole("list", { name: "Activity legend" });
 
-    expect(screen.getByText(/24H · 10M · PARTIAL · READ .* · LATEST/))
-      .toBeInTheDocument();
+    expect(screen.queryByText(/24H · 10M/)).not.toBeInTheDocument();
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(legend).getByText(label)).toBeInTheDocument();
     }
@@ -124,6 +159,20 @@ describe("FlameGraph", () => {
     expect(container.querySelector(".flame-key--unclassified"))
       .toHaveClass("flame-key--unclassified");
     expect(container.querySelectorAll(".flame-prompt-stem")).toHaveLength(2);
+  });
+
+  it("explains the exact green, yellow, and red activity recency boundaries", () => {
+    render(<FlameGraph data={model()} chartWidth={1008} />);
+    const legend = screen.getByRole("list", { name: "Activity recency legend" });
+
+    expect(within(legend).getByLabelText("Green: activity 10 minutes ago or less"))
+      .toHaveTextContent("≤10m");
+    expect(within(legend).getByLabelText(
+      "Yellow: activity more than 10 and up to 30 minutes ago",
+    )).toHaveTextContent(">10m–≤30m");
+    expect(within(legend).getByLabelText(
+      "Red: activity more than 30 minutes ago or no activity",
+    )).toHaveTextContent(">30m / none");
   });
 
   it("renders bucket-aligned prompt stems with globally consistent magnitude", () => {
@@ -182,6 +231,38 @@ describe("FlameGraph", () => {
     );
   });
 
+  it("anchors the tooltip to the same indexed bucket center as the hover guide", () => {
+    vi.stubGlobal("innerWidth", 2_000);
+    vi.stubGlobal("innerHeight", 1_000);
+    const point = model().people[0].buckets[72];
+    const laneRef = {
+      current: {
+        getBoundingClientRect: () => ({
+          bottom: 182,
+          height: 82,
+          left: 100,
+          right: 1108,
+          top: 100,
+          width: 1008,
+          x: 100,
+          y: 100,
+          toJSON: () => ({}),
+        }),
+      },
+    };
+    render(
+      <BucketTooltip
+        active
+        coordinate={{ x: 3.5 }}
+        laneRef={laneRef}
+        personName="Ada Lovelace"
+        payload={[{ payload: point }]}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveStyle({ left: "590px" });
+  });
+
   it("places the first bucket tooltip inside the top-left viewport edges", () => {
     const placement = getBucketTooltipPlacement({
       anchor: { x: 4, y: 4 },
@@ -235,6 +316,7 @@ describe("FlameGraph", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const wrapper = lane.querySelector(".recharts-wrapper");
+    const scroller = container.querySelector(".flame-graph-scroll");
     const bounds = {
       bottom: 82,
       height: 82,
@@ -248,18 +330,29 @@ describe("FlameGraph", () => {
     };
     vi.spyOn(lane, "getBoundingClientRect").mockReturnValue(bounds);
     vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(bounds);
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue({
+      ...bounds,
+      right: 320,
+      width: 320,
+    });
+    Object.defineProperty(scroller, "clientWidth", { configurable: true, value: 320 });
+    Object.defineProperty(scroller, "scrollWidth", { configurable: true, value: 1008 });
+    scroller.scrollLeft = 37;
 
     fireEvent.mouseMove(wrapper, { clientX: 3, clientY: 34 });
     await waitFor(() => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 observed sessions");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 3");
     });
+    expect(container.querySelector(".flame-bucket-hover")).toHaveAttribute("x1", "3.5");
 
     fireEvent.mouseMove(wrapper, { clientX: 1005, clientY: 41 });
     await waitFor(() => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("1 observed session");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 0");
     });
+    expect(container.querySelector(".flame-bucket-hover")).toHaveAttribute("x1", "1004.5");
+    expect(scroller.scrollLeft).toBe(37);
   });
 
   it("opens observed interval details for the exact clicked bucket", () => {
@@ -282,14 +375,19 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
 
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
-    expect(detail).toHaveTextContent("4 observed sessions");
+    expect(detail).toHaveTextContent(/Ada Lovelace.*\d{1,2}:\d{2}.*–.*\d{1,2}:\d{2}/);
+    expect(detail).toHaveTextContent("4 sessions");
     expect(detail).toHaveTextContent("3 prompts");
     expect(detail).toHaveTextContent("Agent2 observed sessions");
     expect(detail).toHaveTextContent("Subagent1 observed session");
     expect(detail).toHaveTextContent("Unclassified1 observed session");
-    expect(detail).toHaveTextContent("Canonical observed evidence");
+    expect(detail).toHaveTextContent("What happened");
+    expect(detail).toHaveTextContent("Sessions");
+    expect(detail).not.toHaveTextContent("Canonical observed evidence");
+    expect(detail).not.toHaveTextContent("Latest API read");
     expect(lane).toHaveAttribute("data-selected-index", "0");
-    expect(lane.querySelector(".flame-bucket-selected")).toBeInTheDocument();
+    expect(lane.closest(".flame-person")).toHaveAttribute("data-selected", "true");
+    expect(lane.querySelector(".flame-bucket-selected")).not.toBeInTheDocument();
   });
 
   it("loads and lists every canonical prompt underneath the interval count", async () => {
@@ -301,11 +399,11 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    expect(screen.getByText("Loading prompt evidence…")).toBeInTheDocument();
+    expect(screen.getByText("Loading prompts…")).toBeInTheDocument();
 
     await waitFor(() => expect(screen.getByText("First exact prompt")).toBeInTheDocument());
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
-    expect(detail).toHaveTextContent("3 prompts recorded in this interval");
+    expect(detail).not.toHaveTextContent("prompts recorded in this interval");
     expect(within(detail).getAllByRole("listitem")).toHaveLength(6);
     expect(detail).toHaveTextContent("Second prompt excerpt");
     expect(detail).toHaveTextContent("Stored excerpt");
@@ -342,14 +440,16 @@ describe("FlameGraph", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "Prompt evidence could not be loaded",
+        "Prompts could not be loaded",
       );
     });
-    expect(screen.queryByText("1 prompt recorded in this interval.")).not.toBeInTheDocument();
+    expect(screen.queryByText("prompts recorded in this interval")).not.toBeInTheDocument();
   });
 
-  it("selects by keyboard and restores chart focus when details close", async () => {
+  it("keeps the drawer mounted until close ends, then clears selection without refocusing a row", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
 
@@ -358,13 +458,63 @@ describe("FlameGraph", () => {
     fireEvent.keyDown(chart, { key: "Enter" });
 
     expect(screen.getByRole("complementary", { name: "Ada Lovelace" })).toHaveTextContent(
-      "0 observed sessions",
+      "0 sessions",
     );
     expect(lane).toHaveAttribute("data-selected-index", "1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Close interval details" }));
+    const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
+    const closeButton = screen.getByRole("button", { name: "Close interval details" });
+    const icon = closeButton.querySelector("svg");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(closeButton).not.toHaveTextContent("×");
+
+    fireEvent.click(closeButton);
+    expect(detail).toHaveClass("flame-detail--closing");
+    expect(closeButton).toBeDisabled();
+    expect(detail).toBeInTheDocument();
+    expect(chart).not.toHaveFocus();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(detail).toHaveClass("flame-detail--closing");
+
+    fireEvent(
+      detail.querySelector("header"),
+      new Event("webkitAnimationEnd", { bubbles: true }),
+    );
+    expect(detail).toBeInTheDocument();
+    expect(chart).not.toHaveFocus();
+
+    fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(chart).toHaveFocus());
+    await waitFor(() => expect(graph).toHaveFocus());
+    expect(chart).not.toHaveFocus();
+    expect(person).not.toHaveAttribute("data-selected");
+    expect(lane).not.toHaveAttribute("data-selected-index");
+  });
+
+  it("uses the same selection-clearing focus lifecycle for Escape", async () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const person = container.querySelector(".flame-person");
+    const lane = container.querySelector(".flame-person .flame-lane");
+    const chart = lane.querySelector('[role="application"]');
+
+    fireEvent.focus(chart);
+    fireEvent.keyDown(chart, { key: "Enter" });
+
+    const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(detail).toHaveClass("flame-detail--closing");
+    expect(detail).toBeInTheDocument();
+    expect(chart).not.toHaveFocus();
+
+    fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitFor(() => expect(graph).toHaveFocus());
+    expect(chart).not.toHaveFocus();
+    expect(person).not.toHaveAttribute("data-selected");
+    expect(lane).not.toHaveAttribute("data-selected-index");
   });
 
   it("exposes stale state without replacing the last-good graph", () => {
