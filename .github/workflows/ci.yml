@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.5.1
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.114.0
+
+      - name: Check Deno formatting and lint
+        run: |
+          deno fmt --check supabase/functions workers scripts
+          deno lint supabase/functions workers scripts
+
+      - name: Type-check Deno entrypoints
+        run: |
+          deno check supabase/functions/sherlock-rollout-ingest/index.ts
+          deno check workers/telemetry-processor/main.ts
+          deno check scripts/reduce-activity.ts
+
+      - name: Run collector tests
+        env:
+          PYTHONPATH: packages/telemetry-collector/src
+        run: python3 -m unittest discover -s tests/collector -v
+
+      - name: Run Deno unit tests
+        run: |
+          deno test supabase/functions/sherlock-rollout-ingest
+          deno test supabase/functions/sherlock-activity-reducer
+          deno test workers/telemetry-processor
+
+      - name: Start isolated Supabase database
+        run: supabase db start
+
+      - name: Run database schema tests
+        run: supabase test db --local supabase/tests/database/schema.test.sql
+
+      - name: Run activity reducer database integration test
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: >-
+          deno test --allow-env --allow-net
+          supabase/functions/sherlock-activity-reducer/postgres_integration_test.ts
+
+      - name: Run queue database integration test
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: >-
+          deno test --allow-env --allow-net
+          workers/telemetry-processor/queue_integration_test.ts
+
+      - name: Stop isolated Supabase database
+        if: always()
+        run: supabase stop --no-backup

@@ -285,6 +285,7 @@ export function parseCollectorIdentity(value: unknown): CollectorIdentity {
   }
   if (
     email.split("@").length !== 2 ||
+    // deno-lint-ignore no-control-regex -- reject ASCII controls explicitly.
     /\s|[\u0000-\u001f]/.test(email) ||
     email.startsWith("@") ||
     email.endsWith("@")

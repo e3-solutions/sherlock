@@ -80,20 +80,20 @@ Deno.test("reduction targets only normalized sessions with no workspace scan", a
   const result = await reduceAffectedSessions(
     "workspace-a",
     ["affected-session"],
-    async (sessionId) => {
+    (sessionId) => {
       assert(sessionId === "affected-session");
-      return 42n;
+      return Promise.resolve(42n);
     },
     {
-      async reduceSession(options) {
+      reduceSession(options) {
         visited.push(options.sessionId);
         assert(options.workspaceId === "workspace-a");
         assert(options.throughEventId === 42n);
-        return {
+        return Promise.resolve({
           candidate_count: 2,
           inserted_count: 2,
           tombstone_count: 0,
-        };
+        });
       },
     },
   );

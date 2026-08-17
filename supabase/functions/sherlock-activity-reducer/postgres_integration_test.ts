@@ -755,6 +755,10 @@ async function cleanup(
 ): Promise<void> {
   await sql.begin(async (tx) => {
     await tx.unsafe(
+      "delete from processing.telemetry_jobs where workspace_id = $1",
+      [workspaceId],
+    );
+    await tx.unsafe(
       "delete from analytics.activity_spans where workspace_id = $1",
       [workspaceId],
     );

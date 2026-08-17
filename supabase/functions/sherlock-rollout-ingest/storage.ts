@@ -32,7 +32,8 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
         "Cache-Control": "private, max-age=31536000, immutable",
         "x-upsert": "false",
       },
-      body: bytes,
+      // Deno 2.5's Linux DOM types narrow BodyInit more than the runtime.
+      body: bytes as BodyInit,
     });
     if (response.ok) return;
     const detail = await response.text();

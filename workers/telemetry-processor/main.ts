@@ -161,8 +161,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         }
         if (!job) break;
         claimedAny = true;
-        let task!: Promise<void>;
-        task = runJob(queue, processor, job, config).finally(() => {
+        const task = runJob(queue, processor, job, config).finally(() => {
           active.delete(task);
         });
         active.set(task, job.workload_class);
