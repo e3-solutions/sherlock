@@ -92,8 +92,11 @@ prompt_candidates as materialized (
    where semantic_rank = 1
 ), keyed_prompt_sources as materialized (
   select canonical_prompt_candidates.*,
-         'logical:' || canonical_scope_key || ':' || normalizer_version || ':' ||
-           logical_event_key || ':' || event_kind prompt_identity,
+         coalesce(
+           'native:' || keyed_native_item_id,
+           'logical:' || canonical_scope_key || ':' || normalizer_version || ':' ||
+             logical_event_key || ':' || event_kind
+         ) prompt_identity,
          keyed_submitted has_submitted,
          coalesce(
            ${nativeItemTimestamp("keyed_native_item_id")},
@@ -102,13 +105,13 @@ prompt_candidates as materialized (
     from canonical_prompt_candidates
    where canonical_scope_key is not null and logical_event_key is not null
 ), native_identity_candidates as materialized (
-  select canonical_prompt_candidates.*,
+  select prompt_candidates.*,
          source_observed_at native_source_observed_at,
          coalesce(
            ${nativeItemTimestamp("native_item_id")},
            source_observed_at
          ) native_observed_at
-    from canonical_prompt_candidates
+    from prompt_candidates
    where event_subtype = 'message'
      and native_item_id is not null
 ), unkeyed_submitted_prompts as materialized (
@@ -166,9 +169,9 @@ prompt_candidates as materialized (
                order by observed_at asc, source_observed_at asc, id
              ) canonical_rank
         from prompt_identities
+       where has_submitted
     ) ranked
    where canonical_rank = 1
-     and has_submitted
      and observed_at >= (select start_at from p)
      and observed_at < (select end_at from p)
  )`;

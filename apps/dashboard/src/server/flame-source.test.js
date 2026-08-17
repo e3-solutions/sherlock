@@ -237,4 +237,31 @@ describe("Sherlock Flame payload", () => {
       "unkeyed_native_candidates as materialized",
     );
   });
+
+  it("cannot let response-only evidence suppress a submitted prompt identity", () => {
+    expect(FLAME_SQL).toContain(
+      "from prompt_identities\n       where has_submitted",
+    );
+    expect(FLAME_SQL).toContain(
+      "partition by person_id, prompt_identity",
+    );
+  });
+
+  it("prefers a keyed group's stable native identity across copied sessions", () => {
+    expect(FLAME_SQL).toContain(
+      "coalesce(\n           'native:' || keyed_native_item_id,",
+    );
+    expect(FLAME_SQL).toContain(
+      "'logical:' || canonical_scope_key || ':' || normalizer_version",
+    );
+  });
+
+  it("retains native identity donors that canonical winner selection can drop", () => {
+    expect(FLAME_SQL).toContain(
+      "native_identity_candidates as materialized (\n  select prompt_candidates.*",
+    );
+    expect(FLAME_SQL).toContain(
+      "native_observed_at\n    from prompt_candidates",
+    );
+  });
 });
