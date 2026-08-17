@@ -4,6 +4,10 @@ export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const DATABASE_ROLE = "sherlock_normalizer";
+const SNAPSHOT_TOKEN_VERSION = "v1";
+const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
+const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
+export const UNKEYED_PROMPT_MATCH_SECONDS = 2;
 
 function nativeItemTimestamp(column) {
   return `case
@@ -25,43 +29,29 @@ select id::text as person_id,
  limit $2
 `;
 
-function promptsCte(contentColumns = "") {
+function promptsCte(contentColumns = "", visibilityPredicate = "") {
   return `
 prompt_candidates as materialized (
   select s.person_id, e.id, e.session_id, e.canonical_scope_key,
-         e.logical_event_key, e.event_kind, e.event_subtype, e.source_priority,
+         e.logical_event_key, e.normalizer_version, e.event_kind,
+         e.event_subtype, e.source_priority,
          e.native_item_id, e.content_sha256${contentColumns},
+         e.occurred_at source_occurred_at,
          coalesce(e.occurred_at, e.observed_at, e.server_received_at) source_observed_at,
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then max(e.native_item_id) filter (
                 where e.event_subtype = 'message' and e.native_item_id is not null
               ) over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.logical_event_key, e.event_kind
+                             e.normalizer_version, e.logical_event_key, e.event_kind
               )
               else null end keyed_native_item_id,
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then bool_or(e.event_subtype = 'user_message') over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.logical_event_key, e.event_kind
+                             e.normalizer_version, e.logical_event_key, e.event_kind
               )
-              else null end keyed_submitted,
-         max(e.native_item_id) filter (
-           where e.event_subtype = 'message' and e.native_item_id is not null
-         ) over (
-           partition by e.session_id, e.content_sha256,
-                        date_trunc(
-                          'second',
-                          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-                        )
-         ) matching_native_item_id,
-         bool_or(e.event_subtype = 'user_message') over (
-           partition by e.session_id, e.content_sha256,
-                        date_trunc(
-                          'second',
-                          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-                        )
-         ) has_submitted_user_message
+              else null end keyed_submitted
     from telemetry.events e
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
@@ -75,11 +65,16 @@ prompt_candidates as materialized (
      and e.content_sha256 is not null and e.content_byte_size > 0
      and e.error_code is null and not e.is_replay and e.actor_role = 'primary'
      and pe.github_id is distinct from 'sherlock-smoke'
+     ${visibilityPredicate}
      and (
-       coalesce(e.occurred_at, e.observed_at, e.server_received_at) >= p.start_at
-       and coalesce(e.occurred_at, e.observed_at, e.server_received_at) < p.end_at
-       or ${nativeItemTimestamp("e.native_item_id")} >= p.start_at
-       and ${nativeItemTimestamp("e.native_item_id")} < p.end_at
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+         >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       and coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+         < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       or ${nativeItemTimestamp("e.native_item_id")}
+         >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       and ${nativeItemTimestamp("e.native_item_id")}
+         < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
      )
 ), canonical_prompt_candidates as materialized (
   select ranked.*
@@ -88,39 +83,95 @@ prompt_candidates as materialized (
              case when canonical_scope_key is not null and logical_event_key is not null
                   then row_number() over (
                     partition by session_id, canonical_scope_key,
-                                 logical_event_key, event_kind
-                    order by source_priority desc, source_observed_at asc nulls last, id
+                                 normalizer_version, logical_event_key, event_kind
+                    order by source_priority desc, source_occurred_at asc nulls last, id
                   )
                   else 1 end semantic_rank
         from prompt_candidates
     ) ranked
    where semantic_rank = 1
-), prompt_identities as materialized (
+), keyed_prompt_sources as materialized (
   select canonical_prompt_candidates.*,
-         case when canonical_scope_key is not null and logical_event_key is not null
-              then 'logical:' || canonical_scope_key || ':' || logical_event_key || ':' || event_kind
-              else coalesce(
-                'native:' || coalesce(matching_native_item_id, native_item_id),
-                'observed:' || id::text || ':' || source_observed_at::text
-              ) end prompt_identity,
-         coalesce(keyed_submitted, has_submitted_user_message) has_submitted,
          coalesce(
-           ${nativeItemTimestamp("coalesce(keyed_native_item_id, matching_native_item_id, native_item_id)")},
+           'native:' || keyed_native_item_id,
+           'logical:' || canonical_scope_key || ':' || normalizer_version || ':' ||
+             logical_event_key || ':' || event_kind
+         ) prompt_identity,
+         keyed_submitted has_submitted,
+         coalesce(
+           ${nativeItemTimestamp("keyed_native_item_id")},
            source_observed_at
          ) observed_at
     from canonical_prompt_candidates
+   where canonical_scope_key is not null and logical_event_key is not null
+), native_identity_candidates as materialized (
+  select prompt_candidates.*,
+         source_observed_at native_source_observed_at,
+         coalesce(
+           ${nativeItemTimestamp("native_item_id")},
+           source_observed_at
+         ) native_observed_at
+    from prompt_candidates
+   where event_subtype = 'message'
+     and native_item_id is not null
+), unkeyed_submitted_prompts as materialized (
+  select canonical_prompt_candidates.*
+    from canonical_prompt_candidates
+   where (canonical_scope_key is null or logical_event_key is null)
+     and event_subtype = 'user_message'
+), unkeyed_prompt_pairs as materialized (
+  select submitted.id submitted_id,
+         native.native_item_id matched_native_item_id,
+         native.native_observed_at matched_native_observed_at
+    from unkeyed_submitted_prompts submitted
+    cross join lateral (
+      select candidate.native_item_id, candidate.native_observed_at
+        from native_identity_candidates candidate
+       where candidate.session_id = submitted.session_id
+         and candidate.content_sha256 = submitted.content_sha256
+         and candidate.native_source_observed_at
+           >= submitted.source_observed_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+         and candidate.native_source_observed_at
+           <= submitted.source_observed_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       order by abs(extract(epoch from (
+                  candidate.native_source_observed_at - submitted.source_observed_at
+                ))),
+                case when candidate.native_source_observed_at >= submitted.source_observed_at
+                     then 0 else 1 end,
+                candidate.native_source_observed_at, candidate.native_item_id, candidate.id
+       limit 1
+    ) native
+), unkeyed_prompt_sources as materialized (
+  select submitted.*,
+         coalesce(
+           'native:' || submitted.native_item_id,
+           'native:' || paired.matched_native_item_id,
+           'event:' || submitted.id::text
+         ) prompt_identity,
+         true has_submitted,
+         coalesce(
+           ${nativeItemTimestamp("submitted.native_item_id")},
+           paired.matched_native_observed_at,
+           submitted.source_observed_at
+         ) observed_at
+    from unkeyed_submitted_prompts submitted
+    left join unkeyed_prompt_pairs paired on paired.submitted_id = submitted.id
+), prompt_identities as materialized (
+  select * from keyed_prompt_sources
+  union all
+  select * from unkeyed_prompt_sources
 ), prompts as materialized (
   select ranked.*
     from (
       select prompt_identities.*,
              row_number() over (
-               partition by session_id, prompt_identity
+               partition by person_id, prompt_identity
                order by observed_at asc, source_observed_at asc, id
              ) canonical_rank
         from prompt_identities
+       where has_submitted
     ) ranked
    where canonical_rank = 1
-     and has_submitted
      and observed_at >= (select start_at from p)
      and observed_at < (select end_at from p)
  )`;
@@ -233,16 +284,25 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
 export const PROMPT_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version
-), ${promptsCte(", e.content_byte_size, e.content_excerpt")}
+         $3::timestamptz end_at, $4::text normalizer_version,
+         $5::pg_snapshot snapshot, $7::timestamptz bucket_start,
+         $8::timestamptz bucket_end
+), ${promptsCte(
+  ", e.content_byte_size, e.content_excerpt",
+  // Recreate the aggregate's event visibility without keeping its transaction open.
+  // telemetry.events is append-only, so filtering each row's creator is sufficient.
+  "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
+)}
 select id::text id, observed_at,
        coalesce(content_excerpt, '') content,
        coalesce(content_byte_size, 0)::bigint content_byte_size,
        octet_length(coalesce(content_excerpt, ''))::bigint excerpt_byte_size
   from prompts
- where person_id = $5::uuid
+ where person_id = $6::uuid
+   and observed_at >= (select bucket_start from p)
+   and observed_at < (select bucket_end from p)
  order by observed_at, id
- limit $6
+limit $9
 `;
 
 export class FlameSourceError extends Error {
@@ -272,7 +332,58 @@ function count(value) {
   return result;
 }
 
-export function buildFlamePayload({ rows, roster, start, read }) {
+function parsePgSnapshot(value) {
+  if (typeof value !== "string" || value.length > MAX_SNAPSHOT_TOKEN_LENGTH ||
+      !PG_SNAPSHOT_PATTERN.test(value)) {
+    throw new FlameSourceError("flame_snapshot_invalid");
+  }
+  const [xminValue, xmaxValue, xipValue] = value.split(":");
+  const xmin = BigInt(xminValue);
+  const xmax = BigInt(xmaxValue);
+  const xips = xipValue ? xipValue.split(",").map((item) => BigInt(item)) : [];
+  if (xmin > xmax || xips.some((xid) => xid < xmin || xid >= xmax)) {
+    throw new FlameSourceError("flame_snapshot_invalid");
+  }
+  return value;
+}
+
+export function encodeSnapshotToken({ snapshot, read }) {
+  const readAt = asDate(read).toISOString();
+  const pgSnapshot = parsePgSnapshot(snapshot);
+  const body = Buffer.from(JSON.stringify([pgSnapshot, readAt]), "utf8").toString("base64url");
+  const token = `${SNAPSHOT_TOKEN_VERSION}.${body}`;
+  if (token.length > MAX_SNAPSHOT_TOKEN_LENGTH) {
+    throw new FlameSourceError("flame_snapshot_too_large");
+  }
+  return token;
+}
+
+export function decodeSnapshotToken(token) {
+  if (typeof token !== "string" || token.length > MAX_SNAPSHOT_TOKEN_LENGTH) {
+    throw new FlameSourceError("flame_prompt_request_invalid");
+  }
+  const [version, body, extra] = token.split(".");
+  if (version !== SNAPSHOT_TOKEN_VERSION || !body || extra !== undefined ||
+      !/^[A-Za-z0-9_-]+$/.test(body)) {
+    throw new FlameSourceError("flame_prompt_request_invalid");
+  }
+  try {
+    const decoded = Buffer.from(body, "base64url").toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== body) {
+      throw new Error("noncanonical_token");
+    }
+    const value = JSON.parse(decoded);
+    if (!Array.isArray(value) || value.length !== 2) throw new Error("invalid_payload");
+    const [snapshot, rawRead] = value;
+    const read = asDate(rawRead);
+    if (read.toISOString() !== rawRead) throw new Error("noncanonical_read");
+    return { snapshot: parsePgSnapshot(snapshot), read };
+  } catch {
+    throw new FlameSourceError("flame_prompt_request_invalid");
+  }
+}
+
+export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   if (roster.length === 0) throw new FlameSourceError("flame_database_roster_empty");
   if (rows.length !== roster.length * BUCKET_COUNT) {
     throw new FlameSourceError("flame_database_result_incomplete");
@@ -320,6 +431,7 @@ export function buildFlamePayload({ rows, roster, start, read }) {
   return {
     start: asDate(start).toISOString(),
     read: asDate(read).toISOString(),
+    snapshot: encodeSnapshotToken({ snapshot, read }),
     latest: latest?.toISOString() ?? null,
     coverage: {
       evidence: "observed_events",
@@ -385,9 +497,10 @@ export class DirectFlameSource {
 
   async fetchDay({ now } = {}) {
     return await this.transaction(async (tx) => {
-      const read = now
-        ? asDate(now)
-        : asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
+      const receipt = (await tx.unsafe(
+        "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
+      ))[0];
+      const read = now ? asDate(now) : asDate(receipt.now);
       const endMs = Math.floor(read.getTime() / BUCKET_MS) * BUCKET_MS;
       const start = new Date(endMs - 24 * 60 * 60 * 1000);
       const end = new Date(endMs);
@@ -404,12 +517,13 @@ export class DirectFlameSource {
         end.toISOString(),
         NORMALIZER_VERSION,
       ]);
-      return buildFlamePayload({ rows, roster, start, read });
+      return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
     });
   }
 
-  async fetchPrompts({ personId, start }) {
+  async fetchPrompts({ personId, start, snapshot }) {
     const startAt = asDate(start);
+    const snapshotReceipt = decodeSnapshotToken(snapshot);
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(personId)) {
       throw new FlameSourceError("flame_prompt_request_invalid");
     }
@@ -420,17 +534,25 @@ export class DirectFlameSource {
     return await this.transaction(async (tx) => {
       const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
       const oldest = read.getTime() - 25 * 60 * 60 * 1000;
-      if (startAt.getTime() < oldest || startAt.getTime() > read.getTime()) {
+      const snapshotEndMs = Math.floor(snapshotReceipt.read.getTime() / BUCKET_MS) * BUCKET_MS;
+      const snapshotStartMs = snapshotEndMs - 24 * 60 * 60 * 1000;
+      if (snapshotReceipt.read.getTime() < oldest ||
+          startAt.getTime() < snapshotStartMs || startAt.getTime() >= snapshotEndMs) {
         throw new FlameSourceError("flame_prompt_request_out_of_range");
       }
       const endAt = new Date(startAt.getTime() + BUCKET_MS);
+      const snapshotStartAt = new Date(snapshotStartMs);
+      const snapshotEndAt = new Date(snapshotEndMs);
       const limit = 501;
       const rows = await tx.unsafe(PROMPT_DETAIL_SQL, [
         this.workspaceId,
+        snapshotStartAt.toISOString(),
+        snapshotEndAt.toISOString(),
+        NORMALIZER_VERSION,
+        snapshotReceipt.snapshot,
+        personId,
         startAt.toISOString(),
         endAt.toISOString(),
-        NORMALIZER_VERSION,
-        personId,
         limit,
       ]);
       if (rows.length === limit) {
@@ -439,6 +561,7 @@ export class DirectFlameSource {
       return {
         personId,
         start: startAt.toISOString(),
+        snapshot,
         prompts: rows.map((row) => ({
           id: String(row.id),
           at: asDate(row.observed_at).toISOString(),

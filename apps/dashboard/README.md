@@ -30,19 +30,31 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   automation is excluded.
 - Canonically selected, non-replay primary-role submitted user messages with
   valid stored content supply prompt counts. Keyed records follow Sherlock's
-  documented source-priority selection. The response-item `native_item_id`
-  deduplicates copied unkeyed history and supplies a Codex-format timestamp when
-  available. Response-item-only runtime context, plus worker and guardian parent
-  messages, is not presented as human prompt input.
-- `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>` lazily
+  documented source-priority selection exactly, including the pinned normalizer
+  version in the identity. For records without both canonical keys, the
+  submitted event's own stable `native_item_id` wins. A response-item
+  `native_item_id` can bridge the paired Codex representation only when the two
+  formats have the same session and content hash and timestamps within two
+  seconds. The closest candidate wins with deterministic stable-ID tie breaking;
+  repeated matches to one native ID collapse to that stable prompt for the
+  person even when copied across session histories. Otherwise the immutable
+  Sherlock event ID remains distinct. Response-item-only runtime
+  context, plus worker and guardian parent messages, is not presented as human
+  prompt input.
+- `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>&snapshot=<token>` lazily
   returns every stored prompt excerpt for the selected bucket, ordered by its
   canonical timestamp. `truncated: true` distinguishes the 1,024-byte database
-  excerpt from full raw content retained in private Storage.
+  excerpt from full raw content retained in private Storage. `/api/flame`
+  captures a PostgreSQL MVCC snapshot token; the detail query accepts only
+  event rows whose creating transaction was visible to that exact aggregate
+  snapshot. Late normalization therefore cannot make a drawer disagree with
+  the selected bar.
 - The response declares partial observed-event coverage because event presence
   is exact evidence for a bucket but is not proof of continuous attention.
-- Aggregate and detail requests are separate database snapshots until Sherlock
-  has a durable publication cutoff. The UI labels each receipt as the latest API
-  read rather than claiming pipeline completeness.
+- Aggregate and detail are separate database transactions, but prompt details
+  are pinned to the aggregate's immutable MVCC visibility token. This is a
+  read-consistency boundary, not a durable pipeline publication cutoff: a later
+  timeline refresh can correctly include newly normalized evidence.
 
 ## Environment
 

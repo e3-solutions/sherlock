@@ -28,6 +28,7 @@ function payload(overrides = {}) {
   return {
     start: "2026-03-08T08:00:00.000Z",
     read: "2026-03-09T08:00:01.000Z",
+    snapshot: "v1.snapshot-token",
     latest: null,
     coverage: {
       evidence: "observed_events",
@@ -70,6 +71,7 @@ describe("adaptFlamePayload", () => {
       state: "partial",
       reason: "event_presence_not_continuous_attention",
     });
+    expect(result.snapshot).toBe("v1.snapshot-token");
     expect(result.people[0].buckets.map(({ index }) => index)).toEqual(
       Array.from({ length: BUCKET_COUNT }, (_, index) => index),
     );
@@ -231,11 +233,13 @@ describe("adaptFlamePayload", () => {
 
 describe("adaptPromptEvidence", () => {
   const startMs = Date.parse("2026-08-17T16:10:00.000Z");
+  const snapshot = "v1.snapshot-token";
 
   it("validates and expands every prompt in the selected bucket", () => {
     expect(adaptPromptEvidence({
       personId: "person-1",
       start: new Date(startMs).toISOString(),
+      snapshot,
       prompts: [
         {
           id: "10",
@@ -250,7 +254,7 @@ describe("adaptPromptEvidence", () => {
           truncated: true,
         },
       ],
-    }, { personId: "person-1", startMs })).toEqual([
+    }, { personId: "person-1", startMs, snapshot })).toEqual([
       {
         id: "10",
         atMs: Date.parse("2026-08-17T16:10:08.631Z"),
@@ -267,15 +271,17 @@ describe("adaptPromptEvidence", () => {
   });
 
   it.each([
-    ["wrong person", { personId: "other", start: new Date(startMs).toISOString(), prompts: [] }],
-    ["wrong bucket", { personId: "person-1", start: new Date(startMs + BUCKET_MS).toISOString(), prompts: [] }],
+    ["wrong person", { personId: "other", start: new Date(startMs).toISOString(), snapshot, prompts: [] }],
+    ["wrong bucket", { personId: "person-1", start: new Date(startMs + BUCKET_MS).toISOString(), snapshot, prompts: [] }],
+    ["wrong snapshot", { personId: "person-1", start: new Date(startMs).toISOString(), snapshot: "v1.other", prompts: [] }],
     ["prompt outside bucket", {
       personId: "person-1",
       start: new Date(startMs).toISOString(),
+      snapshot,
       prompts: [{ id: "10", at: new Date(startMs + BUCKET_MS).toISOString(), content: "x", truncated: false }],
     }],
   ])("rejects %s", (_label, value) => {
-    expect(() => adaptPromptEvidence(value, { personId: "person-1", startMs }))
+    expect(() => adaptPromptEvidence(value, { personId: "person-1", startMs, snapshot }))
       .toThrow(FlameDataError);
   });
 });
