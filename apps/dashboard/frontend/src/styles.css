@@ -451,6 +451,13 @@ input { font: inherit; }
   will-change: transform, opacity;
 }
 
+.flame-detail--closing {
+  pointer-events: none;
+  animation-name: flame-detail-exit-x;
+  animation-duration: 220ms;
+  animation-timing-function: cubic-bezier(.4, 0, 1, 1);
+}
+
 @keyframes flame-detail-enter-x {
   from {
     opacity: 0;
@@ -470,6 +477,28 @@ input { font: inherit; }
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes flame-detail-exit-x {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+}
+
+@keyframes flame-detail-exit-y {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(24px);
   }
 }
 
@@ -517,23 +546,46 @@ input { font: inherit; }
 
 .flame-detail__close {
   display: grid;
-  width: 36px;
-  height: 36px;
-  flex: 0 0 36px;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
   place-items: center;
-  border: 1px solid var(--flame-rule);
-  background: none;
+  margin: -8px -10px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
   color: var(--flame-muted);
   cursor: pointer;
   font-size: 20px;
   line-height: 1;
+  touch-action: manipulation;
+  transition: background-color 160ms ease, color 160ms ease, transform 160ms ease;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.flame-detail__close:hover,
-.flame-detail__close:focus-visible {
-  border-color: var(--flame-ink);
+.flame-detail__close:hover {
+  background: rgb(242 238 226 / 7%);
   color: var(--flame-ink);
-  outline: none;
+}
+
+.flame-detail__close:focus-visible {
+  background: rgb(242 238 226 / 8%);
+  color: var(--flame-ink);
+  outline: 2px solid var(--flame-agent);
+  outline-offset: 2px;
+}
+
+.flame-detail__close:active {
+  background: rgb(242 238 226 / 12%);
+  transform: scale(.92);
+}
+
+.flame-detail__close svg {
+  width: 18px;
+  height: 18px;
+  pointer-events: none;
+  stroke: currentColor;
 }
 
 .flame-detail__section {
@@ -668,6 +720,10 @@ input { font: inherit; }
     border-left: 0;
     box-shadow: 0 -18px 44px rgb(0 0 0 / 42%);
     animation-name: flame-detail-enter-y;
+  }
+
+  .flame-detail.flame-detail--closing {
+    animation-name: flame-detail-exit-y;
   }
 
   .flame-detail__header,
