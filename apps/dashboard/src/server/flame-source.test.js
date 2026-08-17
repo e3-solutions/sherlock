@@ -107,6 +107,10 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("e.actor_role = 'primary'");
     expect(FLAME_SQL).not.toContain("s.actor_role = 'primary'");
     expect(FLAME_SQL).toContain("e.actor_role <> 'automation'");
+    expect(FLAME_SQL).toContain(
+      "e.actor_role = 'unknown' and s.parent_session_id is not null",
+    );
+    expect(FLAME_SQL).toContain("then 'worker' else e.actor_role end actor_role");
     expect(FLAME_SQL).toContain("$5::timestamptz read_at");
     expect(FLAME_SQL).toContain(") < p.read_at");
     expect(FLAME_SQL).toContain("max(a.observed_at) latest_activity");

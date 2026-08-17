@@ -242,41 +242,32 @@ describe("adaptFlamePayload", () => {
 });
 
 describe("getPersonActivityStatus", () => {
-  function adaptedPersonWithRecentBuckets({
-    oldest = [0, 0, 0, 0],
-    middle = [0, 0, 0, 0],
-    latest = [0, 0, 0, 0],
-  } = {}) {
-    const values = buckets();
-    values[141] = oldest;
-    values[142] = middle;
-    values[143] = latest;
+  const readMs = Date.parse("2026-03-09T08:00:01.000Z");
+
+  function adaptedPerson(lastActivity) {
     return adaptFlamePayload(payload({
-      people: [person({ total: [4, 4, 4], buckets: values })],
+      people: [person({ lastActivity })],
     })).people[0];
   }
 
-  it("is active only when the latest completed bucket has session evidence", () => {
-    const adapted = adaptedPersonWithRecentBuckets({ latest: [0, 1, 0, 0] });
+  it("is active when canonical activity was observed in the last ten minutes", () => {
+    const adapted = adaptedPerson("2026-03-09T07:50:01.000Z");
 
-    expect(getPersonActivityStatus(adapted)).toBe("active");
+    expect(getPersonActivityStatus(adapted, readMs)).toBe("active");
   });
 
-  it("is recent when session evidence exists only in the preceding twenty minutes", () => {
-    const adapted = adaptedPersonWithRecentBuckets({ oldest: [0, 0, 1, 0] });
+  it("is recent when canonical activity was observed ten to thirty minutes ago", () => {
+    const adapted = adaptedPerson("2026-03-09T07:30:01.000Z");
 
-    expect(getPersonActivityStatus(adapted)).toBe("recent");
+    expect(getPersonActivityStatus(adapted, readMs)).toBe("recent");
   });
 
-  it("is inactive when only prompts or older session evidence exists", () => {
-    const values = buckets();
-    values[140] = [1, 0, 0, 0];
-    values[143] = [0, 0, 0, 12];
-    const adapted = adaptFlamePayload(payload({
-      people: [person({ total: [1, 0, 0], buckets: values })],
-    })).people[0];
+  it("is inactive when activity is older than thirty minutes or absent", () => {
+    const old = adaptedPerson("2026-03-09T07:30:00.000Z");
+    const absent = adaptedPerson(null);
 
-    expect(getPersonActivityStatus(adapted)).toBe("inactive");
+    expect(getPersonActivityStatus(old, readMs)).toBe("inactive");
+    expect(getPersonActivityStatus(absent, readMs)).toBe("inactive");
   });
 });
 

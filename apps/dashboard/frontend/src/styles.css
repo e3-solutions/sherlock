@@ -11,7 +11,6 @@
   --flame-subagent: #2fe6cf;
   --flame-unclassified: #b991ff;
   --flame-prompt: #fff8da;
-  --flame-hover: rgb(242 238 226 / 10%);
   --flame-selected: #f2eee2;
   --flame-stale: #f0b35c;
   --flame-partial: #c599ff;
@@ -282,8 +281,8 @@ input { font: inherit; }
 }
 
 .flame-person-status {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
   flex: 0 0 auto;
   border-radius: 50%;
   box-shadow: 0 0 0 1px rgb(255 255 255 / 12%);

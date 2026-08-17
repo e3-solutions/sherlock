@@ -416,11 +416,11 @@ function SemanticLegend({ data }) {
 const ACTIVITY_STATUS = {
   active: {
     label: "Active",
-    description: "observed session evidence in the latest completed 10-minute interval",
+    description: "activity observed in the last 10 minutes",
   },
   recent: {
     label: "Recently active",
-    description: "observed session evidence in the preceding 20 minutes",
+    description: "activity observed more than 10 and up to 30 minutes ago",
   },
   inactive: {
     label: "Inactive",
@@ -428,8 +428,8 @@ const ACTIVITY_STATUS = {
   },
 };
 
-function PersonRail({ person, headingId }) {
-  const status = getPersonActivityStatus(person);
+function PersonRail({ person, headingId, readMs }) {
+  const status = getPersonActivityStatus(person, readMs);
   const { label, description } = ACTIVITY_STATUS[status];
 
   return (
@@ -445,7 +445,7 @@ function PersonRail({ person, headingId }) {
   );
 }
 
-function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSelect }) {
+function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSelect, readMs }) {
   const laneRef = useRef(null);
   const [keyboardIndex, setKeyboardIndex] = useState(0);
   const rawId = useId();
@@ -506,7 +506,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
       aria-labelledby={headingId}
       data-selected={selectedIndex === undefined ? undefined : "true"}
     >
-      <PersonRail person={person} headingId={headingId} />
+      <PersonRail person={person} headingId={headingId} readMs={readMs} />
       <div
         ref={laneRef}
         className="flame-lane"
@@ -754,6 +754,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
             peak={peak}
             promptPeak={promptPeak}
             chartWidth={width}
+            readMs={data.readMs}
             selectedIndex={selectedPerson?.id === person.id ? selectedPoint?.index : undefined}
             onSelect={selectInterval}
           />

@@ -31,12 +31,14 @@ function model() {
       {
         id: "ada",
         name: "Ada Lovelace",
+        lastActivity: "2026-08-15T06:56:00.000Z",
         total: [2, 1, 1],
         buckets: adaBuckets,
       },
       {
         id: "zero",
         name: "Zero Activity",
+        lastActivity: null,
         total: [0, 0, 0],
         buckets: emptyBuckets(),
       },
@@ -88,11 +90,11 @@ describe("FlameGraph", () => {
     );
   });
 
-  it("replaces role totals with accessible snapshot-relative activity dots", () => {
+  it("replaces role totals with accessible read-relative activity dots", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
 
     const active = screen.getByRole("img", {
-      name: "Ada Lovelace: Active; observed session evidence in the latest completed 10-minute interval",
+      name: "Ada Lovelace: Active; activity observed in the last 10 minutes",
     });
     const inactive = screen.getByRole("img", {
       name: "Zero Activity: Inactive; no observed session evidence in the trailing 30 minutes",
@@ -101,7 +103,7 @@ describe("FlameGraph", () => {
     expect(active).toHaveClass("flame-person-status--active");
     expect(active).toHaveAttribute(
       "title",
-      expect.stringContaining("latest completed 10-minute interval"),
+      expect.stringContaining("last 10 minutes"),
     );
     expect(inactive).toHaveClass("flame-person-status--inactive");
     expect(container.querySelector(".flame-totals")).toBeNull();

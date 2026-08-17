@@ -193,7 +193,10 @@ with p as materialized (
                          interval '10 minutes') bucket_start
     from p
 ), activity_candidates as materialized (
-  select s.person_id, e.id, e.session_id, e.actor_role, e.event_kind, e.event_subtype,
+  select s.person_id, e.id, e.session_id,
+         case when e.actor_role = 'unknown' and s.parent_session_id is not null
+              then 'worker' else e.actor_role end actor_role,
+         e.event_kind, e.event_subtype,
          coalesce(
            ${nativeItemTimestamp("e.native_item_id")},
            coalesce(e.occurred_at, e.observed_at, e.server_received_at)

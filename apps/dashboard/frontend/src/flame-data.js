@@ -102,23 +102,21 @@ export function getGlobalPeak(people) {
 }
 
 /**
- * Classifies recent observed session evidence relative to the aggregate window.
- * Prompt-only buckets intentionally do not imply a running agent.
+ * Classifies recent observed session evidence relative to the exact API read.
  */
-export function getPersonActivityStatus(person) {
-  if (!person || !Array.isArray(person.buckets) || person.buckets.length < 3) {
-    fail("person", "an adapted person with at least three buckets");
+export function getPersonActivityStatus(person, readMs) {
+  if (!person || !(person.lastActivityMs === null ||
+      Number.isSafeInteger(person.lastActivityMs))) {
+    fail("person", "an adapted person with a nullable activity timestamp");
   }
-
-  const recentBuckets = person.buckets.slice(-3);
-  for (const bucket of recentBuckets) {
-    if (!bucket || !Number.isSafeInteger(bucket.activity) || bucket.activity < 0) {
-      fail("person", "an adapted person with valid activity buckets");
-    }
+  if (!Number.isSafeInteger(readMs)) {
+    fail("readMs", "a safe integer timestamp");
   }
-
-  if (recentBuckets[2].activity > 0) return "active";
-  if (recentBuckets[0].activity > 0 || recentBuckets[1].activity > 0) return "recent";
+  if (person.lastActivityMs === null) return "inactive";
+  const elapsed = readMs - person.lastActivityMs;
+  if (elapsed < 0) fail("person.lastActivityMs", "at or before readMs");
+  if (elapsed <= BUCKET_MS) return "active";
+  if (elapsed <= 3 * BUCKET_MS) return "recent";
   return "inactive";
 }
 
