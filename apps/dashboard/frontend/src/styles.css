@@ -300,11 +300,6 @@ input { font: inherit; }
   touch-action: pan-y;
 }
 
-.flame-lane:focus-within {
-  outline: 2px solid var(--flame-selected);
-  outline-offset: -2px;
-}
-
 .flame-lane .recharts-wrapper,
 .flame-lane .recharts-surface {
   display: block;
@@ -354,18 +349,6 @@ input { font: inherit; }
   stroke-dasharray: 2 2;
   stroke-opacity: .8;
   stroke-width: 1px;
-}
-
-.flame-bucket-selected {
-  position: absolute;
-  top: 10px;
-  bottom: 22px;
-  z-index: 3;
-  min-width: 4px;
-  border: 1px solid var(--flame-selected);
-  background: rgb(242 238 226 / 12%);
-  box-shadow: 0 0 0 1px rgb(9 12 10 / 65%);
-  pointer-events: none;
 }
 
 .flame-tooltip {

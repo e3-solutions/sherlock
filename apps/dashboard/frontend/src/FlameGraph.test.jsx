@@ -314,7 +314,8 @@ describe("FlameGraph", () => {
     expect(detail).not.toHaveTextContent("Canonical observed evidence");
     expect(detail).not.toHaveTextContent("Latest API read");
     expect(lane).toHaveAttribute("data-selected-index", "0");
-    expect(lane.querySelector(".flame-bucket-selected")).toBeInTheDocument();
+    expect(lane.closest(".flame-person")).toHaveAttribute("data-selected", "true");
+    expect(lane.querySelector(".flame-bucket-selected")).not.toBeInTheDocument();
   });
 
   it("loads and lists every canonical prompt underneath the interval count", async () => {

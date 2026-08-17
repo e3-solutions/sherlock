@@ -535,16 +535,6 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
             isAnimationActive={false}
           />
         </ComposedChart>
-        {selectedIndex !== undefined && (
-          <i
-            className="flame-bucket-selected"
-            style={{
-              left: `${(selectedIndex / BUCKET_COUNT) * 100}%`,
-              width: `${100 / BUCKET_COUNT}%`,
-            }}
-            aria-hidden="true"
-          />
-        )}
       </div>
     </section>
   );
