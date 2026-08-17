@@ -581,7 +581,6 @@ function useSharedChartWidth(scrollportRef, requestedWidth) {
 }
 
 export default function FlameGraph({ data, chartWidth, stale = false }) {
-  const rootRef = useRef(null);
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
@@ -693,11 +692,9 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
 
   return (
     <section
-      ref={rootRef}
       className="flame-graph"
       data-state={stale ? "stale" : "current"}
       aria-label="Code activity over the last 24 hours"
-      tabIndex={-1}
     >
       <div className="flame-meta-row">
         <div className="flame-meta-rail" aria-hidden="true" />

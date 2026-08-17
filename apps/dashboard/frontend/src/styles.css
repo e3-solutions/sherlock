@@ -94,10 +94,6 @@ input { font: inherit; }
   min-height: 0;
 }
 
-.flame-graph:focus {
-  outline: none;
-}
-
 .flame-people-scroll {
   flex: 1 1 auto;
   min-height: 0;
