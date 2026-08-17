@@ -7,6 +7,7 @@ export const DATABASE_ROLE = "sherlock_normalizer";
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
+export const UNKEYED_PROMPT_MATCH_SECONDS = 2;
 
 function nativeItemTimestamp(column) {
   return `case
@@ -32,39 +33,25 @@ function promptsCte(contentColumns = "", visibilityPredicate = "") {
   return `
 prompt_candidates as materialized (
   select s.person_id, e.id, e.session_id, e.canonical_scope_key,
-         e.logical_event_key, e.event_kind, e.event_subtype, e.source_priority,
+         e.logical_event_key, e.normalizer_version, e.event_kind,
+         e.event_subtype, e.source_priority,
          e.native_item_id, e.content_sha256${contentColumns},
+         e.occurred_at source_occurred_at,
          coalesce(e.occurred_at, e.observed_at, e.server_received_at) source_observed_at,
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then max(e.native_item_id) filter (
                 where e.event_subtype = 'message' and e.native_item_id is not null
               ) over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.logical_event_key, e.event_kind
+                             e.normalizer_version, e.logical_event_key, e.event_kind
               )
               else null end keyed_native_item_id,
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then bool_or(e.event_subtype = 'user_message') over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.logical_event_key, e.event_kind
+                             e.normalizer_version, e.logical_event_key, e.event_kind
               )
-              else null end keyed_submitted,
-         max(e.native_item_id) filter (
-           where e.event_subtype = 'message' and e.native_item_id is not null
-         ) over (
-           partition by e.session_id, e.content_sha256,
-                        date_trunc(
-                          'second',
-                          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-                        )
-         ) matching_native_item_id,
-         bool_or(e.event_subtype = 'user_message') over (
-           partition by e.session_id, e.content_sha256,
-                        date_trunc(
-                          'second',
-                          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-                        )
-         ) has_submitted_user_message
+              else null end keyed_submitted
     from telemetry.events e
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
@@ -80,10 +67,14 @@ prompt_candidates as materialized (
      and pe.github_id is distinct from 'sherlock-smoke'
      ${visibilityPredicate}
      and (
-       coalesce(e.occurred_at, e.observed_at, e.server_received_at) >= p.start_at
-       and coalesce(e.occurred_at, e.observed_at, e.server_received_at) < p.end_at
-       or ${nativeItemTimestamp("e.native_item_id")} >= p.start_at
-       and ${nativeItemTimestamp("e.native_item_id")} < p.end_at
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+         >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       and coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+         < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       or ${nativeItemTimestamp("e.native_item_id")}
+         >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       and ${nativeItemTimestamp("e.native_item_id")}
+         < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
      )
 ), canonical_prompt_candidates as materialized (
   select ranked.*
@@ -92,27 +83,88 @@ prompt_candidates as materialized (
              case when canonical_scope_key is not null and logical_event_key is not null
                   then row_number() over (
                     partition by session_id, canonical_scope_key,
-                                 logical_event_key, event_kind
-                    order by source_priority desc, source_observed_at asc nulls last, id
+                                 normalizer_version, logical_event_key, event_kind
+                    order by source_priority desc, source_occurred_at asc nulls last, id
                   )
                   else 1 end semantic_rank
         from prompt_candidates
     ) ranked
    where semantic_rank = 1
-), prompt_identities as materialized (
+), keyed_prompt_sources as materialized (
   select canonical_prompt_candidates.*,
-         case when canonical_scope_key is not null and logical_event_key is not null
-              then 'logical:' || canonical_scope_key || ':' || logical_event_key || ':' || event_kind
-              else coalesce(
-                'native:' || coalesce(matching_native_item_id, native_item_id),
-                'observed:' || id::text || ':' || source_observed_at::text
-              ) end prompt_identity,
-         coalesce(keyed_submitted, has_submitted_user_message) has_submitted,
+         'logical:' || canonical_scope_key || ':' || normalizer_version || ':' ||
+           logical_event_key || ':' || event_kind prompt_identity,
+         keyed_submitted has_submitted,
          coalesce(
-           ${nativeItemTimestamp("coalesce(keyed_native_item_id, matching_native_item_id, native_item_id)")},
+           ${nativeItemTimestamp("keyed_native_item_id")},
            source_observed_at
          ) observed_at
     from canonical_prompt_candidates
+   where canonical_scope_key is not null and logical_event_key is not null
+), unkeyed_native_candidates as materialized (
+  select ranked.*
+    from (
+      select canonical_prompt_candidates.*,
+             coalesce(
+               ${nativeItemTimestamp("native_item_id")},
+               source_observed_at
+             ) native_observed_at,
+             row_number() over (
+               partition by session_id, native_item_id
+               order by source_priority desc, source_observed_at asc nulls last, id
+             ) native_rank
+        from canonical_prompt_candidates
+       where (canonical_scope_key is null or logical_event_key is null)
+         and event_subtype = 'message'
+         and native_item_id is not null
+    ) ranked
+   where native_rank = 1
+), unkeyed_submitted_prompts as materialized (
+  select canonical_prompt_candidates.*
+    from canonical_prompt_candidates
+   where (canonical_scope_key is null or logical_event_key is null)
+     and event_subtype = 'user_message'
+), unkeyed_prompt_pairs as materialized (
+  select submitted.id submitted_id,
+         native.native_item_id matched_native_item_id,
+         native.native_observed_at matched_native_observed_at
+    from unkeyed_submitted_prompts submitted
+    cross join lateral (
+      select candidate.native_item_id, candidate.native_observed_at
+        from unkeyed_native_candidates candidate
+       where candidate.session_id = submitted.session_id
+         and candidate.content_sha256 = submitted.content_sha256
+         and candidate.native_observed_at
+           >= submitted.source_observed_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+         and candidate.native_observed_at
+           <= submitted.source_observed_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       order by abs(extract(epoch from (
+                  candidate.native_observed_at - submitted.source_observed_at
+                ))),
+                case when candidate.native_observed_at >= submitted.source_observed_at
+                     then 0 else 1 end,
+                candidate.native_observed_at, candidate.native_item_id, candidate.id
+       limit 1
+    ) native
+), unkeyed_prompt_sources as materialized (
+  select submitted.*,
+         coalesce(
+           'native:' || submitted.native_item_id,
+           'native:' || paired.matched_native_item_id,
+           'event:' || submitted.id::text
+         ) prompt_identity,
+         true has_submitted,
+         coalesce(
+           ${nativeItemTimestamp("submitted.native_item_id")},
+           paired.matched_native_observed_at,
+           submitted.source_observed_at
+         ) observed_at
+    from unkeyed_submitted_prompts submitted
+    left join unkeyed_prompt_pairs paired on paired.submitted_id = submitted.id
+), prompt_identities as materialized (
+  select * from keyed_prompt_sources
+  union all
+  select * from unkeyed_prompt_sources
 ), prompts as materialized (
   select ranked.*
     from (

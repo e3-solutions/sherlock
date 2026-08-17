@@ -30,10 +30,16 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   automation is excluded.
 - Canonically selected, non-replay primary-role submitted user messages with
   valid stored content supply prompt counts. Keyed records follow Sherlock's
-  documented source-priority selection. The response-item `native_item_id`
-  deduplicates copied unkeyed history and supplies a Codex-format timestamp when
-  available. Response-item-only runtime context, plus worker and guardian parent
-  messages, is not presented as human prompt input.
+  documented source-priority selection exactly, including the pinned normalizer
+  version in the identity. For records without both canonical keys, the
+  submitted event's own stable `native_item_id` wins. A response-item
+  `native_item_id` can bridge the paired Codex representation only when the two
+  formats have the same session and content hash and timestamps within two
+  seconds. The closest candidate wins with deterministic stable-ID tie breaking;
+  repeated matches to one native ID collapse to that stable prompt. Otherwise
+  the immutable Sherlock event ID remains distinct. Response-item-only runtime
+  context, plus worker and guardian parent messages, is not presented as human
+  prompt input.
 - `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>&snapshot=<token>` lazily
   returns every stored prompt excerpt for the selected bucket, ordered by its
   canonical timestamp. `truncated: true` distinguishes the 1,024-byte database

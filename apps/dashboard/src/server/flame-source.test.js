@@ -7,6 +7,7 @@ import {
   PEOPLE_SQL,
   PROMPT_DETAIL_SQL,
   DirectFlameSource,
+  UNKEYED_PROMPT_MATCH_SECONDS,
   FlameSourceError,
   buildFlamePayload,
   decodeSnapshotToken,
@@ -117,12 +118,14 @@ describe("Sherlock Flame payload", () => {
 
   it("canonically selects submitted primary prompts before returning details", () => {
     expect(FLAME_SQL).toContain("partition by session_id, canonical_scope_key");
+    expect(FLAME_SQL).toContain("normalizer_version, logical_event_key, event_kind");
     expect(FLAME_SQL).toContain("order by source_priority desc");
+    expect(FLAME_SQL).toContain("source_occurred_at asc nulls last, id");
     expect(FLAME_SQL).toContain("keyed_submitted");
     expect(FLAME_SQL).toContain("e.message_role = 'user'");
     expect(FLAME_SQL).toContain("e.content_byte_size > 0");
     expect(FLAME_SQL).toContain("e.error_code is null");
-    expect(FLAME_SQL).toContain("matching_native_item_id");
+    expect(FLAME_SQL).toContain("keyed_native_item_id");
     expect(FLAME_SQL).toContain("partition by session_id, prompt_identity");
     expect(PROMPT_DETAIL_SQL).toContain("content_excerpt");
     expect(PROMPT_DETAIL_SQL).toContain("$5::pg_snapshot snapshot");
@@ -206,5 +209,21 @@ describe("Sherlock Flame payload", () => {
       snapshot,
       prompts: [{ id: "17", content: "Stable snapshot prompt" }],
     });
+  });
+
+  it("uses stable prompt identifiers before a bounded unkeyed format bridge", () => {
+    expect(UNKEYED_PROMPT_MATCH_SECONDS).toBe(2);
+    expect(FLAME_SQL).toContain("partition by session_id, native_item_id");
+    expect(FLAME_SQL).toContain("'logical:' || canonical_scope_key || ':' || normalizer_version");
+    expect(FLAME_SQL).toContain("'native:' || submitted.native_item_id");
+    expect(FLAME_SQL).toContain("'native:' || paired.matched_native_item_id");
+    expect(FLAME_SQL).toContain("'event:' || submitted.id::text");
+    expect(FLAME_SQL).toContain("cross join lateral");
+    expect(FLAME_SQL).toContain("candidate.native_observed_at - submitted.source_observed_at");
+    expect(FLAME_SQL).toContain("candidate.native_item_id, candidate.id");
+    expect(FLAME_SQL).toContain("interval '2 seconds'");
+    expect(FLAME_SQL).not.toContain("date_trunc(\n                          'second'");
+    expect(FLAME_SQL).not.toContain("matching_native_item_id");
+    expect(FLAME_SQL).not.toContain("has_submitted_user_message");
   });
 });
