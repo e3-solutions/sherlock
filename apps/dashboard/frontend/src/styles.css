@@ -87,7 +87,9 @@ input { font: inherit; }
 
 .flame-graph {
   position: relative;
+  display: flex;
   flex: 1;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
 }
@@ -96,11 +98,13 @@ input { font: inherit; }
   outline: none;
 }
 
-.flame-graph-scroll {
-  height: 100%;
+.flame-people-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   min-width: 100%;
   overflow-x: hidden;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   scrollbar-color: var(--flame-rule) var(--flame-page);
 }
 
@@ -158,17 +162,14 @@ input { font: inherit; }
 }
 
 .flame-meta-row {
-  position: sticky;
-  top: 0;
   z-index: 6;
+  flex: 0 0 auto;
   height: 62px;
   background: var(--flame-page);
 }
 
 .flame-meta-rail,
 .flame-person-rail {
-  position: sticky;
-  left: 0;
   z-index: 4;
   background: var(--flame-surface);
 }

@@ -545,11 +545,11 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
   );
 }
 
-export function getAvailableChartWidth(containerWidth, railWidth) {
-  return Math.max(1, containerWidth - railWidth);
+export function getAvailableChartWidth(scrollportClientWidth, railWidth) {
+  return Math.max(1, scrollportClientWidth - railWidth);
 }
 
-function useSharedChartWidth(rootRef, requestedWidth) {
+function useSharedChartWidth(scrollportRef, requestedWidth) {
   const [measuredWidth, setMeasuredWidth] = useState(requestedWidth ?? 1);
 
   useLayoutEffect(() => {
@@ -558,31 +558,34 @@ function useSharedChartWidth(rootRef, requestedWidth) {
       return undefined;
     }
 
-    const root = rootRef.current;
-    if (!root || typeof ResizeObserver === "undefined") return undefined;
+    const scrollport = scrollportRef.current;
+    if (!scrollport || typeof ResizeObserver === "undefined") return undefined;
 
     const update = () => {
-      const rail = Number.parseFloat(getComputedStyle(root).getPropertyValue("--flame-rail")) || 260;
-      setMeasuredWidth(getAvailableChartWidth(root.clientWidth, rail));
+      const rail = Number.parseFloat(
+        getComputedStyle(scrollport).getPropertyValue("--flame-rail"),
+      ) || 260;
+      setMeasuredWidth(getAvailableChartWidth(scrollport.clientWidth, rail));
     };
     const observer = new ResizeObserver(update);
-    observer.observe(root);
+    observer.observe(scrollport);
     update();
     return () => observer.disconnect();
-  }, [requestedWidth, rootRef]);
+  }, [requestedWidth, scrollportRef]);
 
   return Math.max(1, measuredWidth);
 }
 
 export default function FlameGraph({ data, chartWidth, stale = false }) {
   const rootRef = useRef(null);
+  const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
   const [selection, setSelection] = useState(null);
   const [detailClosing, setDetailClosing] = useState(false);
   const [promptRevision, setPromptRevision] = useState(0);
   const [promptEvidence, setPromptEvidence] = useState({ state: "idle", items: [] });
-  const width = useSharedChartWidth(rootRef, chartWidth);
+  const width = useSharedChartWidth(peopleScrollRef, chartWidth);
   const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
   const promptPeak = data.people.reduce(
     (peoplePeak, person) => person.buckets.reduce(
@@ -692,28 +695,28 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       aria-label="Code activity over the last 24 hours"
       tabIndex={-1}
     >
-      <div className="flame-graph-scroll">
-        <div className="flame-meta-row">
-          <div className="flame-meta-rail" aria-hidden="true" />
-          <div
-            className="flame-time-axis"
-            style={{ width }}
-            aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
-          >
-            {ticks.map((tick, index) => {
-              const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
-              return (
-                <time
-                  key={at}
-                  dateTime={new Date(at).toISOString()}
-                  style={{ left: `${(index / (ticks.length - 1)) * 100}%` }}
-                >
-                  {formatTime(at)}
-                </time>
-              );
-            })}
-          </div>
+      <div className="flame-meta-row">
+        <div className="flame-meta-rail" aria-hidden="true" />
+        <div
+          className="flame-time-axis"
+          style={{ width }}
+          aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
+        >
+          {ticks.map((tick, index) => {
+            const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
+            return (
+              <time
+                key={at}
+                dateTime={new Date(at).toISOString()}
+                style={{ left: `${(index / (ticks.length - 1)) * 100}%` }}
+              >
+                {formatTime(at)}
+              </time>
+            );
+          })}
         </div>
+      </div>
+      <div ref={peopleScrollRef} className="flame-people-scroll">
         {data.people.map((person) => (
           <PersonLane
             key={person.id}

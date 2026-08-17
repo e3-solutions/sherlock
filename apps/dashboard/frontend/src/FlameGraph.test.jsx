@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import FlameGraph, {
@@ -50,8 +50,9 @@ function model() {
 }
 
 describe("getAvailableChartWidth", () => {
-  it("uses all viewport space beside the person rail without a desktop minimum", () => {
+  it("uses scrollbar-adjusted scrollport space beside the person rail", () => {
     expect(getAvailableChartWidth(1_440, 260)).toBe(1_180);
+    expect(getAvailableChartWidth(1_425, 260)).toBe(1_165);
     expect(getAvailableChartWidth(320, 164)).toBe(156);
   });
 
@@ -124,6 +125,50 @@ describe("FlameGraph", () => {
       "aria-label",
       "Zero Activity activity timeline, 144 ten-minute buckets",
     );
+
+    const axis = container.querySelector(".flame-time-axis");
+    const peopleScroll = container.querySelector(".flame-people-scroll");
+    expect(axis.parentElement).toHaveClass("flame-meta-row");
+    expect(peopleScroll.previousElementSibling).toBe(axis.parentElement);
+    expect(peopleScroll).not.toContainElement(axis);
+    expect(peopleScroll.querySelectorAll(".flame-person")).toHaveLength(2);
+  });
+
+  it("sizes both fixed axis and rows from the scrollbar-adjusted people scrollport", async () => {
+    const observations = [];
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback) {
+        this.callback = callback;
+      }
+
+      observe = (target) => {
+        observe(target);
+        observations.push({ callback: this.callback, target });
+      };
+      disconnect = disconnect;
+    });
+
+    const { container } = render(<FlameGraph data={model()} />);
+    const peopleScroll = container.querySelector(".flame-people-scroll");
+    Object.defineProperty(peopleScroll, "clientWidth", {
+      configurable: true,
+      value: 1_425,
+    });
+
+    const peopleObserver = observations.find(({ target }) => target === peopleScroll);
+    expect(peopleObserver).toBeDefined();
+    act(() => peopleObserver.callback());
+
+    await waitFor(() => {
+      expect(container.querySelector(".flame-time-axis")).toHaveStyle({ width: "1165px" });
+      for (const lane of container.querySelectorAll(".flame-lane")) {
+        expect(lane).toHaveStyle({ width: "1165px" });
+      }
+    });
+    expect(observe).toHaveBeenCalledWith(peopleScroll);
+    expect(disconnect).not.toHaveBeenCalled();
   });
 
   it("replaces role totals with accessible read-relative activity dots", () => {
@@ -297,7 +342,7 @@ describe("FlameGraph", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const wrapper = lane.querySelector(".recharts-wrapper");
-    const scroller = container.querySelector(".flame-graph-scroll");
+    const scroller = container.querySelector(".flame-people-scroll");
     const bounds = {
       bottom: 82,
       height: 82,
