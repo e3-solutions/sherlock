@@ -373,7 +373,7 @@ describe("FlameGraph", () => {
     expect(screen.queryByText("prompts recorded in this interval")).not.toBeInTheDocument();
   });
 
-  it("selects by keyboard and restores chart focus when details close", async () => {
+  it("keeps the drawer mounted until its close animation ends, then restores focus", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
@@ -387,7 +387,49 @@ describe("FlameGraph", () => {
     );
     expect(lane).toHaveAttribute("data-selected-index", "1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Close interval details" }));
+    const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
+    const closeButton = screen.getByRole("button", { name: "Close interval details" });
+    const icon = closeButton.querySelector("svg");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(closeButton).not.toHaveTextContent("×");
+
+    fireEvent.click(closeButton);
+    expect(detail).toHaveClass("flame-detail--closing");
+    expect(closeButton).toBeDisabled();
+    expect(detail).toBeInTheDocument();
+    expect(chart).not.toHaveFocus();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(detail).toHaveClass("flame-detail--closing");
+
+    fireEvent(
+      detail.querySelector("header"),
+      new Event("webkitAnimationEnd", { bubbles: true }),
+    );
+    expect(detail).toBeInTheDocument();
+    expect(chart).not.toHaveFocus();
+
+    fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitFor(() => expect(chart).toHaveFocus());
+  });
+
+  it("uses the same closing lifecycle for Escape", async () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const lane = container.querySelector(".flame-person .flame-lane");
+    const chart = lane.querySelector('[role="application"]');
+
+    fireEvent.focus(chart);
+    fireEvent.keyDown(chart, { key: "Enter" });
+
+    const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(detail).toHaveClass("flame-detail--closing");
+    expect(detail).toBeInTheDocument();
+    expect(chart).not.toHaveFocus();
+
+    fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
     await waitFor(() => expect(chart).toHaveFocus());
   });

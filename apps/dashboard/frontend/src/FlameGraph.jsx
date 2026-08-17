@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -244,7 +245,9 @@ function PromptStem({ cx, cy, payload, personName, promptPeak }) {
 function IntervalDetail({
   person,
   point,
+  closing,
   onClose,
+  onCloseAnimationEnd,
   detailRef,
   promptEvidence,
   onRetryPrompts,
@@ -256,12 +259,18 @@ function IntervalDetail({
   ];
   const activeRoles = roles.filter(({ value }) => value > 0);
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const handleAnimationEnd = (event) => {
+    if (event.target === event.currentTarget) {
+      onCloseAnimationEnd();
+    }
+  };
 
   return (
     <aside
       ref={detailRef}
-      className="flame-detail"
+      className={`flame-detail${closing ? " flame-detail--closing" : ""}`}
       aria-labelledby={headingId}
+      onAnimationEnd={handleAnimationEnd}
       tabIndex={-1}
     >
       <header className="flame-detail__header">
@@ -282,8 +291,19 @@ function IntervalDetail({
             {formatPromptCount(point.prompts)}
           </p>
         </div>
-        <button type="button" className="flame-detail__close" onClick={onClose}>
-          <span aria-hidden="true">×</span>
+        <button
+          type="button"
+          className="flame-detail__close"
+          disabled={closing}
+          onClick={onClose}
+        >
+          <svg
+            aria-hidden="true"
+            focusable="false"
+            viewBox="0 0 24 24"
+          >
+            <path d="M6 6 18 18M18 6 6 18" />
+          </svg>
           <span className="visually-hidden">Close interval details</span>
         </button>
       </header>
@@ -563,7 +583,9 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const rootRef = useRef(null);
   const detailRef = useRef(null);
   const selectionOriginRef = useRef(null);
+  const detailClosingRef = useRef(false);
   const [selection, setSelection] = useState(null);
+  const [detailClosing, setDetailClosing] = useState(false);
   const [promptRevision, setPromptRevision] = useState(0);
   const [promptEvidence, setPromptEvidence] = useState({ state: "idle", items: [] });
   const width = useSharedChartWidth(rootRef, chartWidth);
@@ -584,8 +606,26 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     ? selectedPerson.buckets.find(({ startMs }) => startMs === selection.startMs)
     : null;
 
+  const beginCloseDetail = useCallback(() => {
+    if (!selection || detailClosingRef.current) return;
+    detailClosingRef.current = true;
+    setDetailClosing(true);
+  }, [selection]);
+
+  const finalizeCloseDetail = useCallback(() => {
+    if (!detailClosingRef.current) return;
+    detailClosingRef.current = false;
+    setDetailClosing(false);
+    setSelection(null);
+    requestAnimationFrame(() => selectionOriginRef.current?.focus());
+  }, []);
+
   useEffect(() => {
-    if (selection && (!selectedPerson || !selectedPoint)) setSelection(null);
+    if (selection && (!selectedPerson || !selectedPoint)) {
+      detailClosingRef.current = false;
+      setDetailClosing(false);
+      setSelection(null);
+    }
   }, [selection, selectedPerson, selectedPoint]);
 
   useEffect(() => {
@@ -593,13 +633,12 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     detailRef.current?.focus();
     const closeOnEscape = (event) => {
       if (event.key === "Escape") {
-        setSelection(null);
-        requestAnimationFrame(() => selectionOriginRef.current?.focus());
+        beginCloseDetail();
       }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [selectedPoint]);
+  }, [beginCloseDetail, selectedPoint]);
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
@@ -646,13 +685,10 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   }, [data.snapshot, promptRevision, selectedPerson, selectedPoint]);
 
   const selectInterval = (person, point, origin) => {
+    detailClosingRef.current = false;
+    setDetailClosing(false);
     selectionOriginRef.current = origin;
     setSelection({ personId: person.id, startMs: point.startMs });
-  };
-
-  const closeDetail = () => {
-    setSelection(null);
-    requestAnimationFrame(() => selectionOriginRef.current?.focus());
   };
 
   return (
@@ -703,7 +739,9 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
         <IntervalDetail
           person={selectedPerson}
           point={selectedPoint}
-          onClose={closeDetail}
+          closing={detailClosing}
+          onClose={beginCloseDetail}
+          onCloseAnimationEnd={finalizeCloseDetail}
           detailRef={detailRef}
           promptEvidence={promptEvidence}
           onRetryPrompts={() => setPromptRevision((revision) => revision + 1)}
