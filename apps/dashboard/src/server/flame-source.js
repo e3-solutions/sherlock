@@ -32,6 +32,20 @@ prompt_candidates as materialized (
          e.logical_event_key, e.event_kind, e.event_subtype, e.source_priority,
          e.native_item_id, e.content_sha256${contentColumns},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at) source_observed_at,
+         case when e.canonical_scope_key is not null and e.logical_event_key is not null
+              then max(e.native_item_id) filter (
+                where e.event_subtype = 'message' and e.native_item_id is not null
+              ) over (
+                partition by e.session_id, e.canonical_scope_key,
+                             e.logical_event_key, e.event_kind
+              )
+              else null end keyed_native_item_id,
+         case when e.canonical_scope_key is not null and e.logical_event_key is not null
+              then bool_or(e.event_subtype = 'user_message') over (
+                partition by e.session_id, e.canonical_scope_key,
+                             e.logical_event_key, e.event_kind
+              )
+              else null end keyed_submitted,
          max(e.native_item_id) filter (
            where e.event_subtype = 'message' and e.native_item_id is not null
          ) over (
@@ -56,8 +70,10 @@ prompt_candidates as materialized (
     cross join p
    where e.workspace_id = p.workspace_id
      and e.normalizer_version = p.normalizer_version
-     and e.event_kind = 'message' and e.message_origin = 'human'
-     and not e.is_replay and s.actor_role = 'primary'
+     and e.event_kind = 'message'
+     and e.message_origin = 'human' and e.message_role = 'user'
+     and e.content_sha256 is not null and e.content_byte_size > 0
+     and e.error_code is null and not e.is_replay and e.actor_role = 'primary'
      and pe.github_id is distinct from 'sherlock-smoke'
      and (
        coalesce(e.occurred_at, e.observed_at, e.server_received_at) >= p.start_at
@@ -65,32 +81,46 @@ prompt_candidates as materialized (
        or ${nativeItemTimestamp("e.native_item_id")} >= p.start_at
        and ${nativeItemTimestamp("e.native_item_id")} < p.end_at
      )
+), canonical_prompt_candidates as materialized (
+  select ranked.*
+    from (
+      select prompt_candidates.*,
+             case when canonical_scope_key is not null and logical_event_key is not null
+                  then row_number() over (
+                    partition by session_id, canonical_scope_key,
+                                 logical_event_key, event_kind
+                    order by source_priority desc, source_observed_at asc nulls last, id
+                  )
+                  else 1 end semantic_rank
+        from prompt_candidates
+    ) ranked
+   where semantic_rank = 1
 ), prompt_identities as materialized (
-  select prompt_candidates.*,
+  select canonical_prompt_candidates.*,
+         case when canonical_scope_key is not null and logical_event_key is not null
+              then 'logical:' || canonical_scope_key || ':' || logical_event_key || ':' || event_kind
+              else coalesce(
+                'native:' || coalesce(matching_native_item_id, native_item_id),
+                'observed:' || id::text || ':' || source_observed_at::text
+              ) end prompt_identity,
+         coalesce(keyed_submitted, has_submitted_user_message) has_submitted,
          coalesce(
-           'native:' || coalesce(matching_native_item_id, native_item_id),
-           case when canonical_scope_key is not null and logical_event_key is not null
-                then 'logical:' || canonical_scope_key || ':' || logical_event_key || ':' || event_kind
-                else null end,
-           'observed:' || coalesce(content_sha256, id::text) || ':' || source_observed_at::text
-         ) prompt_identity,
-         coalesce(
-           ${nativeItemTimestamp("coalesce(matching_native_item_id, native_item_id)")},
+           ${nativeItemTimestamp("coalesce(keyed_native_item_id, matching_native_item_id, native_item_id)")},
            source_observed_at
          ) observed_at
-    from prompt_candidates
+    from canonical_prompt_candidates
 ), prompts as materialized (
   select ranked.*
     from (
       select prompt_identities.*,
              row_number() over (
                partition by session_id, prompt_identity
-               order by observed_at asc, source_observed_at asc, source_priority desc, id
+               order by observed_at asc, source_observed_at asc, id
              ) canonical_rank
         from prompt_identities
     ) ranked
    where canonical_rank = 1
-     and has_submitted_user_message
+     and has_submitted
      and observed_at >= (select start_at from p)
      and observed_at < (select end_at from p)
  )`;
@@ -110,12 +140,19 @@ with p as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start
     from p
-), activity_events as materialized (
-  select s.person_id, e.session_id, s.actor_role,
+), activity_candidates as materialized (
+  select s.person_id, e.id, e.session_id, e.actor_role, e.event_kind, e.event_subtype,
          coalesce(
            ${nativeItemTimestamp("e.native_item_id")},
            coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-         ) observed_at
+         ) observed_at,
+         case when e.canonical_scope_key is not null and e.logical_event_key is not null
+              then row_number() over (
+                partition by e.session_id, e.canonical_scope_key,
+                             e.logical_event_key, e.event_kind
+                order by e.source_priority desc, e.occurred_at asc nulls last, e.id
+              )
+              else 1 end canonical_rank
     from telemetry.events e
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
@@ -124,12 +161,20 @@ with p as materialized (
    where e.workspace_id = p.workspace_id
      and e.normalizer_version = p.normalizer_version
      and not e.is_replay
-     and s.actor_role <> 'automation'
+     and e.actor_role <> 'automation'
      and e.event_kind in (
        'message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
        'agent_message', 'lifecycle', 'error'
      )
-     and (e.event_kind <> 'message' or e.native_item_id is not null)
+     and (
+       e.event_kind <> 'message'
+       or e.native_item_id is not null
+       or e.event_subtype = 'user_message'
+     )
+     and (
+       e.event_kind <> 'lifecycle'
+       or e.event_subtype in ('task_started', 'task_complete', 'turn_started', 'turn_complete')
+     )
      and coalesce(
        ${nativeItemTimestamp("e.native_item_id")},
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
@@ -138,6 +183,10 @@ with p as materialized (
        ${nativeItemTimestamp("e.native_item_id")},
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
      ) < p.end_at
+), activity_events as materialized (
+  select person_id, session_id, actor_role, observed_at
+    from activity_candidates
+   where canonical_rank = 1
 ), bucket_activity as materialized (
   select a.person_id,
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,

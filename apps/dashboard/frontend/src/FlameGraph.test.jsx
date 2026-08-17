@@ -21,6 +21,11 @@ function model() {
     start: "2026-08-14T07:00:00.000Z",
     read: "2026-08-15T07:01:00.000Z",
     latest: "2026-08-15T06:50:00.000Z",
+    coverage: {
+      evidence: "observed_events",
+      state: "partial",
+      reason: "event_presence_not_continuous_attention",
+    },
     people: [
       {
         id: "ada",
@@ -84,7 +89,7 @@ describe("FlameGraph", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
     const legend = screen.getByRole("list", { name: "Activity legend" });
 
-    expect(screen.getByText(/24H · 10M · COMPLETE · READ .* · LATEST/))
+    expect(screen.getByText(/24H · 10M · PARTIAL · READ .* · LATEST/))
       .toBeInTheDocument();
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(legend).getByText(label)).toBeInTheDocument();
@@ -139,7 +144,7 @@ describe("FlameGraph", () => {
 
     const tooltip = screen.getByRole("status");
     expect(tooltip).toHaveTextContent("Ada Lovelace");
-    expect(tooltip).toHaveTextContent("4 work threads");
+    expect(tooltip).toHaveTextContent("4 observed sessions");
     expect(tooltip).toHaveTextContent("Agent 2");
     expect(tooltip).toHaveTextContent("Subagent 1");
     expect(tooltip).toHaveTextContent("Unclassified 1");
@@ -184,12 +189,12 @@ describe("FlameGraph", () => {
 
     fireEvent.focus(adaChart);
     await waitFor(() => {
-      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 work threads");
+      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 observed sessions");
     });
 
     fireEvent.keyDown(adaChart, { key: "ArrowRight" });
     await waitFor(() => {
-      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("0 work threads");
+      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("0 observed sessions");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 0");
     });
 
@@ -219,13 +224,13 @@ describe("FlameGraph", () => {
 
     fireEvent.mouseMove(wrapper, { clientX: 3, clientY: 34 });
     await waitFor(() => {
-      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 work threads");
+      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 observed sessions");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 3");
     });
 
     fireEvent.mouseMove(wrapper, { clientX: 717, clientY: 34 });
     await waitFor(() => {
-      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("1 work thread");
+      expect(document.querySelector(".flame-tooltip")).toHaveTextContent("1 observed session");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 0");
     });
   });
@@ -250,11 +255,11 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
 
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
-    expect(detail).toHaveTextContent("4 work threads");
+    expect(detail).toHaveTextContent("4 observed sessions");
     expect(detail).toHaveTextContent("3 prompts");
-    expect(detail).toHaveTextContent("Agent2 work threads");
-    expect(detail).toHaveTextContent("Subagent1 work thread");
-    expect(detail).toHaveTextContent("Unclassified1 work thread");
+    expect(detail).toHaveTextContent("Agent2 observed sessions");
+    expect(detail).toHaveTextContent("Subagent1 observed session");
+    expect(detail).toHaveTextContent("Unclassified1 observed session");
     expect(detail).toHaveTextContent("Canonical observed evidence");
     expect(lane).toHaveAttribute("data-selected-index", "0");
     expect(lane.querySelector(".flame-bucket-selected")).toBeInTheDocument();
@@ -293,7 +298,7 @@ describe("FlameGraph", () => {
     fireEvent.keyDown(chart, { key: "Enter" });
 
     expect(screen.getByRole("complementary", { name: "Ada Lovelace" })).toHaveTextContent(
-      "0 work threads",
+      "0 observed sessions",
     );
     expect(lane).toHaveAttribute("data-selected-index", "1");
 

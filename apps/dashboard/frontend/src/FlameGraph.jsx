@@ -41,8 +41,8 @@ function formatTime(value) {
   return timeFormatter.format(new Date(value));
 }
 
-function formatThreadCount(value) {
-  return `${value} work ${value === 1 ? "thread" : "threads"}`;
+function formatSessionCount(value) {
+  return `${value} observed ${value === 1 ? "session" : "sessions"}`;
 }
 
 function formatPromptCount(value) {
@@ -171,7 +171,7 @@ export function BucketTooltip({ active, coordinate, laneRef, payload, personName
         viewport: { width: window.innerWidth, height: window.innerHeight },
       })
     : null;
-  const activityLabel = formatThreadCount(point.activity);
+  const activityLabel = formatSessionCount(point.activity);
   const description = `${personName}, ${formatTime(point.startMs)} to ${formatTime(point.endMs)}: ${activityLabel}; ${point.agent} agent, ${point.subagent} subagent, ${point.unclassified} unclassified; ${point.prompts} prompts`;
 
   return (
@@ -313,7 +313,7 @@ function IntervalDetail({
       </header>
 
       <div className="flame-detail__receipt" role="status">
-        <span>{stale ? "Last good snapshot" : "Current snapshot"}</span>
+        <span>{stale ? "Last successful API read" : "Latest API read"}</span>
         <span>{data.coverage.state === "partial" ? "Partial coverage" : "Complete coverage"}</span>
         <span>Read {formatTime(data.readMs)}</span>
         <span>Latest {data.latestMs === null ? "none" : formatTime(data.latestMs)}</span>
@@ -323,8 +323,8 @@ function IntervalDetail({
         <h3 id={`${headingId}-summary`}>What happened</h3>
         <dl className="flame-detail__summary">
           <div>
-            <dt>Active work</dt>
-            <dd>{formatThreadCount(point.activity)}</dd>
+            <dt>Observed sessions</dt>
+            <dd>{formatSessionCount(point.activity)}</dd>
           </div>
           <div>
             <dt>Prompt activity</dt>
@@ -334,19 +334,19 @@ function IntervalDetail({
       </section>
 
       <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
-        <h3 id={`${headingId}-work`}>Active work</h3>
+        <h3 id={`${headingId}-work`}>Observed sessions</h3>
         {activeRoles.length > 0 ? (
           <ul className="flame-detail__roles">
             {activeRoles.map(({ key, label, value }) => (
               <li key={key}>
                 <i className={`flame-key flame-key--${key}`} aria-hidden="true" />
                 <span>{label}</span>
-                <strong>{formatThreadCount(value)}</strong>
+                <strong>{formatSessionCount(value)}</strong>
               </li>
             ))}
           </ul>
         ) : (
-          <p className="flame-detail__empty">No active work was recorded in this interval.</p>
+          <p className="flame-detail__empty">No session evidence was recorded in this interval.</p>
         )}
       </section>
 

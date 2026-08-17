@@ -88,7 +88,11 @@ describe("Sherlock Flame payload", () => {
   it("uses observed event evidence instead of inferred continuous spans", () => {
     expect(FLAME_SQL).toContain("e.workspace_id = p.workspace_id");
     expect(FLAME_SQL).toContain("date_bin(interval '10 minutes', a.observed_at");
-    expect(FLAME_SQL).toContain("s.actor_role = 'primary'");
+    expect(FLAME_SQL).toContain("e.actor_role = 'primary'");
+    expect(FLAME_SQL).not.toContain("s.actor_role = 'primary'");
+    expect(FLAME_SQL).toContain("e.actor_role <> 'automation'");
+    expect(FLAME_SQL).toContain("where canonical_rank = 1");
+    expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
     expect(FLAME_SQL).not.toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
     expect(FLAME_SQL).not.toContain("content_excerpt");
@@ -100,9 +104,14 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
   });
 
-  it("deduplicates primary prompts by stable native item before returning details", () => {
+  it("canonically selects submitted primary prompts before returning details", () => {
+    expect(FLAME_SQL).toContain("partition by session_id, canonical_scope_key");
+    expect(FLAME_SQL).toContain("order by source_priority desc");
+    expect(FLAME_SQL).toContain("keyed_submitted");
+    expect(FLAME_SQL).toContain("e.message_role = 'user'");
+    expect(FLAME_SQL).toContain("e.content_byte_size > 0");
+    expect(FLAME_SQL).toContain("e.error_code is null");
     expect(FLAME_SQL).toContain("matching_native_item_id");
-    expect(FLAME_SQL).toContain("has_submitted_user_message");
     expect(FLAME_SQL).toContain("partition by session_id, prompt_identity");
     expect(PROMPT_DETAIL_SQL).toContain("content_excerpt");
     expect(PROMPT_DETAIL_SQL).toContain("where person_id = $5::uuid");

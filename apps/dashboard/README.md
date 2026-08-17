@@ -16,8 +16,10 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
 - `telemetry.people` is the roster, so real people with zero activity remain
   visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
   excluded; display names are never used as the filter.
-- Canonical `sherlock.codex-rollout.v1` event presence is grouped into 144
-  ten-minute UTC buckets. Distinct sessions are counted per role and bucket.
+- Canonically selected `sherlock.codex-rollout.v1` event presence is grouped into
+  144 ten-minute UTC buckets. Distinct Sherlock execution sessions are counted
+  per immutable event role and bucket; they are not native thread or duration
+  counts. Metadata-only lifecycle records are not activity evidence.
   The dashboard intentionally does not intersect `analytics.activity_spans`:
   those spans are inferred lifecycle boundaries and can cross days, so treating
   them as continuous attention overclaims what Sherlock observed.
@@ -26,16 +28,21 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   fallback for event types without a stable native item ID.
 - primary is Agent; worker and guardian are Subagent; unknown is Unclassified.
   automation is excluded.
-- Canonical, non-replay primary-session submitted user messages supply prompt counts.
-  The response-item `native_item_id` deduplicates copied history and the paired
-  event-message form. Response-item-only runtime context, plus worker and guardian
-  parent messages, is not presented as human prompt input.
+- Canonically selected, non-replay primary-role submitted user messages with
+  valid stored content supply prompt counts. Keyed records follow Sherlock's
+  documented source-priority selection. The response-item `native_item_id`
+  deduplicates copied unkeyed history and supplies a Codex-format timestamp when
+  available. Response-item-only runtime context, plus worker and guardian parent
+  messages, is not presented as human prompt input.
 - `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>` lazily
   returns every stored prompt excerpt for the selected bucket, ordered by its
   canonical timestamp. `truncated: true` distinguishes the 1,024-byte database
   excerpt from full raw content retained in private Storage.
 - The response declares partial observed-event coverage because event presence
   is exact evidence for a bucket but is not proof of continuous attention.
+- Aggregate and detail requests are separate database snapshots until Sherlock
+  has a durable publication cutoff. The UI labels each receipt as the latest API
+  read rather than claiming pipeline completeness.
 
 ## Environment
 

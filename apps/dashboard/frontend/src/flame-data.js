@@ -110,9 +110,7 @@ export function adaptFlamePayload(value) {
   const startMs = requireDate(payload.start, "start");
   const readMs = requireDate(payload.read, "read");
   const latestMs = requireDate(payload.latest, "latest", true);
-  const rawCoverage = payload.coverage === undefined
-    ? { evidence: "aggregate", state: "complete", reason: null }
-    : requireObject(payload.coverage, "coverage");
+  const rawCoverage = requireObject(payload.coverage, "coverage");
   const coverage = {
     evidence: requireNonemptyString(rawCoverage.evidence, "coverage.evidence"),
     state: requireNonemptyString(rawCoverage.state, "coverage.state"),
@@ -120,8 +118,8 @@ export function adaptFlamePayload(value) {
       ? null
       : requireNonemptyString(rawCoverage.reason, "coverage.reason"),
   };
-  if (!["aggregate", "observed_events"].includes(coverage.evidence)) {
-    fail("coverage.evidence", '"aggregate" or "observed_events"');
+  if (coverage.evidence !== "observed_events") {
+    fail("coverage.evidence", '"observed_events"');
   }
   if (!["complete", "partial"].includes(coverage.state)) {
     fail("coverage.state", '"complete" or "partial"');

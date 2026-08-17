@@ -29,6 +29,11 @@ function payload(overrides = {}) {
     start: "2026-03-08T08:00:00.000Z",
     read: "2026-03-09T08:00:01.000Z",
     latest: null,
+    coverage: {
+      evidence: "observed_events",
+      state: "partial",
+      reason: "event_presence_not_continuous_attention",
+    },
     people: [person()],
     ...overrides,
   };
@@ -61,9 +66,9 @@ describe("adaptFlamePayload", () => {
 
     expect(result.people.map(({ id }) => id)).toEqual(["z", "a"]);
     expect(result.coverage).toEqual({
-      evidence: "aggregate",
-      state: "complete",
-      reason: null,
+      evidence: "observed_events",
+      state: "partial",
+      reason: "event_presence_not_continuous_attention",
     });
     expect(result.people[0].buckets.map(({ index }) => index)).toEqual(
       Array.from({ length: BUCKET_COUNT }, (_, index) => index),
@@ -201,19 +206,6 @@ describe("adaptFlamePayload", () => {
     expect(() => adaptFlamePayload(source)).toThrow(/id must be unique/);
   });
 
-  it("preserves explicit partial aggregate coverage", () => {
-    const result = adaptFlamePayload(payload({
-      coverage: {
-        evidence: "aggregate",
-        state: "partial",
-        reason: "workspace_snapshot_activation_unavailable",
-      },
-    }));
-
-    expect(result.coverage.state).toBe("partial");
-    expect(result.coverage.reason).toBe("workspace_snapshot_activation_unavailable");
-  });
-
   it("preserves explicit observed-event coverage", () => {
     const result = adaptFlamePayload(payload({
       coverage: {
@@ -225,6 +217,15 @@ describe("adaptFlamePayload", () => {
 
     expect(result.coverage.evidence).toBe("observed_events");
     expect(result.coverage.reason).toBe("event_presence_not_continuous_attention");
+  });
+
+  it("rejects missing or legacy aggregate coverage", () => {
+    const missing = payload();
+    delete missing.coverage;
+    expect(() => adaptFlamePayload(missing)).toThrow(FlameDataError);
+    expect(() => adaptFlamePayload(payload({
+      coverage: { evidence: "aggregate", state: "partial", reason: "legacy" },
+    }))).toThrow(FlameDataError);
   });
 });
 

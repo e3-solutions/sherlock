@@ -41,6 +41,18 @@ jobs:
         with:
           version: 2.114.0
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+          cache-dependency-path: apps/dashboard/pnpm-lock.yaml
+
       - name: Check Deno formatting and lint
         run: |
           deno fmt --check supabase/functions workers scripts
@@ -62,6 +74,14 @@ jobs:
           deno test supabase/functions/sherlock-rollout-ingest
           deno test supabase/functions/sherlock-activity-reducer
           deno test workers/telemetry-processor
+
+      - name: Verify dashboard
+        working-directory: apps/dashboard
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm check
+          pnpm test
+          pnpm build
 
       - name: Start isolated Supabase database
         run: supabase db start

@@ -23,7 +23,11 @@ import App, { nextRefreshDelay } from "./App.jsx";
 const payload = { raw: true };
 const model = {
   marker: "adapted timeline",
-  coverage: { evidence: "aggregate", state: "complete", reason: null },
+  coverage: {
+    evidence: "observed_events",
+    state: "partial",
+    reason: "event_presence_not_continuous_attention",
+  },
 };
 
 function response({ ok = true, status = 200, body = payload } = {}) {
@@ -100,7 +104,7 @@ describe("App", () => {
     });
     await settle();
 
-    expect(screen.getByRole("status")).toHaveTextContent(
+    expect(screen.getByText(/Refresh failed\. Showing the last successful read\./)).toHaveTextContent(
       "Refresh failed. Showing the last successful read.",
     );
     expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "true");
