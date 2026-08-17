@@ -442,7 +442,10 @@ input { font: inherit; }
   width: min(420px, 100vw);
   height: 100dvh;
   flex-direction: column;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+  scrollbar-color: var(--flame-rule) var(--flame-page);
   border-left: 1px solid var(--flame-rule);
   background: var(--flame-page);
   box-shadow: -18px 0 44px rgb(0 0 0 / 38%);
@@ -560,24 +563,21 @@ input { font: inherit; }
   font-size: 20px;
   line-height: 1;
   touch-action: manipulation;
-  transition: background-color 160ms ease, color 160ms ease, transform 160ms ease;
+  transition: color 160ms ease, transform 160ms ease;
   -webkit-tap-highlight-color: transparent;
 }
 
 .flame-detail__close:hover {
-  background: rgb(242 238 226 / 7%);
   color: var(--flame-ink);
 }
 
 .flame-detail__close:focus-visible {
-  background: rgb(242 238 226 / 8%);
   color: var(--flame-ink);
   outline: 2px solid var(--flame-agent);
   outline-offset: 2px;
 }
 
 .flame-detail__close:active {
-  background: rgb(242 238 226 / 12%);
   transform: scale(.92);
 }
 
