@@ -30,6 +30,7 @@ function rowsFor(personId, overrides = {}) {
     day_subagent: 0,
     day_other: 0,
     latest: null,
+    latest_activity: null,
     ...overrides[index],
   }));
 }
@@ -46,6 +47,7 @@ describe("Sherlock Flame payload", () => {
         day_subagent: 2,
         day_other: 1,
         latest: new Date("2026-08-16T12:09:00.000Z"),
+        latest_activity: new Date("2026-08-16T12:08:00.000Z"),
       },
     });
     for (const row of ada) {
@@ -53,6 +55,7 @@ describe("Sherlock Flame payload", () => {
       row.day_subagent = 2;
       row.day_other = 1;
       row.latest = new Date("2026-08-16T12:09:00.000Z");
+      row.latest_activity = new Date("2026-08-16T12:08:00.000Z");
     }
     const zero = rowsFor("zero");
     const payload = buildFlamePayload({
@@ -69,6 +72,7 @@ describe("Sherlock Flame payload", () => {
     expect(payload.people).toHaveLength(2);
     expect(payload.people[0]).toMatchObject({
       id: "ada",
+      lastActivity: "2026-08-16T12:08:00.000Z",
       total: [1, 2, 1],
     });
     expect(payload.people[0].buckets[0]).toEqual([1, 2, 1, 3]);
@@ -103,6 +107,10 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("e.actor_role = 'primary'");
     expect(FLAME_SQL).not.toContain("s.actor_role = 'primary'");
     expect(FLAME_SQL).toContain("e.actor_role <> 'automation'");
+    expect(FLAME_SQL).toContain("$5::timestamptz read_at");
+    expect(FLAME_SQL).toContain(") < p.read_at");
+    expect(FLAME_SQL).toContain("max(a.observed_at) latest_activity");
+    expect(FLAME_SQL).toContain("where a.observed_at < p.end_at");
     expect(FLAME_SQL).toContain("where canonical_rank = 1");
     expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
     expect(FLAME_SQL).not.toContain("analytics.activity_spans");

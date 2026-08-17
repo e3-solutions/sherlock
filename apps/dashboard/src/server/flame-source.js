@@ -180,7 +180,8 @@ prompt_candidates as materialized (
 export const FLAME_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version
+         $3::timestamptz end_at, $4::text normalizer_version,
+         $5::timestamptz read_at
 ), roster as materialized (
   select pe.id person_id,
          coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) display_name
@@ -233,7 +234,7 @@ with p as materialized (
      and coalesce(
        ${nativeItemTimestamp("e.native_item_id")},
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-     ) < p.end_at
+     ) < p.read_at
 ), activity_events as materialized (
   select person_id, session_id, actor_role, observed_at
     from activity_candidates
@@ -245,13 +246,26 @@ with p as materialized (
          count(distinct a.session_id) filter (where a.actor_role in ('worker', 'guardian'))::bigint subagent,
          count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other
     from activity_events a cross join p
+   where a.observed_at < p.end_at
    group by a.person_id, bucket_start
 ), day_activity as materialized (
   select r.person_id,
-         count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint day_agent,
-         count(distinct a.session_id) filter (where a.actor_role in ('worker', 'guardian'))::bigint day_subagent,
-         count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint day_other
+         count(distinct a.session_id) filter (
+           where a.actor_role = 'primary' and a.observed_at < p.end_at
+         )::bigint day_agent,
+         count(distinct a.session_id) filter (
+           where a.actor_role in ('worker', 'guardian') and a.observed_at < p.end_at
+         )::bigint day_subagent,
+         count(distinct a.session_id) filter (
+           where a.actor_role = 'unknown' and a.observed_at < p.end_at
+         )::bigint day_other
     from roster r left join activity_events a using (person_id)
+    cross join p
+   group by r.person_id
+), recent_activity as materialized (
+  select r.person_id, max(a.observed_at) latest_activity
+    from roster r
+    left join activity_events a using (person_id)
    group by r.person_id
 ), ${promptsCte()}, prompt_counts as materialized (
   select prompts.person_id,
@@ -270,9 +284,11 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(ba.subagent, 0)::bigint subagent,
        coalesce(ba.other, 0)::bigint other,
        coalesce(pc.prompts, 0)::bigint prompts,
-       d.day_agent, d.day_subagent, d.day_other, l.latest
+       d.day_agent, d.day_subagent, d.day_other, l.latest,
+       ra.latest_activity
   from roster r cross join buckets b
   join day_activity d using (person_id)
+  join recent_activity ra using (person_id)
   cross join latest_observation l
   left join bucket_activity ba
     on ba.person_id = r.person_id and ba.bucket_start = b.bucket_start
@@ -423,6 +439,9 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
     return {
       id: String(person.person_id),
       name: String(person.display_name).slice(0, 160),
+      lastActivity: first.latest_activity === null || first.latest_activity === undefined
+        ? null
+        : asDate(first.latest_activity).toISOString(),
       total,
       buckets,
     };
@@ -516,6 +535,7 @@ export class DirectFlameSource {
         start.toISOString(),
         end.toISOString(),
         NORMALIZER_VERSION,
+        read.toISOString(),
       ]);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
     });

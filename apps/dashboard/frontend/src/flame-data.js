@@ -141,6 +141,14 @@ export function adaptFlamePayload(value) {
     ids.add(id);
 
     const name = requireNonemptyString(person.name, `${path}.name`);
+    const lastActivityMs = requireDate(
+      person.lastActivity,
+      `${path}.lastActivity`,
+      true,
+    );
+    if (lastActivityMs !== null && (lastActivityMs < startMs || lastActivityMs > readMs)) {
+      fail(`${path}.lastActivity`, "inside the dashboard read window");
+    }
     const total = requireFixedCounts(person.total, TOTAL_COUNT, `${path}.total`);
     if (!Array.isArray(person.buckets) || person.buckets.length !== BUCKET_COUNT) {
       fail(`${path}.buckets`, `an array of exactly ${BUCKET_COUNT} buckets`);
@@ -175,7 +183,7 @@ export function adaptFlamePayload(value) {
       };
     });
 
-    return { id, name, total, buckets };
+    return { id, name, lastActivityMs, total, buckets };
   });
 
   return {

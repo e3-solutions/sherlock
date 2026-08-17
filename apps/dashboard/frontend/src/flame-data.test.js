@@ -18,6 +18,7 @@ function person(overrides = {}) {
   return {
     id: "person-1",
     name: "Ada",
+    lastActivity: null,
     total: [3, 2, 1],
     buckets: buckets(),
     ...overrides,
@@ -66,6 +67,10 @@ describe("adaptFlamePayload", () => {
     const startMs = Date.parse(source.start);
 
     expect(result.people.map(({ id }) => id)).toEqual(["z", "a"]);
+    expect(result.people.map(({ lastActivityMs }) => lastActivityMs)).toEqual([
+      null,
+      null,
+    ]);
     expect(result.coverage).toEqual({
       evidence: "observed_events",
       state: "partial",
@@ -152,6 +157,10 @@ describe("adaptFlamePayload", () => {
     ["non-string id", payload({ people: [person({ id: 17 })] })],
     ["blank id", payload({ people: [person({ id: "  " })] })],
     ["blank name", payload({ people: [person({ name: "" })] })],
+    ["missing last activity", payload({ people: [person({ lastActivity: undefined })] })],
+    ["future last activity", payload({
+      people: [person({ lastActivity: "2026-03-09T08:00:02.000Z" })],
+    })],
     ["short total", payload({ people: [person({ total: [1, 2] })] })],
     ["negative total", payload({ people: [person({ total: [-1, 2, 3] })] })],
     ["fractional total", payload({ people: [person({ total: [1.5, 2, 3] })] })],
