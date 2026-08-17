@@ -108,6 +108,11 @@ input { font: inherit; }
   scrollbar-color: var(--flame-rule) var(--flame-page);
 }
 
+.flame-people-scroll:focus-visible {
+  outline: 1px solid var(--flame-accent);
+  outline-offset: -1px;
+}
+
 .load-state {
   place-self: center;
   display: grid;

@@ -128,6 +128,9 @@ describe("FlameGraph", () => {
 
     const axis = container.querySelector(".flame-time-axis");
     const peopleScroll = container.querySelector(".flame-people-scroll");
+    expect(peopleScroll).toHaveAttribute("role", "region");
+    expect(peopleScroll).toHaveAttribute("aria-label", "People activity timelines, 2 people");
+    expect(peopleScroll).toHaveAttribute("tabindex", "0");
     expect(axis.parentElement).toHaveClass("flame-meta-row");
     expect(peopleScroll.previousElementSibling).toBe(axis.parentElement);
     expect(peopleScroll).not.toContainElement(axis);

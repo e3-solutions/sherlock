@@ -716,7 +716,13 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
           })}
         </div>
       </div>
-      <div ref={peopleScrollRef} className="flame-people-scroll">
+      <div
+        ref={peopleScrollRef}
+        className="flame-people-scroll"
+        role="region"
+        aria-label={`People activity timelines, ${data.people.length} people`}
+        tabIndex={0}
+      >
         {data.people.map((person) => (
           <PersonLane
             key={person.id}
