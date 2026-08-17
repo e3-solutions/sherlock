@@ -439,18 +439,22 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
 
   const handleKeyDown = (event) => {
     if (event.key === "ArrowRight") {
+      event.preventDefault();
       setKeyboardIndex((index) => Math.min(points.length - 1, index + 1));
       return;
     }
     if (event.key === "ArrowLeft") {
+      event.preventDefault();
       setKeyboardIndex((index) => Math.max(0, index - 1));
       return;
     }
     if (event.key === "Home") {
+      event.preventDefault();
       setKeyboardIndex(0);
       return;
     }
     if (event.key === "End") {
+      event.preventDefault();
       setKeyboardIndex(points.length - 1);
       return;
     }
@@ -614,7 +618,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     detailClosingRef.current = false;
     setDetailClosing(false);
     setSelection(null);
-    requestAnimationFrame(() => rootRef.current?.focus());
+    requestAnimationFrame(() => peopleScrollRef.current?.focus());
   }, []);
 
   useEffect(() => {

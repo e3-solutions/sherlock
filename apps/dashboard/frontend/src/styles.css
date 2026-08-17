@@ -110,7 +110,7 @@ input { font: inherit; }
 }
 
 .flame-people-scroll:focus-visible {
-  outline: 1px solid var(--flame-accent);
+  outline: 1px solid var(--flame-selected);
   outline-offset: -1px;
 }
 

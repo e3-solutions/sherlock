@@ -341,6 +341,20 @@ describe("FlameGraph", () => {
     });
   });
 
+  it("keeps chart navigation keys from scrolling the people roster", () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
+    const chart = container.querySelector('.flame-person [role="application"]');
+    roster.scrollTop = 42;
+
+    for (const key of ["ArrowLeft", "ArrowRight", "Home", "End"]) {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      fireEvent(chart, event);
+      expect(event.defaultPrevented).toBe(true);
+      expect(roster.scrollTop).toBe(42);
+    }
+  });
+
   it("keeps pointer hover tied to the first and last bucket payloads", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
@@ -477,7 +491,7 @@ describe("FlameGraph", () => {
 
   it("keeps the drawer mounted until close ends, then clears selection without refocusing a row", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
     const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
@@ -515,7 +529,7 @@ describe("FlameGraph", () => {
 
     fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(graph).toHaveFocus());
+    await waitFor(() => expect(roster).toHaveFocus());
     expect(chart).not.toHaveFocus();
     expect(person).not.toHaveAttribute("data-selected");
     expect(lane).not.toHaveAttribute("data-selected-index");
@@ -523,7 +537,7 @@ describe("FlameGraph", () => {
 
   it("uses the same selection-clearing focus lifecycle for Escape", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const graph = screen.getByRole("region", { name: "Code activity over the last 24 hours" });
+    const roster = screen.getByRole("region", { name: "People activity timelines, 2 people" });
     const person = container.querySelector(".flame-person");
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
@@ -540,7 +554,7 @@ describe("FlameGraph", () => {
 
     fireEvent(detail, new Event("webkitAnimationEnd", { bubbles: true }));
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    await waitFor(() => expect(graph).toHaveFocus());
+    await waitFor(() => expect(roster).toHaveFocus());
     expect(chart).not.toHaveFocus();
     expect(person).not.toHaveAttribute("data-selected");
     expect(lane).not.toHaveAttribute("data-selected-index");
