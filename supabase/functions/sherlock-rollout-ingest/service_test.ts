@@ -116,13 +116,14 @@ class MemoryStorage implements ImmutableStorage {
   calls = 0;
   objects = new Map<string, Uint8Array>();
 
-  async ensure(path: string, bytes: Uint8Array): Promise<void> {
+  ensure(path: string, bytes: Uint8Array): Promise<void> {
     this.calls += 1;
     const existing = this.objects.get(path);
     if (existing && existing.toString() !== bytes.toString()) {
       throw new Error("storage conflict");
     }
     this.objects.set(path, bytes);
+    return Promise.resolve();
   }
 }
 
@@ -132,11 +133,11 @@ class MemoryBatches implements BatchRepository {
   failBeforeCommit = false;
   loseResponseAfterCommit = false;
 
-  async findExact(): Promise<CommittedReceipt | null> {
-    return this.receipt;
+  findExact(): Promise<CommittedReceipt | null> {
+    return Promise.resolve(this.receipt);
   }
 
-  async commit(
+  commit(
     attribution: Attribution,
     manifest: BatchManifest,
   ): Promise<CommittedReceipt> {
@@ -150,7 +151,7 @@ class MemoryBatches implements BatchRepository {
       this.loseResponseAfterCommit = false;
       throw new Error("response lost after commit");
     }
-    return this.receipt;
+    return Promise.resolve(this.receipt);
   }
 }
 
