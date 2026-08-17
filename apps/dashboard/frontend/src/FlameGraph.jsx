@@ -24,14 +24,14 @@ import {
   getPersonActivityStatus,
 } from "./flame-data.js";
 
-const MIN_CHART_WIDTH = 720;
-const DEFAULT_CHART_WIDTH = 1_152;
-const LANE_HEIGHT = 68;
+const MIN_CHART_WIDTH = 1_008;
+const DEFAULT_CHART_WIDTH = 1_440;
+const LANE_HEIGHT = 82;
 const MIN_PROMPT_STEM_LENGTH = 4;
 const MAX_PROMPT_STEM_LENGTH = 14;
 const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
-const DEFAULT_TOOLTIP_SIZE = { width: 196, height: 112 };
+const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
@@ -450,8 +450,6 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
   const [keyboardIndex, setKeyboardIndex] = useState(0);
   const rawId = useId();
   const id = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
-  const subagentPatternId = `flame-subagent-${id}`;
-  const unclassifiedPatternId = `flame-unclassified-${id}`;
   const headingId = `flame-person-${id}`;
   const points = useMemo(
     () => person.buckets.map((point) => ({
@@ -525,25 +523,9 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
           width={chartWidth}
           height={LANE_HEIGHT}
           data={points}
-          margin={{ top: 8, right: 0, bottom: 20, left: 0 }}
+          margin={{ top: 10, right: 0, bottom: 22, left: 0 }}
           aria-label={`${person.name} activity timeline`}
         >
-          <defs>
-            <pattern
-              id={subagentPatternId}
-              width="6"
-              height="6"
-              patternUnits="userSpaceOnUse"
-              patternTransform="rotate(35)"
-            >
-              <rect width="6" height="6" fill="var(--flame-subagent-muted)" />
-              <line x1="0" y1="0" x2="0" y2="6" stroke="var(--flame-subagent)" strokeWidth="3" />
-            </pattern>
-            <pattern id={unclassifiedPatternId} width="5" height="5" patternUnits="userSpaceOnUse">
-              <rect width="5" height="5" fill="var(--flame-unclassified-muted)" />
-              <circle cx="1.5" cy="1.5" r="0.8" fill="var(--flame-unclassified)" />
-            </pattern>
-          </defs>
           <XAxis dataKey="index" type="category" hide interval={0} />
           <YAxis yAxisId="activity" hide domain={[0, peak]} allowDataOverflow />
           <YAxis yAxisId="prompts" hide domain={[0, 1]} />
@@ -576,7 +558,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
             dataKey="subagent"
             name="Subagent"
             stackId="activity"
-            fill={`url(#${subagentPatternId})`}
+            fill="var(--flame-subagent)"
             isAnimationActive={false}
           />
           <Bar
@@ -584,7 +566,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
             dataKey="unclassified"
             name="Unclassified"
             stackId="activity"
-            fill={`url(#${unclassifiedPatternId})`}
+            fill="var(--flame-unclassified)"
             isAnimationActive={false}
           />
           <Line
@@ -626,7 +608,7 @@ function useSharedChartWidth(rootRef, requestedWidth) {
     if (!root || typeof ResizeObserver === "undefined") return undefined;
 
     const update = () => {
-      const rail = Number.parseFloat(getComputedStyle(root).getPropertyValue("--flame-rail")) || 220;
+      const rail = Number.parseFloat(getComputedStyle(root).getPropertyValue("--flame-rail")) || 260;
       setMeasuredWidth(Math.max(MIN_CHART_WIDTH, root.clientWidth - rail));
     };
     const observer = new ResizeObserver(update);

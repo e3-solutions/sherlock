@@ -70,7 +70,7 @@ describe("FlameGraph", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("renders every ordered bucket on a shared semantic time axis", () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
 
     expect(screen.getByLabelText("Code activity over the last 24 hours")).toBeInTheDocument();
     expect(container.querySelectorAll(".flame-time-axis time")).toHaveLength(13);
@@ -89,7 +89,7 @@ describe("FlameGraph", () => {
   });
 
   it("replaces role totals with accessible snapshot-relative activity dots", () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
 
     const active = screen.getByRole("img", {
       name: "Ada Lovelace: Active; observed session evidence in the latest completed 10-minute interval",
@@ -108,8 +108,8 @@ describe("FlameGraph", () => {
     expect(screen.queryByLabelText("Ada Lovelace totals")).not.toBeInTheDocument();
   });
 
-  it("uses named legend entries and non-color-only SVG patterns", () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+  it("uses named legend entries and distinct solid role colors", () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const legend = screen.getByRole("list", { name: "Activity legend" });
 
     expect(screen.getByText(/24H · 10M · PARTIAL · READ .* · LATEST/))
@@ -117,14 +117,16 @@ describe("FlameGraph", () => {
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(legend).getByText(label)).toBeInTheDocument();
     }
-    expect(container.querySelectorAll('pattern[id^="flame-subagent-"]')).toHaveLength(2);
-    expect(container.querySelectorAll('pattern[id^="flame-unclassified-"]')).toHaveLength(2);
+    expect(container.querySelectorAll("pattern")).toHaveLength(0);
+    expect(container.querySelector(".flame-key--subagent")).toHaveClass("flame-key--subagent");
+    expect(container.querySelector(".flame-key--unclassified"))
+      .toHaveClass("flame-key--unclassified");
     expect(container.querySelectorAll(".flame-prompt-stem")).toHaveLength(2);
   });
 
   it("renders bucket-aligned prompt stems with globally consistent magnitude", () => {
     const data = model();
-    const { container } = render(<FlameGraph data={data} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
 
     expect(data.people[0].buckets[72]).toMatchObject({ activity: 0, prompts: 2 });
     expect(data.people[1].buckets.every(({ activity, prompts }) => activity === 0 && prompts === 0)).toBe(true);
@@ -141,7 +143,7 @@ describe("FlameGraph", () => {
   });
 
   it("exposes prompt counts to screen readers without adding competing tab stops", () => {
-    render(<FlameGraph data={model()} chartWidth={720} />);
+    render(<FlameGraph data={model()} chartWidth={1008} />);
 
     const threePrompts = screen.getByRole("img", { name: /Ada Lovelace.*3 prompts/ });
     const twoPrompts = screen.getByRole("img", { name: /Ada Lovelace.*2 prompts/ });
@@ -207,7 +209,7 @@ describe("FlameGraph", () => {
   });
 
   it("exposes the first bucket tooltip on keyboard focus and moves by bucket", async () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const adaChart = container.querySelector('.flame-person [role="application"]');
 
     fireEvent.focus(adaChart);
@@ -228,16 +230,16 @@ describe("FlameGraph", () => {
   });
 
   it("keeps pointer hover tied to the first and last bucket payloads", async () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const wrapper = lane.querySelector(".recharts-wrapper");
     const bounds = {
-      bottom: 68,
-      height: 68,
+      bottom: 82,
+      height: 82,
       left: 0,
-      right: 720,
+      right: 1008,
       top: 0,
-      width: 720,
+      width: 1008,
       x: 0,
       y: 0,
       toJSON: () => ({}),
@@ -251,7 +253,7 @@ describe("FlameGraph", () => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 3");
     });
 
-    fireEvent.mouseMove(wrapper, { clientX: 717, clientY: 34 });
+    fireEvent.mouseMove(wrapper, { clientX: 1005, clientY: 41 });
     await waitFor(() => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("1 observed session");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 0");
@@ -259,16 +261,16 @@ describe("FlameGraph", () => {
   });
 
   it("opens observed interval details for the exact clicked bucket", () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const wrapper = lane.querySelector(".recharts-wrapper");
     const bounds = {
-      bottom: 68,
-      height: 68,
+      bottom: 82,
+      height: 82,
       left: 0,
-      right: 720,
+      right: 1008,
       top: 0,
-      width: 720,
+      width: 1008,
       x: 0,
       y: 0,
       toJSON: () => ({}),
@@ -289,10 +291,10 @@ describe("FlameGraph", () => {
   });
 
   it("loads and lists every canonical prompt underneath the interval count", async () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
     vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 68, height: 68, left: 0, right: 720, top: 0, width: 720,
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
       x: 0, y: 0, toJSON: () => ({}),
     });
 
@@ -327,10 +329,10 @@ describe("FlameGraph", () => {
         }),
       });
     });
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
     vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 68, height: 68, left: 0, right: 720, top: 0, width: 720,
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
       x: 0, y: 0, toJSON: () => ({}),
     });
 
@@ -345,7 +347,7 @@ describe("FlameGraph", () => {
   });
 
   it("selects by keyboard and restores chart focus when details close", async () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const lane = container.querySelector(".flame-person .flame-lane");
     const chart = lane.querySelector('[role="application"]');
 
@@ -364,7 +366,7 @@ describe("FlameGraph", () => {
   });
 
   it("exposes stale state without replacing the last-good graph", () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={720} stale />);
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} stale />);
 
     expect(container.querySelector(".flame-graph")).toHaveAttribute("data-state", "stale");
     expect(screen.getByRole("heading", { name: "Ada Lovelace" })).toBeInTheDocument();
