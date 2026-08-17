@@ -67,6 +67,10 @@ input { font: inherit; }
   min-height: 0;
 }
 
+.flame-graph:focus {
+  outline: none;
+}
+
 .flame-graph-scroll {
   height: 100%;
   min-width: 100%;
