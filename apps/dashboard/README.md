@@ -26,9 +26,10 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   fallback for event types without a stable native item ID.
 - primary is Agent; worker and guardian are Subagent; unknown is Unclassified.
   automation is excluded.
-- Canonical, non-replay primary-session human messages supply prompt counts.
+- Canonical, non-replay primary-session submitted user messages supply prompt counts.
   The response-item `native_item_id` deduplicates copied history and the paired
-  event-message form. Worker and guardian parent messages are not human prompts.
+  event-message form. Response-item-only runtime context, plus worker and guardian
+  parent messages, is not presented as human prompt input.
 - `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>` lazily
   returns every stored prompt excerpt for the selected bucket, ordered by its
   canonical timestamp. `truncated: true` distinguishes the 1,024-byte database

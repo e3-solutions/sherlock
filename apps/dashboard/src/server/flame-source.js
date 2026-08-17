@@ -40,7 +40,14 @@ prompt_candidates as materialized (
                           'second',
                           coalesce(e.occurred_at, e.observed_at, e.server_received_at)
                         )
-         ) matching_native_item_id
+         ) matching_native_item_id,
+         bool_or(e.event_subtype = 'user_message') over (
+           partition by e.session_id, e.content_sha256,
+                        date_trunc(
+                          'second',
+                          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+                        )
+         ) has_submitted_user_message
     from telemetry.events e
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
@@ -83,6 +90,7 @@ prompt_candidates as materialized (
         from prompt_identities
     ) ranked
    where canonical_rank = 1
+     and has_submitted_user_message
      and observed_at >= (select start_at from p)
      and observed_at < (select end_at from p)
  )`;

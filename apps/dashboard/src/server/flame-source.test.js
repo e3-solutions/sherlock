@@ -102,6 +102,7 @@ describe("Sherlock Flame payload", () => {
 
   it("deduplicates primary prompts by stable native item before returning details", () => {
     expect(FLAME_SQL).toContain("matching_native_item_id");
+    expect(FLAME_SQL).toContain("has_submitted_user_message");
     expect(FLAME_SQL).toContain("partition by session_id, prompt_identity");
     expect(PROMPT_DETAIL_SQL).toContain("content_excerpt");
     expect(PROMPT_DETAIL_SQL).toContain("where person_id = $5::uuid");
