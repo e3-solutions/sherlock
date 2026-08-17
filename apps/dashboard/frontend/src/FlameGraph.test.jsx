@@ -274,6 +274,7 @@ describe("FlameGraph", () => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 observed sessions");
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("Prompts 3");
     });
+    expect(container.querySelector(".flame-bucket-hover")).not.toBeInTheDocument();
 
     fireEvent.mouseMove(wrapper, { clientX: 1005, clientY: 41 });
     await waitFor(() => {

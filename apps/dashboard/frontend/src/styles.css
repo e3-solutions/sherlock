@@ -247,7 +247,8 @@ input { font: inherit; }
   z-index: 5;
 }
 
-.flame-person[data-selected="true"] .flame-person-rail {
+.flame-person[data-selected="true"] .flame-person-rail,
+.flame-person:focus-within .flame-person-rail {
   background: var(--flame-surface-selected);
   box-shadow: inset 2px 0 0 var(--flame-selected);
 }
@@ -257,7 +258,8 @@ input { font: inherit; }
   height: 82px;
 }
 
-.flame-lane[data-selected-index] {
+.flame-lane[data-selected-index],
+.flame-person:focus-within .flame-lane {
   background: var(--flame-surface-selected);
 }
 
@@ -306,10 +308,7 @@ input { font: inherit; }
   cursor: pointer;
 }
 
-.flame-lane .recharts-surface:focus-visible {
-  outline: 2px solid var(--flame-selected);
-  outline-offset: -2px;
-}
+.flame-lane .recharts-surface:focus { outline: none; }
 
 .flame-prompt-stem {
   cursor: pointer;
@@ -342,13 +341,6 @@ input { font: inherit; }
 .flame-prompt-stem:hover .flame-prompt-stem__cap {
   fill: var(--flame-selected);
   stroke-width: 2px;
-}
-
-.flame-bucket-hover {
-  stroke: var(--flame-ink);
-  stroke-dasharray: 2 2;
-  stroke-opacity: .8;
-  stroke-width: 1px;
 }
 
 .flame-tooltip {

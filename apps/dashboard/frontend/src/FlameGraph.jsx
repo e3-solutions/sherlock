@@ -178,24 +178,6 @@ function promptStemLength(prompts, promptPeak) {
     + magnitude * (MAX_PROMPT_STEM_LENGTH - MIN_PROMPT_STEM_LENGTH);
 }
 
-function BucketCursor({ points }) {
-  const [start, end] = points ?? [];
-  if (!Number.isFinite(start?.x) || !Number.isFinite(start?.y) || !Number.isFinite(end?.y)) {
-    return null;
-  }
-
-  return (
-    <line
-      className="flame-bucket-hover"
-      x1={start.x}
-      x2={start.x}
-      y1={start.y}
-      y2={end.y}
-      vectorEffect="non-scaling-stroke"
-    />
-  );
-}
-
 function PromptStem({ cx, cy, payload, personName, promptPeak }) {
   if (!payload?.prompts || !Number.isFinite(cx) || !Number.isFinite(cy)) {
     return null;
@@ -486,7 +468,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
           <YAxis yAxisId="prompts" hide domain={[0, 1]} />
           <Tooltip
             content={<BucketTooltip laneRef={laneRef} personName={person.name} />}
-            cursor={<BucketCursor />}
+            cursor={false}
             isAnimationActive={false}
             portal={typeof document === "undefined" ? null : document.body}
             wrapperStyle={{
