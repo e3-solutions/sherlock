@@ -152,6 +152,12 @@ input { font: inherit; }
   background: var(--flame-page);
 }
 
+.flame-legends {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+}
+
 .flame-legend {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -170,6 +176,38 @@ input { font: inherit; }
   min-width: 0;
   align-items: center;
   gap: 6px;
+}
+
+.flame-status-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 5px 0 0;
+  border-top: 1px solid var(--flame-rule);
+  color: var(--flame-muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+  line-height: 1;
+  list-style: none;
+  white-space: nowrap;
+}
+
+.flame-status-legend li {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.flame-status-key {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 12%);
 }
 
 .flame-key {
@@ -683,6 +721,17 @@ input { font: inherit; }
   .portal-header h1 { font-size: 18px; }
   .flame-person-rail { padding: 0 10px; }
   .flame-person-rail h2 { font-size: 14px; }
+
+  .flame-meta-row { height: 74px; }
+  .flame-meta-rail { padding: 0 10px; }
+  .flame-legends { gap: 5px; }
+  .flame-status-legend {
+    justify-content: flex-start;
+    gap: 3px 8px;
+    padding-top: 4px;
+    font-size: 8px;
+    flex-wrap: wrap;
+  }
 
   .flame-time-axis time { display: none; }
   .flame-time-axis time:first-child,

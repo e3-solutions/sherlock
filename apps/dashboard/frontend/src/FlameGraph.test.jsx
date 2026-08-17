@@ -137,6 +137,20 @@ describe("FlameGraph", () => {
     expect(container.querySelectorAll(".flame-prompt-stem")).toHaveLength(2);
   });
 
+  it("explains the exact green, yellow, and red activity recency boundaries", () => {
+    render(<FlameGraph data={model()} chartWidth={1008} />);
+    const legend = screen.getByRole("list", { name: "Activity recency legend" });
+
+    expect(within(legend).getByLabelText("Green: activity 10 minutes ago or less"))
+      .toHaveTextContent("≤10m");
+    expect(within(legend).getByLabelText(
+      "Yellow: activity more than 10 and up to 30 minutes ago",
+    )).toHaveTextContent(">10m–≤30m");
+    expect(within(legend).getByLabelText(
+      "Red: activity more than 30 minutes ago or no activity",
+    )).toHaveTextContent(">30m / none");
+  });
+
   it("renders bucket-aligned prompt stems with globally consistent magnitude", () => {
     const data = model();
     const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
