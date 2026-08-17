@@ -1,0 +1,692 @@
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Bar,
+  ComposedChart,
+  Line,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+
+import {
+  BUCKET_COUNT,
+  BUCKET_MS,
+  createTimeAxisTicks,
+  getGlobalPeak,
+} from "./flame-data.js";
+
+const MIN_CHART_WIDTH = 720;
+const DEFAULT_CHART_WIDTH = 1_152;
+const LANE_HEIGHT = 68;
+const MIN_PROMPT_STEM_LENGTH = 4;
+const MAX_PROMPT_STEM_LENGTH = 14;
+const TOOLTIP_EDGE_PADDING = 8;
+const TOOLTIP_GAP = 10;
+const DEFAULT_TOOLTIP_SIZE = { width: 196, height: 112 };
+
+const timeFormatter = new Intl.DateTimeFormat(undefined, {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+function formatTime(value) {
+  return timeFormatter.format(new Date(value));
+}
+
+function formatThreadCount(value) {
+  return `${value} work ${value === 1 ? "thread" : "threads"}`;
+}
+
+function formatPromptCount(value) {
+  return `${value} ${value === 1 ? "prompt" : "prompts"}`;
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+}
+
+export function getBucketTooltipPlacement({
+  anchor,
+  tooltip,
+  viewport,
+  gap = TOOLTIP_GAP,
+  padding = TOOLTIP_EDGE_PADDING,
+}) {
+  const maxLeft = Math.max(padding, viewport.width - padding - tooltip.width);
+  const maxTop = Math.max(padding, viewport.height - padding - tooltip.height);
+  const right = anchor.x + gap;
+  const left = anchor.x - gap - tooltip.width;
+  const above = anchor.y - gap - tooltip.height;
+  const below = anchor.y + gap;
+
+  let horizontal = "right";
+  let resolvedLeft = right;
+  if (right + tooltip.width > viewport.width - padding) {
+    if (left >= padding) {
+      horizontal = "left";
+      resolvedLeft = left;
+    } else {
+      horizontal = "center";
+      resolvedLeft = anchor.x - tooltip.width / 2;
+    }
+  }
+
+  let vertical = "above";
+  let resolvedTop = above;
+  if (above < padding) {
+    if (below + tooltip.height <= viewport.height - padding) {
+      vertical = "below";
+      resolvedTop = below;
+    } else {
+      vertical = "center";
+      resolvedTop = anchor.y - tooltip.height / 2;
+    }
+  }
+
+  return {
+    horizontal,
+    vertical,
+    left: clamp(resolvedLeft, padding, maxLeft),
+    top: clamp(resolvedTop, padding, maxTop),
+  };
+}
+
+export function BucketTooltip({ active, coordinate, laneRef, payload, personName }) {
+  const tooltipRef = useRef(null);
+  const [tooltipSize, setTooltipSize] = useState(DEFAULT_TOOLTIP_SIZE);
+  const [, reposition] = useState(0);
+  const point = payload?.find((entry) => entry?.payload)?.payload;
+
+  useLayoutEffect(() => {
+    if (!active || !Number.isFinite(coordinate?.x) || !laneRef?.current) return;
+    const lane = laneRef.current;
+    const scroller = lane.closest(".flame-graph-scroll");
+    if (!scroller) return;
+
+    const laneBox = lane.getBoundingClientRect();
+    const scrollerBox = scroller.getBoundingClientRect();
+    if (scrollerBox.width <= 0) return;
+    const rail = Number.parseFloat(getComputedStyle(scroller).getPropertyValue("--flame-rail")) || 0;
+    const anchorX = laneBox.left + coordinate.x;
+    const visibleLeft = Math.min(scrollerBox.right, scrollerBox.left + rail + TOOLTIP_EDGE_PADDING);
+    const visibleRight = scrollerBox.right - TOOLTIP_EDGE_PADDING;
+    let delta = 0;
+    if (anchorX < visibleLeft) delta = anchorX - visibleLeft;
+    if (anchorX > visibleRight) delta = anchorX - visibleRight;
+    if (delta !== 0) {
+      const nextScrollLeft = clamp(
+        scroller.scrollLeft + delta,
+        0,
+        scroller.scrollWidth - scroller.clientWidth,
+      );
+      if (nextScrollLeft !== scroller.scrollLeft) {
+        scroller.scrollLeft = nextScrollLeft;
+        reposition((revision) => revision + 1);
+      }
+    }
+  }, [active, coordinate?.x, laneRef]);
+
+  useLayoutEffect(() => {
+    if (!active || !point || !tooltipRef.current) return;
+    const { width, height } = tooltipRef.current.getBoundingClientRect();
+    if (width > 0 && height > 0) {
+      setTooltipSize((current) => (
+        current.width === width && current.height === height
+          ? current
+          : { width, height }
+      ));
+    }
+  }, [active, personName]);
+
+  useEffect(() => {
+    if (!active || !point || typeof window === "undefined") return undefined;
+    const update = () => reposition((revision) => revision + 1);
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [active]);
+
+  if (!active || !point) return null;
+
+  const laneBox = laneRef?.current?.getBoundingClientRect();
+  const hasAnchor = laneBox && Number.isFinite(coordinate?.x);
+  const placement = hasAnchor && typeof window !== "undefined"
+    ? getBucketTooltipPlacement({
+        anchor: {
+          x: laneBox.left + coordinate.x,
+          y: laneBox.top + laneBox.height / 2,
+        },
+        tooltip: tooltipSize,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+      })
+    : null;
+  const activityLabel = formatThreadCount(point.activity);
+  const description = `${personName}, ${formatTime(point.startMs)} to ${formatTime(point.endMs)}: ${activityLabel}; ${point.agent} agent, ${point.subagent} subagent, ${point.unclassified} unclassified; ${point.prompts} prompts`;
+
+  return (
+    <output
+      ref={tooltipRef}
+      className="flame-tooltip"
+      role="status"
+      aria-atomic="true"
+      aria-label={description}
+      aria-live="polite"
+      data-horizontal={placement?.horizontal}
+      data-vertical={placement?.vertical}
+      style={placement ? { left: placement.left, top: placement.top } : undefined}
+    >
+      <span className="flame-tooltip-heading">
+        <strong>{personName}</strong>
+        <time dateTime={new Date(point.startMs).toISOString()}>
+          {formatTime(point.startMs)}–{formatTime(point.endMs)}
+        </time>
+      </span>
+      <strong className="flame-tooltip-activity">{activityLabel}</strong>
+      <span className="flame-tooltip-count"><span>Agent</span> {point.agent}</span>
+      <span className="flame-tooltip-count"><span>Subagent</span> {point.subagent}</span>
+      <span className="flame-tooltip-count"><span>Unclassified</span> {point.unclassified}</span>
+      <span className="flame-tooltip-count"><span>Prompts</span> {point.prompts}</span>
+    </output>
+  );
+}
+
+function promptStemLength(prompts, promptPeak) {
+  const magnitude = Math.log1p(prompts) / Math.log1p(Math.max(1, promptPeak));
+  return MIN_PROMPT_STEM_LENGTH
+    + magnitude * (MAX_PROMPT_STEM_LENGTH - MIN_PROMPT_STEM_LENGTH);
+}
+
+function BucketCursor({ points }) {
+  const [start, end] = points ?? [];
+  if (!Number.isFinite(start?.x) || !Number.isFinite(start?.y) || !Number.isFinite(end?.y)) {
+    return null;
+  }
+
+  return (
+    <line
+      className="flame-bucket-hover"
+      x1={start.x}
+      x2={start.x}
+      y1={start.y}
+      y2={end.y}
+      vectorEffect="non-scaling-stroke"
+    />
+  );
+}
+
+function PromptStem({ cx, cy, payload, personName, promptPeak }) {
+  if (!payload?.prompts || !Number.isFinite(cx) || !Number.isFinite(cy)) {
+    return null;
+  }
+
+  const length = promptStemLength(payload.prompts, promptPeak);
+  const label = `${personName}, ${formatTime(payload.startMs)}–${formatTime(payload.endMs)}: ${payload.prompts} ${payload.prompts === 1 ? "prompt" : "prompts"}`;
+
+  return (
+    <g
+      className="flame-prompt-stem"
+      role="img"
+      aria-label={label}
+      data-bucket-index={payload.index}
+      data-prompt-count={payload.prompts}
+      data-stem-length={length.toFixed(2)}
+    >
+      <title>{label}</title>
+      <line
+        className="flame-prompt-stem__line"
+        x1={cx}
+        y1={cy}
+        x2={cx}
+        y2={cy + length}
+        vectorEffect="non-scaling-stroke"
+      />
+      <line
+        className="flame-prompt-stem__hit-area"
+        x1={cx}
+        y1={cy}
+        x2={cx}
+        y2={cy + length}
+        vectorEffect="non-scaling-stroke"
+        aria-hidden="true"
+      />
+      <circle
+        className="flame-prompt-stem__cap"
+        cx={cx}
+        cy={cy + length}
+        r={1.5}
+        vectorEffect="non-scaling-stroke"
+      />
+    </g>
+  );
+}
+
+function IntervalDetail({ data, person, point, stale, onClose, detailRef }) {
+  const roles = [
+    { key: "agent", label: "Agent", value: point.agent },
+    { key: "subagent", label: "Subagent", value: point.subagent },
+    { key: "unclassified", label: "Unclassified", value: point.unclassified },
+  ];
+  const activeRoles = roles.filter(({ value }) => value > 0);
+  const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+
+  return (
+    <aside
+      ref={detailRef}
+      className="flame-detail"
+      aria-labelledby={headingId}
+      tabIndex={-1}
+    >
+      <header className="flame-detail__header">
+        <div>
+          <p className="flame-detail__eyebrow">10 minute interval</p>
+          <h2 id={headingId}>{person.name}</h2>
+          <p className="flame-detail__range">
+            <time dateTime={new Date(point.startMs).toISOString()}>{formatTime(point.startMs)}</time>
+            <span aria-hidden="true">—</span>
+            <time dateTime={new Date(point.endMs).toISOString()}>{formatTime(point.endMs)}</time>
+          </p>
+        </div>
+        <button type="button" className="flame-detail__close" onClick={onClose}>
+          <span aria-hidden="true">×</span>
+          <span className="visually-hidden">Close interval details</span>
+        </button>
+      </header>
+
+      <div className="flame-detail__receipt" role="status">
+        <span>{stale ? "Last good snapshot" : "Current snapshot"}</span>
+        <span>{data.coverage.state === "partial" ? "Partial coverage" : "Complete coverage"}</span>
+        <span>Read {formatTime(data.readMs)}</span>
+        <span>Latest {data.latestMs === null ? "none" : formatTime(data.latestMs)}</span>
+      </div>
+
+      <section className="flame-detail__section" aria-labelledby={`${headingId}-summary`}>
+        <h3 id={`${headingId}-summary`}>What happened</h3>
+        <dl className="flame-detail__summary">
+          <div>
+            <dt>Active work</dt>
+            <dd>{formatThreadCount(point.activity)}</dd>
+          </div>
+          <div>
+            <dt>Prompt activity</dt>
+            <dd>{formatPromptCount(point.prompts)}</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
+        <h3 id={`${headingId}-work`}>Active work</h3>
+        {activeRoles.length > 0 ? (
+          <ul className="flame-detail__roles">
+            {activeRoles.map(({ key, label, value }) => (
+              <li key={key}>
+                <i className={`flame-key flame-key--${key}`} aria-hidden="true" />
+                <span>{label}</span>
+                <strong>{formatThreadCount(value)}</strong>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="flame-detail__empty">No active work was recorded in this interval.</p>
+        )}
+      </section>
+
+      <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
+        <h3 id={`${headingId}-prompts`}>Prompts</h3>
+        <p className="flame-detail__empty">
+          {point.prompts > 0
+            ? `${formatPromptCount(point.prompts)} recorded in this interval.`
+            : "No prompts were recorded in this interval."}
+        </p>
+      </section>
+
+      <footer className="flame-detail__coverage">
+        <strong>Aggregate evidence only</strong>
+        <p>
+          The current feed does not include prompt text, session metadata, or conversation
+          messages. This view shows only the exact counts already published by /api/flame.
+        </p>
+      </footer>
+    </aside>
+  );
+}
+
+function SemanticLegend({ data }) {
+  return (
+    <div className="flame-meta-copy">
+      <p className="flame-receipt">
+        24H · 10M · {data.coverage.state.toUpperCase()} · READ {formatTime(data.readMs)} · LATEST {data.latestMs === null ? "NONE" : formatTime(data.latestMs)}
+      </p>
+      <ul className="flame-legend" aria-label="Activity legend">
+        <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
+        <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
+        <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
+        <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
+      </ul>
+    </div>
+  );
+}
+
+function PersonRail({ person, headingId }) {
+  const [agent, subagent, unclassified] = person.total;
+
+  return (
+    <header className="flame-person-rail">
+      <h2 id={headingId} title={person.name}>{person.name}</h2>
+      <output className="flame-totals" aria-label={`${person.name} totals`}>
+        <span className="flame-total--agent">A {agent}</span>
+        <span className="flame-total--subagent">S {subagent}</span>
+        {unclassified > 0 && <span>U {unclassified}</span>}
+      </output>
+    </header>
+  );
+}
+
+function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSelect }) {
+  const laneRef = useRef(null);
+  const [keyboardIndex, setKeyboardIndex] = useState(0);
+  const rawId = useId();
+  const id = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
+  const subagentPatternId = `flame-subagent-${id}`;
+  const unclassifiedPatternId = `flame-unclassified-${id}`;
+  const headingId = `flame-person-${id}`;
+  const points = useMemo(
+    () => person.buckets.map((point) => ({
+      ...point,
+      promptMarker: point.prompts > 0 ? 0 : null,
+    })),
+    [person.buckets],
+  );
+
+  const select = (point) => {
+    const target = laneRef.current?.querySelector('[role="application"]');
+    onSelect(person, point, target);
+  };
+
+  const handleClick = (event) => {
+    const wrapper = laneRef.current?.querySelector(".recharts-wrapper");
+    const bounds = wrapper?.getBoundingClientRect();
+    if (!bounds || bounds.width <= 0 || !Number.isFinite(event.clientX)) return;
+    const index = clamp(
+      Math.floor(((event.clientX - bounds.left) / bounds.width) * points.length),
+      0,
+      points.length - 1,
+    );
+    setKeyboardIndex(index);
+    select(points[index]);
+  };
+
+  const handleKeyDown = (event) => {
+    if (event.key === "ArrowRight") {
+      setKeyboardIndex((index) => Math.min(points.length - 1, index + 1));
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      setKeyboardIndex((index) => Math.max(0, index - 1));
+      return;
+    }
+    if (event.key === "Home") {
+      setKeyboardIndex(0);
+      return;
+    }
+    if (event.key === "End") {
+      setKeyboardIndex(points.length - 1);
+      return;
+    }
+    if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+      event.preventDefault();
+      select(points[keyboardIndex]);
+    }
+  };
+
+  return (
+    <section
+      className="flame-person"
+      aria-labelledby={headingId}
+      data-selected={selectedIndex === undefined ? undefined : "true"}
+    >
+      <PersonRail person={person} headingId={headingId} />
+      <div
+        ref={laneRef}
+        className="flame-lane"
+        style={{ width: chartWidth }}
+        role="group"
+        aria-label={`${person.name} activity timeline, 144 ten-minute buckets`}
+        data-bucket-count={points.length}
+        data-selected-index={selectedIndex}
+        onClick={handleClick}
+        onKeyDown={handleKeyDown}
+      >
+        <ComposedChart
+          accessibilityLayer
+          width={chartWidth}
+          height={LANE_HEIGHT}
+          data={points}
+          margin={{ top: 8, right: 0, bottom: 20, left: 0 }}
+          aria-label={`${person.name} activity timeline`}
+        >
+          <defs>
+            <pattern
+              id={subagentPatternId}
+              width="6"
+              height="6"
+              patternUnits="userSpaceOnUse"
+              patternTransform="rotate(35)"
+            >
+              <rect width="6" height="6" fill="var(--flame-subagent-muted)" />
+              <line x1="0" y1="0" x2="0" y2="6" stroke="var(--flame-subagent)" strokeWidth="3" />
+            </pattern>
+            <pattern id={unclassifiedPatternId} width="5" height="5" patternUnits="userSpaceOnUse">
+              <rect width="5" height="5" fill="var(--flame-unclassified-muted)" />
+              <circle cx="1.5" cy="1.5" r="0.8" fill="var(--flame-unclassified)" />
+            </pattern>
+          </defs>
+          <XAxis dataKey="index" type="category" hide interval={0} />
+          <YAxis yAxisId="activity" hide domain={[0, peak]} allowDataOverflow />
+          <YAxis yAxisId="prompts" hide domain={[0, 1]} />
+          <Tooltip
+            content={<BucketTooltip laneRef={laneRef} personName={person.name} />}
+            cursor={<BucketCursor />}
+            isAnimationActive={false}
+            portal={typeof document === "undefined" ? null : document.body}
+            wrapperStyle={{
+              height: 0,
+              left: 0,
+              outline: "none",
+              pointerEvents: "none",
+              position: "fixed",
+              top: 0,
+              width: 0,
+              zIndex: 12,
+            }}
+          />
+          <Bar
+            yAxisId="activity"
+            dataKey="agent"
+            name="Agent"
+            stackId="activity"
+            fill="var(--flame-agent)"
+            isAnimationActive={false}
+          />
+          <Bar
+            yAxisId="activity"
+            dataKey="subagent"
+            name="Subagent"
+            stackId="activity"
+            fill={`url(#${subagentPatternId})`}
+            isAnimationActive={false}
+          />
+          <Bar
+            yAxisId="activity"
+            dataKey="unclassified"
+            name="Unclassified"
+            stackId="activity"
+            fill={`url(#${unclassifiedPatternId})`}
+            isAnimationActive={false}
+          />
+          <Line
+            yAxisId="prompts"
+            dataKey="promptMarker"
+            name="Prompts"
+            stroke="none"
+            dot={<PromptStem personName={person.name} promptPeak={promptPeak} />}
+            activeDot={false}
+            connectNulls={false}
+            isAnimationActive={false}
+          />
+        </ComposedChart>
+        {selectedIndex !== undefined && (
+          <i
+            className="flame-bucket-selected"
+            style={{
+              left: `${(selectedIndex / BUCKET_COUNT) * 100}%`,
+              width: `${100 / BUCKET_COUNT}%`,
+            }}
+            aria-hidden="true"
+          />
+        )}
+      </div>
+    </section>
+  );
+}
+
+function useSharedChartWidth(rootRef, requestedWidth) {
+  const [measuredWidth, setMeasuredWidth] = useState(requestedWidth ?? DEFAULT_CHART_WIDTH);
+
+  useEffect(() => {
+    if (Number.isFinite(requestedWidth)) {
+      setMeasuredWidth(requestedWidth);
+      return undefined;
+    }
+
+    const root = rootRef.current;
+    if (!root || typeof ResizeObserver === "undefined") return undefined;
+
+    const update = () => {
+      const rail = Number.parseFloat(getComputedStyle(root).getPropertyValue("--flame-rail")) || 220;
+      setMeasuredWidth(Math.max(MIN_CHART_WIDTH, root.clientWidth - rail));
+    };
+    const observer = new ResizeObserver(update);
+    observer.observe(root);
+    update();
+    return () => observer.disconnect();
+  }, [requestedWidth, rootRef]);
+
+  return Math.max(MIN_CHART_WIDTH, measuredWidth);
+}
+
+export default function FlameGraph({ data, chartWidth, stale = false }) {
+  const rootRef = useRef(null);
+  const detailRef = useRef(null);
+  const selectionOriginRef = useRef(null);
+  const [selection, setSelection] = useState(null);
+  const width = useSharedChartWidth(rootRef, chartWidth);
+  const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
+  const promptPeak = data.people.reduce(
+    (peoplePeak, person) => person.buckets.reduce(
+      (personPeak, { prompts }) => Math.max(personPeak, prompts),
+      peoplePeak,
+    ),
+    1,
+  );
+  const ticks = data.axisTicks ?? createTimeAxisTicks(data.startMs);
+  const endMs = data.startMs + BUCKET_COUNT * BUCKET_MS;
+  const selectedPerson = selection
+    ? data.people.find(({ id }) => id === selection.personId)
+    : null;
+  const selectedPoint = selectedPerson
+    ? selectedPerson.buckets.find(({ startMs }) => startMs === selection.startMs)
+    : null;
+
+  useEffect(() => {
+    if (selection && (!selectedPerson || !selectedPoint)) setSelection(null);
+  }, [selection, selectedPerson, selectedPoint]);
+
+  useEffect(() => {
+    if (!selectedPoint) return undefined;
+    detailRef.current?.focus();
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") {
+        setSelection(null);
+        requestAnimationFrame(() => selectionOriginRef.current?.focus());
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [selectedPoint]);
+
+  const selectInterval = (person, point, origin) => {
+    selectionOriginRef.current = origin;
+    setSelection({ personId: person.id, startMs: point.startMs });
+  };
+
+  const closeDetail = () => {
+    setSelection(null);
+    requestAnimationFrame(() => selectionOriginRef.current?.focus());
+  };
+
+  return (
+    <section
+      ref={rootRef}
+      className="flame-graph"
+      data-state={stale ? "stale" : "current"}
+      aria-label="Code activity over the last 24 hours"
+    >
+      <div className="flame-graph-scroll">
+        <div className="flame-meta-row">
+          <div className="flame-meta-rail">
+            <SemanticLegend data={data} />
+          </div>
+          <div
+            className="flame-time-axis"
+            style={{ width }}
+            aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
+          >
+            {ticks.map((tick, index) => {
+              const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
+              return (
+                <time
+                  key={at}
+                  dateTime={new Date(at).toISOString()}
+                  style={{ left: `${(index / (ticks.length - 1)) * 100}%` }}
+                >
+                  {formatTime(at)}
+                </time>
+              );
+            })}
+          </div>
+        </div>
+        {data.people.map((person) => (
+          <PersonLane
+            key={person.id}
+            person={person}
+            peak={peak}
+            promptPeak={promptPeak}
+            chartWidth={width}
+            selectedIndex={selectedPerson?.id === person.id ? selectedPoint?.index : undefined}
+            onSelect={selectInterval}
+          />
+        ))}
+      </div>
+      {selectedPerson && selectedPoint && (
+        <IntervalDetail
+          data={data}
+          person={selectedPerson}
+          point={selectedPoint}
+          stale={stale}
+          onClose={closeDetail}
+          detailRef={detailRef}
+        />
+      )}
+    </section>
+  );
+}

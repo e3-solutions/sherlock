@@ -1,0 +1,173 @@
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { adaptMock } = vi.hoisted(() => ({
+  adaptMock: vi.fn(),
+}));
+
+vi.mock("./flame-data.js", () => ({
+  adaptFlamePayload: adaptMock,
+  BUCKET_MS: 10 * 60 * 1000,
+}));
+
+vi.mock("./FlameGraph.jsx", () => ({
+  default: ({ data, stale }) => (
+    <div data-testid="flame-graph" data-stale={String(stale)}>
+      {data.marker}
+    </div>
+  ),
+}));
+
+import App, { nextRefreshDelay } from "./App.jsx";
+
+const payload = { raw: true };
+const model = {
+  marker: "adapted timeline",
+  coverage: { evidence: "aggregate", state: "complete", reason: null },
+};
+
+function response({ ok = true, status = 200, body = payload } = {}) {
+  return {
+    ok,
+    status,
+    json: vi.fn().mockResolvedValue(body),
+  };
+}
+
+async function settle() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+describe("App", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-14T12:03:00Z"));
+    adaptMock.mockReturnValue(model);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("loads, validates, and renders the flame response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    expect(screen.getByRole("status")).toHaveTextContent("Loading timeline");
+    await settle();
+
+    expect(adaptMock).toHaveBeenCalledWith(payload);
+    expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
+    expect(fetchMock).toHaveBeenCalledWith("/api/flame", expect.objectContaining({
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal: expect.any(AbortSignal),
+    }));
+  });
+
+  it("offers an immediate retry after the initial request fails", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ ok: false, status: 503 }))
+      .mockResolvedValueOnce(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    expect(screen.getByRole("alert")).toHaveTextContent("Timeline unavailable");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await settle();
+    expect(screen.getByTestId("flame-graph")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the last-good graph and announces a failed refresh", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response({ ok: false, status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextRefreshDelay(Date.now()));
+    });
+    await settle();
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Refresh failed. Showing the last successful read.",
+    );
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "true");
+    expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
+  });
+
+  it("announces partial workspace snapshot coverage", async () => {
+    adaptMock.mockReturnValueOnce({
+      marker: "partial timeline",
+      coverage: {
+        evidence: "aggregate",
+        state: "partial",
+        reason: "workspace_snapshot_activation_unavailable",
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response()));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByText(/Partial aggregate snapshot/)).toHaveTextContent(
+      "Partial aggregate snapshot",
+    );
+  });
+
+  it("clears the stale state after a later refresh succeeds", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response({ ok: false, status: 503 }))
+      .mockResolvedValueOnce(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextRefreshDelay(Date.now()));
+    });
+    await settle();
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "true");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60 * 1000);
+    });
+    await settle();
+
+    expect(screen.queryByText(/Refresh failed/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "false");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("aborts an in-flight request on unmount", () => {
+    let requestSignal;
+    vi.stubGlobal("fetch", vi.fn((_url, options) => {
+      requestSignal = options.signal;
+      return new Promise(() => {});
+    }));
+
+    const view = render(<App />);
+    expect(requestSignal.aborted).toBe(false);
+    view.unmount();
+    expect(requestSignal.aborted).toBe(true);
+  });
+});
+
+describe("nextRefreshDelay", () => {
+  it("targets ninety seconds after the next ten-minute boundary", () => {
+    const now = Date.parse("2026-08-14T12:03:00Z");
+    expect(nextRefreshDelay(now)).toBe(8.5 * 60 * 1000);
+  });
+});

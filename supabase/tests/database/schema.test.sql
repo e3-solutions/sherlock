@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(85);
+select plan(89);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -73,6 +73,30 @@ select ok(
     where rolname = 'sherlock_worker_login' and rolcanlogin and not rolinherit
   ),
   'Railway uses a login that can only assume explicit worker roles'
+);
+select ok(
+  exists (
+    select 1 from pg_roles
+    where rolname = 'sherlock_dashboard_login' and rolcanlogin and not rolinherit
+  ),
+  'dashboard uses a NOINHERIT login'
+);
+select ok(
+  pg_has_role('sherlock_dashboard_login', 'sherlock_reader', 'member'),
+  'dashboard login can assume the constrained reader role'
+);
+select ok(
+  not pg_has_role('sherlock_dashboard_login', 'sherlock_ingest', 'member') and
+  not pg_has_role('sherlock_dashboard_login', 'sherlock_normalizer', 'member') and
+  not pg_has_role('sherlock_dashboard_login', 'sherlock_reducer', 'member') and
+  not pg_has_role('sherlock_dashboard_login', 'sherlock_processor', 'member'),
+  'dashboard login cannot assume any writer or processor role'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_dashboard_login', 'telemetry.events', 'insert,update,delete,truncate'
+  ),
+  'dashboard login cannot mutate normalized events'
 );
 select ok(
   pg_has_role('postgres', 'sherlock_ingest', 'member'),
@@ -552,10 +576,15 @@ begin
     to_regclass('telemetry.events') is not null and
     to_regclass('analytics.activity_spans') is not null and
     to_regclass('processing.telemetry_jobs') is not null and
-    (select count(*) = 5 from pg_roles where rolname in (
+    (select count(*) = 6 from pg_roles where rolname in (
       'sherlock_ingest', 'sherlock_normalizer', 'sherlock_reducer',
-      'sherlock_reader', 'sherlock_processor'
+      'sherlock_reader', 'sherlock_processor', 'sherlock_dashboard_login'
     )) and
+    pg_has_role('sherlock_dashboard_login', 'sherlock_reader', 'member') and
+    not pg_has_role('sherlock_dashboard_login', 'sherlock_ingest', 'member') and
+    not pg_has_role('sherlock_dashboard_login', 'sherlock_normalizer', 'member') and
+    not pg_has_role('sherlock_dashboard_login', 'sherlock_reducer', 'member') and
+    not pg_has_role('sherlock_dashboard_login', 'sherlock_processor', 'member') and
     pg_has_role('postgres', 'sherlock_ingest', 'member') and
     pg_has_role('postgres', 'sherlock_normalizer', 'member') and
     pg_has_role('postgres', 'sherlock_reducer', 'member') and
@@ -619,7 +648,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 85,
+  'assertion_count', 89,
   'tables', 8,
   'private_bucket', 'telemetry-raw'
 ) as verification;
