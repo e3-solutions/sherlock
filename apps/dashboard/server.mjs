@@ -4,16 +4,11 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { authorizeBasic, hasDashboardCredentials } from "./src/server/auth.js";
 import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
 const PORT = Number.parseInt(process.env.PORT ?? "8000", 10);
-const auth = {
-  username: process.env.SHERLOCK_DASHBOARD_USERNAME ?? "",
-  password: process.env.SHERLOCK_DASHBOARD_PASSWORD ?? "",
-};
 const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
 const databaseUrl = process.env.SHERLOCK_READER_DATABASE_URL ?? "";
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
@@ -75,9 +70,6 @@ function configurationStatus() {
   const missing = [];
   if (!databaseUrl) missing.push("SHERLOCK_READER_DATABASE_URL");
   if (!validWorkspaceId) missing.push("SHERLOCK_WORKSPACE_ID");
-  if (!hasDashboardCredentials(auth)) {
-    missing.push("SHERLOCK_DASHBOARD_USERNAME", "SHERLOCK_DASHBOARD_PASSWORD");
-  }
   if (!validMaxPeople) missing.push("SHERLOCK_DASHBOARD_MAX_PEOPLE");
   return missing.length === 0
     ? null
@@ -95,16 +87,6 @@ const server = createServer(async (request, response) => {
     const invalid = configurationStatus();
     const receipt = invalid ?? await source.readiness();
     sendJson(response, receipt.status === "ok" ? 200 : 503, receipt);
-    return;
-  }
-
-  if (!authorizeBasic(request.headers.authorization, auth)) {
-    sendJson(
-      response,
-      401,
-      { error: "authentication_required" },
-      { "WWW-Authenticate": 'Basic realm="Sherlock dashboard", charset="UTF-8"' },
-    );
     return;
   }
 

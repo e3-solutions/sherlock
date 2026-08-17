@@ -5,9 +5,10 @@ private telemetry schemas. It is a single workspace-scoped service: every query
 uses SHERLOCK_WORKSPACE_ID, every database transaction is repeatable-read and
 read-only, and the server must successfully assume sherlock_reader.
 
-The browser never receives database credentials. HTTP Basic authentication is
-required for the page, static assets, and /api/flame; /healthz is the only
-public route and returns only readiness state.
+The browser never receives database credentials. The page and aggregate API
+are public; every database query remains pinned to one configured workspace and
+runs through a dedicated read-only login. The API does not return prompt text,
+conversation content, or transcript evidence.
 
 ## Data contract
 
@@ -23,9 +24,8 @@ public route and returns only readiness state.
 
 ## Environment
 
-SHERLOCK_READER_DATABASE_URL, SHERLOCK_WORKSPACE_ID,
-SHERLOCK_DASHBOARD_USERNAME, and SHERLOCK_DASHBOARD_PASSWORD are required.
-The database login should be NOINHERIT and a member only of sherlock_reader.
+SHERLOCK_READER_DATABASE_URL and SHERLOCK_WORKSPACE_ID are required. The
+database login should be NOINHERIT and a member only of sherlock_reader.
 SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not exceed 1000.
 
 ## Local verification
