@@ -319,18 +319,13 @@ Rollback means stop producing/reading the new version; prior version rows are
 untouched. Rebuild means rerun the desired scope and bound, never update or
 delete source facts.
 
-## Product adapters and deferred publication behavior
-
-`apps/dashboard` provides a product-specific Flame adapter over a pinned
-normalizer version. It reads versioned events directly, reports observed-event
-coverage as partial, and does not turn the result into a durable publication
-snapshot. This keeps the product view separate from the source-data contract.
+## Deferred application behavior
 
 The current implementation does not yet provide:
 
 - activity-version activation;
 - signed snapshot tokens and contiguous publication cutoffs;
-- durable transcript, usage, health, or coverage publication APIs.
+- transcript, usage, health, coverage, or Flame read APIs.
 
 Implement each behavior in service code with integration tests. Do not describe
 it as a database guarantee until a constraint or verified transaction protocol
