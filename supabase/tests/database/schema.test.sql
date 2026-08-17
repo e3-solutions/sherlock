@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(82);
+select plan(85);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -34,6 +34,17 @@ select ok(
       and indexname = 'events_message_search_idx'
   ),
   'normalized message search has a partial GIN index'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'telemetry'
+      and tablename = 'sessions'
+      and indexname = 'sessions_unresolved_parent_native_idx'
+      and indexdef like '%(workspace_id, collector_key, person_id, parent_native_session_id)%'
+      and indexdef like '%WHERE ((parent_session_id IS NULL) AND (parent_native_session_id IS NOT NULL))%'
+  ),
+  'unresolved session parents have a narrow partial lookup index'
 );
 
 select ok(
@@ -162,6 +173,14 @@ select ok(
 select ok(
   has_table_privilege('sherlock_normalizer', 'telemetry.events', 'insert'),
   'normalizer can insert events'
+);
+select ok(
+  has_table_privilege('sherlock_normalizer', 'telemetry.sessions', 'select'),
+  'normalizer can resolve session parentage'
+);
+select ok(
+  has_table_privilege('sherlock_normalizer', 'telemetry.sessions', 'update'),
+  'normalizer can repair derived session parentage'
 );
 select ok(
   not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'insert'),
@@ -562,6 +581,8 @@ begin
     not has_table_privilege('sherlock_ingest', 'telemetry.events', 'insert') and
     not has_table_privilege('sherlock_ingest', 'analytics.activity_spans', 'insert') and
     has_table_privilege('sherlock_normalizer', 'telemetry.events', 'insert') and
+    has_table_privilege('sherlock_normalizer', 'telemetry.sessions', 'select') and
+    has_table_privilege('sherlock_normalizer', 'telemetry.sessions', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'insert') and
     has_table_privilege('sherlock_reducer', 'telemetry.sessions', 'select') and
     has_table_privilege('sherlock_reducer', 'telemetry.events', 'select') and
@@ -598,7 +619,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 82,
+  'assertion_count', 85,
   'tables', 8,
   'private_bucket', 'telemetry-raw'
 ) as verification;

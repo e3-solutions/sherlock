@@ -12,6 +12,8 @@ from .contract import ContractError, MAX_RECORDS, MAX_SOURCE_BYTES, build_rollou
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
+DEFAULT_MAX_FILES = 64
+DEFAULT_MAX_SYNC_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_OBJECT_BYTES = 5 * 1024 * 1024
 PREFIX_BYTES = 4096
 
@@ -87,8 +89,8 @@ class RolloutCapturer:
         paths: Iterable[Path | str],
         *,
         native_session_ids: Mapping[str, str] | None = None,
-        max_files: int = 16,
-        max_sync_bytes: int = 2 * DEFAULT_CHUNK_BYTES,
+        max_files: int = DEFAULT_MAX_FILES,
+        max_sync_bytes: int = DEFAULT_MAX_SYNC_BYTES,
         best_effort: bool = False,
         priority_count: int = 0,
     ) -> CaptureResult:

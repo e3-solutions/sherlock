@@ -192,15 +192,36 @@ async function upsertSession(
   receipt: CommittedReceipt,
   session: SessionProjection,
 ): Promise<{ id: string; actor_role: ActorRole }> {
-  const parent = session.parent_native_session_id
+  const lockNativeSessionIds = [
+    session.native_session_id,
+    session.parent_native_session_id,
+  ].filter((value): value is string => value !== null)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .sort();
+  for (const nativeSessionId of lockNativeSessionIds) {
+    await tx.unsafe(
+      "select pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [
+        JSON.stringify([
+          receipt.workspace_id,
+          receipt.collector_key,
+          nativeSessionId,
+        ]),
+      ],
+    );
+  }
+
+  const parent = session.parent_native_session_id &&
+      session.parent_native_session_id !== session.native_session_id
     ? await tx.unsafe(
       `select id from telemetry.sessions
         where workspace_id = $1 and collector_key = $2
-          and native_session_id = $3
+          and person_id = $3 and native_session_id = $4
         limit 1`,
       [
         receipt.workspace_id,
         receipt.collector_key,
+        receipt.person_id,
         session.parent_native_session_id,
       ],
     )
@@ -261,6 +282,20 @@ async function upsertSession(
       409,
     );
   }
+  await tx.unsafe(
+    `update telemetry.sessions
+        set parent_session_id = $1, updated_at = now()
+      where workspace_id = $2 and collector_key = $3 and person_id = $4
+        and parent_native_session_id = $5 and parent_session_id is null
+        and id <> $1`,
+    [
+      rows[0].id,
+      receipt.workspace_id,
+      receipt.collector_key,
+      receipt.person_id,
+      session.native_session_id,
+    ],
+  );
   return {
     id: String(rows[0].id),
     actor_role: String(rows[0].actor_role) as ActorRole,
