@@ -1,5 +1,10 @@
 import postgres from "npm:postgres@3.4.7";
-import { PostgresActivityReducer } from "./postgres.ts";
+import {
+  ActivitySessionBusyError,
+  ActivitySessionDeadlineError,
+  ActivitySessionLimitError,
+  PostgresActivityReducer,
+} from "./postgres.ts";
 
 const envPermission = await Deno.permissions.query({
   name: "env",
@@ -27,7 +32,24 @@ Deno.test({
     const fixture = await seed(sql);
     const reducer = PostgresActivityReducer.connect(databaseUrl!);
     try {
-      const immutableBefore = await immutableCounts(sql, fixture.workspaceId);
+      const workspaceCutoff = await reducer.resolveWorkspaceCutoff(
+        fixture.workspaceId,
+        fixture.normalizerVersion,
+        1_000,
+      );
+      const scheduledSessions = await reducer.listSessionIds({
+        workspaceId: fixture.workspaceId,
+        normalizerVersion: fixture.normalizerVersion,
+        throughEventId: workspaceCutoff,
+        afterSessionId: null,
+        limit: 10,
+        statementTimeoutMs: 1_000,
+      });
+      assert(
+        scheduledSessions.length === 4,
+        "the scheduled sweep must enumerate each visible session",
+      );
+
       await reducer.reduceSession({
         workspaceId: fixture.workspaceId,
         sessionId: fixture.primarySessionId,
@@ -111,6 +133,67 @@ Deno.test({
       );
       assert(turnRevisions.some((row) => row.span_state === "active"));
 
+      const lateVisible = await seedLateVisibleCorrection(sql, fixture);
+      const lateVersion = "test.activity.late-visible";
+      const initialLate = await reducer.reduceSession({
+        workspaceId: fixture.workspaceId,
+        sessionId: fixture.primarySessionId,
+        normalizerVersion: fixture.normalizerVersion,
+        activityVersion: lateVersion,
+        throughEventId: lateVisible.highEventId,
+      });
+      assert(
+        initialLate.cutoff_event_id === lateVisible.highEventId,
+        "event pagination must order bigint IDs numerically across digit boundaries",
+      );
+      await lateVisible.commitLowerEvent();
+      const immutableBefore = await immutableCounts(sql, fixture.workspaceId);
+      await reducer.reduceSession({
+        workspaceId: fixture.workspaceId,
+        sessionId: fixture.primarySessionId,
+        normalizerVersion: fixture.normalizerVersion,
+        activityVersion: lateVersion,
+        throughEventId: lateVisible.highEventId,
+      });
+      const lateRows = (await spans(
+        sql,
+        fixture.workspaceId,
+        lateVersion,
+        fixture.primarySessionId,
+      )).filter((row) =>
+        String(row.span_key).includes("turn-1") &&
+        String(row.valid_from_event_id) === lateVisible.highEventId.toString()
+      );
+      assert(
+        lateRows.length === 2,
+        "a lower-ID late commit must append a same-cutoff correction",
+      );
+      assert(
+        lateRows.some((row) =>
+          String(row.start_event_id) === lateVisible.lowerEventId.toString()
+        ),
+        "the corrected revision must retain the late lifecycle evidence",
+      );
+      await reducer.reduceSession({
+        workspaceId: fixture.workspaceId,
+        sessionId: fixture.primarySessionId,
+        normalizerVersion: fixture.normalizerVersion,
+        activityVersion: lateVersion,
+        throughEventId: lateVisible.highEventId,
+      });
+      assert(
+        (await spans(
+          sql,
+          fixture.workspaceId,
+          lateVersion,
+          fixture.primarySessionId,
+        )).filter((row) =>
+          String(row.span_key).includes("turn-1") &&
+          String(row.valid_from_event_id) === lateVisible.highEventId.toString()
+        ).length === 2,
+        "the corrected same-cutoff state must remain an exact-rerun no-op",
+      );
+
       for (
         const sessionId of [
           fixture.workerSessionId,
@@ -155,6 +238,57 @@ Deno.test({
         "new activity version must rebuild independently",
       );
 
+      let bounded = false;
+      try {
+        await reducer.reduceSession({
+          workspaceId: fixture.workspaceId,
+          sessionId: fixture.primarySessionId,
+          normalizerVersion: fixture.normalizerVersion,
+          activityVersion: "test.activity.bounded",
+          throughEventId: fixture.finalCutoff,
+          eventPageSize: 1,
+          maxEventCount: 1,
+        });
+      } catch (error) {
+        bounded = error instanceof ActivitySessionLimitError;
+      }
+      assert(bounded, "the scheduled path must reject an oversized session");
+      assert(
+        Number(
+          (await sql.unsafe(
+            `select count(*) as count from analytics.activity_spans
+            where workspace_id = $1 and activity_version = 'test.activity.bounded'`,
+            [fixture.workspaceId],
+          ))[0].count,
+        ) === 0,
+        "the per-session event cap must fail before span writes",
+      );
+
+      let deadlineExceeded = false;
+      try {
+        await reducer.reduceSession({
+          workspaceId: fixture.workspaceId,
+          sessionId: fixture.primarySessionId,
+          normalizerVersion: fixture.normalizerVersion,
+          activityVersion: "test.activity.expired",
+          throughEventId: fixture.finalCutoff,
+          deadlineAtMs: performance.now() - 1,
+        });
+      } catch (error) {
+        deadlineExceeded = error instanceof ActivitySessionDeadlineError;
+      }
+      assert(deadlineExceeded, "an expired session budget must fail closed");
+      assert(
+        Number(
+          (await sql.unsafe(
+            `select count(*) as count from analytics.activity_spans
+            where workspace_id = $1 and activity_version = 'test.activity.expired'`,
+            [fixture.workspaceId],
+          ))[0].count,
+        ) === 0,
+        "an expired session budget must not append spans",
+      );
+
       const failing = PostgresActivityReducer.connect(databaseUrl!, {
         beforeWriteCommit: () => {
           throw new Error("synthetic reducer failure");
@@ -195,21 +329,48 @@ Deno.test({
         throughEventId: fixture.finalCutoff,
       });
 
-      const concurrentA = PostgresActivityReducer.connect(databaseUrl!);
+      let enteredLockedTransaction!: () => void;
+      const lockedTransaction = new Promise<void>((resolve) => {
+        enteredLockedTransaction = resolve;
+      });
+      let releaseLockedTransaction!: () => void;
+      const release = new Promise<void>((resolve) => {
+        releaseLockedTransaction = resolve;
+      });
+      const concurrentA = PostgresActivityReducer.connect(databaseUrl!, {
+        beforeWriteCommit: async () => {
+          enteredLockedTransaction();
+          await release;
+        },
+      });
       const concurrentB = PostgresActivityReducer.connect(databaseUrl!);
       try {
-        await Promise.all(
-          [concurrentA, concurrentB].map((candidate) =>
-            candidate.reduceSession({
-              workspaceId: fixture.workspaceId,
-              sessionId: fixture.guardianSessionId,
-              normalizerVersion: fixture.normalizerVersion,
-              activityVersion: "test.activity.concurrent",
-              throughEventId: fixture.finalCutoff,
-            })
-          ),
-        );
+        const first = concurrentA.reduceSession({
+          workspaceId: fixture.workspaceId,
+          sessionId: fixture.guardianSessionId,
+          normalizerVersion: fixture.normalizerVersion,
+          activityVersion: "test.activity.concurrent",
+          throughEventId: fixture.finalCutoff,
+        });
+        await lockedTransaction;
+        let busy = false;
+        try {
+          await concurrentB.reduceSession({
+            workspaceId: fixture.workspaceId,
+            sessionId: fixture.guardianSessionId,
+            normalizerVersion: fixture.normalizerVersion,
+            activityVersion: "test.activity.concurrent",
+            throughEventId: fixture.finalCutoff,
+            statementTimeoutMs: 1_000,
+          });
+        } catch (error) {
+          busy = error instanceof ActivitySessionBusyError;
+        }
+        assert(busy, "overlapping work must fail quickly as retryable busy");
+        releaseLockedTransaction();
+        await first;
       } finally {
+        releaseLockedTransaction();
         await Promise.all([concurrentA.close(), concurrentB.close()]);
       }
       const duplicates = await sql.unsafe(
@@ -239,6 +400,7 @@ async function seed(sql: ReturnType<typeof postgres>): Promise<{
   workerSessionId: string;
   guardianSessionId: string;
   automationSessionId: string;
+  batchId: string;
   normalizerVersion: string;
   replacedWinnerCutoff: bigint;
   canonicalMessageId: bigint;
@@ -469,6 +631,7 @@ async function seed(sql: ReturnType<typeof postgres>): Promise<{
       workerSessionId,
       guardianSessionId,
       automationSessionId,
+      batchId,
       normalizerVersion,
       replacedWinnerCutoff: eventIds[0],
       canonicalMessageId: eventIds[1],
@@ -476,6 +639,82 @@ async function seed(sql: ReturnType<typeof postgres>): Promise<{
       finalCutoff: eventIds[7],
     };
   });
+}
+
+async function seedLateVisibleCorrection(
+  sql: ReturnType<typeof postgres>,
+  fixture: {
+    workspaceId: string;
+    primarySessionId: string;
+    batchId: string;
+    normalizerVersion: string;
+  },
+): Promise<{
+  lowerEventId: bigint;
+  highEventId: bigint;
+  commitLowerEvent: () => Promise<void>;
+}> {
+  const reserved = await sql.unsafe(
+    "select nextval(pg_get_serial_sequence('telemetry.events', 'id'))::text as id",
+  );
+  const lowerEventId = BigInt(String(reserved[0].id));
+  const records: string[] = [];
+  for (const index of [100, 101]) {
+    const inserted = await sql.unsafe(
+      `insert into telemetry.native_records (
+         workspace_id, batch_id, record_index, source_start_offset,
+         source_end_offset, record_sha256, parse_status
+       ) values ($1, $2, $3::integer, $3::bigint, $4::bigint, $5, 'ok')
+       returning id::text as id`,
+      [fixture.workspaceId, fixture.batchId, index, index + 1, "d".repeat(64)],
+    );
+    records.push(String(inserted[0].id));
+  }
+  const high = await sql.unsafe(
+    `insert into telemetry.events (
+       workspace_id, session_id, source_record_id, normalizer_version,
+       projection_index, canonical_scope_key, source_priority, event_kind,
+       event_subtype, actor_role, occurred_at, observed_at,
+       server_received_at, project_key
+     ) values ($1, $2, $3, $4, 0, $5, 100, 'unknown', 'late-boundary',
+               'primary', '2026-08-15T00:00:09Z', '2026-08-15T00:00:09Z',
+               '2026-08-15T01:00:00Z', 'sherlock')
+     returning id::text as id`,
+    [
+      fixture.workspaceId,
+      fixture.primarySessionId,
+      records[1],
+      fixture.normalizerVersion,
+      `session:${fixture.primarySessionId}`,
+    ],
+  );
+  const highEventId = BigInt(String(high[0].id));
+  return {
+    lowerEventId,
+    highEventId,
+    commitLowerEvent: async () => {
+      await sql.unsafe(
+        `insert into telemetry.events (
+           id, workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, canonical_scope_key, source_priority, event_kind,
+           event_subtype, actor_role, occurred_at, observed_at,
+           server_received_at, turn_id, project_key
+         ) overriding system value
+           values ($1, $2, $3, $4, $5, 0, $6, 100, 'lifecycle',
+                   'turn_started', 'primary', '2026-08-15T00:00:01Z',
+                   '2026-08-15T00:00:01Z', '2026-08-15T01:00:00Z',
+                   'turn-1', 'sherlock')`,
+        [
+          lowerEventId.toString(),
+          fixture.workspaceId,
+          fixture.primarySessionId,
+          records[0],
+          fixture.normalizerVersion,
+          `session:${fixture.primarySessionId}`,
+        ],
+      );
+    },
+  };
 }
 
 async function immutableCounts(

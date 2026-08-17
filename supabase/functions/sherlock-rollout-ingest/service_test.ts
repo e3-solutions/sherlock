@@ -15,7 +15,6 @@ import {
   publicCollectorGrant,
 } from "./attribution.ts";
 import {
-  type BatchNormalizer,
   type BatchRepository,
   type ImmutableStorage,
   IngestService,
@@ -155,25 +154,6 @@ class MemoryBatches implements BatchRepository {
   }
 }
 
-class MemoryNormalizer implements BatchNormalizer {
-  calls = 0;
-  failOnce = false;
-  sources: string[] = [];
-
-  async normalize(
-    _receipt: CommittedReceipt,
-    _manifest: BatchManifest,
-    source: Uint8Array,
-  ): Promise<void> {
-    this.calls += 1;
-    this.sources.push(new TextDecoder().decode(source));
-    if (this.failOnce) {
-      this.failOnce = false;
-      throw new Error("normalizer unavailable");
-    }
-  }
-}
-
 Deno.test("exact retry returns the stable existing receipt", async () => {
   const { attribution, manifest, stored } = await fixture();
   const storage = new MemoryStorage();
@@ -236,25 +216,16 @@ Deno.test("database success and response loss converges on exact lookup", async 
   );
 });
 
-Deno.test("normalization failure retries from the committed raw batch", async () => {
+Deno.test("durable acceptance returns without a normalization dependency", async () => {
   const { attribution, manifest, stored } = await fixture();
   const storage = new MemoryStorage();
   const batches = new MemoryBatches();
-  const normalizer = new MemoryNormalizer();
-  normalizer.failOnce = true;
-  const service = new IngestService(storage, batches, normalizer);
-
-  await service.ingest(attribution, manifest, stored).then(
-    () => assert(false, "first normalization should fail"),
-    () => undefined,
-  );
+  const service = new IngestService(storage, batches);
   const receipt = await service.ingest(attribution, manifest, stored);
 
   assert(receipt.status === "committed");
   assert(batches.commits === 1, "raw batch must commit only once");
   assert(storage.calls === 1, "raw object must upload only once");
-  assert(normalizer.calls === 2, "normalization must retry after raw commit");
-  assert(normalizer.sources.every((source) => source === "test\n"));
 });
 
 Deno.test("strict timestamp validation rejects impossible calendar dates", async () => {

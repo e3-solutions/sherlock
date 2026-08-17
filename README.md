@@ -71,6 +71,12 @@ email. This is acceptable for the current rollout, but those values are not
 verified identity. Request-size limits, strict contracts, immutable storage,
 and idempotency checks still apply.
 
+Uploads are acknowledged after immutable Storage, auditable ingest/native
+facts, and a durable processing job commit. Normalization and targeted activity
+reduction run asynchronously on Railway; see
+[`docs/telemetry-processing.md`](docs/telemetry-processing.md) for deployment,
+inspection, recovery, and rollback.
+
 Hooks discover active/recent rollout paths from Codex's SQLite state. Exact
 source bytes and checkpoints live under `$CODEX_HOME/sherlock/telemetry`.
 `SessionStart`, `UserPromptSubmit`, and `Stop` capture all recent candidates;
@@ -93,6 +99,7 @@ PYTHONPATH=packages/telemetry-collector/src python3 -m unittest discover -s test
 deno check supabase/functions/sherlock-rollout-ingest/index.ts
 deno test supabase/functions/sherlock-rollout-ingest
 deno test supabase/functions/sherlock-activity-reducer
+deno test workers/telemetry-processor
 ```
 
 Run a bounded internal activity rebuild separately from ingest:

@@ -15,6 +15,10 @@ export interface ReduceSessionOptions {
   activityVersion: string;
   throughEventId: bigint;
   eventPageSize?: number;
+  maxEventCount?: number;
+  statementTimeoutMs?: number;
+  deadlineAtMs?: number;
+  now?: () => number;
 }
 
 export interface ReduceSessionResult {
@@ -28,6 +32,35 @@ export interface ReduceSessionResult {
 export interface ActivityReducerHooks {
   beforeWriteCommit?: () => void | Promise<void>;
 }
+
+export class ActivitySessionLimitError extends Error {
+  readonly code = "session_event_limit_exceeded";
+
+  constructor(
+    public readonly sessionId: string,
+    public readonly maximum: number,
+  ) {
+    super(`session ${sessionId} exceeds the ${maximum} event job limit`);
+  }
+}
+
+export class ActivitySessionBusyError extends Error {
+  readonly code = "session_busy";
+
+  constructor(public readonly sessionId: string) {
+    super(`session ${sessionId} is already being reduced`);
+  }
+}
+
+export class ActivitySessionDeadlineError extends Error {
+  readonly code = "session_deadline_exceeded";
+
+  constructor(public readonly sessionId: string) {
+    super(`session ${sessionId} exceeded the activity job deadline`);
+  }
+}
+
+class StaleSessionReadError extends Error {}
 
 interface PersistedSpan {
   span_key: string;
@@ -100,8 +133,10 @@ export class PostgresActivityReducer {
   async resolveWorkspaceCutoff(
     workspaceId: string,
     normalizerVersion: string,
+    statementTimeoutMs?: number,
   ): Promise<bigint> {
     return await this.sql.begin(async (tx) => {
+      await setStatementTimeout(tx, statementTimeoutMs);
       await tx.unsafe("set local role sherlock_reducer");
       const rows = await tx.unsafe(
         `select coalesce(max(id), 0)::text as cutoff
@@ -120,11 +155,13 @@ export class PostgresActivityReducer {
     throughEventId: bigint;
     afterSessionId?: string | null;
     limit: number;
+    statementTimeoutMs?: number;
   }): Promise<string[]> {
     return await this.sql.begin(async (tx) => {
+      await setStatementTimeout(tx, options.statementTimeoutMs);
       await tx.unsafe("set local role sherlock_reducer");
       const rows = await tx.unsafe(
-        `select distinct e.session_id::text as session_id
+        `select distinct e.session_id as session_id
            from telemetry.events e
           where e.workspace_id = $1 and e.normalizer_version = $2
             and e.session_id is not null and e.id <= $3
@@ -146,113 +183,177 @@ export class PostgresActivityReducer {
   async reduceSession(
     options: ReduceSessionOptions,
   ): Promise<ReduceSessionResult> {
+    try {
+      return await this.reduceSessionBounded(options);
+    } catch (error) {
+      if (
+        error instanceof ActivitySessionDeadlineError ||
+        error instanceof Error && "code" in error && error.code === "57014"
+      ) {
+        throw new ActivitySessionDeadlineError(options.sessionId);
+      }
+      throw error;
+    }
+  }
+
+  private async reduceSessionBounded(
+    options: ReduceSessionOptions,
+  ): Promise<ReduceSessionResult> {
     const session = await this.loadSession(
       options.workspaceId,
       options.sessionId,
+      remainingStatementTimeout(options),
     );
-    const events = await this.loadEvents(options);
-    if (events.length === 0) {
-      return {
-        session_id: options.sessionId,
-        cutoff_event_id: null,
-        candidate_count: 0,
-        inserted_count: 0,
-        tombstone_count: 0,
-      };
-    }
-    const cutoff = events.at(-1)!.id;
-    const candidates = reduceActivity(options.sessionId, events);
-    return await this.sql.begin(async (tx) => {
-      await tx.unsafe("set local role sherlock_reducer");
-      await tx.unsafe(
-        "select pg_advisory_xact_lock(hashtextextended($1, 0))",
-        [JSON.stringify([
-          options.workspaceId,
-          options.activityVersion,
-          options.sessionId,
-        ])],
-      );
-      const previous = await latestSpans(
-        tx,
-        options.workspaceId,
-        options.sessionId,
-        options.activityVersion,
-        cutoff,
-      );
-      const previousByKey = new Map(
-        previous.map((span) => [span.span_key, span]),
-      );
-      const desiredByKey = new Map(
-        candidates.map((span) => [span.span_key, span]),
-      );
-      const revisions: PersistedSpan[] = [];
-      for (const candidate of candidates) {
-        const desired = persisted(candidate);
-        const prior = previousByKey.get(candidate.span_key);
-        if (!prior || !sameProjection(prior, desired)) revisions.push(desired);
-      }
-      for (const prior of previous) {
-        if (prior.is_tombstone || desiredByKey.has(prior.span_key)) continue;
-        revisions.push({
-          ...prior,
-          started_at: null,
-          ended_at: null,
-          start_event_id: null,
-          end_event_id: null,
-          is_tombstone: true,
-        });
-      }
-      if (revisions.length > 0) {
-        const rows = revisions.map((span) => ({
-          workspace_id: options.workspaceId,
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const events = await this.loadEvents(options);
+      if (events.length === 0) {
+        remainingStatementTimeout(options);
+        return {
           session_id: options.sessionId,
-          person_id: session.personId,
-          span_key: span.span_key,
-          activity_version: options.activityVersion,
-          valid_from_event_id: cutoff.toString(),
-          started_at: span.started_at,
-          ended_at: span.ended_at,
-          span_state: span.span_state,
-          activity_kind: span.activity_kind,
-          timing_basis: span.timing_basis,
-          confidence: span.confidence,
-          estimated_start: span.estimated_start,
-          estimated_end: span.estimated_end,
-          actor_role: span.actor_role,
-          project_key: span.project_key,
-          start_event_id: span.start_event_id?.toString() ?? null,
-          end_event_id: span.end_event_id?.toString() ?? null,
-          is_tombstone: span.is_tombstone,
-        }));
-        await tx`insert into analytics.activity_spans ${
-          tx(rows, ...SPAN_COLUMNS)
-        } on conflict (
-          workspace_id, activity_version, span_key, valid_from_event_id
-        ) do nothing`;
+          cutoff_event_id: null,
+          candidate_count: 0,
+          inserted_count: 0,
+          tombstone_count: 0,
+        };
       }
-      await assertExactRevisions(
-        tx,
-        options.workspaceId,
-        options.activityVersion,
-        cutoff,
-        revisions,
-      );
-      await this.hooks.beforeWriteCommit?.();
-      return {
-        session_id: options.sessionId,
-        cutoff_event_id: cutoff,
-        candidate_count: candidates.length,
-        inserted_count: revisions.length,
-        tombstone_count: revisions.filter((span) => span.is_tombstone).length,
-      };
-    });
+      const cutoff = events.at(-1)!.id;
+      remainingStatementTimeout(options);
+      const candidates = reduceActivity(options.sessionId, events);
+      remainingStatementTimeout(options);
+      try {
+        return await this.sql.begin(async (tx) => {
+          await setStatementTimeout(tx, remainingStatementTimeout(options));
+          await tx.unsafe("set local role sherlock_reducer");
+          await setStatementTimeout(tx, remainingStatementTimeout(options));
+          const locks = await tx.unsafe(
+            "select pg_try_advisory_xact_lock(hashtextextended($1, 0)) as acquired",
+            [JSON.stringify([
+              options.workspaceId,
+              options.activityVersion,
+              options.sessionId,
+            ])],
+          );
+          if (!locks[0].acquired) {
+            throw new ActivitySessionBusyError(options.sessionId);
+          }
+          await setStatementTimeout(tx, remainingStatementTimeout(options));
+          const visible = await tx.unsafe(
+            `select count(*)::text as count
+               from telemetry.events
+              where workspace_id = $1 and session_id = $2
+                and normalizer_version = $3 and id <= $4`,
+            [
+              options.workspaceId,
+              options.sessionId,
+              options.normalizerVersion,
+              options.throughEventId.toString(),
+            ],
+          );
+          if (BigInt(String(visible[0].count)) !== BigInt(events.length)) {
+            throw new StaleSessionReadError();
+          }
+          await setStatementTimeout(tx, remainingStatementTimeout(options));
+          const previous = await latestSpans(
+            tx,
+            options.workspaceId,
+            options.sessionId,
+            options.activityVersion,
+            cutoff,
+          );
+          const previousByKey = new Map(
+            previous.map((span) => [span.span_key, span]),
+          );
+          const desiredByKey = new Map(
+            candidates.map((span) => [span.span_key, span]),
+          );
+          const revisions: PersistedSpan[] = [];
+          for (const candidate of candidates) {
+            const desired = persisted(candidate);
+            const prior = previousByKey.get(candidate.span_key);
+            if (!prior || !sameProjection(prior, desired)) {
+              revisions.push(desired);
+            }
+          }
+          for (const prior of previous) {
+            if (prior.is_tombstone || desiredByKey.has(prior.span_key)) {
+              continue;
+            }
+            revisions.push({
+              ...prior,
+              started_at: null,
+              ended_at: null,
+              start_event_id: null,
+              end_event_id: null,
+              is_tombstone: true,
+            });
+          }
+          if (revisions.length > 0) {
+            await setStatementTimeout(tx, remainingStatementTimeout(options));
+            const rows = revisions.map((span) => ({
+              workspace_id: options.workspaceId,
+              session_id: options.sessionId,
+              person_id: session.personId,
+              span_key: span.span_key,
+              activity_version: options.activityVersion,
+              valid_from_event_id: cutoff.toString(),
+              started_at: span.started_at,
+              ended_at: span.ended_at,
+              span_state: span.span_state,
+              activity_kind: span.activity_kind,
+              timing_basis: span.timing_basis,
+              confidence: span.confidence,
+              estimated_start: span.estimated_start,
+              estimated_end: span.estimated_end,
+              actor_role: span.actor_role,
+              project_key: span.project_key,
+              start_event_id: span.start_event_id?.toString() ?? null,
+              end_event_id: span.end_event_id?.toString() ?? null,
+              is_tombstone: span.is_tombstone,
+            }));
+            await tx`insert into analytics.activity_spans ${
+              tx(rows, ...SPAN_COLUMNS)
+            }`;
+          }
+          await setStatementTimeout(tx, remainingStatementTimeout(options));
+          await assertExactRevisions(
+            tx,
+            options.workspaceId,
+            options.activityVersion,
+            cutoff,
+            revisions,
+          );
+          remainingStatementTimeout(options);
+          await this.hooks.beforeWriteCommit?.();
+          return {
+            session_id: options.sessionId,
+            cutoff_event_id: cutoff,
+            candidate_count: candidates.length,
+            inserted_count: revisions.length,
+            tombstone_count: revisions.filter((span) => span.is_tombstone)
+              .length,
+          };
+        });
+      } catch (error) {
+        if (error instanceof StaleSessionReadError && attempt < 2) continue;
+        if (
+          error instanceof ActivitySessionDeadlineError ||
+          error instanceof Error && "code" in error && error.code === "57014"
+        ) {
+          throw new ActivitySessionDeadlineError(options.sessionId);
+        }
+        throw error;
+      }
+    }
+    throw new Error("activity reducer exhausted stale-read retries");
   }
 
   private async loadSession(
     workspaceId: string,
     sessionId: string,
+    statementTimeoutMs?: number,
   ): Promise<{ personId: string }> {
     return await this.sql.begin(async (tx) => {
+      await setStatementTimeout(tx, statementTimeoutMs);
       await tx.unsafe("set local role sherlock_reducer");
       const rows = await tx.unsafe(
         `select person_id::text as person_id
@@ -274,7 +375,17 @@ export class PostgresActivityReducer {
     const pageSize = options.eventPageSize ?? 1_000;
     let after = 0n;
     while (true) {
+      const pageLimit = options.maxEventCount === undefined
+        ? pageSize
+        : Math.min(pageSize, options.maxEventCount - result.length + 1);
+      if (pageLimit <= 0) {
+        throw new ActivitySessionLimitError(
+          options.sessionId,
+          options.maxEventCount!,
+        );
+      }
       const page = await this.sql.begin(async (tx) => {
+        await setStatementTimeout(tx, remainingStatementTimeout(options));
         await tx.unsafe("set local role sherlock_reducer");
         return await tx.unsafe(
           `select id::text as id, workspace_id::text as workspace_id,
@@ -288,7 +399,7 @@ export class PostgresActivityReducer {
              from telemetry.events
             where workspace_id = $1 and session_id = $2
               and normalizer_version = $3 and id > $4 and id <= $5
-            order by id
+            order by telemetry.events.id
             limit $6`,
           [
             options.workspaceId,
@@ -296,15 +407,49 @@ export class PostgresActivityReducer {
             options.normalizerVersion,
             after.toString(),
             options.throughEventId.toString(),
-            pageSize,
+            pageLimit,
           ],
         );
       });
       result.push(...page.map(eventFromRow));
-      if (page.length < pageSize) return result;
+      if (
+        options.maxEventCount !== undefined &&
+        result.length > options.maxEventCount
+      ) {
+        throw new ActivitySessionLimitError(
+          options.sessionId,
+          options.maxEventCount,
+        );
+      }
+      if (page.length < pageLimit) return result;
       after = result.at(-1)!.id;
     }
   }
+}
+
+function remainingStatementTimeout(
+  options: ReduceSessionOptions,
+): number | undefined {
+  let timeout = options.statementTimeoutMs;
+  if (options.deadlineAtMs === undefined) return timeout;
+  const remaining = Math.floor(
+    options.deadlineAtMs - (options.now ?? (() => performance.now()))(),
+  );
+  if (remaining <= 0) {
+    throw new ActivitySessionDeadlineError(options.sessionId);
+  }
+  timeout = timeout === undefined ? remaining : Math.min(timeout, remaining);
+  return Math.max(1, timeout);
+}
+
+async function setStatementTimeout(
+  tx: TransactionSql,
+  milliseconds: number | undefined,
+): Promise<void> {
+  if (milliseconds === undefined) return;
+  await tx.unsafe("select set_config('statement_timeout', $1, true)", [
+    `${milliseconds}ms`,
+  ]);
 }
 
 async function latestSpans(
@@ -338,7 +483,7 @@ async function assertExactRevisions(
        from analytics.activity_spans
       where workspace_id = $1 and activity_version = $2
         and valid_from_event_id = $3 and span_key = any($4::text[])
-      order by span_key`,
+      order by span_key, id`,
     [
       workspaceId,
       activityVersion,
