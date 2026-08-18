@@ -291,14 +291,6 @@ describe("getPersonActivityStatus", () => {
 describe("interval and work evidence adapters", () => {
   const startMs = Date.parse("2026-08-17T16:10:00.000Z");
   const expected = { personId: "person-1", startMs, snapshot: "v1.snapshot-token" };
-  const coverage = {
-    evidence: "observed_events",
-    state: "partial",
-    reason: "event_presence_not_continuous_attention",
-    timing: "observed_evidence_window_not_duration",
-    filesAvailable: false,
-    filesReason: "tool_payload_not_projected",
-  };
 
   it("validates source-backed work rows", () => {
     const result = adaptIntervalEvidence({
@@ -306,19 +298,16 @@ describe("interval and work evidence adapters", () => {
       start: new Date(startMs).toISOString(),
       snapshot: expected.snapshot,
       work: [{
-        id: "s1:agent", sessionId: "s1", role: "agent", actorRoles: ["primary"],
-        roleBasis: "normalized_event", firstAt: new Date(startMs + 1000).toISOString(),
+        id: "s1:agent", sessionId: "s1", role: "agent",
+        firstAt: new Date(startMs + 1000).toISOString(),
         lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
-        summary: "Investigate the cursor", summaryTruncated: false, detailAvailable: true,
+        summary: "Investigate the cursor",
       }],
-      coverage,
     }, expected);
 
     expect(result.work[0]).toMatchObject({
       id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2,
-      detailAvailable: true,
     });
-    expect(result.coverage).toMatchObject({ filesAvailable: false });
   });
 
   it("preserves equal conversation text under distinct source event ids", () => {
@@ -333,17 +322,16 @@ describe("interval and work evidence adapters", () => {
       lastAt: new Date(startMs + 5000).toISOString(),
       eventCount: 2,
       items: [{
-        id: "e1", at: new Date(startMs + 2000).toISOString(), kind: "conversation",
-        role: "assistant", label: null, content: "Tracing it now", truncated: false,
+        id: "e1", at: new Date(startMs + 2000).toISOString(), role: "assistant",
+        content: "Tracing it now", truncated: false,
       }, {
-        id: "e2", at: new Date(startMs + 3000).toISOString(), kind: "conversation",
-        role: "assistant", label: null, content: "Tracing it now", truncated: false,
+        id: "e2", at: new Date(startMs + 3000).toISOString(), role: "assistant",
+        content: "Tracing it now", truncated: false,
       }],
       nextCursor: "cursor-2",
-      coverage,
     }, { ...expected, workId: "s1:agent", sessionId: "s1", role: "agent" });
 
-    expect(result.items[0]).toMatchObject({ kind: "conversation", role: "assistant" });
+    expect(result.items[0]).toMatchObject({ role: "assistant" });
     expect(result.items).toHaveLength(2);
     expect(result.items.map((item) => item.id)).toEqual(["e1", "e2"]);
     expect(result.nextCursor).toBe("cursor-2");
@@ -351,21 +339,18 @@ describe("interval and work evidence adapters", () => {
 
   it.each([
     ["unsupported semantic role", { role: "supervisor" }],
-    ["unavailable files claimed available", { coverage: { ...coverage, filesAvailable: true } }],
-    ["unsupported role basis", { workRoleBasis: "inferred" }],
   ])("rejects %s", (_label, mutation) => {
     const work = {
-      id: "s1:agent", sessionId: "s1", role: "agent", actorRoles: ["primary"],
-      roleBasis: mutation.workRoleBasis ?? "normalized_event",
+      id: "s1:agent", sessionId: "s1", role: "agent",
       firstAt: new Date(startMs + 1000).toISOString(),
       lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
-      summary: null, detailAvailable: true,
+      summary: null,
     };
     const source = {
       personId: expected.personId,
       start: new Date(startMs).toISOString(),
       snapshot: expected.snapshot,
-      work: [{ ...work, ...mutation }], coverage: mutation.coverage ?? coverage,
+      work: [{ ...work, ...mutation }],
     };
     expect(() => adaptIntervalEvidence(source, expected)).toThrow(FlameDataError);
   });

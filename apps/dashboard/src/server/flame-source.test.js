@@ -433,11 +433,7 @@ describe("Sherlock Flame payload", () => {
         first_at: new Date("2026-08-16T12:00:09.000Z"),
         last_at: new Date("2026-08-16T12:04:00.000Z"),
         event_count: 4,
-        actor_roles: ["unknown", "worker"],
-        role_basis: "resolved_parent",
         summary: "Inspect the query",
-        summary_byte_size: 17,
-        summary_excerpt_byte_size: 17,
       }]);
     source.transaction = (callback) => callback({ unsafe });
     const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
@@ -459,16 +455,8 @@ describe("Sherlock Flame payload", () => {
         sessionId,
         role: "subagent",
         eventCount: 4,
-        actorRoles: ["unknown", "worker"],
-        roleBasis: "resolved_parent",
         summary: "Inspect the query",
-        detailAvailable: true,
       }],
-      coverage: {
-        timing: "observed_evidence_window_not_duration",
-        filesAvailable: false,
-        filesReason: "tool_payload_not_projected",
-      },
     });
   });
 
@@ -483,50 +471,22 @@ describe("Sherlock Flame payload", () => {
       first_at: new Date("2026-08-16T12:00:00.000Z"),
       last_at: new Date("2026-08-16T12:00:03.000Z"),
       event_count: 2,
-      actor_roles: ["primary"],
-      role_basis: "normalized_event",
       summary: "Build it",
-      summary_byte_size: 8,
-      summary_excerpt_byte_size: 8,
     };
     const items = [{
       id: "41",
       observed_at: new Date("2026-08-16T12:00:01.000Z"),
       observed_at_microseconds: "1786881601000000",
-      event_kind: "message",
-      event_subtype: "user_message",
-      stored_actor_role: "primary",
       message_role: "user",
-      phase: null,
-      tool_call_id: null,
-      tool_name: null,
-      tool_status: null,
-      model: "gpt-5",
-      project_key: "sherlock",
-      repo_remote: null,
-      branch: null,
-      cwd: "/repo",
       content_byte_size: 8,
       content_excerpt: "Build it",
     }, {
       id: "42",
       observed_at: new Date("2026-08-16T12:00:02.000Z"),
       observed_at_microseconds: "1786881602000000",
-      event_kind: "tool_call",
-      event_subtype: "function_call",
-      stored_actor_role: "primary",
-      message_role: null,
-      phase: null,
-      tool_call_id: "call-1",
-      tool_name: "apply_patch",
-      tool_status: "completed",
-      model: "gpt-5",
-      project_key: "sherlock",
-      repo_remote: null,
-      branch: null,
-      cwd: "/repo",
-      content_byte_size: null,
-      content_excerpt: null,
+      message_role: "assistant",
+      content_byte_size: 12,
+      content_excerpt: "Patched it.",
     }];
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
@@ -548,7 +508,6 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[2][1].at(-1)).toBe(2);
     expect(detail.items).toEqual([expect.objectContaining({
       id: "41",
-      kind: "conversation",
       role: "user",
       content: "Build it",
       truncated: false,
@@ -561,7 +520,6 @@ describe("Sherlock Flame payload", () => {
     expect(detail).toMatchObject({
       workId: `${sessionId}:agent`,
       eventCount: 2,
-      coverage: { filesAvailable: false },
     });
   });
 

@@ -661,7 +661,6 @@ input { font: inherit; }
 
 .flame-detail__back {
   display: inline-flex;
-  min-height: 44px;
   align-items: center;
   gap: 6px;
   padding: 0;
@@ -687,12 +686,6 @@ input { font: inherit; }
 }
 
 .flame-detail__back:hover { color: var(--flame-ink); }
-
-.flame-detail__back:focus-visible {
-  color: var(--flame-ink);
-  outline: 2px solid var(--flame-selected);
-  outline-offset: 3px;
-}
 
 .flame-detail__close:hover {
   color: var(--flame-ink);
@@ -744,7 +737,6 @@ input { font: inherit; }
 .flame-detail__state button,
 .flame-detail__more {
   min-width: 88px;
-  min-height: 44px;
   border: 1px solid var(--flame-rule);
   background: none;
   color: var(--flame-ink);
@@ -754,13 +746,6 @@ input { font: inherit; }
 .flame-detail__state button:hover,
 .flame-detail__more:hover {
   border-color: var(--flame-ink);
-}
-
-.flame-detail__state button:focus-visible,
-.flame-detail__more:focus-visible {
-  border-color: var(--flame-ink);
-  outline: 2px solid var(--flame-selected);
-  outline-offset: 2px;
 }
 
 .flame-detail__error { color: var(--flame-stale); }
@@ -787,8 +772,7 @@ input { font: inherit; }
 
 .flame-detail__work li { border-bottom: 1px solid var(--flame-rule); }
 
-.flame-detail__work button,
-.flame-detail__work li > div {
+.flame-detail__work button {
   display: grid;
   width: 100%;
   min-height: 60px;
@@ -805,12 +789,6 @@ input { font: inherit; }
 .flame-detail__work button { cursor: pointer; }
 
 .flame-detail__work button:hover { background: var(--flame-surface-selected); }
-
-.flame-detail__work button:focus-visible {
-  background: var(--flame-surface-selected);
-  outline: 2px solid var(--flame-selected);
-  outline-offset: -2px;
-}
 
 .flame-detail__work-copy {
   display: grid;
@@ -858,7 +836,6 @@ input { font: inherit; }
 
 .flame-detail__work-expander {
   width: 100%;
-  min-height: 44px;
   margin-top: 8px;
   padding: 0;
   border: 0;
@@ -873,12 +850,6 @@ input { font: inherit; }
 
 .flame-detail__work-expander:hover {
   color: var(--flame-ink);
-}
-
-.flame-detail__work-expander:focus-visible {
-  color: var(--flame-ink);
-  outline: 2px solid var(--flame-selected);
-  outline-offset: 2px;
 }
 
 .flame-detail__disclosure {
@@ -901,12 +872,6 @@ input { font: inherit; }
 
 .flame-detail__disclosure summary:hover {
   background: var(--flame-surface-selected);
-}
-
-.flame-detail__disclosure summary:focus-visible {
-  background: var(--flame-surface-selected);
-  outline: 2px solid var(--flame-selected);
-  outline-offset: -2px;
 }
 
 .flame-detail__disclosure > div {
@@ -933,56 +898,6 @@ input { font: inherit; }
   font-variant-numeric: tabular-nums;
 }
 
-.flame-detail__activity { padding: 0; }
-
-.flame-detail__activity-toggle {
-  display: flex;
-  width: 100%;
-  min-height: 58px;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 24px;
-  border: 0;
-  background: none;
-  color: var(--flame-muted);
-  cursor: pointer;
-  font: inherit;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: .11em;
-  text-align: left;
-  text-transform: uppercase;
-}
-
-.flame-detail__activity-toggle > span:last-child {
-  color: var(--flame-ink);
-  font-size: 18px;
-  font-weight: 400;
-}
-
-.flame-detail__activity-toggle:hover {
-  background: var(--flame-surface-selected);
-  color: var(--flame-ink);
-}
-
-.flame-detail__activity-toggle:focus-visible {
-  background: var(--flame-surface-selected);
-  color: var(--flame-ink);
-  outline: 2px solid var(--flame-selected);
-  outline-offset: -2px;
-}
-
-.flame-detail__activity > .flame-detail__empty,
-.flame-detail__activity > .flame-detail__items,
-.flame-detail__activity > .flame-detail__more,
-.flame-detail__activity > .flame-detail__more-error {
-  width: calc(100% - 48px);
-  margin-right: 24px;
-  margin-left: 24px;
-}
-
-.flame-detail__activity > .flame-detail__more { margin-bottom: 20px; }
-
 .flame-detail__items {
   margin: 14px 0 0;
   padding: 0;
@@ -1005,69 +920,21 @@ input { font: inherit; }
   text-transform: uppercase;
 }
 
-.flame-detail__items li[data-kind="conversation"][data-role="user"] header strong {
+.flame-detail__items li[data-role="user"] header strong {
   color: var(--flame-message-user);
 }
 
-.flame-detail__items li[data-kind="conversation"][data-role="assistant"] header strong {
+.flame-detail__items li[data-role="assistant"] header strong {
   color: var(--flame-message-assistant);
 }
 
-.flame-detail__items li[data-kind="tool"] header strong { color: var(--flame-subagent); }
-.flame-detail__items li[data-kind="context"] header strong { color: var(--flame-unclassified); }
 .flame-detail__items header span { margin-left: auto; color: var(--flame-partial); }
-.flame-detail__items b { display: block; margin-top: 7px; font-size: 12px; }
 
 .flame-detail__items p {
   margin: 8px 0 0;
   overflow-wrap: anywhere;
   line-height: 1.55;
   white-space: pre-wrap;
-}
-
-.flame-detail__items small {
-  display: block;
-  margin-top: 7px;
-  color: var(--flame-muted);
-  font-size: 9px;
-  letter-spacing: .05em;
-  text-transform: uppercase;
-}
-
-.flame-detail__metadata {
-  display: grid;
-  gap: 5px;
-  margin: 10px 0 0;
-  color: var(--flame-muted);
-  font-size: 11px;
-}
-
-.flame-detail__metadata > div {
-  display: grid;
-  grid-template-columns: 104px minmax(0, 1fr);
-  gap: 10px;
-}
-
-.flame-detail__metadata dt { color: var(--flame-muted); }
-.flame-detail__metadata dd { margin: 0; overflow-wrap: anywhere; color: var(--flame-ink); }
-
-.flame-detail__event-details { margin-top: 9px; color: var(--flame-muted); }
-
-.flame-detail__event-details summary {
-  min-height: 32px;
-  cursor: pointer;
-  font-size: 10px;
-  line-height: 32px;
-}
-
-.flame-detail__event-details summary:hover {
-  color: var(--flame-ink);
-}
-
-.flame-detail__event-details summary:focus-visible {
-  color: var(--flame-ink);
-  outline: 2px solid var(--flame-selected);
-  outline-offset: 2px;
 }
 
 .flame-detail__more { width: 100%; margin-top: 14px; }
@@ -1148,17 +1015,7 @@ input { font: inherit; }
   .flame-detail__header,
   .flame-detail__section { padding-right: 18px; padding-left: 18px; }
 
-  .flame-detail__activity { padding-right: 0; padding-left: 0; }
-  .flame-detail__activity-toggle,
   .flame-detail__disclosure summary { padding-right: 18px; padding-left: 18px; }
-  .flame-detail__activity > .flame-detail__empty,
-  .flame-detail__activity > .flame-detail__items,
-  .flame-detail__activity > .flame-detail__more,
-  .flame-detail__activity > .flame-detail__more-error {
-    width: calc(100% - 36px);
-    margin-right: 18px;
-    margin-left: 18px;
-  }
   .flame-detail__disclosure > div { padding-right: 18px; padding-left: 18px; }
 }
 

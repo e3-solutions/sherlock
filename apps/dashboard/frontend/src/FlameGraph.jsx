@@ -307,21 +307,14 @@ function roleLabel(role) {
   return role === "agent" ? "Agent" : role === "subagent" ? "Subagent" : "Unclassified";
 }
 
-function EvidenceCoverage({ coverage }) {
-  if (!coverage) return null;
+function EvidenceLimits() {
   return (
     <details className="flame-detail__disclosure">
       <summary>Evidence limits</summary>
       <div>
         <p>Times mark the first and last observed source events, not continuous activity.</p>
         <p>Truncated means Sherlock is showing only the stored database excerpt (up to 1,024 UTF-8 bytes), not the full source content.</p>
-        {!coverage.filesAvailable && (
-          <p>
-            Verified file-touch evidence is unavailable because tool payloads are not projected as
-            structured canonical fields. Paths in message excerpts are conversation text, not proof
-            of file access or change.
-          </p>
-        )}
+        <p>File-touch evidence is unavailable because tool payloads are not canonical fields.</p>
       </div>
     </details>
   );
@@ -379,23 +372,12 @@ function IntervalOverview({
             <small>{work.eventCount} {work.eventCount === 1 ? "event" : "events"}</small>
           </span>
         </span>
-        {work.detailAvailable && <span className="flame-detail__chevron" aria-hidden="true">›</span>}
+        <span className="flame-detail__chevron" aria-hidden="true">›</span>
       </>
     );
     return (
       <li key={work.id}>
-        {work.detailAvailable ? (
-          <button
-            type="button"
-            data-work-id={work.id}
-            aria-label={`Open ${roleLabel(work.role)} session evidence from ${formatTime(work.firstAtMs)} to ${formatTime(work.lastAtMs)}`}
-            onClick={() => onOpenWork(work)}
-          >
-            {contents}
-          </button>
-        ) : (
-          <div>{contents}</div>
-        )}
+        <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
       </li>
     );
   }
@@ -461,7 +443,6 @@ function IntervalOverview({
               </>
             )}
           </section>
-          <EvidenceCoverage coverage={evidence.coverage} />
         </div>
       )}
     </div>
@@ -479,9 +460,6 @@ function WorkDetail({
   closing,
 }) {
   const headingId = `flame-work-${work.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const [showActivity, setShowActivity] = useState(false);
-  const conversation = evidence.items.filter(({ kind }) => kind === "conversation");
-  const activity = evidence.items.filter(({ kind }) => kind !== "conversation");
   return (
     <div className="flame-detail__view" data-view="work">
       <header className="flame-detail__header flame-detail__header--work">
@@ -517,12 +495,12 @@ function WorkDetail({
         <div className="flame-detail__body">
           <section className="flame-detail__section" aria-labelledby={`${headingId}-conversation`}>
             <h3 id={`${headingId}-conversation`}>Conversation</h3>
-            {conversation.length === 0 ? (
+            {evidence.items.length === 0 ? (
               <p className="flame-detail__empty">No stored conversation turns were observed for this work row.</p>
             ) : (
               <ol className="flame-detail__items">
-                {conversation.map((item) => (
-                  <li key={item.id} data-kind={item.kind} data-role={item.role}>
+                {evidence.items.map((item) => (
+                  <li key={item.id} data-role={item.role}>
                     <header>
                       <strong>{item.role}</strong>
                       <time dateTime={new Date(item.atMs).toISOString()}>{formatTime(item.atMs)}</time>
@@ -549,53 +527,7 @@ function WorkDetail({
               More session evidence could not be loaded. Try again.
             </p>
           )}
-          <section className="flame-detail__section flame-detail__activity" aria-labelledby={`${headingId}-activity`}>
-            <button
-              type="button"
-              className="flame-detail__activity-toggle"
-              id={`${headingId}-activity`}
-              aria-expanded={showActivity}
-              onClick={() => setShowActivity((shown) => !shown)}
-            >
-              <span>Activity log</span>
-              <span aria-hidden="true">{showActivity ? "−" : "+"}</span>
-            </button>
-            {showActivity && (activity.length === 0 ? (
-              <p className="flame-detail__empty">No tool or system events were observed for this session.</p>
-            ) : (
-              <ol className="flame-detail__items flame-detail__items--activity">
-                {activity.map((item) => {
-                  const metadata = [
-                    ["Tool", item.toolName], ["Status", item.toolStatus], ["Phase", item.phase],
-                    ["Model", item.model], ["Project", item.projectKey], ["Repository", item.repoRemote],
-                    ["Branch", item.branch], ["Working directory", item.cwd],
-                    ["Tool call", item.toolCallId], ["Actor role", item.actorRole],
-                  ].filter(([, value]) => value);
-                  return (
-                    <li key={item.id} data-kind={item.kind}>
-                      <header>
-                        <strong>{item.label ?? item.kind}</strong>
-                        <time dateTime={new Date(item.atMs).toISOString()}>{formatTime(item.atMs)}</time>
-                        {item.truncated && <span>Truncated</span>}
-                      </header>
-                      {item.content && <p>{item.content}</p>}
-                      {metadata.length > 0 && (
-                        <details className="flame-detail__event-details">
-                          <summary>Event details</summary>
-                          <dl className="flame-detail__metadata">
-                            {metadata.map(([label, value]) => (
-                              <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
-                            ))}
-                          </dl>
-                        </details>
-                      )}
-                    </li>
-                  );
-                })}
-              </ol>
-            ))}
-          </section>
-          <EvidenceCoverage coverage={evidence.coverage} />
+          <EvidenceLimits />
         </div>
       )}
     </div>
@@ -670,7 +602,7 @@ function PersonLane({
   );
 
   const select = (point) => {
-    onSelect(person, point, laneRef.current?.querySelector('[role="application"]'));
+    onSelect(person, point);
   };
 
   const handleClick = (event) => {
@@ -855,8 +787,6 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
-  const selectionOriginRef = useRef(null);
-  const returnWorkIdRef = useRef(null);
   const workRequestRef = useRef(null);
   const [selection, setSelection] = useState(null);
   const [activeTooltipPersonId, setActiveTooltipPersonId] = useState(null);
@@ -866,10 +796,10 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const [intervalRevision, setIntervalRevision] = useState(0);
   const [workRevision, setWorkRevision] = useState(0);
   const [intervalEvidence, setIntervalEvidence] = useState({
-    state: "idle", work: [], coverage: null, workIncomplete: false,
+    state: "idle", work: [], workIncomplete: false,
   });
   const [workEvidence, setWorkEvidence] = useState({
-    state: "idle", items: [], coverage: null, nextCursor: null,
+    state: "idle", items: [], nextCursor: null,
   });
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
   const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
@@ -908,11 +838,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     setDetailClosing(false);
     setSelection(null);
     setDrawerView({ screen: "overview" });
-    requestAnimationFrame(() => {
-      const target = selectionOriginRef.current;
-      if (target?.isConnected) target.focus();
-      else peopleScrollRef.current?.focus();
-    });
+    requestAnimationFrame(() => peopleScrollRef.current?.focus());
   }, []);
 
   const handleDetailAnimationEnd = (event) => {
@@ -942,14 +868,14 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
       setIntervalEvidence({
-        state: "idle", work: [], coverage: null, workIncomplete: false,
+        state: "idle", work: [], workIncomplete: false,
       });
       return undefined;
     }
 
     const controller = new AbortController();
     setIntervalEvidence({
-      state: "loading", work: [], coverage: null, workIncomplete: false,
+      state: "loading", work: [], workIncomplete: false,
     });
     const query = new URLSearchParams({
       personId: selectedPerson.id,
@@ -984,7 +910,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       .catch(() => {
         if (!controller.signal.aborted) {
           setIntervalEvidence({
-            state: "error", work: [], coverage: null, workIncomplete: false,
+            state: "error", work: [], workIncomplete: false,
           });
         }
       });
@@ -994,14 +920,14 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   useEffect(() => {
     if (!selectedPerson || !selectedPoint || drawerView.screen !== "work") {
       workRequestRef.current?.abort();
-      setWorkEvidence({ state: "idle", items: [], coverage: null, nextCursor: null });
+      setWorkEvidence({ state: "idle", items: [], nextCursor: null });
       return undefined;
     }
 
     const controller = new AbortController();
     workRequestRef.current?.abort();
     workRequestRef.current = controller;
-    setWorkEvidence({ state: "loading", items: [], coverage: null, nextCursor: null });
+    setWorkEvidence({ state: "loading", items: [], nextCursor: null });
     const query = new URLSearchParams({
       personId: selectedPerson.id,
       start: new Date(selectedPoint.startMs).toISOString(),
@@ -1032,7 +958,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       })
       .catch(() => {
         if (!controller.signal.aborted) {
-          setWorkEvidence({ state: "error", items: [], coverage: null, nextCursor: null });
+          setWorkEvidence({ state: "error", items: [], nextCursor: null });
         }
       });
     return () => controller.abort();
@@ -1047,11 +973,9 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     workRevision,
   ]);
 
-  const selectInterval = (person, point, origin) => {
+  const selectInterval = (person, point) => {
     detailClosingRef.current = false;
     setDetailClosing(false);
-    selectionOriginRef.current = origin;
-    returnWorkIdRef.current = null;
     setShowAdditionalWork(false);
     setDrawerView({ screen: "overview" });
     setSelection({ personId: person.id, startMs: point.startMs });
@@ -1063,10 +987,6 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     ));
   }, []);
 
-  const closeDetail = () => {
-    beginCloseDetail();
-  };
-
   const openWork = (work) => {
     setDrawerView({
       screen: "work",
@@ -1077,18 +997,10 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       lastAtMs: work.lastAtMs,
       eventCount: work.eventCount,
     });
-    requestAnimationFrame(() => detailRef.current?.focus());
   };
 
   const backToOverview = () => {
-    returnWorkIdRef.current = drawerView.workId;
     setDrawerView({ screen: "overview" });
-    requestAnimationFrame(() => {
-      const buttons = detailRef.current?.querySelectorAll("[data-work-id]") ?? [];
-      const target = [...buttons].find(({ dataset }) => dataset.workId === returnWorkIdRef.current);
-      target?.focus();
-      returnWorkIdRef.current = null;
-    });
   };
 
   const loadMoreWork = async () => {
@@ -1209,7 +1121,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
               stale={stale}
               closing={detailClosing}
               onBack={backToOverview}
-              onClose={closeDetail}
+              onClose={beginCloseDetail}
               onRetry={() => setWorkRevision((revision) => revision + 1)}
               onLoadMore={loadMoreWork}
             />
@@ -1221,7 +1133,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
               evidence={intervalEvidence}
               stale={stale}
               closing={detailClosing}
-              onClose={closeDetail}
+              onClose={beginCloseDetail}
               onRetry={() => setIntervalRevision((revision) => revision + 1)}
               onOpenWork={openWork}
               showAdditionalWork={showAdditionalWork}

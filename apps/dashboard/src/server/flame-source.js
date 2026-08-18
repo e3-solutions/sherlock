@@ -373,7 +373,7 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
 const DETAIL_ACTIVITY_COLUMNS = `,
          e.actor_role stored_actor_role,
          e.canonical_scope_key, e.logical_event_key, e.turn_id,
-         e.message_role, e.phase,
+         e.message_role,
          e.native_item_id source_native_item_id,
          e.content_sha256,
          nr.batch_id source_batch_id, nr.record_index source_record_index,
@@ -386,13 +386,11 @@ const DETAIL_ACTIVITY_COLUMNS = `,
          ib.start_offset source_batch_start_offset,
          ib.end_offset source_batch_end_offset,
          ib.record_count source_batch_record_count,
-         e.tool_call_id, e.tool_name, e.tool_status,
-         e.model, e.project_key, e.repo_remote, e.branch, e.cwd,
          e.content_byte_size, e.content_excerpt`;
 
 const DETAIL_EVENT_COLUMNS = `, id, event_kind, event_subtype,
          stored_actor_role, canonical_scope_key, logical_event_key, turn_id,
-         message_role, phase,
+         message_role,
          source_native_item_id,
          content_sha256, source_batch_id, source_record_index,
          source_start_offset, source_end_offset,
@@ -401,8 +399,6 @@ const DETAIL_EVENT_COLUMNS = `, id, event_kind, event_subtype,
          generation_key, generation_seq,
          source_batch_start_offset, source_batch_end_offset,
          source_batch_record_count,
-         tool_call_id, tool_name, tool_status,
-         model, project_key, repo_remote, branch, cwd,
          content_byte_size, content_excerpt`;
 
 function canonicalActivityEvidenceCte() {
@@ -563,24 +559,15 @@ with p as materialized (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
          count(*)::bigint event_count,
-         array_agg(distinct stored_actor_role order by stored_actor_role) actor_roles,
-         case when bool_or(stored_actor_role = 'unknown' and actor_role = 'worker')
-              then 'resolved_parent' else 'normalized_event' end role_basis,
          (array_agg(content_excerpt order by observed_at, id) filter (
            where event_subtype = 'user_message'
              and message_role = 'user' and content_excerpt is not null
-         ))[1] summary,
-         (array_agg(content_byte_size order by observed_at, id) filter (
-           where event_subtype = 'user_message'
-             and message_role = 'user' and content_excerpt is not null
-         ))[1] summary_byte_size
+         ))[1] summary
     from bucket_events
    group by session_id, semantic_role
 )
 select session_id::text session_id, semantic_role, first_at, last_at,
-       event_count, actor_roles, role_basis, summary,
-       summary_byte_size,
-       octet_length(coalesce(summary, ''))::bigint summary_excerpt_byte_size
+       event_count, summary
   from grouped
  order by first_at, session_id, semantic_role
  limit $10
@@ -622,8 +609,10 @@ with p as materialized (
 ), selected as (
   select bucket_events.*,
          (extract(epoch from bucket_events.observed_at) * 1000000)::bigint observed_at_microseconds
-    from bucket_events cross join p
+   from bucket_events cross join p
    where bucket_events.semantic_role = p.semantic_role
+     and bucket_events.event_kind in ('message', 'agent_message')
+     and bucket_events.message_role in ('user', 'assistant')
      and (
        (extract(epoch from bucket_events.observed_at) * 1000000)::bigint,
        bucket_events.id
@@ -632,10 +621,8 @@ with p as materialized (
    limit $14
 )
 select selected.id::text id, selected.observed_at,
-       selected.observed_at_microseconds, selected.event_kind,
-       selected.event_subtype, selected.stored_actor_role, message_role,
-       phase, tool_call_id, tool_name, tool_status, model,
-       project_key, repo_remote, branch, cwd, content_byte_size, content_excerpt
+       selected.observed_at_microseconds, message_role,
+       content_byte_size, content_excerpt
   from selected
  order by selected.observed_at, selected.id
 `;
@@ -770,17 +757,6 @@ export function decodeWorkCursor(cursor) {
   }
 }
 
-function detailCoverage() {
-  return {
-    evidence: "observed_events",
-    state: "partial",
-    reason: "event_presence_not_continuous_attention",
-    timing: "observed_evidence_window_not_duration",
-    filesAvailable: false,
-    filesReason: "tool_payload_not_projected",
-  };
-}
-
 function parseWorkLimit(value) {
   if (value === null || value === undefined || value === "") {
     return DEFAULT_WORK_DETAIL_LIMIT;
@@ -845,53 +821,22 @@ function workFromRow(row) {
     lastAt: asDate(row.last_at).toISOString(),
     eventCount: count(row.event_count),
     summary,
-    summaryTruncated: summary === null
-      ? false
-      : count(row.summary_byte_size) > count(row.summary_excerpt_byte_size),
-    actorRoles: Array.isArray(row.actor_roles)
-      ? row.actor_roles.map(String)
-      : [],
-    roleBasis: String(row.role_basis),
-    detailAvailable: count(row.event_count) > 0,
   };
 }
 
 function detailItemFromRow(row) {
-  const eventKind = String(row.event_kind);
-  const kind = eventKind === "message" || eventKind === "agent_message"
-    ? "conversation"
-    : eventKind === "tool_call" || eventKind === "tool_result"
-    ? "tool"
-    : "context";
   const content = row.content_excerpt === null || row.content_excerpt === undefined
     ? ""
     : String(row.content_excerpt);
   const contentBytes = row.content_byte_size === null || row.content_byte_size === undefined
     ? 0
     : count(row.content_byte_size);
-  const label = kind === "tool"
-    ? String(row.tool_name ?? row.event_subtype ?? eventKind)
-    : String(row.event_subtype ?? eventKind);
   return {
     id: String(row.id),
     at: asDate(row.observed_at).toISOString(),
-    kind,
-    role: kind === "conversation" && row.message_role !== null
-      ? String(row.message_role)
-      : null,
-    actorRole: row.stored_actor_role === null ? null : String(row.stored_actor_role),
-    phase: row.phase === null ? null : String(row.phase),
-    label,
+    role: String(row.message_role),
     content,
     truncated: contentBytes > Buffer.byteLength(content, "utf8"),
-    toolName: row.tool_name === null ? null : String(row.tool_name),
-    toolStatus: row.tool_status === null ? null : String(row.tool_status),
-    toolCallId: row.tool_call_id === null ? null : String(row.tool_call_id),
-    model: row.model === null ? null : String(row.model),
-    projectKey: row.project_key === null ? null : String(row.project_key),
-    repoRemote: row.repo_remote === null ? null : String(row.repo_remote),
-    branch: row.branch === null ? null : String(row.branch),
-    cwd: row.cwd === null ? null : String(row.cwd),
   };
 }
 
@@ -1073,7 +1018,6 @@ export class DirectFlameSource {
         start: startAt.toISOString(),
         snapshot,
         work: work.map(workFromRow),
-        coverage: detailCoverage(),
       };
     });
   }
@@ -1161,7 +1105,6 @@ export class DirectFlameSource {
         eventCount: header.eventCount,
         items: pageRows.map(detailItemFromRow),
         nextCursor,
-        coverage: detailCoverage(),
       };
     });
   }

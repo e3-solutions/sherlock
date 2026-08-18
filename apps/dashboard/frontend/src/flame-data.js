@@ -284,35 +284,7 @@ export function adaptFlamePayload(value) {
 }
 
 const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
-const ACTOR_ROLES = ["primary", "worker", "guardian", "unknown"];
-const ROLE_BASES = ["normalized_event", "resolved_parent"];
-const DETAIL_KINDS = ["conversation", "tool", "context"];
 const CONVERSATION_ROLES = ["user", "assistant"];
-
-function adaptCoverage(value, path) {
-  const coverage = requireObject(value, path);
-  const evidence = requireEnum(coverage.evidence, ["observed_events"], `${path}.evidence`);
-  const state = requireEnum(coverage.state, ["partial"], `${path}.state`);
-  const reason = requireEnum(
-    coverage.reason,
-    ["event_presence_not_continuous_attention"],
-    `${path}.reason`,
-  );
-  const timing = requireEnum(
-    coverage.timing,
-    ["observed_evidence_window_not_duration"],
-    `${path}.timing`,
-  );
-  if (requireBoolean(coverage.filesAvailable, `${path}.filesAvailable`) !== false) {
-    fail(`${path}.filesAvailable`, "false for the current evidence contract");
-  }
-  const filesReason = requireEnum(
-    coverage.filesReason,
-    ["tool_payload_not_projected"],
-    `${path}.filesReason`,
-  );
-  return { evidence, state, reason, timing, filesAvailable: false, filesReason };
-}
 
 /** Validates the bounded, snapshot-pinned interval overview response. */
 export function adaptIntervalEvidence(value, expected) {
@@ -334,13 +306,6 @@ export function adaptIntervalEvidence(value, expected) {
     const lastAtMs = requireBucketDate(item.lastAt, `${path}.lastAt`, startMs);
     if (lastAtMs < firstAtMs) fail(`${path}.lastAt`, "at or after firstAt");
     previousWorkAt = requireChronological(previousWorkAt, firstAtMs, `${path}.firstAt`);
-    if (!Array.isArray(item.actorRoles) || item.actorRoles.length === 0) {
-      fail(`${path}.actorRoles`, "a nonempty array");
-    }
-    const actorRoles = item.actorRoles.map((role, roleIndex) => (
-      requireEnum(role, ACTOR_ROLES, `${path}.actorRoles[${roleIndex}]`)
-    ));
-    if (new Set(actorRoles).size !== actorRoles.length) fail(`${path}.actorRoles`, "unique");
     const summary = requireNullableString(item.summary, `${path}.summary`);
     return {
       id,
@@ -349,20 +314,11 @@ export function adaptIntervalEvidence(value, expected) {
       lastAtMs,
       eventCount: requirePositiveCount(item.eventCount, `${path}.eventCount`),
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
-      actorRoles,
-      roleBasis: requireEnum(item.roleBasis, ROLE_BASES, `${path}.roleBasis`),
       summary,
-      summaryTruncated: summary === null
-        ? false
-        : requireBoolean(item.summaryTruncated, `${path}.summaryTruncated`),
-      detailAvailable: requireBoolean(item.detailAvailable, `${path}.detailAvailable`),
     };
   });
 
-  return {
-    work,
-    coverage: adaptCoverage(payload.coverage, "interval evidence.coverage"),
-  };
+  return { work };
 }
 
 /** Validates one bounded page of chronological work/session evidence. */
@@ -390,29 +346,14 @@ export function adaptWorkEvidence(value, expected) {
     ids.add(id);
     const atMs = requireBucketDate(item.at, `${path}.at`, expected.startMs);
     previousAt = requireChronological(previousAt, atMs, `${path}.at`);
-    const kind = requireEnum(item.kind, DETAIL_KINDS, `${path}.kind`);
-    const role = kind === "conversation"
-      ? requireEnum(item.role, CONVERSATION_ROLES, `${path}.role`)
-      : item.role === null ? null : requireNonemptyString(item.role, `${path}.role`);
+    const role = requireEnum(item.role, CONVERSATION_ROLES, `${path}.role`);
     if (typeof item.content !== "string") fail(`${path}.content`, "a string");
     return {
       id,
       atMs,
-      kind,
       role,
-      label: requireNullableString(item.label, `${path}.label`),
       content: item.content,
       truncated: requireBoolean(item.truncated, `${path}.truncated`),
-      actorRole: requireNullableString(item.actorRole, `${path}.actorRole`),
-      phase: requireNullableString(item.phase, `${path}.phase`),
-      toolName: requireNullableString(item.toolName, `${path}.toolName`),
-      toolStatus: requireNullableString(item.toolStatus, `${path}.toolStatus`),
-      toolCallId: requireNullableString(item.toolCallId, `${path}.toolCallId`),
-      model: requireNullableString(item.model, `${path}.model`),
-      projectKey: requireNullableString(item.projectKey, `${path}.projectKey`),
-      repoRemote: requireNullableString(item.repoRemote, `${path}.repoRemote`),
-      branch: requireNullableString(item.branch, `${path}.branch`),
-      cwd: requireNullableString(item.cwd, `${path}.cwd`),
     };
   });
 
@@ -427,7 +368,6 @@ export function adaptWorkEvidence(value, expected) {
       return role;
     })(),
     items,
-    coverage: adaptCoverage(payload.coverage, "work evidence.coverage"),
     nextCursor: payload.nextCursor === null
       ? null
       : requireNonemptyString(payload.nextCursor, "work evidence.nextCursor"),

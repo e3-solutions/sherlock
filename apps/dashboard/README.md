@@ -91,23 +91,17 @@ objects.
   snapshot-pinned aggregate; the interval endpoint does not resend unused prompt
   excerpts.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
-  lazily pages the selected row's canonical conversation, tool, lifecycle,
-  reasoning, and error evidence. The default page size is 50 and the maximum
-  is 100. Cursors are opaque and keyset pagination is ordered by effective
-  event timestamp and immutable event ID.
+  lazily pages the selected row's canonical user and assistant conversation
+  excerpts. The default page size is 50 and the maximum is 100. Cursors are
+  opaque and keyset pagination is ordered by effective event timestamp and
+  immutable event ID.
 - Every interval/work event is filtered with the aggregate's PostgreSQL MVCC
   snapshot token. Session-row visibility is additionally required for the
   unknown-role parent fallback. Queries are workspace scoped and parameterized,
   and no endpoint performs per-row database or Storage reads.
-- Normalized tool facts include tool name, call ID, status, timestamp, and
-  stored repository/context labels. Tool arguments, outputs, and file paths
-  are not projected as structured tool fields, so the API explicitly reports
-  that verified file-touch evidence is unavailable instead of inferring it.
-  Message excerpts can contain serialized tool text from a source, but those
-  strings are conversation evidence rather than proof that a file was accessed
-  or changed.
-- The response declares partial observed-event coverage because event presence
-  is exact evidence for a bucket but is not proof of continuous attention.
+- The detail drawer states that event presence is not proof of continuous
+  attention, stored excerpts may be truncated, and verified file-touch evidence
+  is unavailable because tool payloads are not canonical fields.
 - Aggregate and detail are separate database transactions, but interval and
   work evidence are pinned to the aggregate's immutable MVCC visibility token. This is a
   read-consistency boundary, not a durable pipeline publication cutoff: a later
