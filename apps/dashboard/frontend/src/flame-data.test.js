@@ -19,6 +19,7 @@ function person(overrides = {}) {
   return {
     id: "person-1",
     name: "Ada",
+    activeSeconds: 0,
     lastActivity: null,
     total: [3, 2, 1],
     buckets: buckets(),
@@ -72,6 +73,7 @@ describe("adaptFlamePayload", () => {
       null,
       null,
     ]);
+    expect(result.people.map(({ activeSeconds }) => activeSeconds)).toEqual([0, 0]);
     expect(result.coverage).toEqual({
       evidence: "observed_events",
       state: "partial",
@@ -158,6 +160,10 @@ describe("adaptFlamePayload", () => {
     ["non-string id", payload({ people: [person({ id: 17 })] })],
     ["blank id", payload({ people: [person({ id: "  " })] })],
     ["blank name", payload({ people: [person({ name: "" })] })],
+    ["missing active seconds", payload({ people: [person({ activeSeconds: undefined })] })],
+    ["negative active seconds", payload({ people: [person({ activeSeconds: -1 })] })],
+    ["fractional active seconds", payload({ people: [person({ activeSeconds: 1.5 })] })],
+    ["more than 24 hours active", payload({ people: [person({ activeSeconds: 86_401 })] })],
     ["missing last activity", payload({ people: [person({ lastActivity: undefined })] })],
     ["future last activity", payload({
       people: [person({ lastActivity: "2026-03-09T08:00:02.000Z" })],

@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(85);
+select plan(86);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -284,6 +284,19 @@ select ok(
       and pg_get_indexdef(i.indexrelid) like '%valid_from_event_id DESC, id DESC%'
   ),
   'same-cutoff activity corrections remain appendable and ordered by row id'
+);
+select ok(
+  exists (
+    select 1
+    from pg_index i
+    join pg_class c on c.oid = i.indexrelid
+    where c.oid = 'analytics.activity_spans_ended_window_idx'::regclass
+      and i.indisvalid
+      and pg_get_indexdef(i.indexrelid) like
+        '%(workspace_id, activity_version, ended_at, started_at) INCLUDE (span_key)%'
+      and pg_get_expr(i.indpred, i.indrelid) = '(NOT is_tombstone)'
+  ),
+  'rolling active-time reads can skip spans that ended before the window'
 );
 
 select ok(
@@ -619,7 +632,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 85,
+  'assertion_count', 86,
   'tables', 8,
   'private_bucket', 'telemetry-raw'
 ) as verification;

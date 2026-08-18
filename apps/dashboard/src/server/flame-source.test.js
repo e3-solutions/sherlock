@@ -31,6 +31,7 @@ function rowsFor(personId, overrides = {}) {
     day_other: 0,
     latest: null,
     latest_activity: null,
+    active_seconds: 0,
     ...overrides[index],
   }));
 }
@@ -56,6 +57,7 @@ describe("Sherlock Flame payload", () => {
       row.day_other = 1;
       row.latest = new Date("2026-08-16T12:09:00.000Z");
       row.latest_activity = new Date("2026-08-16T12:08:00.000Z");
+      row.active_seconds = 5_400;
     }
     const zero = rowsFor("zero");
     const payload = buildFlamePayload({
@@ -73,6 +75,7 @@ describe("Sherlock Flame payload", () => {
     expect(payload.people[0]).toMatchObject({
       id: "ada",
       lastActivity: "2026-08-16T12:08:00.000Z",
+      activeSeconds: 5_400,
       total: [1, 2, 1],
     });
     expect(payload.people[0].buckets[0]).toEqual([1, 2, 1, 3]);
@@ -91,6 +94,26 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
+  it("checks activity-span read access before reporting ready", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    const unsafe = vi.fn().mockResolvedValueOnce([{
+      backend_role: true,
+      read_only: true,
+      can_read_people: true,
+      can_read_events: true,
+      can_read_activity_spans: true,
+    }]);
+    source.transaction = (callback) => callback({ unsafe });
+
+    await expect(source.readiness()).resolves.toEqual({
+      status: "ok",
+      mode: "sherlock_backend_aggregate",
+    });
+    expect(unsafe.mock.calls[0][0]).toContain(
+      "'analytics.activity_spans', 'select'",
+    );
+  });
+
   it("rejects incomplete result grids", () => {
     expect(() => buildFlamePayload({
       rows: rowsFor("ada").slice(1),
@@ -101,7 +124,7 @@ describe("Sherlock Flame payload", () => {
     })).toThrow(FlameSourceError);
   });
 
-  it("uses observed event evidence instead of inferred continuous spans", () => {
+  it("keeps observed-event buckets while adding unioned completed active time", () => {
     expect(FLAME_SQL).toContain("e.workspace_id = p.workspace_id");
     expect(FLAME_SQL).toContain("date_bin(interval '10 minutes', a.observed_at");
     expect(FLAME_SQL).toContain("e.actor_role = 'primary'");
@@ -120,10 +143,38 @@ describe("Sherlock Flame payload", () => {
       "where canonical_rank = 1\n     and observed_at >= date_trunc('milliseconds', session_started_at)",
     );
     expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
-    expect(FLAME_SQL).not.toContain("analytics.activity_spans");
+    expect(FLAME_SQL).toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
     expect(FLAME_SQL).not.toContain("content_excerpt");
     expect(FLAME_SQL).not.toContain("email");
+  });
+
+  it("returns zero active seconds for roster members without eligible spans", () => {
+    const payload = buildFlamePayload({
+      rows: rowsFor("zero"),
+      roster: [{ person_id: "zero", display_name: "Zero Activity" }],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    });
+    expect(payload.people[0].activeSeconds).toBe(0);
+  });
+
+  it("rejects active time outside the 24-hour wall-clock bound or inconsistent rows", () => {
+    expect(() => buildFlamePayload({
+      rows: rowsFor("ada", { 0: { active_seconds: 86_401 } }),
+      roster: [{ person_id: "ada", display_name: "Ada" }],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    })).toThrow(FlameSourceError);
+    expect(() => buildFlamePayload({
+      rows: rowsFor("ada", { 1: { active_seconds: 1 } }),
+      roster: [{ person_id: "ada", display_name: "Ada" }],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    })).toThrow(FlameSourceError);
   });
 
   it("excludes stable smoke identities from the complete roster", () => {
@@ -187,6 +238,14 @@ describe("Sherlock Flame payload", () => {
       snapshot: PG_SNAPSHOT,
       read: READ,
     });
+    expect(unsafe.mock.calls[2][1]).toEqual([
+      source.workspaceId,
+      START.toISOString(),
+      "2026-08-17T12:00:00.000Z",
+      "sherlock.codex-rollout.v1",
+      READ.toISOString(),
+      "sherlock.activity.v1",
+    ]);
   });
 
   it("pins prompt details to the aggregate snapshot and echoes its receipt", async () => {

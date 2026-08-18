@@ -93,7 +93,7 @@ jobs:
         working-directory: apps/dashboard
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
-        run: pnpm test
+        run: pnpm test:postgres
 
       - name: Run activity reducer database integration test
         env:
