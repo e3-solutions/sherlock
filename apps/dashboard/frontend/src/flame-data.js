@@ -4,6 +4,7 @@ export const BUCKET_MS = 10 * 60 * 1000;
 const TOTAL_COUNT = 3;
 const BUCKET_VALUE_COUNT = 4;
 const AXIS_INTERVAL_BUCKETS = 12;
+const MAX_ACTIVE_SECONDS = 24 * 60 * 60;
 
 export class FlameDataError extends Error {
   constructor(message) {
@@ -160,6 +161,10 @@ export function adaptFlamePayload(value) {
     ids.add(id);
 
     const name = requireNonemptyString(person.name, `${path}.name`);
+    const activeSeconds = requireCount(person.activeSeconds, `${path}.activeSeconds`);
+    if (activeSeconds > MAX_ACTIVE_SECONDS) {
+      fail(`${path}.activeSeconds`, `no greater than ${MAX_ACTIVE_SECONDS}`);
+    }
     const lastActivityMs = requireDate(
       person.lastActivity,
       `${path}.lastActivity`,
@@ -202,7 +207,7 @@ export function adaptFlamePayload(value) {
       };
     });
 
-    return { id, name, lastActivityMs, total, buckets };
+    return { id, name, activeSeconds, lastActivityMs, total, buckets };
   });
 
   return {

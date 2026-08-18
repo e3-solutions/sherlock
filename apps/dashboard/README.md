@@ -20,9 +20,18 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   144 ten-minute UTC buckets. Distinct Sherlock execution sessions are counted
   per effective role and bucket; they are not native thread or duration counts.
   Metadata-only lifecycle records are not activity evidence.
-  The dashboard intentionally does not intersect `analytics.activity_spans`:
-  those spans are inferred lifecycle boundaries and can cross days, so treating
-  them as continuous attention overclaims what Sherlock observed.
+  The timeline intentionally does not use `analytics.activity_spans`: those
+  spans are inferred lifecycle boundaries and can cross days, so painting them
+  as continuous timeline evidence would overclaim what Sherlock observed.
+- The person rail's 24-hour active time is a separate product summary. It selects
+  the latest revision of each completed `sherlock.activity.v1` span, excludes
+  tombstones, provisional open spans, and automation, clips the remaining spans
+  to the dashboard window, and unions every overlap for the person before
+  summing. Nested tools and parallel agent or subagent sessions therefore never
+  count the same wall-clock second twice. The result remains an estimate from
+  inferred boundaries, not measured attention or CPU runtime. Newly normalized
+  events can appear before the asynchronous reducer publishes their spans, so a
+  later refresh may increase the active-time summary for the same window.
 - UUIDv7 `native_item_id` values provide the original creation timestamp for
   response items copied into a later rollout. Envelope timestamps remain the
   fallback for event types without a stable native item ID.
@@ -33,12 +42,13 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   older Codex payload encoded `source.subagent` as a string the v1 normalizer did
   not classify.
   Unknown root sessions remain Unclassified; stored event roles are not changed.
-- The person rail shows read-relative recency rather than daily role totals.
-  The API supplies each person's latest canonical activity timestamp, including
-  the current partial interval: green means activity in the last ten minutes,
-  yellow means activity ten to thirty minutes ago, and red means no activity in
-  the trailing thirty minutes. These are recent observed events, not a process
-  heartbeat or proof that an agent is still running.
+- The person rail shows unioned 24-hour active time alongside read-relative
+  recency rather than daily role totals. The API supplies each person's latest
+  canonical activity timestamp, including the current partial interval: green
+  means activity in the last ten minutes, yellow means activity ten to thirty
+  minutes ago, and red means no activity in the trailing thirty minutes. These
+  are recent observed events, not a process heartbeat or proof that an agent is
+  still running.
 - Canonically selected, non-replay primary-role submitted user messages with
   valid stored content supply prompt counts. Keyed records follow Sherlock's
   documented source-priority selection exactly, including the pinned normalizer

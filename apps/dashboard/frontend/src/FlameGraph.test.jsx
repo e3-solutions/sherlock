@@ -7,6 +7,7 @@ import FlameGraph, {
   getAvailableChartWidth,
   getBucketCenterX,
   getBucketTooltipPlacement,
+  formatActiveTime,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
 
@@ -34,6 +35,7 @@ function model() {
       {
         id: "ada",
         name: "Ada Lovelace",
+        activeSeconds: 13_320,
         lastActivity: "2026-08-15T06:56:00.000Z",
         total: [2, 1, 1],
         buckets: adaBuckets,
@@ -41,6 +43,7 @@ function model() {
       {
         id: "zero",
         name: "Zero Activity",
+        activeSeconds: 0,
         lastActivity: null,
         total: [0, 0, 0],
         buckets: emptyBuckets(),
@@ -58,6 +61,22 @@ describe("getAvailableChartWidth", () => {
 
   it("keeps the chart renderable when the rail consumes the measured width", () => {
     expect(getAvailableChartWidth(160, 164)).toBe(1);
+  });
+});
+
+describe("formatActiveTime", () => {
+  it.each([
+    [0, "0m active"],
+    [1, "<1m active"],
+    [59, "<1m active"],
+    [60, "1m active"],
+    [3_599, "59m active"],
+    [3_600, "1h active"],
+    [3_660, "1h 1m active"],
+    [13_320, "3h 42m active"],
+    [86_400, "24h active"],
+  ])("formats %i seconds as %s", (seconds, expected) => {
+    expect(formatActiveTime(seconds)).toBe(expected);
   });
 });
 
@@ -192,6 +211,22 @@ describe("FlameGraph", () => {
     expect(inactive).toHaveClass("flame-person-status--inactive");
     expect(container.querySelector(".flame-totals")).toBeNull();
     expect(screen.queryByLabelText("Ada Lovelace totals")).not.toBeInTheDocument();
+  });
+
+  it("shows each person's compact active time beneath their name", () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const rails = container.querySelectorAll(".flame-person-rail");
+
+    expect(within(rails[0]).getByRole("heading", { name: "Ada Lovelace" }))
+      .toBeInTheDocument();
+    expect(within(rails[0]).getByLabelText(
+      "3 hours 42 minutes active in the last 24 hours",
+    )).toHaveTextContent("3h 42m active");
+    expect(within(rails[1]).getByRole("heading", { name: "Zero Activity" }))
+      .toBeInTheDocument();
+    expect(within(rails[1]).getByLabelText(
+      "0 minutes active in the last 24 hours",
+    )).toHaveTextContent("0m active");
   });
 
   it("uses distinct solid role colors", () => {

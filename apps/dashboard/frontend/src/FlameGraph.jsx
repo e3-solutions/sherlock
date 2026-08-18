@@ -50,6 +50,33 @@ function formatPromptCount(value) {
   return `${value} ${value === 1 ? "prompt" : "prompts"}`;
 }
 
+export function formatActiveTime(seconds) {
+  if (seconds === 0) return "0m active";
+  if (seconds < 60) return "<1m active";
+
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours === 0) return `${minutes}m active`;
+  if (remainingMinutes === 0) return `${hours}h active`;
+  return `${hours}h ${remainingMinutes}m active`;
+}
+
+function describeActiveTime(seconds) {
+  if (seconds === 0) return "0 minutes active in the last 24 hours";
+  if (seconds < 60) return "Less than 1 minute active in the last 24 hours";
+
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  const parts = [];
+  if (hours > 0) parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
+  if (remainingMinutes > 0) {
+    parts.push(`${remainingMinutes} ${remainingMinutes === 1 ? "minute" : "minutes"}`);
+  }
+  return `${parts.join(" ")} active in the last 24 hours`;
+}
+
 function clamp(value, minimum, maximum) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
 }
@@ -395,7 +422,16 @@ function PersonRail({ person, headingId, readMs }) {
 
   return (
     <header className="flame-person-rail">
-      <h2 id={headingId} title={person.name}>{person.name}</h2>
+      <div className="flame-person-copy">
+        <h2 id={headingId} title={person.name}>{person.name}</h2>
+        <p
+          className="flame-person-active-time"
+          aria-label={describeActiveTime(person.activeSeconds)}
+          title={describeActiveTime(person.activeSeconds)}
+        >
+          {formatActiveTime(person.activeSeconds)}
+        </p>
+      </div>
       <span
         className={`flame-person-status flame-person-status--${status}`}
         role="img"
