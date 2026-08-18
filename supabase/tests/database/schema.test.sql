@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(86);
+select plan(87);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -297,6 +297,23 @@ select ok(
       and pg_get_expr(i.indpred, i.indrelid) = '(NOT is_tombstone)'
   ),
   'rolling active-time reads can skip spans that ended before the window'
+);
+select ok(
+  exists (
+    select 1
+    from pg_index i
+    join pg_class c on c.oid = i.indexrelid
+    where c.oid = 'telemetry.events_dashboard_timeline_idx'::regclass
+      and i.indisvalid
+      and pg_get_indexdef(i.indexrelid) like
+        '%workspace_id, normalizer_version, COALESCE(%'
+      and pg_get_indexdef(i.indexrelid) like
+        '%INCLUDE (id, session_id, actor_role, event_kind, event_subtype,%'
+      and pg_get_indexdef(i.indexrelid) like
+        '%canonical_scope_key, logical_event_key, source_priority, occurred_at, observed_at, server_received_at, native_item_id)%'
+      and pg_get_expr(i.indpred, i.indrelid) like '%(NOT is_replay)%'
+  ),
+  'dashboard timeline reads use the canonical timestamp window index'
 );
 
 select ok(
