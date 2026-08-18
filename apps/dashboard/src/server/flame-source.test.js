@@ -138,7 +138,10 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain(") < p.read_at");
     expect(FLAME_SQL).toContain("max(a.observed_at) latest_activity");
     expect(FLAME_SQL).toContain("where a.observed_at < p.end_at");
-    expect(FLAME_SQL).toContain("where canonical_rank = 1");
+    expect(FLAME_SQL).toContain("s.started_at session_started_at");
+    expect(FLAME_SQL).toContain(
+      "where canonical_rank = 1\n     and observed_at >= date_trunc('milliseconds', session_started_at)",
+    );
     expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
     expect(FLAME_SQL).toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");

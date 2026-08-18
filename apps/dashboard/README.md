@@ -34,7 +34,10 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   later refresh may increase the active-time summary for the same window.
 - UUIDv7 `native_item_id` values provide the original creation timestamp for
   response items copied into a later rollout. Envelope timestamps remain the
-  fallback for event types without a stable native item ID.
+  fallback for event types without a stable native item ID. Canonical activity
+  evidence must be at or after its owning Sherlock session's millisecond-aligned
+  start. Copied pre-start source facts remain immutable in telemetry, but they do
+  not make the later session active in an earlier dashboard bucket.
 - primary is Agent; worker and guardian are Subagent; unknown is Unclassified.
   automation is excluded. When a v1 event is `unknown` but its Sherlock session
   has a resolved parent, the dashboard presents it as Subagent: parent topology
@@ -87,7 +90,9 @@ exceed 1000.
 ## Local verification
 
 Run corepack pnpm install --frozen-lockfile, then pnpm check, pnpm test, and
-pnpm build.
+pnpm build. With the repository's isolated Supabase database running, set
+`SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to execute the dashboard SQL
+integration fixture.
 
 ## Railway deployment
 
