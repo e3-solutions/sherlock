@@ -292,6 +292,7 @@ export function adaptIntervalEvidence(value, expected) {
   requireEcho(payload, expected, "interval evidence");
   const { startMs } = expected;
   if (!Array.isArray(payload.work)) fail("interval evidence.work", "an array");
+  if (!Array.isArray(payload.prompts)) fail("interval evidence.prompts", "an array");
 
   const workIds = new Set();
   let previousWorkAt = null;
@@ -318,7 +319,30 @@ export function adaptIntervalEvidence(value, expected) {
     };
   });
 
-  return { work };
+  if (payload.prompts.length !== expected.promptCount) {
+    fail("interval evidence.prompts", `exactly ${expected.promptCount} canonical prompt rows`);
+  }
+  const promptIds = new Set();
+  let previousPromptAt = null;
+  const prompts = payload.prompts.map((value, index) => {
+    const path = `interval evidence.prompts[${index}]`;
+    const item = requireObject(value, path);
+    const id = requireNonemptyString(item.id, `${path}.id`);
+    if (promptIds.has(id)) fail(`${path}.id`, "unique");
+    promptIds.add(id);
+    const atMs = requireBucketDate(item.at, `${path}.at`, startMs);
+    previousPromptAt = requireChronological(previousPromptAt, atMs, `${path}.at`);
+    if (typeof item.content !== "string") fail(`${path}.content`, "a string");
+    return {
+      id,
+      sessionId: requireNonemptyString(item.sessionId, `${path}.sessionId`),
+      atMs,
+      content: item.content,
+      truncated: requireBoolean(item.truncated, `${path}.truncated`),
+    };
+  });
+
+  return { work, prompts };
 }
 
 /** Validates one bounded page of chronological work/session evidence. */

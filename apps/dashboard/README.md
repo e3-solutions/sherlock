@@ -82,14 +82,16 @@ objects.
   records, ambiguous candidates, and independently identified turns remain
   distinct evidence.
 - `GET /api/flame/interval?personId=<uuid>&start=<bucket ISO timestamp>&snapshot=<token>`
-  returns at most 200 session/semantic-role work rows. A work row exists only
+  returns at most 200 session/semantic-role work rows and 200 canonical human
+  prompt rows. Prompt rows use the same source-backed identities and MVCC
+  snapshot as the aggregate count, are chronologically ordered, and contain
+  only the stored database excerpt plus an explicit truncation flag. A work row exists only
   when the same canonical activity universe used by the aggregate contains
   visible evidence for that session and role. Its first/last timestamps are the
   observed evidence window, not active duration. Its optional summary is the
   first submitted `user_message` excerpt in the frame; response-only runtime
-  context is excluded and no title is synthesized. Prompt counts remain in the
-  snapshot-pinned aggregate; the interval endpoint does not resend unused prompt
-  excerpts.
+  context is excluded and no title is synthesized. The drawer keeps Active Work
+  primary and exposes prompt excerpts through a compact, collapsed disclosure.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
   excerpts. The default page size is 50 and the maximum is 100. Cursors are
@@ -99,6 +101,9 @@ objects.
   snapshot token. Session-row visibility is additionally required for the
   unknown-role parent fallback. Queries are workspace scoped and parameterized,
   and no endpoint performs per-row database or Storage reads.
+- Client disconnects cancel in-flight PostgreSQL queries. Snapshot expiry,
+  statement timeout, validation, and transient database failures remain distinct
+  API errors so the drawer can explain the appropriate recovery action.
 - The detail drawer states that event presence is not proof of continuous
   attention, stored excerpts may be truncated, and verified file-touch evidence
   is unavailable because tool payloads are not canonical fields.

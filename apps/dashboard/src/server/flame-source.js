@@ -14,6 +14,7 @@ export const UNKEYED_PROMPT_MATCH_SECONDS = 2;
 export const UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS = 100;
 export const ASSISTANT_REPRESENTATION_MATCH_SECONDS = 3;
 export const INTERVAL_WORK_LIMIT = 200;
+export const INTERVAL_PROMPT_LIMIT = 200;
 export const DEFAULT_WORK_DETAIL_LIMIT = 50;
 export const MAX_WORK_DETAIL_LIMIT = 100;
 
@@ -102,7 +103,11 @@ select id::text as person_id,
  limit $2
 `;
 
-function promptsCte(contentColumns = "", visibilityPredicate = "") {
+function promptsCte({
+  candidatePredicate = "",
+  contentColumns = "",
+  visibilityPredicate = "",
+} = {}) {
   return `
 prompt_candidates as materialized (
   select s.person_id, e.id, e.session_id, e.canonical_scope_key,
@@ -149,6 +154,7 @@ prompt_candidates as materialized (
      and e.content_sha256 is not null and e.content_byte_size > 0
      and e.error_code is null and not e.is_replay and e.actor_role = 'primary'
      and pe.github_id is distinct from 'sherlock-smoke'
+     ${candidatePredicate}
      ${visibilityPredicate}
      and (
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
@@ -370,7 +376,76 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
 
-const DETAIL_ACTIVITY_COLUMNS = `,
+// Canonical ranking must see the full snapshot window, but representation matching only
+// needs the selected frame plus the largest supported source-pairing tolerance. Keeping
+// enrichment and the wide self-joins behind this padded boundary avoids materializing a
+// person's entire day of native source metadata for a ten-minute evidence request.
+function detailActivityCte(candidatePredicate = "") {
+  return `
+activity_candidates as materialized (
+  select s.person_id, e.id, e.session_id,
+         s.started_at session_started_at,
+         case when e.actor_role = 'unknown' and s.parent_session_id is not null
+              then 'worker' else e.actor_role end actor_role,
+         e.event_kind, e.event_subtype,
+         coalesce(
+           ${nativeItemTimestamp("e.native_item_id")},
+           coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+         ) observed_at,
+         case when e.canonical_scope_key is not null and e.logical_event_key is not null
+              then row_number() over (
+                partition by e.session_id, e.canonical_scope_key,
+                             e.normalizer_version, e.logical_event_key, e.event_kind
+                order by e.source_priority desc, e.occurred_at asc nulls last, e.id
+              )
+              else 1 end canonical_rank
+    from telemetry.events e
+    join telemetry.sessions s
+      on s.workspace_id = e.workspace_id and s.id = e.session_id
+    cross join p
+   where e.workspace_id = p.workspace_id
+     and e.normalizer_version = p.normalizer_version
+     and not e.is_replay
+     and e.actor_role <> 'automation'
+     ${candidatePredicate}
+     and e.event_kind in (
+       'message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
+       'agent_message', 'lifecycle', 'error'
+     )
+     and (
+       e.event_kind <> 'message'
+       or e.native_item_id is not null
+       or e.event_subtype = 'user_message'
+     )
+     and (
+       e.event_kind <> 'lifecycle'
+       or e.event_subtype in ('task_started', 'task_complete', 'turn_started', 'turn_complete')
+     )
+     and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
+     and (
+       e.actor_role <> 'unknown'
+       or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)
+     )
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) >= p.start_at
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) < p.read_at
+), activity_event_ids as materialized (
+  select activity_candidates.person_id, activity_candidates.id,
+         activity_candidates.session_id, activity_candidates.actor_role,
+         activity_candidates.observed_at
+    from activity_candidates cross join p
+   where canonical_rank = 1
+     and observed_at >= date_trunc('milliseconds', session_started_at)
+     and observed_at >= p.bucket_start - interval '${ASSISTANT_REPRESENTATION_MATCH_SECONDS} seconds'
+     and observed_at < p.bucket_end + interval '${ASSISTANT_REPRESENTATION_MATCH_SECONDS} seconds'
+), activity_events as materialized (
+  select ids.person_id, ids.session_id, ids.actor_role, ids.observed_at,
+         e.id, e.event_kind, e.event_subtype,
          e.actor_role stored_actor_role,
          e.canonical_scope_key, e.logical_event_key, e.turn_id,
          e.message_role,
@@ -386,20 +461,15 @@ const DETAIL_ACTIVITY_COLUMNS = `,
          ib.start_offset source_batch_start_offset,
          ib.end_offset source_batch_end_offset,
          ib.record_count source_batch_record_count,
-         e.content_byte_size, e.content_excerpt`;
-
-const DETAIL_EVENT_COLUMNS = `, id, event_kind, event_subtype,
-         stored_actor_role, canonical_scope_key, logical_event_key, turn_id,
-         message_role,
-         source_native_item_id,
-         content_sha256, source_batch_id, source_record_index,
-         source_start_offset, source_end_offset,
-         source_native_type, source_native_payload_type,
-         source_collector_key, source_kind, source_stream_key,
-         generation_key, generation_seq,
-         source_batch_start_offset, source_batch_end_offset,
-         source_batch_record_count,
-         content_byte_size, content_excerpt`;
+         e.content_byte_size, e.content_excerpt
+    from activity_event_ids ids
+    join telemetry.events e on e.id = ids.id
+    join telemetry.native_records nr
+      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
+    join telemetry.ingest_batches ib
+      on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
+)`;
+}
 
 function canonicalActivityEvidenceCte() {
   return `
@@ -533,20 +603,7 @@ with p as materialized (
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end
-), ${activityCte({
-  candidateColumns: DETAIL_ACTIVITY_COLUMNS,
-  candidatePredicate: "and s.person_id = p.person_id",
-  eventColumns: DETAIL_EVENT_COLUMNS,
-  joins: `join telemetry.native_records nr
-      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
-    join telemetry.ingest_batches ib
-      on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id`,
-  visibilityPredicate: `and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
-     and (
-       e.actor_role <> 'unknown'
-       or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)
-     )`,
-})}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
+), ${detailActivityCte("and s.person_id = p.person_id")}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
               when actor_role in ('worker', 'guardian') then 'subagent'
@@ -573,6 +630,28 @@ select session_id::text session_id, semantic_role, first_at, last_at,
  limit $10
 `;
 
+export const INTERVAL_PROMPTS_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::timestamptz start_at,
+         $3::timestamptz end_at, $4::text normalizer_version,
+         $5::timestamptz read_at, $6::pg_snapshot snapshot,
+         $7::uuid person_id, $8::timestamptz bucket_start,
+         $9::timestamptz bucket_end
+), ${promptsCte({
+  candidatePredicate: "and s.person_id = p.person_id",
+  contentColumns: ", e.content_byte_size, e.content_excerpt",
+  visibilityPredicate: "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
+})}
+select prompt_identity, session_id::text session_id, observed_at,
+       content_byte_size, content_excerpt
+  from prompts cross join p
+ where prompts.person_id = p.person_id
+   and prompts.observed_at >= p.bucket_start
+   and prompts.observed_at < p.bucket_end
+ order by prompts.observed_at, prompt_identity
+ limit $10
+`;
+
 export const WORK_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
@@ -582,21 +661,8 @@ with p as materialized (
          $9::timestamptz bucket_end, $10::uuid session_id,
          $11::text semantic_role, $12::bigint cursor_at_microseconds,
          $13::bigint cursor_id
-), ${activityCte({
-  candidateColumns: DETAIL_ACTIVITY_COLUMNS,
-  candidatePredicate: `and s.person_id = p.person_id
-     and e.session_id = p.session_id`,
-  eventColumns: DETAIL_EVENT_COLUMNS,
-  joins: `join telemetry.native_records nr
-      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
-    join telemetry.ingest_batches ib
-      on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id`,
-  visibilityPredicate: `and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
-     and (
-       e.actor_role <> 'unknown'
-       or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)
-     )`,
-})}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
+), ${detailActivityCte(`and s.person_id = p.person_id
+     and e.session_id = p.session_id`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
               when actor_role in ('worker', 'guardian') then 'subagent'
@@ -606,6 +672,18 @@ with p as materialized (
      and candidate.session_id = p.session_id
      and candidate.observed_at >= p.bucket_start
      and candidate.observed_at < p.bucket_end
+), header as (
+  select bucket_events.session_id, bucket_events.semantic_role,
+         min(bucket_events.observed_at) first_at, max(bucket_events.observed_at) last_at,
+         count(*)::bigint event_count,
+         (array_agg(bucket_events.content_excerpt order by bucket_events.observed_at, bucket_events.id) filter (
+           where bucket_events.event_subtype = 'user_message'
+             and bucket_events.message_role = 'user'
+             and bucket_events.content_excerpt is not null
+         ))[1] summary
+    from bucket_events cross join p
+   where bucket_events.semantic_role = p.semantic_role
+   group by bucket_events.session_id, bucket_events.semantic_role
 ), selected as (
   select bucket_events.*,
          (extract(epoch from bucket_events.observed_at) * 1000000)::bigint observed_at_microseconds
@@ -620,16 +698,18 @@ with p as materialized (
    order by bucket_events.observed_at, bucket_events.id
    limit $14
 )
-select selected.id::text id, selected.observed_at,
-       selected.observed_at_microseconds, message_role,
-       content_byte_size, content_excerpt
-  from selected
- order by selected.observed_at, selected.id
+select header.session_id::text session_id, header.semantic_role,
+       header.first_at, header.last_at, header.event_count, header.summary,
+       selected.id::text id, selected.observed_at,
+       selected.observed_at_microseconds, selected.message_role,
+       selected.content_byte_size, selected.content_excerpt
+  from header left join selected on true
+ order by selected.observed_at nulls first, selected.id nulls first
 `;
 
 export class FlameSourceError extends Error {
-  constructor(code) {
-    super(code);
+  constructor(code, options) {
+    super(code, options);
     this.name = "FlameSourceError";
     this.code = code;
   }
@@ -796,8 +876,10 @@ function snapshotBounds(snapshotReceipt, startAt, read, prefix) {
   const oldest = read.getTime() - 25 * 60 * 60 * 1000;
   const snapshotEndMs = Math.floor(snapshotReceipt.read.getTime() / BUCKET_MS) * BUCKET_MS;
   const snapshotStartMs = snapshotEndMs - 24 * 60 * 60 * 1000;
-  if (snapshotReceipt.read.getTime() < oldest ||
-      startAt.getTime() < snapshotStartMs || startAt.getTime() >= snapshotEndMs) {
+  if (snapshotReceipt.read.getTime() < oldest) {
+    throw new FlameSourceError(`flame_${prefix}_snapshot_expired`);
+  }
+  if (startAt.getTime() < snapshotStartMs || startAt.getTime() >= snapshotEndMs) {
     throw new FlameSourceError(`flame_${prefix}_request_out_of_range`);
   }
   return {
@@ -838,6 +920,34 @@ function detailItemFromRow(row) {
     content,
     truncated: contentBytes > Buffer.byteLength(content, "utf8"),
   };
+}
+
+function promptFromRow(row) {
+  const content = row.content_excerpt === null || row.content_excerpt === undefined
+    ? ""
+    : String(row.content_excerpt);
+  const contentBytes = row.content_byte_size === null || row.content_byte_size === undefined
+    ? 0
+    : count(row.content_byte_size);
+  return {
+    id: String(row.prompt_identity),
+    sessionId: String(row.session_id),
+    at: asDate(row.observed_at).toISOString(),
+    content,
+    truncated: contentBytes > Buffer.byteLength(content, "utf8"),
+  };
+}
+
+async function runQuery(tx, text, params, signal) {
+  if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
+  const query = params === undefined ? tx.unsafe(text) : tx.unsafe(text, params);
+  const cancel = () => { void query.cancel?.(); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    return await query;
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+  }
 }
 
 export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
@@ -925,17 +1035,21 @@ export class DirectFlameSource {
     await this.sql.end({ timeout: 5 });
   }
 
-  async transaction(callback) {
+  async transaction(callback, { signal } = {}) {
     try {
       return await this.sql.begin(async (tx) => {
-        await tx.unsafe("set transaction isolation level repeatable read, read only");
-        await tx.unsafe("select set_config('statement_timeout', '20000', true)");
-        await tx.unsafe(`set local role ${DATABASE_ROLE}`);
+        await runQuery(tx, "set transaction isolation level repeatable read, read only", undefined, signal);
+        await runQuery(tx, "select set_config('statement_timeout', '20000', true)", undefined, signal);
+        await runQuery(tx, `set local role ${DATABASE_ROLE}`, undefined, signal);
         return await callback(tx);
       });
     } catch (error) {
       if (error instanceof FlameSourceError) throw error;
-      throw new FlameSourceError("flame_database_unavailable");
+      if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
+      if (error?.code === "57014") {
+        throw new FlameSourceError("flame_database_timeout", { cause: error });
+      }
+      throw new FlameSourceError("flame_database_unavailable", { cause: error });
     }
   }
 
@@ -962,43 +1076,48 @@ export class DirectFlameSource {
     }
   }
 
-  async fetchDay({ now } = {}) {
+  async fetchDay({ now, signal } = {}) {
     return await this.transaction(async (tx) => {
-      const receipt = (await tx.unsafe(
+      const receipt = (await runQuery(tx,
         "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
+        undefined,
+        signal,
       ))[0];
       const read = now ? asDate(now) : asDate(receipt.now);
       const endMs = Math.floor(read.getTime() / BUCKET_MS) * BUCKET_MS;
       const start = new Date(endMs - 24 * 60 * 60 * 1000);
       const end = new Date(endMs);
-      const roster = await tx.unsafe(
+      const roster = await runQuery(tx,
         PEOPLE_SQL,
         [this.workspaceId, this.maxPeople + 1],
+        signal,
       );
       if (roster.length > this.maxPeople) {
         throw new FlameSourceError("flame_database_roster_too_large");
       }
-      const rows = await tx.unsafe(FLAME_SQL, [
+      const rows = await runQuery(tx, FLAME_SQL, [
         this.workspaceId,
         start.toISOString(),
         end.toISOString(),
         NORMALIZER_VERSION,
         read.toISOString(),
-      ]);
+      ], signal);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
-    });
+    }, { signal });
   }
 
-  async fetchInterval({ personId, start, snapshot }) {
+  async fetchInterval({ personId, start, snapshot, signal }) {
     const startAt = requestStart(start, "interval");
     const snapshotReceipt = requestSnapshot(snapshot, "interval");
     validateIntervalIdentity(personId, startAt, "interval");
 
     return await this.transaction(async (tx) => {
-      const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
+      const read = asDate((await runQuery(
+        tx, "select transaction_timestamp() as now", undefined, signal,
+      ))[0].now);
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
       const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const work = await tx.unsafe(INTERVAL_WORK_SQL, [
+      const work = await runQuery(tx, INTERVAL_WORK_SQL, [
         this.workspaceId,
         bounds.snapshotStart.toISOString(),
         bounds.snapshotEnd.toISOString(),
@@ -1009,20 +1128,37 @@ export class DirectFlameSource {
         startAt.toISOString(),
         bounds.bucketEnd.toISOString(),
         workLimit,
-      ]);
+      ], signal);
       if (work.length === workLimit) {
         throw new FlameSourceError("flame_interval_work_result_too_large");
+      }
+      const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
+      const prompts = await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+        this.workspaceId,
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
+        NORMALIZER_VERSION,
+        snapshotReceipt.read.toISOString(),
+        snapshotReceipt.snapshot,
+        personId,
+        startAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
+        promptLimit,
+      ], signal);
+      if (prompts.length === promptLimit) {
+        throw new FlameSourceError("flame_interval_prompt_result_too_large");
       }
       return {
         personId,
         start: startAt.toISOString(),
         snapshot,
         work: work.map(workFromRow),
+        prompts: prompts.map(promptFromRow),
       };
-    });
+    }, { signal });
   }
 
-  async fetchWork({ personId, start, sessionId, role, snapshot, cursor, limit }) {
+  async fetchWork({ personId, start, sessionId, role, snapshot, cursor, limit, signal }) {
     const startAt = requestStart(start, "work");
     const snapshotReceipt = requestSnapshot(snapshot, "work");
     validateIntervalIdentity(personId, startAt, "work");
@@ -1034,7 +1170,9 @@ export class DirectFlameSource {
     const pageSize = parseWorkLimit(limit);
 
     return await this.transaction(async (tx) => {
-      const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
+      const read = asDate((await runQuery(
+        tx, "select transaction_timestamp() as now", undefined, signal,
+      ))[0].now);
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
       const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
       const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
@@ -1045,31 +1183,10 @@ export class DirectFlameSource {
           throw new FlameSourceError("flame_work_cursor_invalid");
         }
       }
-      const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const workRows = await tx.unsafe(INTERVAL_WORK_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        workLimit,
-      ]);
-      if (workRows.length === workLimit) {
-        throw new FlameSourceError("flame_work_result_too_large");
-      }
-      const headerRow = workRows.find((row) =>
-        String(row.session_id) === sessionId && String(row.semantic_role) === role
-      );
-      if (!headerRow) throw new FlameSourceError("flame_work_request_not_found");
-      const header = workFromRow(headerRow);
       const cursorAtMicroseconds = decodedCursor?.atMicroseconds ??
         bucketStartMicroseconds.toString();
       const cursorId = decodedCursor?.id ?? "0";
-      const itemRows = await tx.unsafe(WORK_DETAIL_SQL, [
+      const resultRows = await runQuery(tx, WORK_DETAIL_SQL, [
         this.workspaceId,
         bounds.snapshotStart.toISOString(),
         bounds.snapshotEnd.toISOString(),
@@ -1084,7 +1201,10 @@ export class DirectFlameSource {
         cursorAtMicroseconds,
         cursorId,
         pageSize + 1,
-      ]);
+      ], signal);
+      if (resultRows.length === 0) throw new FlameSourceError("flame_work_request_not_found");
+      const header = workFromRow(resultRows[0]);
+      const itemRows = resultRows.filter((row) => row.id !== null && row.id !== undefined);
       const hasMore = itemRows.length > pageSize;
       const pageRows = hasMore ? itemRows.slice(0, pageSize) : itemRows;
       const nextCursor = hasMore
@@ -1106,6 +1226,6 @@ export class DirectFlameSource {
         items: pageRows.map(detailItemFromRow),
         nextCursor,
       };
-    });
+    }, { signal });
   }
 }

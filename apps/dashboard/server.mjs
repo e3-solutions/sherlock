@@ -41,6 +41,7 @@ const MIME_TYPES = new Map([
 ]);
 
 function sendJson(response, status, body, headers = {}) {
+  if (response.destroyed || response.writableEnded) return;
   response.writeHead(status, {
     ...SECURITY_HEADERS,
     "Cache-Control": "no-store",
@@ -48,6 +49,23 @@ function sendJson(response, status, body, headers = {}) {
     ...headers,
   });
   response.end(JSON.stringify(body));
+}
+
+function requestAbortSignal(request, response) {
+  const controller = new AbortController();
+  request.once("aborted", () => controller.abort());
+  response.once("close", () => {
+    if (!response.writableEnded) controller.abort();
+  });
+  return controller.signal;
+}
+
+function apiStatus(code, prefix) {
+  if (code === `${prefix}_snapshot_expired`) return 410;
+  if (code === `${prefix}_request_not_found`) return 404;
+  if (code.endsWith("_result_too_large")) return 413;
+  if (code.startsWith(`${prefix}_request_`) || code === "flame_work_cursor_invalid") return 400;
+  return 503;
 }
 
 async function sendFile(response, filePath, cacheControl) {
@@ -95,13 +113,14 @@ const server = createServer(async (request, response) => {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
+    const signal = requestAbortSignal(request, response);
     try {
-      sendJson(response, 200, await source.fetchDay());
+      sendJson(response, 200, await source.fetchDay({ signal }));
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      sendJson(response, 503, { error: code });
+      if (code !== "flame_request_aborted") sendJson(response, 503, { error: code });
     }
     return;
   }
@@ -111,20 +130,21 @@ const server = createServer(async (request, response) => {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
+    const signal = requestAbortSignal(request, response);
     try {
       sendJson(response, 200, await source.fetchInterval({
         personId: url.searchParams.get("personId") ?? "",
         start: url.searchParams.get("start") ?? "",
         snapshot: url.searchParams.get("snapshot") ?? "",
+        signal,
       }));
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      const status = code.endsWith("_result_too_large")
-        ? 413
-        : code.startsWith("flame_interval_request_") ? 400 : 503;
-      sendJson(response, status, { error: code });
+      if (code !== "flame_request_aborted") {
+        sendJson(response, apiStatus(code, "flame_interval"), { error: code });
+      }
     }
     return;
   }
@@ -134,6 +154,7 @@ const server = createServer(async (request, response) => {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
+    const signal = requestAbortSignal(request, response);
     try {
       sendJson(response, 200, await source.fetchWork({
         personId: url.searchParams.get("personId") ?? "",
@@ -143,18 +164,15 @@ const server = createServer(async (request, response) => {
         snapshot: url.searchParams.get("snapshot") ?? "",
         cursor: url.searchParams.get("cursor") ?? "",
         limit: url.searchParams.get("limit") ?? "",
+        signal,
       }));
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      const status = code === "flame_work_request_not_found"
-        ? 404
-        : code.endsWith("_result_too_large") ? 413
-        : code.startsWith("flame_work_request_") || code === "flame_work_cursor_invalid"
-        ? 400
-        : 503;
-      sendJson(response, status, { error: code });
+      if (code !== "flame_request_aborted") {
+        sendJson(response, apiStatus(code, "flame_work"), { error: code });
+      }
     }
     return;
   }

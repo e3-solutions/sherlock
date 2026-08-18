@@ -5,6 +5,7 @@ import {
   BUCKET_MS,
   DEFAULT_WORK_DETAIL_LIMIT,
   FLAME_SQL,
+  INTERVAL_PROMPTS_SQL,
   INTERVAL_WORK_SQL,
   MAX_WORK_DETAIL_LIMIT,
   PEOPLE_SQL,
@@ -386,9 +387,17 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_WORK_SQL).toContain("and s.person_id = p.person_id");
     expect(INTERVAL_WORK_SQL).toContain("limit $10");
     expect(WORK_DETAIL_SQL).toContain("and e.session_id = p.session_id");
+    expect(WORK_DETAIL_SQL).toContain("p.bucket_start - interval '3 seconds'");
+    expect(WORK_DETAIL_SQL).toContain("from header left join selected on true");
     expect(WORK_DETAIL_SQL).toContain(") > (p.cursor_at_microseconds, p.cursor_id)");
-    expect(WORK_DETAIL_SQL).toContain("order by selected.observed_at, selected.id");
+    expect(WORK_DETAIL_SQL).toContain("order by selected.observed_at nulls first");
     expect(WORK_DETAIL_SQL).toContain("limit $14");
+    expect(INTERVAL_PROMPTS_SQL).toContain("e.message_origin = 'human'");
+    expect(INTERVAL_PROMPTS_SQL).toContain("e.message_role = 'user'");
+    expect(INTERVAL_PROMPTS_SQL).toContain("e.actor_role = 'primary'");
+    expect(INTERVAL_PROMPTS_SQL).toContain("and s.person_id = p.person_id");
+    expect(INTERVAL_PROMPTS_SQL).toContain("pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)");
+    expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
   });
 
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
@@ -434,6 +443,13 @@ describe("Sherlock Flame payload", () => {
         last_at: new Date("2026-08-16T12:04:00.000Z"),
         event_count: 4,
         summary: "Inspect the query",
+      }])
+      .mockResolvedValueOnce([{
+        prompt_identity: "native:msg_1",
+        session_id: sessionId,
+        observed_at: new Date("2026-08-16T12:00:10.000Z"),
+        content_byte_size: 17,
+        content_excerpt: "Inspect the query",
       }]);
     source.transaction = (callback) => callback({ unsafe });
     const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
@@ -446,6 +462,8 @@ describe("Sherlock Flame payload", () => {
 
     expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
     expect(unsafe.mock.calls[1][1].at(-1)).toBe(201);
+    expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[2][1].at(-1)).toBe(201);
     expect(interval).toMatchObject({
       personId,
       start: START.toISOString(),
@@ -457,6 +475,86 @@ describe("Sherlock Flame payload", () => {
         eventCount: 4,
         summary: "Inspect the query",
       }],
+      prompts: [{
+        id: "native:msg_1",
+        sessionId,
+        content: "Inspect the query",
+        truncated: false,
+      }],
+    });
+  });
+
+  it("distinguishes an expired snapshot from an invalid frame range", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+    const unsafe = vi.fn().mockResolvedValue([{
+      now: new Date(READ.getTime() + 25 * 60 * 60 * 1000 + 1),
+    }]);
+    source.transaction = (callback) => callback({ unsafe });
+
+    await expect(source.fetchInterval({
+      personId, start: START.toISOString(), snapshot,
+    })).rejects.toMatchObject({ code: "flame_interval_snapshot_expired" });
+    expect(unsafe).toHaveBeenCalledTimes(1);
+
+    unsafe.mockReset().mockResolvedValue([{ now: new Date(READ.getTime() + 1000) }]);
+    await expect(source.fetchInterval({
+      personId,
+      start: new Date(START.getTime() - BUCKET_MS).toISOString(),
+      snapshot,
+    })).rejects.toMatchObject({ code: "flame_interval_request_out_of_range" });
+  });
+
+  it("cancels in-flight database work when the HTTP request signal aborts", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.maxPeople = 10;
+    let rejectRows;
+    const pendingRows = new Promise((resolve, reject) => { rejectRows = reject; });
+    pendingRows.cancel = vi.fn(() => rejectRows(Object.assign(new Error("cancelled"), {
+      code: "57014",
+    })));
+    const resolved = (value) => {
+      const result = Promise.resolve(value);
+      result.cancel = vi.fn();
+      return result;
+    };
+    const unsafe = vi.fn()
+      .mockImplementationOnce(() => resolved([]))
+      .mockImplementationOnce(() => resolved([]))
+      .mockImplementationOnce(() => resolved([]))
+      .mockImplementationOnce(() => resolved([{
+        now: READ,
+        snapshot: PG_SNAPSHOT,
+      }]))
+      .mockImplementationOnce(() => resolved([{
+        person_id: "22222222-2222-4222-8222-222222222222",
+        display_name: "Ada",
+      }]))
+      .mockImplementationOnce(() => pendingRows);
+    source.sql = { begin: (callback) => callback({ unsafe }) };
+    const controller = new AbortController();
+
+    const request = source.fetchDay({ signal: controller.signal });
+    await vi.waitFor(() => expect(unsafe).toHaveBeenCalledTimes(6));
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({ code: "flame_request_aborted" });
+    expect(pendingRows.cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports PostgreSQL statement cancellation as a timeout when the client is connected", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.sql = {
+      begin: vi.fn().mockRejectedValue(Object.assign(new Error("statement timeout"), {
+        code: "57014",
+      })),
+    };
+
+    await expect(source.transaction(() => undefined)).rejects.toMatchObject({
+      code: "flame_database_timeout",
     });
   });
 
@@ -474,6 +572,7 @@ describe("Sherlock Flame payload", () => {
       summary: "Build it",
     };
     const items = [{
+      ...header,
       id: "41",
       observed_at: new Date("2026-08-16T12:00:01.000Z"),
       observed_at_microseconds: "1786881601000000",
@@ -481,6 +580,7 @@ describe("Sherlock Flame payload", () => {
       content_byte_size: 8,
       content_excerpt: "Build it",
     }, {
+      ...header,
       id: "42",
       observed_at: new Date("2026-08-16T12:00:02.000Z"),
       observed_at_microseconds: "1786881602000000",
@@ -490,7 +590,6 @@ describe("Sherlock Flame payload", () => {
     }];
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-      .mockResolvedValueOnce([header])
       .mockResolvedValueOnce(items);
     source.transaction = (callback) => callback({ unsafe });
     const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
@@ -504,8 +603,9 @@ describe("Sherlock Flame payload", () => {
       limit: "1",
     });
 
-    expect(unsafe.mock.calls[2][0]).toBe(WORK_DETAIL_SQL);
-    expect(unsafe.mock.calls[2][1].at(-1)).toBe(2);
+    expect(unsafe.mock.calls).toHaveLength(2);
+    expect(unsafe.mock.calls[1][0]).toBe(WORK_DETAIL_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(2);
     expect(detail.items).toEqual([expect.objectContaining({
       id: "41",
       role: "user",
