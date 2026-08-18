@@ -129,12 +129,6 @@ function PortalHeader() {
 function SemanticLegend() {
   return (
     <div className="flame-legends">
-      <ul className="flame-legend" aria-label="Activity legend">
-        <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
-        <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
-        <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
-        <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
-      </ul>
       <ul className="flame-status-legend" aria-label="Activity recency legend">
         <li aria-label="Green: activity 10 minutes ago or less">
           <i className="flame-status-key flame-person-status--active" aria-hidden="true" />
@@ -148,6 +142,12 @@ function SemanticLegend() {
           <i className="flame-status-key flame-person-status--inactive" aria-hidden="true" />
           &gt;30m / none
         </li>
+      </ul>
+      <ul className="flame-legend" aria-label="Activity legend">
+        <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
+        <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
+        <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
+        <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
       </ul>
     </div>
   );

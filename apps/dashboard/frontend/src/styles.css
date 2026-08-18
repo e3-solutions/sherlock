@@ -49,7 +49,7 @@ input { font: inherit; }
   flex: 0 0 auto;
   flex-direction: column;
   align-items: flex-start;
-  gap: 10px;
+  gap: 48px;
   margin-bottom: 12px;
 }
 
@@ -185,22 +185,29 @@ input { font: inherit; }
 .flame-legends {
   display: flex;
   min-width: 0;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   justify-content: flex-start;
-  gap: 18px;
+  gap: 7px;
 }
 
 .flame-legend {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-start;
-  gap: 6px 14px;
+  gap: 12px;
   margin: 0;
   padding: 0;
   color: var(--flame-muted);
-  font-size: 10px;
-  letter-spacing: .05em;
   list-style: none;
+}
+
+.flame-legend,
+.flame-status-legend {
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: .04em;
+  line-height: 1;
 }
 
 .flame-legend li {
@@ -215,13 +222,9 @@ input { font: inherit; }
   align-items: center;
   gap: 10px;
   margin: 0;
-  padding: 0 0 0 18px;
-  border-left: 1px solid var(--flame-rule);
+  padding: 0;
   color: var(--flame-muted);
-  font-size: 9px;
   font-variant-numeric: tabular-nums;
-  letter-spacing: .02em;
-  line-height: 1;
   list-style: none;
   white-space: nowrap;
 }
@@ -748,7 +751,7 @@ input { font: inherit; }
   #root { padding: 24px; }
   .portal-header {
     min-height: 0;
-    gap: 8px;
+    gap: 36px;
     padding-bottom: 10px;
   }
   .portal-header__logo { width: 34px; height: 42px; }
@@ -758,17 +761,18 @@ input { font: inherit; }
     padding: 8px 0 0;
     border-top: 1px solid var(--flame-rule);
   }
-  .flame-legends { justify-content: space-between; gap: 14px; }
-  .flame-legend { gap: 4px 8px; font-size: 9px; }
+  .flame-legends { gap: 6px; }
+  .flame-legend { gap: 10px; }
   .flame-legend li { gap: 4px; }
-  .flame-status-legend { padding-left: 14px; font-size: 8px; }
+  .flame-legend,
+  .flame-status-legend { font-size: 8px; }
   .flame-time-axis time:nth-child(even) { display: none; }
 }
 
 @media (max-width: 520px) {
   :root { --flame-rail: 164px; }
   #root { padding: 16px; }
-  .portal-header { gap: 7px; padding-bottom: 8px; }
+  .portal-header { gap: 32px; padding-bottom: 8px; }
   .portal-header__brand { gap: 9px; }
   .portal-header__logo { width: 31px; height: 38px; }
   .portal-header h1 { font-size: 18px; }
@@ -776,20 +780,15 @@ input { font: inherit; }
   .flame-person-rail h2 { font-size: 14px; }
 
   .flame-legends {
-    display: grid;
     gap: 6px;
   }
   .flame-legend {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    justify-content: stretch;
+    gap: 8px;
   }
   .flame-status-legend {
-    justify-content: space-between;
-    gap: 6px;
-    padding: 5px 0 0;
-    border-top: 1px solid var(--flame-rule);
-    border-left: 0;
+    justify-content: flex-start;
+    gap: 8px;
+    padding: 0;
     font-size: 8px;
   }
 

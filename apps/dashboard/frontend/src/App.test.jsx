@@ -77,7 +77,7 @@ describe("App", () => {
     }));
   });
 
-  it("keeps the full activity and recency legends beneath the brand", () => {
+  it("stacks recency above the role legend beneath the brand", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     const { container } = render(<App />);
     const header = container.querySelector(".portal-header");
@@ -90,6 +90,7 @@ describe("App", () => {
     expect(header.querySelector(".portal-header__brand")).toHaveTextContent("Bonaparte");
     expect(header.querySelector(".portal-header__brand + .portal-header__legend"))
       .toBe(legendRegion);
+    expect(statusLegend.nextElementSibling).toBe(activityLegend);
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(activityLegend).getByText(label)).toBeInTheDocument();
     }
