@@ -505,7 +505,14 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            900, 900, repeat('a', 64), $5, 'identity', 900, repeat('b', 64), $6,
            'fixture.v1'
          )`,
-        [batchId, workspaceId, `stream-${batchId}`, `fixture/${batchId}`, events.length],
+        [
+          batchId,
+          workspaceId,
+          personId,
+          `stream-${batchId}`,
+          `fixture/${batchId}`,
+          events.length,
+        ],
       );
 
       for (const [index, event] of events.entries()) {
