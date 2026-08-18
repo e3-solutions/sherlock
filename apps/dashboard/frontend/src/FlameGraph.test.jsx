@@ -653,6 +653,29 @@ describe("FlameGraph", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(copy);
   });
 
+  it("refreshes the timeline instead of retrying an expired interval snapshot", async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 410,
+      json: () => Promise.resolve({ error: "flame_interval_snapshot_expired" }),
+    });
+    const onRefresh = vi.fn();
+    const { container } = render(
+      <FlameGraph data={model()} chartWidth={1008} onRefresh={onRefresh} />,
+    );
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh timeline" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps prompt text out of busy frame overviews and resets extra sessions by frame", async () => {
     const busyModel = model();
     busyModel.people[0].buckets[0].prompts = 7;
@@ -751,6 +774,39 @@ describe("FlameGraph", () => {
     expect(backButton.querySelector("svg")).toBeInTheDocument();
     fireEvent.click(backButton);
     expect(await screen.findByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
+  });
+
+  it("returns to the refreshed frame when a selected session is no longer present", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation((url, options) => {
+      const request = new URL(url, "http://dashboard.test");
+      if (request.pathname !== "/api/flame/work") return defaultFetch(url, options);
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({ error: "flame_work_request_not_found" }),
+      });
+    });
+    const onRefresh = vi.fn();
+    const { container } = render(
+      <FlameGraph data={model()} chartWidth={1008} onRefresh={onRefresh} />,
+    );
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: /First exact prompt/ }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "This session is no longer present in the selected snapshot.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refresh timeline" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Active work")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("loads later conversation turns", async () => {

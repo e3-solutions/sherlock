@@ -87,6 +87,10 @@ function evidenceFailureReason(error) {
     : "flame_database_unavailable";
 }
 
+function needsTimelineRefresh(reason) {
+  return reason?.endsWith("_snapshot_expired") || reason?.endsWith("_request_not_found");
+}
+
 export function formatActiveTime(seconds) {
   if (seconds === 0) return "0m active";
   if (seconds < 60) return "<1m active";
@@ -378,6 +382,7 @@ function IntervalOverview({
   onClose,
   evidence,
   onRetry,
+  onRefresh,
   onOpenWork,
   showAdditionalWork,
   onToggleAdditionalWork,
@@ -447,7 +452,12 @@ function IntervalOverview({
       ) : evidence.state === "error" ? (
         <div className="flame-detail__state flame-detail__error" role="alert">
           <p>{evidenceErrorCopy("frame", evidence.reason)}</p>
-          <button type="button" onClick={onRetry}>Retry</button>
+          <button
+            type="button"
+            onClick={needsTimelineRefresh(evidence.reason) ? onRefresh : onRetry}
+          >
+            {needsTimelineRefresh(evidence.reason) ? "Refresh timeline" : "Retry"}
+          </button>
         </div>
       ) : evidence.state === "ready" && (
         <div className="flame-detail__body">
@@ -508,6 +518,7 @@ function WorkDetail({
   onBack,
   onClose,
   onRetry,
+  onRefresh,
   onLoadMore,
   stale,
   closing,
@@ -542,7 +553,12 @@ function WorkDetail({
       ) : evidence.state === "error" ? (
         <div className="flame-detail__state flame-detail__error" role="alert">
           <p>{evidenceErrorCopy("session", evidence.reason)}</p>
-          <button type="button" onClick={onRetry}>Retry</button>
+          <button
+            type="button"
+            onClick={needsTimelineRefresh(evidence.reason) ? onRefresh : onRetry}
+          >
+            {needsTimelineRefresh(evidence.reason) ? "Refresh timeline" : "Retry"}
+          </button>
         </div>
       ) : evidence.state === "ready" && (
         <div className="flame-detail__body">
@@ -836,7 +852,7 @@ function useSharedChartWidth(scrollportRef, requestedWidth) {
   return Math.max(1, measuredWidth);
 }
 
-export default function FlameGraph({ data, chartWidth, stale = false }) {
+export default function FlameGraph({ data, chartWidth, stale = false, onRefresh }) {
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
@@ -1061,6 +1077,17 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     setDrawerView({ screen: "overview" });
   };
 
+  const refreshIntervalTimeline = () => {
+    if (onRefresh) onRefresh();
+    else setIntervalRevision((revision) => revision + 1);
+  };
+
+  const refreshWorkTimeline = () => {
+    if (workEvidence.reason?.endsWith("_request_not_found")) backToOverview();
+    if (onRefresh) onRefresh();
+    else setWorkRevision((revision) => revision + 1);
+  };
+
   const loadMoreWork = async () => {
     if (drawerView.screen !== "work" || workEvidence.state !== "ready" ||
         !workEvidence.nextCursor || workEvidence.loadingMore || !selectedPerson || !selectedPoint) return;
@@ -1181,6 +1208,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
               onBack={backToOverview}
               onClose={beginCloseDetail}
               onRetry={() => setWorkRevision((revision) => revision + 1)}
+              onRefresh={refreshWorkTimeline}
               onLoadMore={loadMoreWork}
             />
           ) : (
@@ -1193,6 +1221,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
               closing={detailClosing}
               onClose={beginCloseDetail}
               onRetry={() => setIntervalRevision((revision) => revision + 1)}
+              onRefresh={refreshIntervalTimeline}
               onOpenWork={openWork}
               showAdditionalWork={showAdditionalWork}
               onToggleAdditionalWork={() => setShowAdditionalWork((shown) => !shown)}

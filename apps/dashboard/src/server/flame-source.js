@@ -13,6 +13,8 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 export const UNKEYED_PROMPT_MATCH_SECONDS = 2;
 export const UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS = 100;
 export const ASSISTANT_REPRESENTATION_MATCH_SECONDS = 3;
+export const ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS =
+  ASSISTANT_REPRESENTATION_MATCH_SECONDS * 2;
 export const INTERVAL_WORK_LIMIT = 200;
 export const INTERVAL_PROMPT_LIMIT = 200;
 export const DEFAULT_WORK_DETAIL_LIMIT = 50;
@@ -376,10 +378,10 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
 
-// Canonical ranking must see the full snapshot window, but representation matching only
-// needs the selected frame plus the largest supported source-pairing tolerance. Keeping
-// enrichment and the wide self-joins behind this padded boundary avoids materializing a
-// person's entire day of native source metadata for a ten-minute evidence request.
+// Canonical ranking must see the full snapshot window. Mutual-unique representation
+// matching also needs each direct match's alternative partners, so enrichment keeps two
+// hops of the largest pairing tolerance around the selected frame. This preserves degree
+// semantics without materializing a person's full day of native source metadata.
 function detailActivityCte(candidatePredicate = "") {
   return `
 activity_candidates as materialized (
@@ -441,8 +443,8 @@ activity_candidates as materialized (
     from activity_candidates cross join p
    where canonical_rank = 1
      and observed_at >= date_trunc('milliseconds', session_started_at)
-     and observed_at >= p.bucket_start - interval '${ASSISTANT_REPRESENTATION_MATCH_SECONDS} seconds'
-     and observed_at < p.bucket_end + interval '${ASSISTANT_REPRESENTATION_MATCH_SECONDS} seconds'
+     and observed_at >= p.bucket_start - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+     and observed_at < p.bucket_end + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
 ), activity_events as materialized (
   select ids.person_id, ids.session_id, ids.actor_role, ids.observed_at,
          e.id, e.event_kind, e.event_subtype,
@@ -941,7 +943,12 @@ function promptFromRow(row) {
 async function runQuery(tx, text, params, signal) {
   if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
   const query = params === undefined ? tx.unsafe(text) : tx.unsafe(text, params);
-  const cancel = () => { void query.cancel?.(); };
+  const cancel = () => {
+    const cancellation = query.cancel?.();
+    if (cancellation && typeof cancellation.catch === "function") {
+      void cancellation.catch(() => {});
+    }
+  };
   signal?.addEventListener("abort", cancel, { once: true });
   try {
     return await query;

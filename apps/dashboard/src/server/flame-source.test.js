@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS,
   BUCKET_COUNT,
   BUCKET_MS,
   DEFAULT_WORK_DETAIL_LIMIT,
@@ -387,7 +388,8 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_WORK_SQL).toContain("and s.person_id = p.person_id");
     expect(INTERVAL_WORK_SQL).toContain("limit $10");
     expect(WORK_DETAIL_SQL).toContain("and e.session_id = p.session_id");
-    expect(WORK_DETAIL_SQL).toContain("p.bucket_start - interval '3 seconds'");
+    expect(ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS).toBe(6);
+    expect(WORK_DETAIL_SQL).toContain("p.bucket_start - interval '6 seconds'");
     expect(WORK_DETAIL_SQL).toContain("from header left join selected on true");
     expect(WORK_DETAIL_SQL).toContain(") > (p.cursor_at_microseconds, p.cursor_id)");
     expect(WORK_DETAIL_SQL).toContain("order by selected.observed_at nulls first");
@@ -507,15 +509,16 @@ describe("Sherlock Flame payload", () => {
     })).rejects.toMatchObject({ code: "flame_interval_request_out_of_range" });
   });
 
-  it("cancels in-flight database work when the HTTP request signal aborts", async () => {
+  it("cancels in-flight work without leaking a cancellation transport rejection", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     source.maxPeople = 10;
     let rejectRows;
     const pendingRows = new Promise((resolve, reject) => { rejectRows = reject; });
-    pendingRows.cancel = vi.fn(() => rejectRows(Object.assign(new Error("cancelled"), {
-      code: "57014",
-    })));
+    pendingRows.cancel = vi.fn(() => {
+      rejectRows(Object.assign(new Error("cancelled"), { code: "57014" }));
+      return Promise.reject(new Error("cancel transport failed"));
+    });
     const resolved = (value) => {
       const result = Promise.resolve(value);
       result.cancel = vi.fn();

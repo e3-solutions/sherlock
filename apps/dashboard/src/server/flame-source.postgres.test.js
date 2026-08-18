@@ -263,6 +263,145 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     }
   }, 30_000);
 
+  it("preserves ambiguous representation partners across a frame boundary", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const frameStart = new Date("2026-08-18T11:20:00.000Z");
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const content = "Boundary assistant response";
+    const contentHash = "d".repeat(64);
+    const representations = [{
+      kind: "agent_message",
+      subtype: "agent_message",
+      nativeType: "event_msg",
+      payloadType: "agent_message",
+      at: new Date(frameStart.getTime() + 50),
+      nativeItemId: null,
+    }, {
+      kind: "message",
+      subtype: "message",
+      nativeType: "response_item",
+      payloadType: "message",
+      at: new Date(frameStart.getTime() - 2_900),
+      nativeItemId: nativeItemId(new Date(frameStart.getTime() - 2_900)),
+    }, {
+      kind: "agent_message",
+      subtype: "agent_message",
+      nativeType: "event_msg",
+      payloadType: "agent_message",
+      at: new Date(frameStart.getTime() - 5_850),
+      nativeItemId: null,
+    }];
+    let source;
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name) values ($1, $2, $3)`,
+        [workspaceId, `boundary-${workspaceId}`, "Representation boundary fixture"],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
+         values ($1, $2, $3, 'Boundary Person')`,
+        [personId, workspaceId, `person-${personId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         ) values ($1, $2, $3, 'fixture', $4, 'primary', 'fixture.v1', $5)`,
+        [
+          sessionId, workspaceId, personId, sessionId,
+          new Date(frameStart.getTime() - 10_000).toISOString(),
+        ],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_kind,
+           source_stream_key, generation_key, generation_seq, start_offset,
+           end_offset, source_byte_count, source_sha256, storage_path,
+           storage_encoding, stored_byte_count, stored_sha256, record_count,
+           contract_version
+         ) values (
+           $1, $2, $3, 'fixture', 'rollout', $4, 'fixture-generation', 0, 0,
+           300, 300, repeat('a', 64), $5, 'identity', 300, repeat('b', 64), 3,
+           'fixture.v1'
+         )`,
+        [batchId, workspaceId, personId, `stream-${batchId}`, `fixture/${batchId}`],
+      );
+
+      for (const [index, representation] of representations.entries()) {
+        const [record] = await sql.unsafe(
+          `insert into telemetry.native_records (
+             workspace_id, batch_id, record_index, source_start_offset,
+             source_end_offset, record_sha256, parse_status,
+             native_type, native_payload_type
+           ) values ($1, $2, $3, $4, $5, $6, 'ok', $7, $8)
+           returning id`,
+          [
+            workspaceId, batchId, index, index * 100, index * 100 + 100,
+            String(index + 5).repeat(64), representation.nativeType,
+            representation.payloadType,
+          ],
+        );
+        await sql.unsafe(
+          `insert into telemetry.events (
+             workspace_id, session_id, source_record_id, normalizer_version,
+             projection_index, source_priority, event_kind, event_subtype,
+             actor_role, occurred_at, observed_at, server_received_at,
+             native_item_id, message_role, content_sha256, content_byte_size,
+             content_excerpt
+           ) values (
+             $1, $2, $3, $4, 0, 100, $5, $6, 'primary', $7, $7, $7,
+             $8, 'assistant', $9, $10, $11
+           )`,
+          [
+            workspaceId, sessionId, record.id, NORMALIZER_VERSION,
+            representation.kind, representation.subtype, representation.at.toISOString(),
+            representation.nativeItemId, contentHash,
+            Buffer.byteLength(content, "utf8"), content,
+          ],
+        );
+      }
+
+      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      const day = await source.fetchDay({ now: FIXED_NOW });
+      expect(day.people[0].buckets[bucketIndex(frameStart)].slice(0, 3)).toEqual([1, 0, 0]);
+
+      const interval = await source.fetchInterval({
+        personId,
+        start: frameStart.toISOString(),
+        snapshot: day.snapshot,
+      });
+      expect(interval.work).toEqual([expect.objectContaining({
+        id: `${sessionId}:agent`,
+        sessionId,
+        role: "agent",
+        eventCount: 1,
+      })]);
+
+      const detail = await source.fetchWork({
+        personId,
+        start: frameStart.toISOString(),
+        sessionId,
+        role: "agent",
+        snapshot: day.snapshot,
+      });
+      expect(detail.items).toEqual([expect.objectContaining({
+        role: "assistant",
+        content,
+      })]);
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
   it("returns exactly three canonical human prompts without copied worker context", async () => {
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();

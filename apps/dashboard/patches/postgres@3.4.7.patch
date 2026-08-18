@@ -1,0 +1,33 @@
+diff --git a/cf/src/query.js b/cf/src/query.js
+index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..9ca9f08b18c2f7e5efd881b71d73fbc85dbc879c 100644
+--- a/cf/src/query.js
++++ b/cf/src/query.js
+@@ -53 +53,5 @@ export class Query extends Promise {
+-    return this.canceller && (this.canceller(this), this.canceller = null)
++    if (!this.canceller)
++      return
++    const canceller = this.canceller
++    this.canceller = null
++    return canceller(this)
+diff --git a/cjs/src/query.js b/cjs/src/query.js
+index 45327f2fabcdbf8f8ec5020675012c310c04fee6..b3e6150afe118608801dd87564579a442abc8a46 100644
+--- a/cjs/src/query.js
++++ b/cjs/src/query.js
+@@ -53 +53,5 @@ const Query = module.exports.Query = class Query extends Promise {
+-    return this.canceller && (this.canceller(this), this.canceller = null)
++    if (!this.canceller)
++      return
++    const canceller = this.canceller
++    this.canceller = null
++    return canceller(this)
+diff --git a/src/query.js b/src/query.js
+index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..9ca9f08b18c2f7e5efd881b71d73fbc85dbc879c 100644
+--- a/src/query.js
++++ b/src/query.js
+@@ -53 +53,5 @@ export class Query extends Promise {
+-    return this.canceller && (this.canceller(this), this.canceller = null)
++    if (!this.canceller)
++      return
++    const canceller = this.canceller
++    this.canceller = null
++    return canceller(this)
