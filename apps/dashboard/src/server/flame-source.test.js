@@ -8,7 +8,6 @@ import {
   INTERVAL_WORK_SQL,
   MAX_WORK_DETAIL_LIMIT,
   PEOPLE_SQL,
-  PROMPT_DETAIL_SQL,
   WORK_DETAIL_SQL,
   ASSISTANT_REPRESENTATION_MATCH_SECONDS,
   DirectFlameSource,
@@ -233,7 +232,7 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
   });
 
-  it("canonically selects submitted primary prompts before returning details", () => {
+  it("canonically counts submitted primary prompts", () => {
     expect(FLAME_SQL).toContain("partition by session_id, canonical_scope_key");
     expect(FLAME_SQL).toContain("normalizer_version, logical_event_key, event_kind");
     expect(FLAME_SQL).toContain("order by source_priority desc");
@@ -244,15 +243,6 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("e.error_code is null");
     expect(FLAME_SQL).toContain("keyed_native_item_id");
     expect(FLAME_SQL).toContain("partition by person_id, prompt_identity");
-    expect(PROMPT_DETAIL_SQL).toContain("content_excerpt");
-    expect(PROMPT_DETAIL_SQL).toContain("$5::pg_snapshot snapshot");
-    expect(PROMPT_DETAIL_SQL).toContain(
-      "pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
-    );
-    expect(PROMPT_DETAIL_SQL).toContain("where person_id = $6::uuid");
-    expect(PROMPT_DETAIL_SQL).toContain("$7::timestamptz bucket_start");
-    expect(PROMPT_DETAIL_SQL).toContain("observed_at >= (select bucket_start from p)");
-    expect(PROMPT_DETAIL_SQL).toContain("limit $9");
   });
 
   it("round-trips a bounded immutable aggregate snapshot receipt", () => {
@@ -298,47 +288,6 @@ describe("Sherlock Flame payload", () => {
     ]);
   });
 
-  it("pins prompt details to the aggregate snapshot and echoes its receipt", async () => {
-    const source = Object.create(DirectFlameSource.prototype);
-    source.workspaceId = "11111111-1111-4111-8111-111111111111";
-    const unsafe = vi.fn()
-      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-      .mockResolvedValueOnce([{
-        id: "17",
-        observed_at: new Date("2026-08-16T12:00:08.000Z"),
-        content: "Stable snapshot prompt",
-        content_byte_size: 22,
-        excerpt_byte_size: 22,
-      }]);
-    source.transaction = (callback) => callback({ unsafe });
-    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
-
-    const detail = await source.fetchPrompts({
-      personId: "22222222-2222-4222-8222-222222222222",
-      start: START.toISOString(),
-      snapshot,
-    });
-
-    expect(unsafe.mock.calls[1][0]).toBe(PROMPT_DETAIL_SQL);
-    expect(unsafe.mock.calls[1][1]).toEqual([
-      source.workspaceId,
-      START.toISOString(),
-      "2026-08-17T12:00:00.000Z",
-      "sherlock.codex-rollout.v1",
-      PG_SNAPSHOT,
-      "22222222-2222-4222-8222-222222222222",
-      START.toISOString(),
-      new Date(START.getTime() + BUCKET_MS).toISOString(),
-      501,
-    ]);
-    expect(detail).toMatchObject({
-      personId: "22222222-2222-4222-8222-222222222222",
-      start: START.toISOString(),
-      snapshot,
-      prompts: [{ id: "17", content: "Stable snapshot prompt" }],
-    });
-  });
-
   it("uses stable prompt identifiers before a mutually unique source-stream bridge", () => {
     const promptSql = FLAME_SQL.slice(
       FLAME_SQL.indexOf("prompt_candidates as materialized"),
@@ -372,23 +321,21 @@ describe("Sherlock Flame payload", () => {
 
   it("collapses only adjacent native-ID-less copies of one submitted prompt", () => {
     expect(UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS).toBe(100);
-    for (const sql of [FLAME_SQL, PROMPT_DETAIL_SQL]) {
-      expect(sql).toContain("join telemetry.native_records nr");
-      expect(sql).toContain(
-        "previous.source_record_index = duplicate.source_record_index - 1",
-      );
-      expect(sql).toContain(
-        "previous.source_end_offset = duplicate.source_start_offset",
-      );
-      expect(sql).toContain("previous.content_sha256 = duplicate.content_sha256");
-      expect(sql).toContain("previous.source_native_type = 'event_msg'");
-      expect(sql).toContain("previous.source_native_payload_type = 'user_message'");
-      expect(sql).toContain("previous.native_item_id is null");
-      expect(sql).toContain("duplicate.native_item_id is null");
-      expect(sql).toContain("previous.turn_id is null");
-      expect(sql).toContain("duplicate.turn_id is null");
-      expect(sql).toContain("<= 100 / 1000.0");
-    }
+    expect(FLAME_SQL).toContain("join telemetry.native_records nr");
+    expect(FLAME_SQL).toContain(
+      "previous.source_record_index = duplicate.source_record_index - 1",
+    );
+    expect(FLAME_SQL).toContain(
+      "previous.source_end_offset = duplicate.source_start_offset",
+    );
+    expect(FLAME_SQL).toContain("previous.content_sha256 = duplicate.content_sha256");
+    expect(FLAME_SQL).toContain("previous.source_native_type = 'event_msg'");
+    expect(FLAME_SQL).toContain("previous.source_native_payload_type = 'user_message'");
+    expect(FLAME_SQL).toContain("previous.native_item_id is null");
+    expect(FLAME_SQL).toContain("duplicate.native_item_id is null");
+    expect(FLAME_SQL).toContain("previous.turn_id is null");
+    expect(FLAME_SQL).toContain("duplicate.turn_id is null");
+    expect(FLAME_SQL).toContain("<= 100 / 1000.0");
   });
 
   it("cannot let response-only evidence suppress a submitted prompt identity", () => {
@@ -473,20 +420,13 @@ describe("Sherlock Flame payload", () => {
     }
   });
 
-  it("returns bounded prompts and semantic-role work rows for one interval", async () => {
+  it("returns bounded semantic-role work rows for one interval", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     const personId = "22222222-2222-4222-8222-222222222222";
     const sessionId = "33333333-3333-4333-8333-333333333333";
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-      .mockResolvedValueOnce([{
-        id: "17",
-        observed_at: new Date("2026-08-16T12:00:08.000Z"),
-        content: "First exact prompt",
-        content_byte_size: 18,
-        excerpt_byte_size: 18,
-      }])
       .mockResolvedValueOnce([{
         session_id: sessionId,
         semantic_role: "subagent",
@@ -508,14 +448,12 @@ describe("Sherlock Flame payload", () => {
       snapshot,
     });
 
-    expect(unsafe.mock.calls[1][0]).toBe(PROMPT_DETAIL_SQL);
-    expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_WORK_SQL);
-    expect(unsafe.mock.calls[2][1].at(-1)).toBe(201);
+    expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(201);
     expect(interval).toMatchObject({
       personId,
       start: START.toISOString(),
       snapshot,
-      prompts: [{ id: "17", content: "First exact prompt", truncated: false }],
       work: [{
         id: `${sessionId}:subagent`,
         sessionId,
@@ -559,7 +497,6 @@ describe("Sherlock Flame payload", () => {
       event_subtype: "user_message",
       stored_actor_role: "primary",
       message_role: "user",
-      message_origin: "human",
       phase: null,
       tool_call_id: null,
       tool_name: null,
@@ -571,7 +508,6 @@ describe("Sherlock Flame payload", () => {
       cwd: "/repo",
       content_byte_size: 8,
       content_excerpt: "Build it",
-      time_basis: "occurred_at",
     }, {
       id: "42",
       observed_at: new Date("2026-08-16T12:00:02.000Z"),
@@ -580,7 +516,6 @@ describe("Sherlock Flame payload", () => {
       event_subtype: "function_call",
       stored_actor_role: "primary",
       message_role: null,
-      message_origin: null,
       phase: null,
       tool_call_id: "call-1",
       tool_name: "apply_patch",
@@ -592,7 +527,6 @@ describe("Sherlock Flame payload", () => {
       cwd: "/repo",
       content_byte_size: null,
       content_excerpt: null,
-      time_basis: "native_item_uuidv7",
     }];
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
@@ -618,8 +552,6 @@ describe("Sherlock Flame payload", () => {
       role: "user",
       content: "Build it",
       truncated: false,
-      timeBasis: "occurred_at",
-      provenance: "normalized_event",
     })]);
     expect(detail.nextCursor).toMatch(/^v1\./);
     expect(decodeWorkCursor(detail.nextCursor)).toEqual({
@@ -629,7 +561,6 @@ describe("Sherlock Flame payload", () => {
     expect(detail).toMatchObject({
       workId: `${sessionId}:agent`,
       eventCount: 2,
-      taskSummary: "Build it",
       coverage: { filesAvailable: false },
     });
   });

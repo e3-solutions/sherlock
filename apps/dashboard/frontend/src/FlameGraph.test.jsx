@@ -126,21 +126,21 @@ describe("FlameGraph", () => {
             personId, start, snapshot, workId: `${sessionId}:${role}`, sessionId, role,
             firstAt: start,
             lastAt: new Date(Date.parse(start) + 3000).toISOString(),
-            eventCount: 2,
-            taskSummary: "First exact prompt",
-            taskSummaryTruncated: false,
+            eventCount: 3,
             items: [
               {
                 id: "event-1", at: start, kind: "conversation", role: "user",
-                eventKind: "message", eventSubtype: "user_message",
                 label: null, content: "First exact prompt", truncated: false,
-                provenance: "normalized_event", timeBasis: "occurred_at",
               },
               {
-                id: "event-2", at: new Date(Date.parse(start) + 3000).toISOString(),
+                id: "event-2", at: new Date(Date.parse(start) + 2000).toISOString(),
+                kind: "conversation", role: "assistant", label: null, content: "Ready to ship",
+                truncated: true,
+              },
+              {
+                id: "event-3", at: new Date(Date.parse(start) + 3000).toISOString(),
                 kind: "tool", role: null, label: "exec_command", content: "Tests passed",
-                eventKind: "tool_result", eventSubtype: "tool_result",
-                truncated: false, provenance: "normalized_event", timeBasis: "observed_at",
+                truncated: false,
               },
             ],
             nextCursor: null,
@@ -154,17 +154,12 @@ describe("FlameGraph", () => {
           personId,
           start,
           snapshot,
-          prompts: [
-            { id: "p1", at: start, content: "First exact prompt", truncated: false },
-            { id: "p2", at: new Date(Date.parse(start) + 1000).toISOString(), content: "Second prompt excerpt", truncated: true },
-            { id: "p3", at: new Date(Date.parse(start) + 2000).toISOString(), content: "Third exact prompt", truncated: false },
-          ],
           work: [
             {
               id: "session-1:agent", sessionId: "session-1", role: "agent",
               actorRoles: ["primary"], roleBasis: "normalized_event",
               firstAt: start, lastAt: new Date(Date.parse(start) + 3000).toISOString(),
-              eventCount: 2, summary: "First exact prompt", summaryTruncated: false,
+              eventCount: 3, summary: "First exact prompt", summaryTruncated: false,
               detailAvailable: true,
             },
             {
@@ -172,7 +167,7 @@ describe("FlameGraph", () => {
               actorRoles: ["worker"], roleBasis: "normalized_event",
               firstAt: new Date(Date.parse(start) + 4000).toISOString(),
               lastAt: new Date(Date.parse(start) + 5000).toISOString(),
-              eventCount: 1, summary: null, detailAvailable: false,
+              eventCount: 1, summary: null, detailAvailable: true,
             },
             {
               id: "session-3:agent", sessionId: "session-3", role: "agent",
@@ -579,7 +574,7 @@ describe("FlameGraph", () => {
     expect(lane.querySelector(".flame-bucket-selected")).not.toBeInTheDocument();
   });
 
-  it("loads and lists every canonical prompt underneath the interval count", async () => {
+  it("keeps canonical prompt counts while leading the frame with active work", async () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
     vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
@@ -590,15 +585,25 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
     expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
 
-    await waitFor(() => expect(screen.getAllByText("First exact prompt")).toHaveLength(2));
+    await waitFor(() => expect(screen.getByText("First exact prompt")).toBeInTheDocument());
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
     expect(detail).not.toHaveTextContent("prompts recorded in this interval");
-    expect(within(detail).getAllByRole("listitem")).toHaveLength(7);
-    expect(detail).toHaveTextContent("Second prompt excerpt");
-    expect(detail).toHaveTextContent("Stored excerpt");
+    expect(within(detail).getAllByRole("listitem")).toHaveLength(1);
+    expect(detail).not.toHaveTextContent("What happened");
+    expect(detail).not.toHaveTextContent("Second prompt excerpt");
+    expect(detail).not.toHaveTextContent("Stored excerpt");
     expect(detail).toHaveTextContent("Active work");
     expect(screen.getByRole("button", { name: /Open Agent session evidence/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Subagent session evidence/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();
+
+    const workExpander = screen.getByRole("button", { name: "Show 3 more sessions" });
+    expect(workExpander).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(workExpander);
+    expect(workExpander).toHaveAttribute("aria-expanded", "true");
+    expect(within(detail).getAllByRole("listitem")).toHaveLength(4);
+    expect(screen.getByText("Subagent session")).toBeInTheDocument();
+    expect(screen.getByText("Agent session")).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining("/api/flame/interval?"),
       expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
@@ -621,11 +626,12 @@ describe("FlameGraph", () => {
     expect(await screen.findByText(
       /Some session-role evidence changed after this timeline snapshot/,
     )).toHaveAttribute("role", "status");
-    expect(screen.getByText("What happened")).toBeInTheDocument();
+    expect(screen.getByText("Active work")).toBeInTheDocument();
+    expect(screen.queryByText("What happened")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("keeps busy interval overviews concise until more prompts are requested", async () => {
+  it("keeps prompt text out of busy frame overviews and resets extra sessions by frame", async () => {
     const busyModel = model();
     busyModel.people[0].buckets[0].prompts = 7;
     Object.assign(busyModel.people[0].buckets[1], {
@@ -644,12 +650,6 @@ describe("FlameGraph", () => {
           personId: request.searchParams.get("personId"),
           start,
           snapshot: request.searchParams.get("snapshot"),
-          prompts: Array.from({ length: 7 }, (_, index) => ({
-            id: `prompt-${index + 1}`,
-            at: new Date(Date.parse(start) + index).toISOString(),
-            content: `Prompt ${index + 1}`,
-            truncated: false,
-          })),
           work: Array.from({ length: 4 }, (_, index) => ({
             id: `session-${index + 1}:agent`,
             sessionId: `session-${index + 1}`,
@@ -681,20 +681,25 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    const expander = await screen.findByRole("button", { name: "Show 4 more prompts" });
-    expect(screen.getByText("Prompt 3")).toBeInTheDocument();
-    expect(screen.queryByText("Prompt 4")).not.toBeInTheDocument();
+    const expander = await screen.findByRole("button", { name: "Show 4 more sessions" });
+    expect(screen.queryByText("Prompt 1")).not.toBeInTheDocument();
+    expect(screen.queryByText("What happened")).not.toBeInTheDocument();
 
     fireEvent.click(expander);
-    expect(screen.getByText("Prompt 6")).toBeInTheDocument();
-    expect(screen.getByText("Prompt 7")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /more prompts/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide 4 more sessions" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getAllByText("Agent session")).toHaveLength(4);
 
     const chart = screen.getByRole("application", { name: "Ada Lovelace activity timeline" });
     fireEvent.keyDown(chart, { key: "ArrowRight" });
     fireEvent.keyDown(chart, { key: "Enter" });
-    expect(await screen.findByRole("button", { name: "Show 4 more prompts" })).toBeInTheDocument();
-    expect(screen.queryByText("Prompt 4")).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Show 4 more sessions" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByText("Agent session")).not.toBeInTheDocument();
   });
 
   it("drills into real session evidence, returns focus to the row, and keeps Escape for close", async () => {
@@ -712,15 +717,29 @@ describe("FlameGraph", () => {
 
     expect(screen.getByText("Loading session evidence…")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText("Conversation")).toBeInTheDocument());
-    expect(screen.getByText("Implementation evidence")).toBeInTheDocument();
+    expect(document.querySelector('.flame-detail__items li[data-role="user"]')).toHaveTextContent("user");
+    expect(document.querySelector('.flame-detail__items li[data-role="assistant"]')).toHaveTextContent("assistant");
+    expect(screen.getAllByText("First exact prompt")).toHaveLength(1);
+    expect(screen.queryByText("Prompt in this frame")).not.toBeInTheDocument();
+    expect(screen.getByText("Ready to ship")).toBeInTheDocument();
+    expect(screen.getByText("Truncated")).toBeInTheDocument();
+    const activityToggle = screen.getByRole("button", { name: "Activity log" });
+    expect(activityToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Tests passed")).not.toBeInTheDocument();
+    fireEvent.click(activityToggle);
+    expect(activityToggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("Tests passed")).toBeInTheDocument();
+    expect(screen.queryByText(/normalized_event/)).not.toBeInTheDocument();
     expect(screen.getByText(/Verified file-touch evidence is unavailable/)).toBeInTheDocument();
+    expect(screen.getByText("Evidence limits").closest("details")).not.toHaveAttribute("open");
     expect(fetch).toHaveBeenCalledWith(
       expect.stringMatching(/\/api\/flame\/work\?.*sessionId=session-1.*role=agent/),
       expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
+    const backButton = screen.getByRole("button", { name: "Back to frame" });
+    expect(backButton.querySelector("svg")).toBeInTheDocument();
+    fireEvent.click(backButton);
     const restored = await screen.findByRole("button", { name: /Open Agent session evidence/ });
     await waitFor(() => expect(restored).toHaveFocus());
 
@@ -735,22 +754,54 @@ describe("FlameGraph", () => {
     await waitFor(() => expect(chart).toHaveFocus());
   });
 
-  it("rejects prompt details whose count disagrees with the selected snapshot", async () => {
-    vi.mocked(fetch).mockImplementationOnce((url) => {
+  it("loads later conversation turns without requiring the activity log to be expanded", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation((url, options) => {
       const request = new URL(url, "http://dashboard.test");
+      if (request.pathname !== "/api/flame/work") return defaultFetch(url, options);
       const start = request.searchParams.get("start");
+      const personId = request.searchParams.get("personId");
+      const snapshot = request.searchParams.get("snapshot");
+      const sessionId = request.searchParams.get("sessionId");
+      const role = request.searchParams.get("role");
+      const laterPage = request.searchParams.has("cursor");
       return Promise.resolve({
         ok: true,
         json: () => Promise.resolve({
-          personId: request.searchParams.get("personId"),
-          start,
-          snapshot: request.searchParams.get("snapshot"),
-          prompts: [
-            { id: "p1", at: start, content: "Only one row", truncated: false },
-          ],
+          personId, start, snapshot, workId: `${sessionId}:${role}`, sessionId, role,
+          firstAt: start,
+          lastAt: new Date(Date.parse(start) + 2000).toISOString(),
+          eventCount: 2,
+          items: laterPage ? [{
+            id: "event-later",
+            at: new Date(Date.parse(start) + 2000).toISOString(),
+            kind: "conversation",
+            role: "assistant",
+            label: null,
+            content: "Later assistant turn",
+            truncated: false,
+          }] : [{
+            id: "event-first",
+            at: start,
+            kind: "conversation",
+            role: "user",
+            label: null,
+            content: "First exact prompt",
+            truncated: false,
+          }],
+          nextCursor: laterPage ? null : "next-page",
+          coverage: {
+            evidence: "observed_events",
+            state: "partial",
+            reason: "event_presence_not_continuous_attention",
+            timing: "observed_evidence_window_not_duration",
+            filesAvailable: false,
+            filesReason: "tool_payload_not_projected",
+          },
         }),
       });
     });
+
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
     vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
@@ -759,11 +810,37 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: /Open Agent session evidence/ }));
+    const activityToggle = await screen.findByRole("button", { name: "Activity log" });
+    expect(activityToggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Load more session evidence" }));
 
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("Frame evidence could not be loaded");
+    expect(await screen.findByText("Later assistant turn")).toBeInTheDocument();
+    expect(activityToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Load more session evidence" })).not.toBeInTheDocument();
+  });
+
+  it("restores an expanded promptless session row when returning from its detail", async () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
     });
-    expect(screen.queryByText("prompts recorded in this interval")).not.toBeInTheDocument();
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: "Show 3 more sessions" }));
+    const row = screen.getByRole("button", { name: /Open Subagent session evidence/ });
+    fireEvent.click(row);
+    await screen.findByText("Conversation");
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
+    const restored = await screen.findByRole("button", { name: /Open Subagent session evidence/ });
+    expect(screen.getByRole("button", { name: "Hide 3 more sessions" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    await waitFor(() => expect(restored).toHaveFocus());
   });
 
   it("keeps selection mounted through close, then restores exact chart focus", async () => {

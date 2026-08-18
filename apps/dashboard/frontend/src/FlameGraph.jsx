@@ -33,7 +33,6 @@ const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
 const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;
 const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
-const PROMPT_PREVIEW_COUNT = 3;
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
@@ -311,17 +310,20 @@ function roleLabel(role) {
 function EvidenceCoverage({ coverage }) {
   if (!coverage) return null;
   return (
-    <div className="flame-detail__disclosure">
-      <strong>Evidence limits</strong>
-      <p>Times mark the first and last observed source events, not continuous activity.</p>
-      {!coverage.filesAvailable && (
-        <p>
-          Verified file-touch evidence is unavailable because tool payloads are not projected as
-          structured canonical fields. Paths in message excerpts are conversation text, not proof
-          of file access or change.
-        </p>
-      )}
-    </div>
+    <details className="flame-detail__disclosure">
+      <summary>Evidence limits</summary>
+      <div>
+        <p>Times mark the first and last observed source events, not continuous activity.</p>
+        <p>Truncated means Sherlock is showing only the stored database excerpt (up to 1,024 UTF-8 bytes), not the full source content.</p>
+        {!coverage.filesAvailable && (
+          <p>
+            Verified file-touch evidence is unavailable because tool payloads are not projected as
+            structured canonical fields. Paths in message excerpts are conversation text, not proof
+            of file access or change.
+          </p>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -348,15 +350,55 @@ function IntervalOverview({
   evidence,
   onRetry,
   onOpenWork,
+  showAdditionalWork,
+  onToggleAdditionalWork,
   stale,
   closing,
 }) {
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const [showAllPrompts, setShowAllPrompts] = useState(false);
-  const visiblePrompts = showAllPrompts
-    ? evidence.prompts
-    : evidence.prompts.slice(0, PROMPT_PREVIEW_COUNT);
-  const hiddenPromptCount = evidence.prompts.length - visiblePrompts.length;
+  const promptedWork = evidence.work.filter(({ summary }) => summary !== null);
+  const additionalWork = evidence.work.filter(({ summary }) => summary === null);
+  const visibleWork = showAdditionalWork
+    ? [...promptedWork, ...additionalWork]
+    : promptedWork;
+
+  function workRow(work) {
+    const label = work.summary ?? `${roleLabel(work.role)} session`;
+    const contents = (
+      <>
+        <i className={`flame-key flame-key--${work.role}`} aria-hidden="true" />
+        <span className="flame-detail__work-copy">
+          <strong className={work.summary ? undefined : "flame-detail__work-generic"}>{label}</strong>
+          <span>
+            <b>{roleLabel(work.role)}</b>
+            <span aria-hidden="true">·</span>
+            <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
+            <span aria-hidden="true">–</span>
+            <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
+            <span aria-hidden="true">·</span>
+            <small>{work.eventCount} {work.eventCount === 1 ? "event" : "events"}</small>
+          </span>
+        </span>
+        {work.detailAvailable && <span className="flame-detail__chevron" aria-hidden="true">›</span>}
+      </>
+    );
+    return (
+      <li key={work.id}>
+        {work.detailAvailable ? (
+          <button
+            type="button"
+            data-work-id={work.id}
+            aria-label={`Open ${roleLabel(work.role)} session evidence from ${formatTime(work.firstAtMs)} to ${formatTime(work.lastAtMs)}`}
+            onClick={() => onOpenWork(work)}
+          >
+            {contents}
+          </button>
+        ) : (
+          <div>{contents}</div>
+        )}
+      </li>
+    );
+  }
 
   return (
     <div className="flame-detail__view" data-view="overview">
@@ -391,40 +433,6 @@ function IntervalOverview({
         </div>
       ) : evidence.state === "ready" && (
         <div className="flame-detail__body">
-          <section className="flame-detail__section" aria-labelledby={`${headingId}-prompts`}>
-            <h3 id={`${headingId}-prompts`}>What happened</h3>
-            {evidence.prompts.length === 0 ? (
-              <p className="flame-detail__empty">No user prompts observed in this interval.</p>
-            ) : (
-              <>
-                <ol className="flame-detail__prompts">
-                  {visiblePrompts.map((prompt) => (
-                    <li key={prompt.id}>
-                      <header>
-                        <strong>User</strong>
-                        <time dateTime={new Date(prompt.atMs).toISOString()}>
-                          {formatTime(prompt.atMs)}
-                        </time>
-                        {prompt.truncated && <span>Stored excerpt</span>}
-                      </header>
-                      <p>{prompt.content || "Prompt text was empty."}</p>
-                    </li>
-                  ))}
-                </ol>
-                {hiddenPromptCount > 0 && (
-                  <button
-                    type="button"
-                    className="flame-detail__prompt-expander"
-                    aria-expanded={showAllPrompts}
-                    onClick={() => setShowAllPrompts(true)}
-                  >
-                    Show {hiddenPromptCount} more {hiddenPromptCount === 1 ? "prompt" : "prompts"}
-                  </button>
-                )}
-              </>
-            )}
-          </section>
-
           <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
             <h3 id={`${headingId}-work`}>Active work</h3>
             {evidence.workIncomplete && (
@@ -436,45 +444,21 @@ function IntervalOverview({
             {evidence.work.length === 0 ? (
               <p className="flame-detail__empty">No work-session evidence observed in this interval.</p>
             ) : (
-              <ul className="flame-detail__work">
-                {evidence.work.map((work) => {
-                  const contents = (
-                    <>
-                      <i className={`flame-key flame-key--${work.role}`} aria-hidden="true" />
-                      <span className="flame-detail__work-copy">
-                        <span>
-                          <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
-                          <span aria-hidden="true">–</span>
-                          <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
-                          <b>{roleLabel(work.role)}</b>
-                        </span>
-                        <strong>{work.summary ?? "No submitted user message"}</strong>
-                        <small>
-                          {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
-                          {work.summaryTruncated ? " · Stored excerpt" : ""}
-                        </small>
-                      </span>
-                      {work.detailAvailable && <span className="flame-detail__chevron" aria-hidden="true">›</span>}
-                    </>
-                  );
-                  return (
-                    <li key={work.id}>
-                      {work.detailAvailable ? (
-                        <button
-                          type="button"
-                          data-work-id={work.id}
-                          aria-label={`Open ${roleLabel(work.role)} session evidence from ${formatTime(work.firstAtMs)} to ${formatTime(work.lastAtMs)}`}
-                          onClick={() => onOpenWork(work)}
-                        >
-                          {contents}
-                        </button>
-                      ) : (
-                        <div>{contents}</div>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
+              <>
+                {visibleWork.length > 0 && (
+                  <ul className="flame-detail__work">{visibleWork.map(workRow)}</ul>
+                )}
+                {additionalWork.length > 0 && (
+                  <button
+                    type="button"
+                    className="flame-detail__work-expander"
+                    aria-expanded={showAdditionalWork}
+                    onClick={onToggleAdditionalWork}
+                  >
+                    {showAdditionalWork ? "Hide" : "Show"} {additionalWork.length} more {additionalWork.length === 1 ? "session" : "sessions"}
+                  </button>
+                )}
+              </>
             )}
           </section>
           <EvidenceCoverage coverage={evidence.coverage} />
@@ -495,13 +479,16 @@ function WorkDetail({
   closing,
 }) {
   const headingId = `flame-work-${work.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const [showActivity, setShowActivity] = useState(false);
   const conversation = evidence.items.filter(({ kind }) => kind === "conversation");
-  const implementation = evidence.items.filter(({ kind }) => kind !== "conversation");
+  const activity = evidence.items.filter(({ kind }) => kind !== "conversation");
   return (
     <div className="flame-detail__view" data-view="work">
       <header className="flame-detail__header flame-detail__header--work">
         <button type="button" className="flame-detail__back" onClick={onBack}>
-          <span aria-hidden="true">‹</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+            <path d="m15 18-6-6 6-6" />
+          </svg>
           <span>Back to frame</span>
         </button>
         <DrawerCloseButton closing={closing} onClose={onClose} />
@@ -528,16 +515,6 @@ function WorkDetail({
         </div>
       ) : evidence.state === "ready" && (
         <div className="flame-detail__body">
-          <section className="flame-detail__section" aria-labelledby={`${headingId}-task`}>
-            <h3 id={`${headingId}-task`}>Task prompt evidence</h3>
-            <p className="flame-detail__task">
-              {evidence.taskSummary ?? "No submitted user message was observed for this work row."}
-            </p>
-            {evidence.taskSummary && (
-              <p className="flame-detail__provenance">First submitted user-message excerpt in this frame</p>
-            )}
-            {evidence.taskSummaryTruncated && <p className="flame-detail__provenance">Stored excerpt</p>}
-          </section>
           <section className="flame-detail__section" aria-labelledby={`${headingId}-conversation`}>
             <h3 id={`${headingId}-conversation`}>Conversation</h3>
             {conversation.length === 0 ? (
@@ -545,26 +522,49 @@ function WorkDetail({
             ) : (
               <ol className="flame-detail__items">
                 {conversation.map((item) => (
-                  <li key={item.id} data-kind={item.kind}>
+                  <li key={item.id} data-kind={item.kind} data-role={item.role}>
                     <header>
                       <strong>{item.role}</strong>
                       <time dateTime={new Date(item.atMs).toISOString()}>{formatTime(item.atMs)}</time>
-                      {item.truncated && <span>Stored excerpt</span>}
+                      {item.truncated && <span>Truncated</span>}
                     </header>
                     <p>{item.content || "Stored event content was empty."}</p>
-                    <small>{item.provenance} · {item.timeBasis.replaceAll("_", " ")}</small>
                   </li>
                 ))}
               </ol>
             )}
           </section>
-          <section className="flame-detail__section" aria-labelledby={`${headingId}-implementation`}>
-            <h3 id={`${headingId}-implementation`}>Implementation evidence</h3>
-            {implementation.length === 0 ? (
-              <p className="flame-detail__empty">No tool or implementation events were observed for this work row.</p>
+          {evidence.nextCursor && (
+            <button
+              type="button"
+              className="flame-detail__more flame-detail__more--session"
+              onClick={onLoadMore}
+              disabled={evidence.loadingMore}
+            >
+              {evidence.loadingMore ? "Loading more…" : "Load more session evidence"}
+            </button>
+          )}
+          {evidence.moreError && (
+            <p className="flame-detail__more-error flame-detail__more-error--session" role="alert">
+              More session evidence could not be loaded. Try again.
+            </p>
+          )}
+          <section className="flame-detail__section flame-detail__activity" aria-labelledby={`${headingId}-activity`}>
+            <button
+              type="button"
+              className="flame-detail__activity-toggle"
+              id={`${headingId}-activity`}
+              aria-expanded={showActivity}
+              onClick={() => setShowActivity((shown) => !shown)}
+            >
+              <span>Activity log</span>
+              <span aria-hidden="true">{showActivity ? "−" : "+"}</span>
+            </button>
+            {showActivity && (activity.length === 0 ? (
+              <p className="flame-detail__empty">No tool or system events were observed for this session.</p>
             ) : (
-              <ol className="flame-detail__items">
-                {implementation.map((item) => {
+              <ol className="flame-detail__items flame-detail__items--activity">
+                {activity.map((item) => {
                   const metadata = [
                     ["Tool", item.toolName], ["Status", item.toolStatus], ["Phase", item.phase],
                     ["Model", item.model], ["Project", item.projectKey], ["Repository", item.repoRemote],
@@ -576,38 +576,24 @@ function WorkDetail({
                       <header>
                         <strong>{item.label ?? item.kind}</strong>
                         <time dateTime={new Date(item.atMs).toISOString()}>{formatTime(item.atMs)}</time>
-                        {item.truncated && <span>Stored excerpt</span>}
+                        {item.truncated && <span>Truncated</span>}
                       </header>
                       {item.content && <p>{item.content}</p>}
                       {metadata.length > 0 && (
-                        <dl className="flame-detail__metadata">
-                          {metadata.map(([label, value]) => (
-                            <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
-                          ))}
-                        </dl>
+                        <details className="flame-detail__event-details">
+                          <summary>Event details</summary>
+                          <dl className="flame-detail__metadata">
+                            {metadata.map(([label, value]) => (
+                              <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+                            ))}
+                          </dl>
+                        </details>
                       )}
-                      <small>
-                        {item.eventKind}{item.eventSubtype ? ` / ${item.eventSubtype}` : ""}
-                        {` · ${item.provenance} · ${item.timeBasis.replaceAll("_", " ")}`}
-                      </small>
                     </li>
                   );
                 })}
               </ol>
-            )}
-            {evidence.nextCursor && (
-              <button
-                type="button"
-                className="flame-detail__more"
-                onClick={onLoadMore}
-                disabled={evidence.loadingMore}
-              >
-                {evidence.loadingMore ? "Loading more…" : "Show more"}
-              </button>
-            )}
-            {evidence.moreError && (
-              <p className="flame-detail__more-error" role="alert">More evidence could not be loaded. Try again.</p>
-            )}
+            ))}
           </section>
           <EvidenceCoverage coverage={evidence.coverage} />
         </div>
@@ -876,10 +862,11 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const [activeTooltipPersonId, setActiveTooltipPersonId] = useState(null);
   const [detailClosing, setDetailClosing] = useState(false);
   const [drawerView, setDrawerView] = useState({ screen: "overview" });
+  const [showAdditionalWork, setShowAdditionalWork] = useState(false);
   const [intervalRevision, setIntervalRevision] = useState(0);
   const [workRevision, setWorkRevision] = useState(0);
   const [intervalEvidence, setIntervalEvidence] = useState({
-    state: "idle", prompts: [], work: [], coverage: null, workIncomplete: false,
+    state: "idle", work: [], coverage: null, workIncomplete: false,
   });
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], coverage: null, nextCursor: null,
@@ -955,14 +942,14 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
       setIntervalEvidence({
-        state: "idle", prompts: [], work: [], coverage: null, workIncomplete: false,
+        state: "idle", work: [], coverage: null, workIncomplete: false,
       });
       return undefined;
     }
 
     const controller = new AbortController();
     setIntervalEvidence({
-      state: "loading", prompts: [], work: [], coverage: null, workIncomplete: false,
+      state: "loading", work: [], coverage: null, workIncomplete: false,
     });
     const query = new URLSearchParams({
       personId: selectedPerson.id,
@@ -985,9 +972,6 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
           startMs: selectedPoint.startMs,
           snapshot: data.snapshot,
         });
-        if (evidence.prompts.length !== selectedPoint.prompts) {
-          throw new Error("Prompt evidence count does not match the timeline snapshot");
-        }
         if (evidence.work.length > selectedPoint.activity) {
           throw new Error("Work evidence count does not match the timeline snapshot");
         }
@@ -1000,12 +984,12 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       .catch(() => {
         if (!controller.signal.aborted) {
           setIntervalEvidence({
-            state: "error", prompts: [], work: [], coverage: null, workIncomplete: false,
+            state: "error", work: [], coverage: null, workIncomplete: false,
           });
         }
       });
     return () => controller.abort();
-  }, [data.snapshot, intervalRevision, selectedPerson?.id, selectedPoint?.startMs, selectedPoint?.prompts]);
+  }, [data.snapshot, intervalRevision, selectedPerson?.id, selectedPoint?.startMs]);
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint || drawerView.screen !== "work") {
@@ -1068,6 +1052,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     setDetailClosing(false);
     selectionOriginRef.current = origin;
     returnWorkIdRef.current = null;
+    setShowAdditionalWork(false);
     setDrawerView({ screen: "overview" });
     setSelection({ personId: person.id, startMs: point.startMs });
   };
@@ -1239,6 +1224,8 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
               onClose={closeDetail}
               onRetry={() => setIntervalRevision((revision) => revision + 1)}
               onOpenWork={openWork}
+              showAdditionalWork={showAdditionalWork}
+              onToggleAdditionalWork={() => setShowAdditionalWork((shown) => !shown)}
             />
           )}
         </aside>

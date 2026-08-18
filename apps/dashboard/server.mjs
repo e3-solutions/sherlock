@@ -106,29 +106,6 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname === "/api/flame/prompts") {
-    if (!source) {
-      sendJson(response, 503, { error: "dashboard_not_configured" });
-      return;
-    }
-    try {
-      sendJson(response, 200, await source.fetchPrompts({
-        personId: url.searchParams.get("personId") ?? "",
-        start: url.searchParams.get("start") ?? "",
-        snapshot: url.searchParams.get("snapshot") ?? "",
-      }));
-    } catch (error) {
-      const code = error instanceof FlameSourceError
-        ? error.code
-        : "flame_database_unavailable";
-      const status = code === "flame_prompt_result_too_large"
-        ? 413
-        : code.startsWith("flame_prompt_request_") ? 400 : 503;
-      sendJson(response, status, { error: code });
-    }
-    return;
-  }
-
   if (url.pathname === "/api/flame/interval") {
     if (!source) {
       sendJson(response, 503, { error: "dashboard_not_configured" });

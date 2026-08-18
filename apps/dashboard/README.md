@@ -81,21 +81,15 @@ objects.
   Identical excerpts, separate streams or sessions, nonadjacent same-format
   records, ambiguous candidates, and independently identified turns remain
   distinct evidence.
-- `GET /api/flame/prompts?personId=<uuid>&start=<bucket ISO timestamp>&snapshot=<token>` lazily
-  returns every stored prompt excerpt for the selected bucket, ordered by its
-  canonical timestamp. `truncated: true` distinguishes the 1,024-byte database
-  excerpt from full raw content retained in private Storage. `/api/flame`
-  captures a PostgreSQL MVCC snapshot token; the detail query accepts only
-  event rows whose creating transaction was visible to that exact aggregate
-  snapshot. Late normalization therefore cannot make a drawer disagree with
-  the selected bar.
 - `GET /api/flame/interval?personId=<uuid>&start=<bucket ISO timestamp>&snapshot=<token>`
-  returns at most 500 canonical prompts and 200 session/semantic-role work
-  rows. A work row exists only when the same canonical activity universe used
-  by the aggregate contains visible evidence for that session and role. Its
-  first/last timestamps are the observed evidence window, not active duration.
-  Its optional summary is the first submitted `user_message` excerpt in the
-  frame; response-only runtime context is excluded and no title is synthesized.
+  returns at most 200 session/semantic-role work rows. A work row exists only
+  when the same canonical activity universe used by the aggregate contains
+  visible evidence for that session and role. Its first/last timestamps are the
+  observed evidence window, not active duration. Its optional summary is the
+  first submitted `user_message` excerpt in the frame; response-only runtime
+  context is excluded and no title is synthesized. Prompt counts remain in the
+  snapshot-pinned aggregate; the interval endpoint does not resend unused prompt
+  excerpts.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical conversation, tool, lifecycle,
   reasoning, and error evidence. The default page size is 50 and the maximum
@@ -114,8 +108,8 @@ objects.
   or changed.
 - The response declares partial observed-event coverage because event presence
   is exact evidence for a bucket but is not proof of continuous attention.
-- Aggregate and detail are separate database transactions, but prompt details
-  are pinned to the aggregate's immutable MVCC visibility token. This is a
+- Aggregate and detail are separate database transactions, but interval and
+  work evidence are pinned to the aggregate's immutable MVCC visibility token. This is a
   read-consistency boundary, not a durable pipeline publication cutoff: a later
   timeline refresh can correctly include newly normalized evidence.
 - Initial page load makes one `GET /api/flame` request and renders the complete

@@ -13,7 +13,6 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 export const UNKEYED_PROMPT_MATCH_SECONDS = 2;
 export const UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS = 100;
 export const ASSISTANT_REPRESENTATION_MATCH_SECONDS = 3;
-export const INTERVAL_PROMPT_LIMIT = 500;
 export const INTERVAL_WORK_LIMIT = 200;
 export const DEFAULT_WORK_DETAIL_LIMIT = 50;
 export const MAX_WORK_DETAIL_LIMIT = 100;
@@ -371,34 +370,10 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
 
-export const PROMPT_DETAIL_SQL = `
-with p as materialized (
-  select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version,
-         $5::pg_snapshot snapshot, $7::timestamptz bucket_start,
-         $8::timestamptz bucket_end
-), ${promptsCte(
-  ", e.content_byte_size, e.content_excerpt",
-  // Recreate the aggregate's event visibility without keeping its transaction open.
-  // telemetry.events is append-only, so filtering each row's creator is sufficient.
-  "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
-)}
-select id::text id, observed_at,
-       coalesce(content_excerpt, '') content,
-       coalesce(content_byte_size, 0)::bigint content_byte_size,
-       octet_length(coalesce(content_excerpt, ''))::bigint excerpt_byte_size
-  from prompts
- where person_id = $6::uuid
-   and observed_at >= (select bucket_start from p)
-   and observed_at < (select bucket_end from p)
- order by observed_at, id
-limit $9
-`;
-
 const DETAIL_ACTIVITY_COLUMNS = `,
          e.actor_role stored_actor_role,
          e.canonical_scope_key, e.logical_event_key, e.turn_id,
-         e.message_role, e.message_origin, e.phase,
+         e.message_role, e.phase,
          e.native_item_id source_native_item_id,
          e.content_sha256,
          nr.batch_id source_batch_id, nr.record_index source_record_index,
@@ -413,18 +388,11 @@ const DETAIL_ACTIVITY_COLUMNS = `,
          ib.record_count source_batch_record_count,
          e.tool_call_id, e.tool_name, e.tool_status,
          e.model, e.project_key, e.repo_remote, e.branch, e.cwd,
-         e.content_byte_size, e.content_excerpt,
-         case
-           when ${nativeItemTimestamp("e.native_item_id")} is not null
-             then 'native_item_uuidv7'
-           when e.occurred_at is not null then 'occurred_at'
-           when e.observed_at is not null then 'observed_at'
-           else 'server_received_at'
-         end time_basis`;
+         e.content_byte_size, e.content_excerpt`;
 
 const DETAIL_EVENT_COLUMNS = `, id, event_kind, event_subtype,
          stored_actor_role, canonical_scope_key, logical_event_key, turn_id,
-         message_role, message_origin, phase,
+         message_role, phase,
          source_native_item_id,
          content_sha256, source_batch_id, source_record_index,
          source_start_offset, source_end_offset,
@@ -435,7 +403,7 @@ const DETAIL_EVENT_COLUMNS = `, id, event_kind, event_subtype,
          source_batch_record_count,
          tool_call_id, tool_name, tool_status,
          model, project_key, repo_remote, branch, cwd,
-         content_byte_size, content_excerpt, time_basis`;
+         content_byte_size, content_excerpt`;
 
 function canonicalActivityEvidenceCte() {
   return `
@@ -666,9 +634,8 @@ with p as materialized (
 select selected.id::text id, selected.observed_at,
        selected.observed_at_microseconds, selected.event_kind,
        selected.event_subtype, selected.stored_actor_role, message_role,
-       message_origin, phase, tool_call_id, tool_name, tool_status, model,
-       project_key, repo_remote, branch, cwd, content_byte_size, content_excerpt,
-       time_basis
+       phase, tool_call_id, tool_name, tool_status, model,
+       project_key, repo_remote, branch, cwd, content_byte_size, content_excerpt
   from selected
  order by selected.observed_at, selected.id
 `;
@@ -864,15 +831,6 @@ function snapshotBounds(snapshotReceipt, startAt, read, prefix) {
   };
 }
 
-function promptFromRow(row) {
-  return {
-    id: String(row.id),
-    at: asDate(row.observed_at).toISOString(),
-    content: String(row.content),
-    truncated: count(row.content_byte_size) > count(row.excerpt_byte_size),
-  };
-}
-
 function workFromRow(row) {
   const role = String(row.semantic_role);
   const sessionId = String(row.session_id);
@@ -918,14 +876,10 @@ function detailItemFromRow(row) {
     id: String(row.id),
     at: asDate(row.observed_at).toISOString(),
     kind,
-    eventKind,
-    eventSubtype: row.event_subtype === null ? null : String(row.event_subtype),
-    timeBasis: String(row.time_basis),
     role: kind === "conversation" && row.message_role !== null
       ? String(row.message_role)
       : null,
     actorRole: row.stored_actor_role === null ? null : String(row.stored_actor_role),
-    origin: row.message_origin === null ? null : String(row.message_origin),
     phase: row.phase === null ? null : String(row.phase),
     label,
     content,
@@ -938,7 +892,6 @@ function detailItemFromRow(row) {
     repoRemote: row.repo_remote === null ? null : String(row.repo_remote),
     branch: row.branch === null ? null : String(row.branch),
     cwd: row.cwd === null ? null : String(row.cwd),
-    provenance: "normalized_event",
   };
 }
 
@@ -1091,38 +1044,6 @@ export class DirectFlameSource {
     });
   }
 
-  async fetchPrompts({ personId, start, snapshot }) {
-    const startAt = requestStart(start, "prompt");
-    const snapshotReceipt = requestSnapshot(snapshot, "prompt");
-    validateIntervalIdentity(personId, startAt, "prompt");
-
-    return await this.transaction(async (tx) => {
-      const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
-      const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const limit = INTERVAL_PROMPT_LIMIT + 1;
-      const rows = await tx.unsafe(PROMPT_DETAIL_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        limit,
-      ]);
-      if (rows.length === limit) {
-        throw new FlameSourceError("flame_prompt_result_too_large");
-      }
-      return {
-        personId,
-        start: startAt.toISOString(),
-        snapshot,
-        prompts: rows.map(promptFromRow),
-      };
-    });
-  }
-
   async fetchInterval({ personId, start, snapshot }) {
     const startAt = requestStart(start, "interval");
     const snapshotReceipt = requestSnapshot(snapshot, "interval");
@@ -1131,21 +1052,6 @@ export class DirectFlameSource {
     return await this.transaction(async (tx) => {
       const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
-      const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
-      const prompts = await tx.unsafe(PROMPT_DETAIL_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        promptLimit,
-      ]);
-      if (prompts.length === promptLimit) {
-        throw new FlameSourceError("flame_interval_prompt_result_too_large");
-      }
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = await tx.unsafe(INTERVAL_WORK_SQL, [
         this.workspaceId,
@@ -1166,7 +1072,6 @@ export class DirectFlameSource {
         personId,
         start: startAt.toISOString(),
         snapshot,
-        prompts: prompts.map(promptFromRow),
         work: work.map(workFromRow),
         coverage: detailCoverage(),
       };
@@ -1254,8 +1159,6 @@ export class DirectFlameSource {
         firstAt: header.firstAt,
         lastAt: header.lastAt,
         eventCount: header.eventCount,
-        taskSummary: header.summary,
-        taskSummaryTruncated: header.summaryTruncated,
         items: pageRows.map(detailItemFromRow),
         nextCursor,
         coverage: detailCoverage(),

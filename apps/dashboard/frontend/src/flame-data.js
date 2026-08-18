@@ -283,47 +283,11 @@ export function adaptFlamePayload(value) {
   };
 }
 
-export function adaptPromptEvidence(value, { personId, startMs, snapshot }) {
-  const payload = requireObject(value, "prompt evidence");
-  if (requireNonemptyString(payload.personId, "prompt evidence.personId") !== personId) {
-    fail("prompt evidence.personId", "the selected person id");
-  }
-  if (requireDate(payload.start, "prompt evidence.start") !== startMs) {
-    fail("prompt evidence.start", "the selected bucket start");
-  }
-  if (requireNonemptyString(payload.snapshot, "prompt evidence.snapshot") !== snapshot) {
-    fail("prompt evidence.snapshot", "the timeline snapshot");
-  }
-  if (!Array.isArray(payload.prompts)) {
-    fail("prompt evidence.prompts", "an array");
-  }
-  const ids = new Set();
-  return payload.prompts.map((value, index) => {
-    const path = `prompt evidence.prompts[${index}]`;
-    const prompt = requireObject(value, path);
-    const id = requireNonemptyString(prompt.id, `${path}.id`);
-    if (ids.has(id)) fail(`${path}.id`, "unique");
-    ids.add(id);
-    const atMs = requireDate(prompt.at, `${path}.at`);
-    if (atMs < startMs || atMs >= startMs + BUCKET_MS) {
-      fail(`${path}.at`, "inside the selected bucket");
-    }
-    if (typeof prompt.content !== "string") fail(`${path}.content`, "a string");
-    if (typeof prompt.truncated !== "boolean") fail(`${path}.truncated`, "a boolean");
-    return { id, atMs, content: prompt.content, truncated: prompt.truncated };
-  });
-}
-
 const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
 const ACTOR_ROLES = ["primary", "worker", "guardian", "unknown"];
 const ROLE_BASES = ["normalized_event", "resolved_parent"];
 const DETAIL_KINDS = ["conversation", "tool", "context"];
 const CONVERSATION_ROLES = ["user", "assistant"];
-const TIME_BASES = ["native_item_uuidv7", "occurred_at", "observed_at", "server_received_at"];
-const EVENT_KINDS = [
-  "message", "reasoning", "tool_call", "tool_result", "agent_spawn", "agent_message",
-  "lifecycle", "error",
-];
 
 function adaptCoverage(value, path) {
   const coverage = requireObject(value, path);
@@ -355,27 +319,7 @@ export function adaptIntervalEvidence(value, expected) {
   const payload = requireObject(value, "interval evidence");
   requireEcho(payload, expected, "interval evidence");
   const { startMs } = expected;
-  if (!Array.isArray(payload.prompts)) fail("interval evidence.prompts", "an array");
   if (!Array.isArray(payload.work)) fail("interval evidence.work", "an array");
-
-  const promptIds = new Set();
-  let previousPromptAt = null;
-  const prompts = payload.prompts.map((value, index) => {
-    const path = `interval evidence.prompts[${index}]`;
-    const prompt = requireObject(value, path);
-    const id = requireNonemptyString(prompt.id, `${path}.id`);
-    if (promptIds.has(id)) fail(`${path}.id`, "unique");
-    promptIds.add(id);
-    const atMs = requireBucketDate(prompt.at, `${path}.at`, startMs);
-    previousPromptAt = requireChronological(previousPromptAt, atMs, `${path}.at`);
-    if (typeof prompt.content !== "string") fail(`${path}.content`, "a string");
-    return {
-      id,
-      atMs,
-      content: prompt.content,
-      truncated: requireBoolean(prompt.truncated, `${path}.truncated`),
-    };
-  });
 
   const workIds = new Set();
   let previousWorkAt = null;
@@ -416,7 +360,6 @@ export function adaptIntervalEvidence(value, expected) {
   });
 
   return {
-    prompts,
     work,
     coverage: adaptCoverage(payload.coverage, "interval evidence.coverage"),
   };
@@ -435,7 +378,6 @@ export function adaptWorkEvidence(value, expected) {
   const firstAtMs = requireBucketDate(payload.firstAt, "work evidence.firstAt", expected.startMs);
   const lastAtMs = requireBucketDate(payload.lastAt, "work evidence.lastAt", expected.startMs);
   if (lastAtMs < firstAtMs) fail("work evidence.lastAt", "at or after firstAt");
-  const taskSummary = requireNullableString(payload.taskSummary, "work evidence.taskSummary");
   if (!Array.isArray(payload.items)) fail("work evidence.items", "an array");
 
   const ids = new Set();
@@ -461,12 +403,7 @@ export function adaptWorkEvidence(value, expected) {
       label: requireNullableString(item.label, `${path}.label`),
       content: item.content,
       truncated: requireBoolean(item.truncated, `${path}.truncated`),
-      provenance: requireEnum(item.provenance, ["normalized_event"], `${path}.provenance`),
-      timeBasis: requireEnum(item.timeBasis, TIME_BASES, `${path}.timeBasis`),
-      eventKind: requireEnum(item.eventKind, EVENT_KINDS, `${path}.eventKind`),
-      eventSubtype: requireNullableString(item.eventSubtype, `${path}.eventSubtype`),
       actorRole: requireNullableString(item.actorRole, `${path}.actorRole`),
-      origin: requireNullableString(item.origin, `${path}.origin`),
       phase: requireNullableString(item.phase, `${path}.phase`),
       toolName: requireNullableString(item.toolName, `${path}.toolName`),
       toolStatus: requireNullableString(item.toolStatus, `${path}.toolStatus`),
@@ -489,10 +426,6 @@ export function adaptWorkEvidence(value, expected) {
       if (role !== expected.role) fail("work evidence.role", "the selected semantic role");
       return role;
     })(),
-    taskSummary,
-    taskSummaryTruncated: taskSummary === null
-      ? false
-      : requireBoolean(payload.taskSummaryTruncated, "work evidence.taskSummaryTruncated"),
     items,
     coverage: adaptCoverage(payload.coverage, "work evidence.coverage"),
     nextCursor: payload.nextCursor === null
