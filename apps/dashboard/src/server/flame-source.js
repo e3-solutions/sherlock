@@ -194,6 +194,7 @@ with p as materialized (
     from p
 ), activity_candidates as materialized (
   select s.person_id, e.id, e.session_id,
+         s.started_at session_started_at,
          case when e.actor_role = 'unknown' and s.parent_session_id is not null
               then 'worker' else e.actor_role end actor_role,
          e.event_kind, e.event_subtype,
@@ -242,6 +243,7 @@ with p as materialized (
   select person_id, session_id, actor_role, observed_at
     from activity_candidates
    where canonical_rank = 1
+     and observed_at >= date_trunc('milliseconds', session_started_at)
 ), bucket_activity as materialized (
   select a.person_id,
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
