@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   BUCKET_COUNT,
   BUCKET_MS,
+  RECENT_BUCKET_COUNT,
   FLAME_SQL,
   PEOPLE_SQL,
   PROMPT_DETAIL_SQL,
@@ -18,10 +19,13 @@ const START = new Date("2026-08-16T12:00:00.000Z");
 const READ = new Date("2026-08-17T12:00:01.000Z");
 const PG_SNAPSHOT = "730:741:733,739";
 
-function rowsFor(personId, overrides = {}) {
-  return Array.from({ length: BUCKET_COUNT }, (_, index) => ({
+function rowsFor(personId, overrides = {}, {
+  bucketCount = BUCKET_COUNT,
+  start = START,
+} = {}) {
+  return Array.from({ length: bucketCount }, (_, index) => ({
     person_id: personId,
-    bucket_start: new Date(START.getTime() + index * BUCKET_MS),
+    bucket_start: new Date(start.getTime() + index * BUCKET_MS),
     agent: 0,
     subagent: 0,
     other: 0,
@@ -238,6 +242,35 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[2][1]).toEqual([
       source.workspaceId,
       START.toISOString(),
+      "2026-08-17T12:00:00.000Z",
+      "sherlock.codex-rollout.v1",
+      READ.toISOString(),
+      "sherlock.activity.v1",
+    ]);
+  });
+
+  it("queries and returns a bounded recent window for the progressive first render", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.maxPeople = 5;
+    const roster = [{ person_id: "ada", display_name: "Ada" }];
+    const recentStart = new Date("2026-08-17T10:00:00.000Z");
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: READ, snapshot: PG_SNAPSHOT }])
+      .mockResolvedValueOnce(roster)
+      .mockResolvedValueOnce(rowsFor("ada", {}, {
+        bucketCount: RECENT_BUCKET_COUNT,
+        start: recentStart,
+      }));
+    source.transaction = (callback) => callback({ unsafe });
+
+    const payload = await source.fetchDay({ bucketCount: RECENT_BUCKET_COUNT });
+
+    expect(payload.start).toBe(recentStart.toISOString());
+    expect(payload.people[0].buckets).toHaveLength(RECENT_BUCKET_COUNT);
+    expect(unsafe.mock.calls[2][1]).toEqual([
+      source.workspaceId,
+      recentStart.toISOString(),
       "2026-08-17T12:00:00.000Z",
       "sherlock.codex-rollout.v1",
       READ.toISOString(),

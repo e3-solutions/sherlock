@@ -62,9 +62,18 @@ export function formatActiveTime(seconds) {
   return `${hours}h ${remainingMinutes}m active`;
 }
 
-function describeActiveTime(seconds) {
-  if (seconds === 0) return "0 minutes active in the last 24 hours";
-  if (seconds < 60) return "Less than 1 minute active in the last 24 hours";
+function formatWindowDuration(windowMinutes) {
+  if (windowMinutes % 60 === 0) {
+    const hours = windowMinutes / 60;
+    return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+  }
+  return `${windowMinutes} minutes`;
+}
+
+function describeActiveTime(seconds, windowMinutes) {
+  const windowLabel = formatWindowDuration(windowMinutes);
+  if (seconds === 0) return `0 minutes active in the last ${windowLabel}`;
+  if (seconds < 60) return `Less than 1 minute active in the last ${windowLabel}`;
 
   const minutes = Math.floor(seconds / 60);
   const hours = Math.floor(minutes / 60);
@@ -74,7 +83,7 @@ function describeActiveTime(seconds) {
   if (remainingMinutes > 0) {
     parts.push(`${remainingMinutes} ${remainingMinutes === 1 ? "minute" : "minutes"}`);
   }
-  return `${parts.join(" ")} active in the last 24 hours`;
+  return `${parts.join(" ")} active in the last ${windowLabel}`;
 }
 
 function clamp(value, minimum, maximum) {
@@ -127,12 +136,12 @@ export function getBucketTooltipPlacement({
   };
 }
 
-export function getBucketCenterX(index, chartWidth) {
-  const boundedIndex = clamp(index, 0, BUCKET_COUNT - 1);
-  return ((boundedIndex + 0.5) / BUCKET_COUNT) * chartWidth;
+export function getBucketCenterX(index, chartWidth, bucketCount = BUCKET_COUNT) {
+  const boundedIndex = clamp(index, 0, bucketCount - 1);
+  return ((boundedIndex + 0.5) / bucketCount) * chartWidth;
 }
 
-export function BucketTooltip({ active, laneRef, payload, personName }) {
+export function BucketTooltip({ active, bucketCount = BUCKET_COUNT, laneRef, payload, personName }) {
   const tooltipRef = useRef(null);
   const [tooltipSize, setTooltipSize] = useState(DEFAULT_TOOLTIP_SIZE);
   const [, reposition] = useState(0);
@@ -168,7 +177,7 @@ export function BucketTooltip({ active, laneRef, payload, personName }) {
   const placement = hasAnchor && typeof window !== "undefined"
     ? getBucketTooltipPlacement({
         anchor: {
-          x: laneBox.left + getBucketCenterX(point.index, laneBox.width),
+          x: laneBox.left + getBucketCenterX(point.index, laneBox.width, bucketCount),
           y: laneBox.top + laneBox.height / 2,
         },
         tooltip: tooltipSize,
@@ -205,7 +214,14 @@ export function BucketTooltip({ active, laneRef, payload, personName }) {
   );
 }
 
-export function BucketCursor({ payloadIndex, left, top, width, height }) {
+export function BucketCursor({
+  bucketCount = BUCKET_COUNT,
+  payloadIndex,
+  left,
+  top,
+  width,
+  height,
+}) {
   const index = Number(payloadIndex);
   if (
     payloadIndex == null
@@ -219,7 +235,7 @@ export function BucketCursor({ payloadIndex, left, top, width, height }) {
     return null;
   }
 
-  const x = left + getBucketCenterX(index, width);
+  const x = left + getBucketCenterX(index, width, bucketCount);
   return (
     <line
       className="flame-bucket-hover"
@@ -416,7 +432,7 @@ const ACTIVITY_STATUS = {
   },
 };
 
-function PersonRail({ person, headingId, readMs }) {
+function PersonRail({ person, headingId, readMs, windowMinutes }) {
   const status = getPersonActivityStatus(person, readMs);
   const { label, description } = ACTIVITY_STATUS[status];
 
@@ -426,8 +442,8 @@ function PersonRail({ person, headingId, readMs }) {
         <h2 id={headingId} title={person.name}>{person.name}</h2>
         <p
           className="flame-person-active-time"
-          aria-label={describeActiveTime(person.activeSeconds)}
-          title={describeActiveTime(person.activeSeconds)}
+          aria-label={describeActiveTime(person.activeSeconds, windowMinutes)}
+          title={describeActiveTime(person.activeSeconds, windowMinutes)}
         >
           {formatActiveTime(person.activeSeconds)}
         </p>
@@ -453,6 +469,7 @@ function PersonLane({
   tooltipActive,
   onTooltipActivate,
   onTooltipDeactivate,
+  windowMinutes,
 }) {
   const laneRef = useRef(null);
   const [keyboardIndex, setKeyboardIndex] = useState(0);
@@ -523,13 +540,18 @@ function PersonLane({
       aria-labelledby={headingId}
       data-selected={selectedIndex === undefined ? undefined : "true"}
     >
-      <PersonRail person={person} headingId={headingId} readMs={readMs} />
+      <PersonRail
+        person={person}
+        headingId={headingId}
+        readMs={readMs}
+        windowMinutes={windowMinutes}
+      />
       <div
         ref={laneRef}
         className="flame-lane"
         style={{ width: chartWidth }}
         role="group"
-        aria-label={`${person.name} activity timeline, 144 ten-minute buckets`}
+        aria-label={`${person.name} activity timeline, ${points.length} ten-minute buckets`}
         data-bucket-count={points.length}
         data-selected-index={selectedIndex}
         onClick={handleClick}
@@ -552,8 +574,14 @@ function PersonLane({
           <YAxis yAxisId="prompts" hide domain={[0, 1]} />
           <Tooltip
             active={tooltipActive ? undefined : false}
-            content={<BucketTooltip laneRef={laneRef} personName={person.name} />}
-            cursor={<BucketCursor />}
+            content={(
+              <BucketTooltip
+                bucketCount={points.length}
+                laneRef={laneRef}
+                personName={person.name}
+              />
+            )}
+            cursor={<BucketCursor bucketCount={points.length} />}
             isAnimationActive={false}
             portal={typeof document === "undefined" ? null : document.body}
             wrapperStyle={{
@@ -656,8 +684,11 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     ),
     1,
   );
-  const ticks = data.axisTicks ?? createTimeAxisTicks(data.startMs);
-  const endMs = data.startMs + BUCKET_COUNT * BUCKET_MS;
+  const bucketCount = data.bucketCount ?? data.people[0]?.buckets.length ?? BUCKET_COUNT;
+  const windowMinutes = data.windowMinutes ?? bucketCount * BUCKET_MS / (60 * 1000);
+  const windowLabel = formatWindowDuration(windowMinutes);
+  const ticks = data.axisTicks ?? createTimeAxisTicks(data.startMs, bucketCount);
+  const endMs = data.startMs + bucketCount * BUCKET_MS;
   const selectedPerson = selection
     ? data.people.find(({ id }) => id === selection.personId)
     : null;
@@ -759,7 +790,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     <section
       className="flame-graph"
       data-state={stale ? "stale" : "current"}
-      aria-label="Code activity over the last 24 hours"
+      aria-label={`Code activity over the last ${windowLabel}`}
     >
       <div className="flame-meta-row">
         <div className="flame-meta-rail" aria-hidden="true" />
@@ -797,6 +828,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
             promptPeak={promptPeak}
             chartWidth={width}
             readMs={data.readMs}
+            windowMinutes={windowMinutes}
             selectedIndex={selectedPerson?.id === person.id ? selectedPoint?.index : undefined}
             onSelect={selectInterval}
             tooltipActive={activeTooltipPersonId === person.id}
