@@ -60,7 +60,7 @@ describe("adaptFlamePayload", () => {
     firstBuckets[143] = [0, 1, 0, 0];
     const source = payload({
       people: [
-        person({ id: "z", name: "First", buckets: firstBuckets }),
+        person({ id: "z", name: "First", activeSeconds: 2_400, buckets: firstBuckets }),
         person({ id: "a", name: "Second" }),
       ],
     });
@@ -73,7 +73,7 @@ describe("adaptFlamePayload", () => {
       null,
       null,
     ]);
-    expect(result.people.map(({ activeSeconds }) => activeSeconds)).toEqual([0, 0]);
+    expect(result.people.map(({ activeSeconds }) => activeSeconds)).toEqual([2_400, 0]);
     expect(result.coverage).toEqual({
       evidence: "observed_events",
       state: "partial",
@@ -126,7 +126,7 @@ describe("adaptFlamePayload", () => {
     const result = adaptFlamePayload(
       payload({
         people: [
-          person({ total: [1, 0, 0], buckets: sourceBuckets }),
+          person({ activeSeconds: 1_200, total: [1, 0, 0], buckets: sourceBuckets }),
           person({ id: "person-2", name: "Zero", total: [0, 0, 0] }),
         ],
       }),
@@ -164,6 +164,16 @@ describe("adaptFlamePayload", () => {
     ["negative active seconds", payload({ people: [person({ activeSeconds: -1 })] })],
     ["fractional active seconds", payload({ people: [person({ activeSeconds: 1.5 })] })],
     ["more than 24 hours active", payload({ people: [person({ activeSeconds: 86_401 })] })],
+    [
+      "active seconds disagree with occupied buckets",
+      (() => {
+        const values = buckets();
+        values[0] = [1, 0, 0, 0];
+        return payload({
+          people: [person({ activeSeconds: 0, total: [1, 0, 0], buckets: values })],
+        });
+      })(),
+    ],
     ["missing last activity", payload({ people: [person({ lastActivity: undefined })] })],
     ["future last activity", payload({
       people: [person({ lastActivity: "2026-03-09T08:00:02.000Z" })],
@@ -345,7 +355,9 @@ describe("chart helpers", () => {
     const values = buckets();
     values[9] = [1, 2, 3, 100];
     const adapted = adaptFlamePayload(
-      payload({ people: [person({ total: [1, 2, 3], buckets: values })] }),
+      payload({
+        people: [person({ activeSeconds: 600, total: [1, 2, 3], buckets: values })],
+      }),
     );
 
     expect(getGlobalPeak(adapted.people)).toBe(6);

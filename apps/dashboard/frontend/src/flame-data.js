@@ -206,6 +206,16 @@ export function adaptFlamePayload(value) {
         activity: safeActivity(agent, subagent, unclassified, bucketPath),
       };
     });
+    const expectedActiveSeconds = buckets.reduce(
+      (seconds, bucket) => seconds + (bucket.activity > 0 ? BUCKET_MS / 1000 : 0),
+      0,
+    );
+    if (activeSeconds !== expectedActiveSeconds) {
+      fail(
+        `${path}.activeSeconds`,
+        `equal to ${expectedActiveSeconds} seconds from occupied activity buckets`,
+      );
+    }
 
     return { id, name, activeSeconds, lastActivityMs, total, buckets };
   });

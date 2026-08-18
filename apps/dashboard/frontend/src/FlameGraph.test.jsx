@@ -35,7 +35,7 @@ function model() {
       {
         id: "ada",
         name: "Ada Lovelace",
-        activeSeconds: 13_320,
+        activeSeconds: 1_200,
         lastActivity: "2026-08-15T06:56:00.000Z",
         total: [2, 1, 1],
         buckets: adaBuckets,
@@ -220,8 +220,8 @@ describe("FlameGraph", () => {
     expect(within(rails[0]).getByRole("heading", { name: "Ada Lovelace" }))
       .toBeInTheDocument();
     expect(within(rails[0]).getByLabelText(
-      "3 hours 42 minutes active in the last 24 hours",
-    )).toHaveTextContent("3h 42m active");
+      "20 minutes active in the last 24 hours",
+    )).toHaveTextContent("20m active");
     expect(within(rails[1]).getByRole("heading", { name: "Zero Activity" }))
       .toBeInTheDocument();
     expect(within(rails[1]).getByLabelText(
