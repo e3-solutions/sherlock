@@ -1,6 +1,7 @@
 import postgres from "postgres";
 
 export const BUCKET_COUNT = 144;
+export const RECENT_BUCKET_COUNT = 12;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const DATABASE_ROLE = "sherlock_normalizer";
@@ -404,9 +405,19 @@ export function decodeSnapshotToken(token) {
   }
 }
 
-export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
+export function buildFlamePayload({
+  rows,
+  roster,
+  start,
+  read,
+  snapshot,
+  bucketCount = BUCKET_COUNT,
+}) {
+  if (![RECENT_BUCKET_COUNT, BUCKET_COUNT].includes(bucketCount)) {
+    throw new FlameSourceError("flame_window_invalid");
+  }
   if (roster.length === 0) throw new FlameSourceError("flame_database_roster_empty");
-  if (rows.length !== roster.length * BUCKET_COUNT) {
+  if (rows.length !== roster.length * bucketCount) {
     throw new FlameSourceError("flame_database_result_incomplete");
   }
 
@@ -422,7 +433,7 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   const people = roster.map((person) => {
     const personRows = byPerson.get(String(person.person_id));
     personRows.sort((left, right) => asDate(left.bucket_start) - asDate(right.bucket_start));
-    for (let index = 0; index < BUCKET_COUNT; index += 1) {
+    for (let index = 0; index < bucketCount; index += 1) {
       if (asDate(personRows[index].bucket_start).getTime() !== startMs + index * BUCKET_MS) {
         throw new FlameSourceError("flame_database_result_incomplete");
       }
@@ -526,14 +537,17 @@ export class DirectFlameSource {
     }
   }
 
-  async fetchDay({ now } = {}) {
+  async fetchDay({ now, bucketCount = BUCKET_COUNT } = {}) {
+    if (![RECENT_BUCKET_COUNT, BUCKET_COUNT].includes(bucketCount)) {
+      throw new FlameSourceError("flame_window_invalid");
+    }
     return await this.transaction(async (tx) => {
       const receipt = (await tx.unsafe(
         "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
       ))[0];
       const read = now ? asDate(now) : asDate(receipt.now);
       const endMs = Math.floor(read.getTime() / BUCKET_MS) * BUCKET_MS;
-      const start = new Date(endMs - 24 * 60 * 60 * 1000);
+      const start = new Date(endMs - bucketCount * BUCKET_MS);
       const end = new Date(endMs);
       const roster = await tx.unsafe(
         PEOPLE_SQL,
@@ -549,7 +563,14 @@ export class DirectFlameSource {
         NORMALIZER_VERSION,
         read.toISOString(),
       ]);
-      return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
+      return buildFlamePayload({
+        rows,
+        roster,
+        start,
+        read,
+        snapshot: receipt.snapshot,
+        bucketCount,
+      });
     });
   }
 

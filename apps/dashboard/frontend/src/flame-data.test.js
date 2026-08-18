@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   BUCKET_COUNT,
   BUCKET_MS,
+  RECENT_BUCKET_COUNT,
   FlameDataError,
   adaptFlamePayload,
   adaptPromptEvidence,
@@ -116,6 +117,29 @@ describe("adaptFlamePayload", () => {
     expect(result.axisTicks.at(-1) - result.axisTicks[0]).toBe(
       24 * 60 * 60 * 1000,
     );
+  });
+
+  it("adapts the recent window without inventing unloaded intervals", () => {
+    const recentBuckets = Array.from(
+      { length: RECENT_BUCKET_COUNT },
+      () => [0, 0, 0, 0],
+    );
+    recentBuckets[RECENT_BUCKET_COUNT - 1] = [1, 0, 0, 0];
+    const result = adaptFlamePayload(payload({
+      start: "2026-03-09T06:00:00.000Z",
+      people: [person({
+        activeSeconds: 600,
+        lastActivity: "2026-03-09T07:59:00.000Z",
+        total: [1, 0, 0],
+        buckets: recentBuckets,
+      })],
+    }));
+
+    expect(result.bucketCount).toBe(RECENT_BUCKET_COUNT);
+    expect(result.windowMinutes).toBe(120);
+    expect(result.axisTicks).toHaveLength(5);
+    expect(result.axisTicks.at(-1) - result.axisTicks[0]).toBe(2 * 60 * 60 * 1000);
+    expect(result.people[0].buckets).toHaveLength(RECENT_BUCKET_COUNT);
   });
 
   it("preserves prompt-only, all-zero, and repeated-thread buckets", () => {
