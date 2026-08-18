@@ -13,6 +13,7 @@
     "dev": "concurrently -k \"node --watch server.mjs\" \"vite --config frontend/vite.config.js\"",
     "start": "node server.mjs",
     "test": "vitest run --config frontend/vitest.config.js",
+    "test:postgres": "vitest run --config frontend/vitest.config.js --environment node src/server/flame-source.postgres.test.js",
     "test:watch": "vitest --config frontend/vitest.config.js"
   },
   "dependencies": {
