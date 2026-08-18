@@ -291,6 +291,7 @@ select ok(
     from pg_index i
     join pg_class c on c.oid = i.indexrelid
     where c.oid = 'analytics.activity_spans_ended_window_idx'::regclass
+      and i.indisvalid
       and pg_get_indexdef(i.indexrelid) like
         '%(workspace_id, activity_version, ended_at, started_at) INCLUDE (span_key)%'
       and pg_get_expr(i.indpred, i.indrelid) = '(NOT is_tombstone)'

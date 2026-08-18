@@ -89,6 +89,12 @@ jobs:
       - name: Run database schema tests
         run: supabase test db --local supabase/tests/database/schema.test.sql
 
+      - name: Run dashboard database integration test
+        working-directory: apps/dashboard
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: pnpm test:postgres
+
       - name: Run activity reducer database integration test
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres

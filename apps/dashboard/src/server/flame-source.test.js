@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  ACTIVITY_VERSION,
   BUCKET_COUNT,
   BUCKET_MS,
   FLAME_SQL,
@@ -147,36 +146,7 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).not.toContain("email");
   });
 
-  it("selects the latest activity revision before filtering its eligibility", () => {
-    expect(ACTIVITY_VERSION).toBe("sherlock.activity.v1");
-    expect(FLAME_SQL).toContain("$6::text activity_version");
-    expect(FLAME_SQL).toContain("candidate_span_keys as materialized");
-    expect(FLAME_SQL).toContain("sp.span_key = candidate.span_key");
-    expect(FLAME_SQL).toContain("order by sp.valid_from_event_id desc, sp.id desc");
-    const latestRevision = FLAME_SQL.indexOf("latest_span_revisions as materialized");
-    const activeRanges = FLAME_SQL.indexOf("active_ranges as materialized");
-    const latestSelection = FLAME_SQL.slice(latestRevision, activeRanges);
-    expect(latestSelection).not.toContain("sp.span_state = 'active'");
-    expect(latestSelection).not.toContain("sp.actor_role <> 'automation'");
-    expect(latestSelection).not.toContain("not sp.is_tombstone");
-  });
-
-  it("clips and unions eligible spans across all sessions without double-counting", () => {
-    expect(FLAME_SQL).toContain("sp.span_state = 'active'");
-    expect(FLAME_SQL).toContain("sp.actor_role <> 'automation'");
-    expect(FLAME_SQL).toContain("sp.started_at < p.end_at");
-    expect(FLAME_SQL).toContain("sp.ended_at > p.start_at");
-    expect(FLAME_SQL).toContain("greatest(sp.started_at, p.start_at)");
-    expect(FLAME_SQL).toContain("least(sp.ended_at, p.end_at)");
-    expect(FLAME_SQL).toContain("range_agg(tstzrange(");
-    expect(FLAME_SQL).toContain("unnest(ar.merged_ranges)");
-    expect(FLAME_SQL).toContain("upper(merged.active_range) - lower(merged.active_range)");
-    expect(FLAME_SQL).not.toContain("group by sp.person_id, sp.session_id");
-  });
-
   it("returns zero active seconds for roster members without eligible spans", () => {
-    expect(FLAME_SQL).toContain("from roster r\n    left join active_ranges ar using (person_id)");
-    expect(FLAME_SQL).toContain("coalesce(floor(sum(extract(epoch from (");
     const payload = buildFlamePayload({
       rows: rowsFor("zero"),
       roster: [{ person_id: "zero", display_name: "Zero Activity" }],
