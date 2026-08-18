@@ -292,15 +292,21 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         `insert into telemetry.sessions (
            id, workspace_id, person_id, collector_key, native_session_id,
            actor_role, role_version, started_at
-         ) values ($1, $2, $3, 'fixture', $1::text, 'primary', 'fixture.v1', $4)`,
-        [primarySessionId, workspaceId, personId, frameStart.toISOString()],
+         ) values ($1, $2, $3, 'fixture', $4, 'primary', 'fixture.v1', $5)`,
+        [
+          primarySessionId, workspaceId, personId, primarySessionId,
+          frameStart.toISOString(),
+        ],
       );
       await sql.unsafe(
         `insert into telemetry.sessions (
            id, workspace_id, person_id, collector_key, native_session_id,
            parent_session_id, actor_role, role_version, started_at
-         ) values ($1, $2, $3, 'fixture', $1::text, $4, 'worker', 'fixture.v1', $5)`,
-        [workerSessionId, workspaceId, personId, primarySessionId, frameStart.toISOString()],
+         ) values ($1, $2, $3, 'fixture', $4, $5, 'worker', 'fixture.v1', $6)`,
+        [
+          workerSessionId, workspaceId, personId, workerSessionId,
+          primarySessionId, frameStart.toISOString(),
+        ],
       );
       await sql.unsafe(
         `insert into telemetry.ingest_batches (
