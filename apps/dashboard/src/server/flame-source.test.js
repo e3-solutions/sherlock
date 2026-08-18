@@ -8,6 +8,8 @@ import {
   INTERVAL_WORK_SQL,
   MAX_WORK_DETAIL_LIMIT,
   PEOPLE_SQL,
+  PREFERRED_DASHBOARD_EMAIL_DOMAIN,
+  REPLACED_DASHBOARD_EMAIL_DOMAIN,
   WORK_DETAIL_SQL,
   ASSISTANT_REPRESENTATION_MATCH_SECONDS,
   DirectFlameSource,
@@ -148,7 +150,6 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).not.toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
     expect(FLAME_SQL).not.toContain("content_excerpt");
-    expect(FLAME_SQL).not.toContain("email");
   });
 
   it("returns zero active seconds for roster members without observed sessions", () => {
@@ -230,6 +231,21 @@ describe("Sherlock Flame payload", () => {
   it("excludes stable smoke identities from the complete roster", () => {
     expect(PEOPLE_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
     expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
+  });
+
+  it("prefers the E3 dashboard identity over a matching Core Edge identity", () => {
+    expect(PREFERRED_DASHBOARD_EMAIL_DOMAIN).toBe("e3group.ai");
+    expect(REPLACED_DASHBOARD_EMAIL_DOMAIN).toBe("coreedgesolution.com");
+    for (const query of [PEOPLE_SQL, FLAME_SQL]) {
+      expect(query).toContain("from telemetry.people preferred");
+      expect(query).toContain("preferred.github_id = pe.github_id");
+      expect(query).toContain(
+        "split_part(pe.email, '@', 2) = 'coreedgesolution.com'",
+      );
+      expect(query).toContain(
+        "split_part(preferred.email, '@', 2) = 'e3group.ai'",
+      );
+    }
   });
 
   it("canonically counts submitted primary prompts", () => {
