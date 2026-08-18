@@ -52,6 +52,52 @@ function requireCount(value, path) {
   return value;
 }
 
+function requirePositiveCount(value, path) {
+  const result = requireCount(value, path);
+  if (result === 0) fail(path, "a positive safe integer");
+  return result;
+}
+
+function requireBoolean(value, path) {
+  if (typeof value !== "boolean") fail(path, "a boolean");
+  return value;
+}
+
+function requireNullableString(value, path) {
+  return value === null || value === undefined ? null : requireNonemptyString(value, path);
+}
+
+function requireEnum(value, allowed, path) {
+  const result = requireNonemptyString(value, path);
+  if (!allowed.includes(result)) fail(path, allowed.map((item) => `"${item}"`).join(" or "));
+  return result;
+}
+
+function requireEcho(payload, { personId, startMs, snapshot }, label) {
+  if (requireNonemptyString(payload.personId, `${label}.personId`) !== personId) {
+    fail(`${label}.personId`, "the selected person id");
+  }
+  if (requireDate(payload.start, `${label}.start`) !== startMs) {
+    fail(`${label}.start`, "the selected bucket start");
+  }
+  if (requireNonemptyString(payload.snapshot, `${label}.snapshot`) !== snapshot) {
+    fail(`${label}.snapshot`, "the timeline snapshot");
+  }
+}
+
+function requireBucketDate(value, path, startMs) {
+  const atMs = requireDate(value, path);
+  if (atMs < startMs || atMs >= startMs + BUCKET_MS) {
+    fail(path, "inside the selected bucket");
+  }
+  return atMs;
+}
+
+function requireChronological(previous, atMs, path) {
+  if (previous !== null && atMs < previous) fail(path, "chronological");
+  return atMs;
+}
+
 function requireFixedCounts(value, length, path) {
   if (!Array.isArray(value) || value.length !== length) {
     fail(path, `an array of exactly ${length} counts`);
@@ -237,33 +283,93 @@ export function adaptFlamePayload(value) {
   };
 }
 
-export function adaptPromptEvidence(value, { personId, startMs, snapshot }) {
-  const payload = requireObject(value, "prompt evidence");
-  if (requireNonemptyString(payload.personId, "prompt evidence.personId") !== personId) {
-    fail("prompt evidence.personId", "the selected person id");
+const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
+const CONVERSATION_ROLES = ["user", "assistant"];
+
+/** Validates the bounded, snapshot-pinned interval overview response. */
+export function adaptIntervalEvidence(value, expected) {
+  const payload = requireObject(value, "interval evidence");
+  requireEcho(payload, expected, "interval evidence");
+  const { startMs } = expected;
+  if (!Array.isArray(payload.work)) fail("interval evidence.work", "an array");
+
+  const workIds = new Set();
+  let previousWorkAt = null;
+  const work = payload.work.map((value, index) => {
+    const path = `interval evidence.work[${index}]`;
+    const item = requireObject(value, path);
+    const id = requireNonemptyString(item.id, `${path}.id`);
+    const sessionId = requireNonemptyString(item.sessionId, `${path}.sessionId`);
+    if (workIds.has(id)) fail(`${path}.id`, "unique");
+    workIds.add(id);
+    const firstAtMs = requireBucketDate(item.firstAt, `${path}.firstAt`, startMs);
+    const lastAtMs = requireBucketDate(item.lastAt, `${path}.lastAt`, startMs);
+    if (lastAtMs < firstAtMs) fail(`${path}.lastAt`, "at or after firstAt");
+    previousWorkAt = requireChronological(previousWorkAt, firstAtMs, `${path}.firstAt`);
+    const summary = requireNullableString(item.summary, `${path}.summary`);
+    return {
+      id,
+      sessionId,
+      firstAtMs,
+      lastAtMs,
+      eventCount: requirePositiveCount(item.eventCount, `${path}.eventCount`),
+      role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
+      summary,
+    };
+  });
+
+  return { work };
+}
+
+/** Validates one bounded page of chronological work/session evidence. */
+export function adaptWorkEvidence(value, expected) {
+  const payload = requireObject(value, "work evidence");
+  requireEcho(payload, expected, "work evidence");
+  if (requireNonemptyString(payload.sessionId, "work evidence.sessionId") !== expected.sessionId) {
+    fail("work evidence.sessionId", "the selected session id");
   }
-  if (requireDate(payload.start, "prompt evidence.start") !== startMs) {
-    fail("prompt evidence.start", "the selected bucket start");
+  if (requireNonemptyString(payload.workId, "work evidence.workId") !== expected.workId) {
+    fail("work evidence.workId", "the selected work id");
   }
-  if (requireNonemptyString(payload.snapshot, "prompt evidence.snapshot") !== snapshot) {
-    fail("prompt evidence.snapshot", "the timeline snapshot");
-  }
-  if (!Array.isArray(payload.prompts)) {
-    fail("prompt evidence.prompts", "an array");
-  }
+  const firstAtMs = requireBucketDate(payload.firstAt, "work evidence.firstAt", expected.startMs);
+  const lastAtMs = requireBucketDate(payload.lastAt, "work evidence.lastAt", expected.startMs);
+  if (lastAtMs < firstAtMs) fail("work evidence.lastAt", "at or after firstAt");
+  if (!Array.isArray(payload.items)) fail("work evidence.items", "an array");
+
   const ids = new Set();
-  return payload.prompts.map((value, index) => {
-    const path = `prompt evidence.prompts[${index}]`;
-    const prompt = requireObject(value, path);
-    const id = requireNonemptyString(prompt.id, `${path}.id`);
+  let previousAt = null;
+  const items = payload.items.map((value, index) => {
+    const path = `work evidence.items[${index}]`;
+    const item = requireObject(value, path);
+    const id = requireNonemptyString(item.id, `${path}.id`);
     if (ids.has(id)) fail(`${path}.id`, "unique");
     ids.add(id);
-    const atMs = requireDate(prompt.at, `${path}.at`);
-    if (atMs < startMs || atMs >= startMs + BUCKET_MS) {
-      fail(`${path}.at`, "inside the selected bucket");
-    }
-    if (typeof prompt.content !== "string") fail(`${path}.content`, "a string");
-    if (typeof prompt.truncated !== "boolean") fail(`${path}.truncated`, "a boolean");
-    return { id, atMs, content: prompt.content, truncated: prompt.truncated };
+    const atMs = requireBucketDate(item.at, `${path}.at`, expected.startMs);
+    previousAt = requireChronological(previousAt, atMs, `${path}.at`);
+    const role = requireEnum(item.role, CONVERSATION_ROLES, `${path}.role`);
+    if (typeof item.content !== "string") fail(`${path}.content`, "a string");
+    return {
+      id,
+      atMs,
+      role,
+      content: item.content,
+      truncated: requireBoolean(item.truncated, `${path}.truncated`),
+    };
   });
+
+  return {
+    sessionId: expected.sessionId,
+    firstAtMs,
+    lastAtMs,
+    eventCount: requirePositiveCount(payload.eventCount, "work evidence.eventCount"),
+    role: (() => {
+      const role = requireEnum(payload.role, SEMANTIC_ROLES, "work evidence.role");
+      if (role !== expected.role) fail("work evidence.role", "the selected semantic role");
+      return role;
+    })(),
+    items,
+    nextCursor: payload.nextCursor === null
+      ? null
+      : requireNonemptyString(payload.nextCursor, "work evidence.nextCursor"),
+  };
 }

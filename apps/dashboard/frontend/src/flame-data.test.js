@@ -5,7 +5,8 @@ import {
   BUCKET_MS,
   FlameDataError,
   adaptFlamePayload,
-  adaptPromptEvidence,
+  adaptIntervalEvidence,
+  adaptWorkEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
   getPersonActivityStatus,
@@ -287,58 +288,71 @@ describe("getPersonActivityStatus", () => {
   });
 });
 
-describe("adaptPromptEvidence", () => {
+describe("interval and work evidence adapters", () => {
   const startMs = Date.parse("2026-08-17T16:10:00.000Z");
-  const snapshot = "v1.snapshot-token";
+  const expected = { personId: "person-1", startMs, snapshot: "v1.snapshot-token" };
 
-  it("validates and expands every prompt in the selected bucket", () => {
-    expect(adaptPromptEvidence({
-      personId: "person-1",
+  it("validates source-backed work rows", () => {
+    const result = adaptIntervalEvidence({
+      personId: expected.personId,
       start: new Date(startMs).toISOString(),
-      snapshot,
-      prompts: [
-        {
-          id: "10",
-          at: "2026-08-17T16:10:08.631Z",
-          content: "Investigate the dashboard counts",
-          truncated: false,
-        },
-        {
-          id: "11",
-          at: "2026-08-17T16:19:59.999Z",
-          content: "A long stored excerpt",
-          truncated: true,
-        },
-      ],
-    }, { personId: "person-1", startMs, snapshot })).toEqual([
-      {
-        id: "10",
-        atMs: Date.parse("2026-08-17T16:10:08.631Z"),
-        content: "Investigate the dashboard counts",
-        truncated: false,
-      },
-      {
-        id: "11",
-        atMs: Date.parse("2026-08-17T16:19:59.999Z"),
-        content: "A long stored excerpt",
-        truncated: true,
-      },
-    ]);
+      snapshot: expected.snapshot,
+      work: [{
+        id: "s1:agent", sessionId: "s1", role: "agent",
+        firstAt: new Date(startMs + 1000).toISOString(),
+        lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
+        summary: "Investigate the cursor",
+      }],
+    }, expected);
+
+    expect(result.work[0]).toMatchObject({
+      id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2,
+    });
+  });
+
+  it("preserves equal conversation text under distinct source event ids", () => {
+    const result = adaptWorkEvidence({
+      personId: expected.personId,
+      start: new Date(startMs).toISOString(),
+      snapshot: expected.snapshot,
+      workId: "s1:agent",
+      sessionId: "s1",
+      role: "agent",
+      firstAt: new Date(startMs + 1000).toISOString(),
+      lastAt: new Date(startMs + 5000).toISOString(),
+      eventCount: 2,
+      items: [{
+        id: "e1", at: new Date(startMs + 2000).toISOString(), role: "assistant",
+        content: "Tracing it now", truncated: false,
+      }, {
+        id: "e2", at: new Date(startMs + 3000).toISOString(), role: "assistant",
+        content: "Tracing it now", truncated: false,
+      }],
+      nextCursor: "cursor-2",
+    }, { ...expected, workId: "s1:agent", sessionId: "s1", role: "agent" });
+
+    expect(result.items[0]).toMatchObject({ role: "assistant" });
+    expect(result.items).toHaveLength(2);
+    expect(result.items.map((item) => item.id)).toEqual(["e1", "e2"]);
+    expect(result.nextCursor).toBe("cursor-2");
   });
 
   it.each([
-    ["wrong person", { personId: "other", start: new Date(startMs).toISOString(), snapshot, prompts: [] }],
-    ["wrong bucket", { personId: "person-1", start: new Date(startMs + BUCKET_MS).toISOString(), snapshot, prompts: [] }],
-    ["wrong snapshot", { personId: "person-1", start: new Date(startMs).toISOString(), snapshot: "v1.other", prompts: [] }],
-    ["prompt outside bucket", {
-      personId: "person-1",
+    ["unsupported semantic role", { role: "supervisor" }],
+  ])("rejects %s", (_label, mutation) => {
+    const work = {
+      id: "s1:agent", sessionId: "s1", role: "agent",
+      firstAt: new Date(startMs + 1000).toISOString(),
+      lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
+      summary: null,
+    };
+    const source = {
+      personId: expected.personId,
       start: new Date(startMs).toISOString(),
-      snapshot,
-      prompts: [{ id: "10", at: new Date(startMs + BUCKET_MS).toISOString(), content: "x", truncated: false }],
-    }],
-  ])("rejects %s", (_label, value) => {
-    expect(() => adaptPromptEvidence(value, { personId: "person-1", startMs, snapshot }))
-      .toThrow(FlameDataError);
+      snapshot: expected.snapshot,
+      work: [{ ...work, ...mutation }],
+    };
+    expect(() => adaptIntervalEvidence(source, expected)).toThrow(FlameDataError);
   });
 });
 

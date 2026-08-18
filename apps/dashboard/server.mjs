@@ -106,13 +106,13 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname === "/api/flame/prompts") {
+  if (url.pathname === "/api/flame/interval") {
     if (!source) {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
     try {
-      sendJson(response, 200, await source.fetchPrompts({
+      sendJson(response, 200, await source.fetchInterval({
         personId: url.searchParams.get("personId") ?? "",
         start: url.searchParams.get("start") ?? "",
         snapshot: url.searchParams.get("snapshot") ?? "",
@@ -121,9 +121,39 @@ const server = createServer(async (request, response) => {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      const status = code === "flame_prompt_result_too_large"
+      const status = code.endsWith("_result_too_large")
         ? 413
-        : code.startsWith("flame_prompt_request_") ? 400 : 503;
+        : code.startsWith("flame_interval_request_") ? 400 : 503;
+      sendJson(response, status, { error: code });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/flame/work") {
+    if (!source) {
+      sendJson(response, 503, { error: "dashboard_not_configured" });
+      return;
+    }
+    try {
+      sendJson(response, 200, await source.fetchWork({
+        personId: url.searchParams.get("personId") ?? "",
+        start: url.searchParams.get("start") ?? "",
+        sessionId: url.searchParams.get("sessionId") ?? "",
+        role: url.searchParams.get("role") ?? "",
+        snapshot: url.searchParams.get("snapshot") ?? "",
+        cursor: url.searchParams.get("cursor") ?? "",
+        limit: url.searchParams.get("limit") ?? "",
+      }));
+    } catch (error) {
+      const code = error instanceof FlameSourceError
+        ? error.code
+        : "flame_database_unavailable";
+      const status = code === "flame_work_request_not_found"
+        ? 404
+        : code.endsWith("_result_too_large") ? 413
+        : code.startsWith("flame_work_request_") || code === "flame_work_cursor_invalid"
+        ? 400
+        : 503;
       sendJson(response, status, { error: code });
     }
     return;
