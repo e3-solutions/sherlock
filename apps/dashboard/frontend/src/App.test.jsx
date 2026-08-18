@@ -70,52 +70,12 @@ describe("App", () => {
 
     expect(adaptMock).toHaveBeenCalledWith(payload);
     expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/flame?window=recent",
-      expect.objectContaining({
-        cache: "no-store",
-        headers: { Accept: "application/json" },
-        signal: expect.any(AbortSignal),
-      }),
-    );
     expect(fetchMock).toHaveBeenCalledWith("/api/flame", expect.objectContaining({
       cache: "no-store",
       headers: { Accept: "application/json" },
       signal: expect.any(AbortSignal),
     }));
-  });
-
-  it("renders the recent window before the full timeline request completes", async () => {
-    const recentPayload = { marker: "recent response" };
-    const recentModel = { ...model, marker: "recent timeline" };
-    let resolveFull;
-    const fullRequest = new Promise((resolve) => {
-      resolveFull = resolve;
-    });
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response({ body: recentPayload }))
-      .mockReturnValueOnce(fullRequest);
-    adaptMock.mockImplementation((value) => (
-      value === recentPayload ? recentModel : model
-    ));
-    vi.stubGlobal("fetch", fetchMock);
-
-    render(<App />);
-    await settle();
-
-    expect(screen.getByTestId("flame-graph")).toHaveTextContent("recent timeline");
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Showing the latest 2 hours while earlier intervals load.",
-    );
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/flame?window=recent",
-      "/api/flame",
-    ]);
-
-    resolveFull(response());
-    await settle();
-    expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
-    expect(screen.queryByText(/while earlier intervals load/)).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("stacks recency above the role legend beneath the brand", () => {
@@ -148,7 +108,6 @@ describe("App", () => {
   it("offers an immediate retry after the initial request fails", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({ ok: false, status: 503 }))
-      .mockResolvedValueOnce(response())
       .mockResolvedValueOnce(response());
     vi.stubGlobal("fetch", fetchMock);
 
@@ -159,12 +118,11 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await settle();
     expect(screen.getByTestId("flame-graph")).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("retains the last-good graph and announces a failed refresh", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response())
       .mockResolvedValueOnce(response())
       .mockResolvedValueOnce(response({ ok: false, status: 503 }));
     vi.stubGlobal("fetch", fetchMock);
@@ -206,7 +164,6 @@ describe("App", () => {
   it("clears the stale state after a later refresh succeeds", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response())
-      .mockResolvedValueOnce(response())
       .mockResolvedValueOnce(response({ ok: false, status: 503 }))
       .mockResolvedValueOnce(response());
     vi.stubGlobal("fetch", fetchMock);
@@ -226,7 +183,7 @@ describe("App", () => {
 
     expect(screen.queryByText(/Refresh failed/)).not.toBeInTheDocument();
     expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "false");
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("aborts an in-flight request on unmount", () => {
