@@ -31,7 +31,6 @@ function rowsFor(personId, overrides = {}) {
     day_other: 0,
     latest: null,
     latest_activity: null,
-    active_seconds: 0,
     ...overrides[index],
   }));
 }
@@ -57,7 +56,6 @@ describe("Sherlock Flame payload", () => {
       row.day_other = 1;
       row.latest = new Date("2026-08-16T12:09:00.000Z");
       row.latest_activity = new Date("2026-08-16T12:08:00.000Z");
-      row.active_seconds = 5_400;
     }
     const zero = rowsFor("zero");
     const payload = buildFlamePayload({
@@ -75,7 +73,7 @@ describe("Sherlock Flame payload", () => {
     expect(payload.people[0]).toMatchObject({
       id: "ada",
       lastActivity: "2026-08-16T12:08:00.000Z",
-      activeSeconds: 5_400,
+      activeSeconds: 600,
       total: [1, 2, 1],
     });
     expect(payload.people[0].buckets[0]).toEqual([1, 2, 1, 3]);
@@ -94,14 +92,13 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
-  it("checks activity-span read access before reporting ready", async () => {
+  it("checks source read access before reporting ready", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     const unsafe = vi.fn().mockResolvedValueOnce([{
       backend_role: true,
       read_only: true,
       can_read_people: true,
       can_read_events: true,
-      can_read_activity_spans: true,
     }]);
     source.transaction = (callback) => callback({ unsafe });
 
@@ -109,9 +106,7 @@ describe("Sherlock Flame payload", () => {
       status: "ok",
       mode: "sherlock_backend_aggregate",
     });
-    expect(unsafe.mock.calls[0][0]).toContain(
-      "'analytics.activity_spans', 'select'",
-    );
+    expect(unsafe.mock.calls[0][0]).not.toContain("analytics.activity_spans");
   });
 
   it("rejects incomplete result grids", () => {
@@ -124,7 +119,7 @@ describe("Sherlock Flame payload", () => {
     })).toThrow(FlameSourceError);
   });
 
-  it("keeps observed-event buckets while adding unioned completed active time", () => {
+  it("keeps observed-event buckets without querying inferred activity spans", () => {
     expect(FLAME_SQL).toContain("e.workspace_id = p.workspace_id");
     expect(FLAME_SQL).toContain("date_bin(interval '10 minutes', a.observed_at");
     expect(FLAME_SQL).toContain("e.actor_role = 'primary'");
@@ -143,13 +138,13 @@ describe("Sherlock Flame payload", () => {
       "where canonical_rank = 1\n     and observed_at >= date_trunc('milliseconds', session_started_at)",
     );
     expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
-    expect(FLAME_SQL).toContain("analytics.activity_spans");
+    expect(FLAME_SQL).not.toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
     expect(FLAME_SQL).not.toContain("content_excerpt");
     expect(FLAME_SQL).not.toContain("email");
   });
 
-  it("returns zero active seconds for roster members without eligible spans", () => {
+  it("returns zero active seconds for roster members without observed sessions", () => {
     const payload = buildFlamePayload({
       rows: rowsFor("zero"),
       roster: [{ person_id: "zero", display_name: "Zero Activity" }],
@@ -160,21 +155,69 @@ describe("Sherlock Flame payload", () => {
     expect(payload.people[0].activeSeconds).toBe(0);
   });
 
-  it("rejects active time outside the 24-hour wall-clock bound or inconsistent rows", () => {
-    expect(() => buildFlamePayload({
-      rows: rowsFor("ada", { 0: { active_seconds: 86_401 } }),
+  it("counts one occupied bucket once despite parallel session counts", () => {
+    const payload = buildFlamePayload({
+      rows: rowsFor("ada", {
+        0: {
+          agent: 3,
+          subagent: 2,
+          other: 4,
+          day_agent: 3,
+          day_subagent: 2,
+          day_other: 4,
+        },
+      }),
       roster: [{ person_id: "ada", display_name: "Ada" }],
       start: START,
       read: READ,
       snapshot: PG_SNAPSHOT,
-    })).toThrow(FlameSourceError);
-    expect(() => buildFlamePayload({
-      rows: rowsFor("ada", { 1: { active_seconds: 1 } }),
+    });
+
+    expect(payload.people[0].activeSeconds).toBe(600);
+  });
+
+  it("adds separated occupied buckets without filling the gap", () => {
+    const payload = buildFlamePayload({
+      rows: rowsFor("ada", {
+        0: { agent: 1, day_agent: 1, day_subagent: 1 },
+        12: { subagent: 1 },
+      }),
       roster: [{ person_id: "ada", display_name: "Ada" }],
       start: START,
       read: READ,
       snapshot: PG_SNAPSHOT,
-    })).toThrow(FlameSourceError);
+    });
+
+    expect(payload.people[0].activeSeconds).toBe(1_200);
+  });
+
+  it("does not count a prompt-only bucket as observed session time", () => {
+    const payload = buildFlamePayload({
+      rows: rowsFor("ada", { 0: { prompts: 7 } }),
+      roster: [{ person_id: "ada", display_name: "Ada" }],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    });
+
+    expect(payload.people[0].activeSeconds).toBe(0);
+  });
+
+  it("caps naturally at 24 hours when all 144 buckets are occupied", () => {
+    const rows = rowsFor("ada");
+    for (const row of rows) {
+      row.agent = 1;
+      row.day_agent = 1;
+    }
+    const payload = buildFlamePayload({
+      rows,
+      roster: [{ person_id: "ada", display_name: "Ada" }],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    });
+
+    expect(payload.people[0].activeSeconds).toBe(86_400);
   });
 
   it("excludes stable smoke identities from the complete roster", () => {
@@ -244,7 +287,6 @@ describe("Sherlock Flame payload", () => {
       "2026-08-17T12:00:00.000Z",
       "sherlock.codex-rollout.v1",
       READ.toISOString(),
-      "sherlock.activity.v1",
     ]);
   });
 

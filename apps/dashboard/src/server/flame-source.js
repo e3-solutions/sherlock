@@ -3,7 +3,6 @@ import postgres from "postgres";
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
-export const ACTIVITY_VERSION = "sherlock.activity.v1";
 export const DATABASE_ROLE = "sherlock_normalizer";
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
@@ -182,7 +181,7 @@ export const FLAME_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text normalizer_version,
-         $5::timestamptz read_at, $6::text activity_version
+         $5::timestamptz read_at
 ), roster as materialized (
   select pe.id person_id,
          coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) display_name
@@ -268,53 +267,6 @@ with p as materialized (
     from roster r left join activity_events a using (person_id)
     cross join p
    group by r.person_id
-), candidate_span_keys as materialized (
-  select distinct sp.span_key
-    from analytics.activity_spans sp cross join p
-   where sp.workspace_id = p.workspace_id
-     and sp.activity_version = p.activity_version
-     and not sp.is_tombstone
-     and sp.started_at < p.end_at
-     and sp.ended_at > p.start_at
-), latest_span_revisions as materialized (
-  select latest.*
-    from candidate_span_keys candidate
-    cross join p
-    cross join lateral (
-      select sp.person_id, sp.span_key, sp.started_at, sp.ended_at,
-             sp.span_state, sp.actor_role, sp.is_tombstone
-        from analytics.activity_spans sp
-       where sp.workspace_id = p.workspace_id
-         and sp.activity_version = p.activity_version
-         and sp.span_key = candidate.span_key
-       order by sp.valid_from_event_id desc, sp.id desc
-       limit 1
-    ) latest
-), active_ranges as materialized (
-  select sp.person_id,
-         range_agg(tstzrange(
-           greatest(sp.started_at, p.start_at),
-           least(sp.ended_at, p.end_at),
-           '[)'
-         )) merged_ranges
-    from latest_span_revisions sp
-    join roster r using (person_id)
-    cross join p
-   where not sp.is_tombstone
-     and sp.span_state = 'active'
-     and sp.actor_role <> 'automation'
-     and sp.started_at < p.end_at
-     and sp.ended_at > p.start_at
-   group by sp.person_id
-), active_time as materialized (
-  select r.person_id,
-         coalesce(floor(sum(extract(epoch from (
-           upper(merged.active_range) - lower(merged.active_range)
-         )))), 0)::bigint active_seconds
-    from roster r
-    left join active_ranges ar using (person_id)
-    left join lateral unnest(ar.merged_ranges) merged(active_range) on true
-   group by r.person_id
 ), recent_activity as materialized (
   select r.person_id, max(a.observed_at) latest_activity
     from roster r
@@ -338,10 +290,9 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(ba.other, 0)::bigint other,
        coalesce(pc.prompts, 0)::bigint prompts,
        d.day_agent, d.day_subagent, d.day_other, l.latest,
-       ra.latest_activity, at.active_seconds
+       ra.latest_activity
   from roster r cross join buckets b
   join day_activity d using (person_id)
-  join active_time at using (person_id)
   join recent_activity ra using (person_id)
   cross join latest_observation l
   left join bucket_activity ba
@@ -477,12 +428,6 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
       }
     }
     const first = personRows[0];
-    const activeSeconds = count(first.active_seconds);
-    if (activeSeconds > 24 * 60 * 60 || personRows.some((row) =>
-      count(row.active_seconds) !== activeSeconds
-    )) {
-      throw new FlameSourceError("flame_database_result_invalid");
-    }
     const total = [count(first.day_agent), count(first.day_subagent), count(first.day_other)];
     const buckets = personRows.map((row) => [
       count(row.agent), count(row.subagent), count(row.other), count(row.prompts),
@@ -492,6 +437,12 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
     )) {
       throw new FlameSourceError("flame_database_result_invalid");
     }
+    const activeSeconds = buckets.reduce(
+      (seconds, bucket) => seconds + (
+        bucket.slice(0, 3).some((value) => value > 0) ? BUCKET_MS / 1000 : 0
+      ),
+      0,
+    );
     if (first.latest !== null && first.latest !== undefined) {
       const observed = asDate(first.latest);
       latest = latest === null || observed > latest ? observed : latest;
@@ -559,10 +510,7 @@ export class DirectFlameSource {
           select current_role = 'sherlock_normalizer' as backend_role,
                  current_setting('transaction_read_only') = 'on' as read_only,
                  has_table_privilege(current_role, 'telemetry.people', 'select') as can_read_people,
-                 has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events,
-                 has_table_privilege(
-                   current_role, 'analytics.activity_spans', 'select'
-                 ) as can_read_activity_spans
+                 has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events
             from pg_roles where rolname = current_role
         `);
         if (!rows[0] || Object.values(rows[0]).some((value) => value !== true)) {
@@ -600,7 +548,6 @@ export class DirectFlameSource {
         end.toISOString(),
         NORMALIZER_VERSION,
         read.toISOString(),
-        ACTIVITY_VERSION,
       ]);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
     });
