@@ -4,11 +4,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  DirectFlameSource,
-  FlameSourceError,
-  RECENT_BUCKET_COUNT,
-} from "./src/server/flame-source.js";
+import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -99,15 +95,8 @@ const server = createServer(async (request, response) => {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
-    const window = url.searchParams.get("window");
-    if (window !== null && window !== "recent") {
-      sendJson(response, 400, { error: "flame_window_invalid" });
-      return;
-    }
     try {
-      sendJson(response, 200, await source.fetchDay({
-        bucketCount: window === "recent" ? RECENT_BUCKET_COUNT : undefined,
-      }));
+      sendJson(response, 200, await source.fetchDay());
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
