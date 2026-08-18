@@ -47,10 +47,10 @@ input { font: inherit; }
   display: flex;
   min-height: 56px;
   flex: 0 0 auto;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-  margin-bottom: 6px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 12px;
 }
 
 .portal-header__brand {
@@ -80,9 +80,7 @@ input { font: inherit; }
 
 .portal-header__legend {
   min-width: 0;
-  margin-left: auto;
-  padding-left: 24px;
-  border-left: 1px solid var(--flame-rule);
+  margin-left: 0;
 }
 
 .flame-graph {
@@ -188,14 +186,14 @@ input { font: inherit; }
   display: flex;
   min-width: 0;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 18px;
 }
 
 .flame-legend {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 6px 14px;
   margin: 0;
   padding: 0;
@@ -750,18 +748,15 @@ input { font: inherit; }
   #root { padding: 24px; }
   .portal-header {
     min-height: 0;
-    flex-wrap: wrap;
-    gap: 8px 16px;
+    gap: 8px;
     padding-bottom: 10px;
   }
   .portal-header__logo { width: 34px; height: 42px; }
   .portal-header h1 { font-size: 20px; }
   .portal-header__legend {
     width: 100%;
-    margin-left: 0;
     padding: 8px 0 0;
     border-top: 1px solid var(--flame-rule);
-    border-left: 0;
   }
   .flame-legends { justify-content: space-between; gap: 14px; }
   .flame-legend { gap: 4px 8px; font-size: 9px; }
