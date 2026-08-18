@@ -406,7 +406,18 @@ function PersonRail({ person, headingId, readMs }) {
   );
 }
 
-function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSelect, readMs }) {
+function PersonLane({
+  person,
+  peak,
+  promptPeak,
+  chartWidth,
+  selectedIndex,
+  onSelect,
+  readMs,
+  tooltipActive,
+  onTooltipActivate,
+  onTooltipDeactivate,
+}) {
   const laneRef = useRef(null);
   const [keyboardIndex, setKeyboardIndex] = useState(0);
   const rawId = useId();
@@ -464,6 +475,12 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
     }
   };
 
+  const handleBlur = (event) => {
+    if (!event.currentTarget.contains(event.relatedTarget)) {
+      onTooltipDeactivate(person.id);
+    }
+  };
+
   return (
     <section
       className="flame-person"
@@ -480,6 +497,10 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
         data-bucket-count={points.length}
         data-selected-index={selectedIndex}
         onClick={handleClick}
+        onMouseEnter={() => onTooltipActivate(person.id)}
+        onMouseLeave={() => onTooltipDeactivate(person.id)}
+        onFocusCapture={() => onTooltipActivate(person.id)}
+        onBlurCapture={handleBlur}
         onKeyDown={handleKeyDown}
       >
         <ComposedChart
@@ -494,6 +515,7 @@ function PersonLane({ person, peak, promptPeak, chartWidth, selectedIndex, onSel
           <YAxis yAxisId="activity" hide domain={[0, peak]} allowDataOverflow />
           <YAxis yAxisId="prompts" hide domain={[0, 1]} />
           <Tooltip
+            active={tooltipActive ? undefined : false}
             content={<BucketTooltip laneRef={laneRef} personName={person.name} />}
             cursor={<BucketCursor />}
             isAnimationActive={false}
@@ -585,6 +607,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
   const [selection, setSelection] = useState(null);
+  const [activeTooltipPersonId, setActiveTooltipPersonId] = useState(null);
   const [detailClosing, setDetailClosing] = useState(false);
   const [promptRevision, setPromptRevision] = useState(0);
   const [promptEvidence, setPromptEvidence] = useState({ state: "idle", items: [] });
@@ -690,6 +713,12 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
     setSelection({ personId: person.id, startMs: point.startMs });
   };
 
+  const deactivateTooltip = useCallback((personId) => {
+    setActiveTooltipPersonId((activePersonId) => (
+      activePersonId === personId ? null : activePersonId
+    ));
+  }, []);
+
   return (
     <section
       className="flame-graph"
@@ -734,6 +763,9 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
             readMs={data.readMs}
             selectedIndex={selectedPerson?.id === person.id ? selectedPoint?.index : undefined}
             onSelect={selectInterval}
+            tooltipActive={activeTooltipPersonId === person.id}
+            onTooltipActivate={setActiveTooltipPersonId}
+            onTooltipDeactivate={deactivateTooltip}
           />
         ))}
       </div>
