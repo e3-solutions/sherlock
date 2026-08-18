@@ -21,7 +21,7 @@ export default function App() {
   const requestRef = useRef(null);
   const mountedRef = useRef(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ recentFirst = false } = {}) => {
     window.clearTimeout(timerRef.current);
     requestRef.current?.abort();
 
@@ -29,7 +29,8 @@ export default function App() {
     requestRef.current = controller;
 
     try {
-      const response = await fetch("/api/flame", {
+      const endpoint = recentFirst ? "/api/flame?window=recent" : "/api/flame";
+      const response = await fetch(endpoint, {
         headers: { Accept: "application/json" },
         cache: "no-store",
         signal: controller.signal,
@@ -43,8 +44,13 @@ export default function App() {
 
       lastGoodRef.current = nextData;
       setData(nextData);
-      setState("ready");
       setMessage("");
+      if (recentFirst) {
+        setState("expanding");
+        return;
+      }
+
+      setState("ready");
       timerRef.current = window.setTimeout(load, nextRefreshDelay(Date.now()));
     } catch (error) {
       if (!mountedRef.current || controller.signal.aborted) return;
@@ -56,7 +62,10 @@ export default function App() {
       } else {
         setState("error");
       }
-      timerRef.current = window.setTimeout(load, RETRY_MS);
+      timerRef.current = window.setTimeout(
+        () => load({ recentFirst: !lastGoodRef.current }),
+        RETRY_MS,
+      );
     } finally {
       if (requestRef.current === controller) requestRef.current = null;
     }
@@ -64,13 +73,17 @@ export default function App() {
 
   useEffect(() => {
     mountedRef.current = true;
-    load();
+    load({ recentFirst: true });
     return () => {
       mountedRef.current = false;
       window.clearTimeout(timerRef.current);
       requestRef.current?.abort();
     };
   }, [load]);
+
+  useEffect(() => {
+    if (state === "expanding") load();
+  }, [load, state]);
 
   if (!data && state === "loading") {
     return (
@@ -87,7 +100,7 @@ export default function App() {
         <PortalHeader />
         <div className="load-state" role="alert">
           <span>Timeline unavailable</span>
-          <button type="button" onClick={load}>Retry</button>
+          <button type="button" onClick={() => load({ recentFirst: true })}>Retry</button>
         </div>
       </>
     );
@@ -96,6 +109,11 @@ export default function App() {
   return (
     <>
       <PortalHeader />
+      {state === "expanding" && (
+        <p className="refresh-warning" role="status">
+          Showing the latest 2 hours while earlier intervals load.
+        </p>
+      )}
       {state === "stale" && (
         <p className="refresh-warning" role="status">
           Refresh failed. Showing the last successful read.

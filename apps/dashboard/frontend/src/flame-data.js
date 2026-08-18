@@ -1,10 +1,11 @@
 export const BUCKET_COUNT = 144;
+export const RECENT_BUCKET_COUNT = 12;
 export const BUCKET_MS = 10 * 60 * 1000;
 
 const TOTAL_COUNT = 3;
 const BUCKET_VALUE_COUNT = 4;
-const AXIS_INTERVAL_BUCKETS = 12;
-const MAX_ACTIVE_SECONDS = 24 * 60 * 60;
+const FULL_AXIS_INTERVAL_BUCKETS = 12;
+const RECENT_AXIS_INTERVAL_BUCKETS = 3;
 
 export class FlameDataError extends Error {
   constructor(message) {
@@ -68,15 +69,21 @@ function safeActivity(agent, subagent, unclassified, path) {
 }
 
 /**
- * Returns the 13 two-hour tick timestamps spanning the complete 24-hour window.
+ * Returns evenly spaced tick timestamps spanning a supported dashboard window.
  */
-export function createTimeAxisTicks(startMs) {
+export function createTimeAxisTicks(startMs, bucketCount = BUCKET_COUNT) {
   if (!Number.isSafeInteger(startMs)) {
     fail("startMs", "a safe integer timestamp");
   }
+  if (![RECENT_BUCKET_COUNT, BUCKET_COUNT].includes(bucketCount)) {
+    fail("bucketCount", `${RECENT_BUCKET_COUNT} or ${BUCKET_COUNT}`);
+  }
+  const intervalBuckets = bucketCount === BUCKET_COUNT
+    ? FULL_AXIS_INTERVAL_BUCKETS
+    : RECENT_AXIS_INTERVAL_BUCKETS;
   return Array.from(
-    { length: BUCKET_COUNT / AXIS_INTERVAL_BUCKETS + 1 },
-    (_, index) => startMs + index * AXIS_INTERVAL_BUCKETS * BUCKET_MS,
+    { length: bucketCount / intervalBuckets + 1 },
+    (_, index) => startMs + index * intervalBuckets * BUCKET_MS,
   );
 }
 
@@ -151,6 +158,16 @@ export function adaptFlamePayload(value) {
   }
 
   const ids = new Set();
+  const rawBucketCount = payload.people[0]?.buckets?.length;
+  if (![RECENT_BUCKET_COUNT, BUCKET_COUNT].includes(rawBucketCount)) {
+    fail(
+      "people[0].buckets",
+      `an array of exactly ${RECENT_BUCKET_COUNT} or ${BUCKET_COUNT} buckets`,
+    );
+  }
+  const bucketCount = rawBucketCount;
+  const maxActiveSeconds = bucketCount * BUCKET_MS / 1000;
+
   const people = payload.people.map((rawPerson, personIndex) => {
     const path = `people[${personIndex}]`;
     const person = requireObject(rawPerson, path);
@@ -162,8 +179,8 @@ export function adaptFlamePayload(value) {
 
     const name = requireNonemptyString(person.name, `${path}.name`);
     const activeSeconds = requireCount(person.activeSeconds, `${path}.activeSeconds`);
-    if (activeSeconds > MAX_ACTIVE_SECONDS) {
-      fail(`${path}.activeSeconds`, `no greater than ${MAX_ACTIVE_SECONDS}`);
+    if (activeSeconds > maxActiveSeconds) {
+      fail(`${path}.activeSeconds`, `no greater than ${maxActiveSeconds}`);
     }
     const lastActivityMs = requireDate(
       person.lastActivity,
@@ -174,8 +191,8 @@ export function adaptFlamePayload(value) {
       fail(`${path}.lastActivity`, "inside the dashboard read window");
     }
     const total = requireFixedCounts(person.total, TOTAL_COUNT, `${path}.total`);
-    if (!Array.isArray(person.buckets) || person.buckets.length !== BUCKET_COUNT) {
-      fail(`${path}.buckets`, `an array of exactly ${BUCKET_COUNT} buckets`);
+    if (!Array.isArray(person.buckets) || person.buckets.length !== bucketCount) {
+      fail(`${path}.buckets`, `an array of exactly ${bucketCount} buckets`);
     }
 
     const buckets = person.buckets.map((rawBucket, bucketIndex) => {
@@ -219,7 +236,9 @@ export function adaptFlamePayload(value) {
     readMs,
     latestMs,
     coverage,
-    axisTicks: createTimeAxisTicks(startMs),
+    bucketCount,
+    windowMinutes: bucketCount * BUCKET_MS / (60 * 1000),
+    axisTicks: createTimeAxisTicks(startMs, bucketCount),
     globalPeak: getGlobalPeak(people),
     people,
   };

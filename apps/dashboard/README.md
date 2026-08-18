@@ -79,6 +79,12 @@ person and one ten-minute bucket; it never reads full raw Storage objects.
   are pinned to the aggregate's immutable MVCC visibility token. This is a
   read-consistency boundary, not a durable pipeline publication cutoff: a later
   timeline refresh can correctly include newly normalized evidence.
+- Initial page load requests `GET /api/flame?window=recent` first. That bounded
+  read computes and renders the latest twelve ten-minute buckets (two hours),
+  including window-scoped active time and an immutable snapshot receipt. Once
+  it is visible, the browser requests the normal `GET /api/flame` response and
+  replaces the recent view with all 144 buckets. Refreshes after the first full
+  response continue to use the complete endpoint without shrinking the graph.
 
 ## Environment
 

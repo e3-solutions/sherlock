@@ -9,7 +9,11 @@ import FlameGraph, {
   getBucketTooltipPlacement,
   formatActiveTime,
 } from "./FlameGraph.jsx";
-import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
+import {
+  adaptFlamePayload,
+  BUCKET_COUNT,
+  RECENT_BUCKET_COUNT,
+} from "./flame-data.js";
 
 function emptyBuckets() {
   return Array.from({ length: BUCKET_COUNT }, () => [0, 0, 0, 0]);
@@ -87,6 +91,11 @@ describe("bucket hover geometry", () => {
     expect(getBucketCenterX(143, 1008)).toBe(1004.5);
   });
 
+  it("resolves bucket centers against the displayed window", () => {
+    expect(getBucketCenterX(0, 120, RECENT_BUCKET_COUNT)).toBe(5);
+    expect(getBucketCenterX(11, 120, RECENT_BUCKET_COUNT)).toBe(115);
+  });
+
   it("draws the guide through the indexed bucket center", () => {
     const { container } = render(
       <svg>
@@ -154,6 +163,45 @@ describe("FlameGraph", () => {
     expect(peopleScroll.previousElementSibling).toBe(axis.parentElement);
     expect(peopleScroll).not.toContainElement(axis);
     expect(peopleScroll.querySelectorAll(".flame-person")).toHaveLength(2);
+  });
+
+  it("renders the recent first-paint window as a truthful two-hour timeline", () => {
+    const recentBuckets = Array.from(
+      { length: RECENT_BUCKET_COUNT },
+      () => [0, 0, 0, 0],
+    );
+    recentBuckets[RECENT_BUCKET_COUNT - 1] = [1, 0, 0, 0];
+    const data = adaptFlamePayload({
+      start: "2026-08-15T05:00:00.000Z",
+      read: "2026-08-15T07:01:00.000Z",
+      snapshot: "v1.recent-snapshot",
+      latest: "2026-08-15T06:50:00.000Z",
+      coverage: {
+        evidence: "observed_events",
+        state: "partial",
+        reason: "event_presence_not_continuous_attention",
+      },
+      people: [{
+        id: "ada",
+        name: "Ada Lovelace",
+        activeSeconds: 600,
+        lastActivity: "2026-08-15T06:56:00.000Z",
+        total: [1, 0, 0],
+        buckets: recentBuckets,
+      }],
+    });
+
+    const { container } = render(<FlameGraph data={data} chartWidth={120} />);
+
+    expect(screen.getByLabelText("Code activity over the last 2 hours"))
+      .toBeInTheDocument();
+    expect(container.querySelectorAll(".flame-time-axis time")).toHaveLength(5);
+    expect(container.querySelector(".flame-lane")).toHaveAttribute(
+      "aria-label",
+      "Ada Lovelace activity timeline, 12 ten-minute buckets",
+    );
+    expect(screen.getByLabelText("10 minutes active in the last 2 hours"))
+      .toHaveTextContent("10m active");
   });
 
   it("sizes both fixed axis and rows from the scrollbar-adjusted people scrollport", async () => {
