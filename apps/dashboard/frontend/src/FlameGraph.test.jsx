@@ -382,6 +382,7 @@ describe("FlameGraph", () => {
     Object.defineProperty(scroller, "scrollWidth", { configurable: true, value: 1008 });
     scroller.scrollLeft = 37;
 
+    fireEvent.mouseEnter(lane);
     fireEvent.mouseMove(wrapper, { clientX: 3, clientY: 34 });
     await waitFor(() => {
       expect(document.querySelector(".flame-tooltip")).toHaveTextContent("4 observed sessions");
@@ -396,6 +397,50 @@ describe("FlameGraph", () => {
     });
     expect(container.querySelector(".flame-bucket-hover")).toHaveAttribute("x1", "1004.5");
     expect(scroller.scrollLeft).toBe(37);
+  });
+
+  it("keeps only the current lane tooltip open and clears it on exit", async () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const lanes = [...container.querySelectorAll(".flame-lane")];
+    const wrappers = lanes.map((lane) => lane.querySelector(".recharts-wrapper"));
+    const bounds = {
+      bottom: 82,
+      height: 82,
+      left: 0,
+      right: 1008,
+      top: 0,
+      width: 1008,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    };
+
+    for (const lane of lanes) {
+      vi.spyOn(lane, "getBoundingClientRect").mockReturnValue(bounds);
+    }
+    for (const wrapper of wrappers) {
+      vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(bounds);
+    }
+
+    fireEvent.mouseEnter(lanes[0]);
+    fireEvent.mouseMove(wrappers[0], { clientX: 3, clientY: 34 });
+    await waitFor(() => {
+      expect(screen.getAllByRole("status")).toHaveLength(1);
+      expect(screen.getByRole("status")).toHaveTextContent("Ada Lovelace");
+    });
+
+    fireEvent.mouseLeave(lanes[0]);
+    fireEvent.mouseEnter(lanes[1]);
+    fireEvent.mouseMove(wrappers[1], { clientX: 3, clientY: 34 });
+    await waitFor(() => {
+      expect(screen.getAllByRole("status")).toHaveLength(1);
+      expect(screen.getByRole("status")).toHaveTextContent("Zero Activity");
+    });
+
+    fireEvent.mouseLeave(lanes[1]);
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
   });
 
   it("opens observed interval details for the exact clicked bucket", () => {
