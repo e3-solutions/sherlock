@@ -512,6 +512,9 @@ describe("Sherlock Flame payload", () => {
     expect(MCP_PEOPLE_PAGE_SQL).toContain("pe.id > $2::uuid");
     expect(MCP_PEOPLE_PAGE_SQL).toContain("order by pe.id");
     expect(MCP_USAGE_SQL).toContain("pe.id = any($6::uuid[])");
+    expect(MCP_USAGE_SQL).toContain(
+      "s.person_id in (select person_id from roster)",
+    );
   });
 
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {

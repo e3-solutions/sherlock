@@ -392,7 +392,9 @@ with p as materialized (
     from roster r
     left join activity_events a using (person_id)
    group by r.person_id
-), ${promptsCte()}, prompt_counts as materialized (
+), ${promptsCte({
+  candidatePredicate: "and s.person_id in (select person_id from roster)",
+})}, prompt_counts as materialized (
   select prompts.person_id,
          date_bin(interval '10 minutes', prompts.observed_at, p.start_at) bucket_start,
          count(*)::bigint prompts
