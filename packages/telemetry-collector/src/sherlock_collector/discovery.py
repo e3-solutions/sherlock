@@ -148,7 +148,12 @@ def discover_rollouts(
     errors: list[str] = []
     payload = hook_payload or {}
     payload_session = payload.get("session_id")
-    for key in ("rollout_path", "transcript_path"):
+    payload_agent = payload.get("agent_id")
+    for key, native_id in (
+        ("rollout_path", payload_session),
+        ("transcript_path", payload_session),
+        ("agent_transcript_path", payload_agent),
+    ):
         raw_path = payload.get(key)
         if isinstance(raw_path, str) and raw_path:
             try:
@@ -156,7 +161,7 @@ def discover_rollouts(
                 if path is not None:
                     discovered[path] = (
                         int(path.stat().st_mtime_ns // 1_000_000),
-                        _native_session_id(payload_session),
+                        _native_session_id(native_id),
                     )
                     payload_paths.append(path)
             except OSError:

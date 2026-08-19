@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -25,18 +28,30 @@ from .rollout import (
     RolloutCapturer,
     SourceSnapshot,
 )
-from .spool import DurableSpool
+from .spool import DurableSpool, _atomic_json, secure_lock
 
 
-HOOK_EVENTS = {
+CODEX_HOOK_EVENTS = {
     "SessionStart",
     "UserPromptSubmit",
+    "PostToolUse",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
     "Stop",
+}
+CLAUDE_HOOK_EVENTS = {
+    "SessionStart",
+    "UserPromptSubmit",
     "PostToolUse",
     "SubagentStart",
     "SubagentStop",
+    "Stop",
     "SessionEnd",
 }
+HOOK_EVENTS = CODEX_HOOK_EVENTS | CLAUDE_HOOK_EVENTS
+POST_TOOL_DEBOUNCE_SECONDS = 30
+POST_TOOL_STATE_VERSION = 1
 COORDINATION_TOOLS = {
     "spawn_agent",
     "wait_agent",
@@ -71,6 +86,24 @@ def _tool_name(payload: Mapping[str, object]) -> str:
 def is_coordination_tool(name: str) -> bool:
     normalized = name.strip().lower().replace("-", "_")
     return normalized.rsplit(".", 1)[-1] in COORDINATION_TOOLS
+
+
+def _post_tool_capture_due(path: Path, now_ns: int) -> bool:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+    if not isinstance(value, dict):
+        return True
+    last_capture_ns = value.get("last_capture_ns")
+    if (
+        value.get("state_version") != POST_TOOL_STATE_VERSION
+        or isinstance(last_capture_ns, bool)
+        or not isinstance(last_capture_ns, int)
+    ):
+        return True
+    elapsed_ns = now_ns - last_capture_ns
+    return elapsed_ns < 0 or elapsed_ns >= POST_TOOL_DEBOUNCE_SECONDS * 1_000_000_000
 
 
 def _spawn_drain(
@@ -144,7 +177,7 @@ def capture_and_spawn_drain(
     return outcome
 
 
-def run_hook(
+def _capture_hook(
     event_name: str,
     payload: Mapping[str, object],
     *,
@@ -160,12 +193,6 @@ def run_hook(
         return HookResult(event_name, skipped="unsupported_hook")
     if provider not in {"codex", "claude_code"}:
         return HookResult(event_name, skipped="unsupported_provider")
-    if (
-        provider == "codex"
-        and event_name == "PostToolUse"
-        and not is_coordination_tool(_tool_name(payload))
-    ):
-        return HookResult(event_name, skipped="ordinary_tool")
     home = Path(
         (claude_home or default_claude_home())
         if provider == "claude_code"
@@ -285,3 +312,63 @@ def run_hook(
         deferred_bytes=outcome.deferred_bytes + hook_outcome.deferred_bytes,
         locked=outcome.locked or hook_outcome.locked,
     )
+
+
+def run_hook(
+    event_name: str,
+    payload: Mapping[str, object],
+    *,
+    codex_home: Path | str | None = None,
+    claude_home: Path | str | None = None,
+    state_root: Path | str | None = None,
+    provider: str = "codex",
+    raw_payload: bytes | None = None,
+    drain_command: Sequence[str],
+    drain_environment: Mapping[str, str] | None = None,
+) -> HookResult:
+    provider_events = (
+        CLAUDE_HOOK_EVENTS if provider == "claude_code" else CODEX_HOOK_EVENTS
+    )
+    if provider not in {"codex", "claude_code"}:
+        return HookResult(event_name, skipped="unsupported_provider")
+    if event_name not in provider_events:
+        return HookResult(event_name, skipped="unsupported_hook")
+    home = Path(
+        (claude_home or default_claude_home())
+        if provider == "claude_code"
+        else (codex_home or default_codex_home())
+    ).expanduser().resolve()
+    root = Path(state_root or default_state_root(home)).expanduser().resolve()
+
+    arguments = {
+        "codex_home": codex_home,
+        "claude_home": claude_home,
+        "state_root": root,
+        "provider": provider,
+        "raw_payload": raw_payload,
+        "drain_command": drain_command,
+        "drain_environment": drain_environment,
+    }
+    if event_name != "PostToolUse" or is_coordination_tool(_tool_name(payload)):
+        return _capture_hook(event_name, payload, **arguments)
+
+    state_stem = f"{provider}-post-tool-capture"
+    state_path = root / f"{state_stem}.json"
+    with secure_lock(root / f"{state_stem}.lock") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return HookResult(event_name, skipped="busy")
+        now_ns = time.time_ns()
+        if not _post_tool_capture_due(state_path, now_ns):
+            return HookResult(event_name, skipped="debounced")
+        result = _capture_hook(event_name, payload, **arguments)
+        if not result.locked:
+            _atomic_json(
+                state_path,
+                {
+                    "state_version": POST_TOOL_STATE_VERSION,
+                    "last_capture_ns": now_ns,
+                },
+            )
+        return result

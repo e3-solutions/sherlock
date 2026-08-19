@@ -23,7 +23,7 @@ from sherlock_collector.discovery import (
     CLAUDE_BACKFILL_MAX_FILES,
     discover_claude_transcripts,
 )
-from sherlock_collector.hook import run_hook
+from sherlock_collector.hook import POST_TOOL_DEBOUNCE_SECONDS, run_hook
 from sherlock_collector.rollout import RolloutCapturer
 from sherlock_collector.spool import DurableSpool
 
@@ -517,6 +517,67 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertEqual(item["metadata"]["workload_class"], "backfill")
             self.assertEqual(popen.call_count, 2)
 
+    def test_claude_post_tool_use_is_captured_then_debounced(self):
+        with TemporaryDirectory() as temporary:
+            claude_home = Path(temporary) / "claude"
+            transcript = claude_home / "projects" / "repo" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            first_record = b'{"type":"user","sessionId":"session-123"}\n'
+            second_record = b'{"type":"assistant","sessionId":"session-123"}\n'
+            transcript.write_bytes(first_record)
+            state_root = claude_home / "sherlock" / "telemetry"
+            payload = {
+                "session_id": "session-123",
+                "transcript_path": str(transcript),
+            }
+            first_ns = 1_000_000_000_000
+
+            with (
+                patch("sherlock_collector.hook.subprocess.Popen") as popen,
+                patch(
+                    "sherlock_collector.hook.time.time_ns",
+                    side_effect=[
+                        first_ns,
+                        first_ns + 1,
+                        first_ns
+                        + POST_TOOL_DEBOUNCE_SECONDS * 1_000_000_000,
+                    ],
+                ),
+            ):
+                first = run_hook(
+                    "PostToolUse",
+                    payload,
+                    provider="claude_code",
+                    claude_home=claude_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                with transcript.open("ab") as handle:
+                    handle.write(second_record)
+                second = run_hook(
+                    "PostToolUse",
+                    payload,
+                    provider="claude_code",
+                    claude_home=claude_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                third = run_hook(
+                    "PostToolUse",
+                    payload,
+                    provider="claude_code",
+                    claude_home=claude_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertEqual(first.captured_bytes, len(first_record))
+            self.assertEqual(second.skipped, "debounced")
+            self.assertEqual(third.captured_bytes, len(second_record))
+            self.assertEqual(popen.call_count, 2)
+            throttle = state_root / "claude_code-post-tool-capture.json"
+            self.assertEqual(throttle.stat().st_mode & 0o777, 0o600)
+
     def test_session_start_keeps_current_transcript_out_of_backfill_lane(self):
         with TemporaryDirectory() as temporary:
             claude_home = Path(temporary) / "claude"
@@ -661,6 +722,20 @@ class ClaudePluginTests(unittest.TestCase):
                     break
                 time.sleep(0.02)
             self.assertEqual(len(paths), 2)
+            telemetry = claude_home / "sherlock" / "telemetry"
+            state_paths = (
+                telemetry / "claude-hook-state.json",
+                telemetry / "claude-transcript-state.json",
+            )
+            while time.monotonic() < deadline:
+                if all(path.is_file() for path in state_paths):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(all(path.is_file() for path in state_paths))
+            # The launcher intentionally returns before its detached capture.
+            # Give that child a short quiet window after both durable cursors
+            # appear so temporary-directory cleanup cannot race its final fsync.
+            time.sleep(0.1)
             items = [
                 json.loads(path.read_text(encoding="utf-8")) for path in paths
             ]
