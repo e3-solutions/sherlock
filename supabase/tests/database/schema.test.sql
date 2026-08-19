@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(88);
+select plan(89);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -81,6 +81,10 @@ select ok(
 select ok(
   pg_has_role('postgres', 'sherlock_normalizer', 'member'),
   'Edge Function database login can assume the constrained normalizer role'
+);
+select ok(
+  pg_has_role('postgres', 'sherlock_reader', 'member'),
+  'local and CI database login can exercise the MCP read-only role'
 );
 select ok(
   pg_has_role('postgres', 'sherlock_reducer', 'member'),
