@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
+import { FlameDayCache } from "./src/server/flame-cache.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -19,6 +20,24 @@ const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople
 const source = databaseUrl && validWorkspaceId && validMaxPeople
   ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
   : null;
+
+let databaseVerified = false;
+async function loadTimeline({ signal }) {
+  if (!databaseVerified) {
+    const readiness = await source.readiness({ signal });
+    if (readiness.status !== "ok") throw new FlameSourceError(readiness.reason);
+    databaseVerified = true;
+  }
+  return await source.fetchDay({ signal });
+}
+
+const cache = source
+  ? new FlameDayCache({
+      load: loadTimeline,
+      log: (event) => console.log(JSON.stringify(event)),
+    })
+  : null;
+cache?.start();
 
 const SECURITY_HEADERS = {
   "Content-Security-Policy":
@@ -103,7 +122,7 @@ const server = createServer(async (request, response) => {
 
   if (url.pathname === "/healthz") {
     const invalid = configurationStatus();
-    const receipt = invalid ?? await source.readiness();
+    const receipt = invalid ?? cache.readiness();
     sendJson(response, receipt.status === "ok" ? 200 : 503, receipt);
     return;
   }
@@ -115,12 +134,23 @@ const server = createServer(async (request, response) => {
     }
     const signal = requestAbortSignal(request, response);
     try {
-      sendJson(response, 200, await source.fetchDay({ signal }));
+      const refresh = url.searchParams.get("refresh");
+      const result = await cache.read({
+        signal,
+        forceRefresh: refresh === "force",
+        waitForRefresh: refresh === "wait",
+      });
+      sendJson(response, 200, result.payload, {
+        "X-Sherlock-Timeline-Cache": result.state,
+      });
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      if (code !== "flame_request_aborted") sendJson(response, 503, { error: code });
+      if (code !== "flame_request_aborted" || !signal.aborted) {
+        sendJson(response, code === "flame_refresh_throttled" ? 429 : 503, { error: code },
+          code === "flame_refresh_throttled" ? { "Retry-After": "60" } : {});
+      }
     }
     return;
   }
@@ -202,7 +232,9 @@ server.listen(PORT, "0.0.0.0", () => {
 
 async function shutdown(signal) {
   console.log(JSON.stringify({ event: "dashboard_shutdown", signal }));
-  server.close();
+  const drained = new Promise((resolve) => server.close(resolve));
+  await cache?.close();
+  await drained;
   await source?.close();
 }
 

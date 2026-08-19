@@ -1136,7 +1136,7 @@ export class DirectFlameSource {
     }
   }
 
-  async readiness() {
+  async readiness({ signal } = {}) {
     try {
       return await this.transaction(async (tx) => {
         const rows = await tx.unsafe(`
@@ -1150,7 +1150,7 @@ export class DirectFlameSource {
           throw new FlameSourceError("flame_database_reader_unsafe");
         }
         return { status: "ok", mode: "sherlock_backend_aggregate" };
-      });
+      }, { signal });
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code

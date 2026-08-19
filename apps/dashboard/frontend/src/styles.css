@@ -143,6 +143,18 @@ input { font: inherit; }
   letter-spacing: .08em;
 }
 
+.timeline-read {
+  flex: 0 0 auto;
+  margin: 0 0 8px;
+  color: var(--flame-muted);
+  font-size: 11px;
+  letter-spacing: .04em;
+}
+
+.timeline-read--delayed {
+  color: var(--flame-stale);
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;

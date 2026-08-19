@@ -8,20 +8,48 @@ const REFRESH_OFFSET_MS = 90 * 1000;
 const RETRY_MS = 60 * 1000;
 
 function nextRefreshDelay(now) {
-  const nextClosedBucket = (Math.floor(now / BUCKET_MS) + 1) * BUCKET_MS;
-  return Math.max(1000, nextClosedBucket + REFRESH_OFFSET_MS - now);
+  const boundary = Math.floor(now / BUCKET_MS) * BUCKET_MS;
+  const candidate = boundary + REFRESH_OFFSET_MS;
+  return Math.max(1000, (candidate > now ? candidate : candidate + BUCKET_MS) - now);
+}
+
+function expectedTimelineEnd(now) {
+  return Math.floor((now - REFRESH_OFFSET_MS) / BUCKET_MS) * BUCKET_MS;
+}
+
+function readAge(readMs, now) {
+  const elapsed = Math.max(0, now - readMs);
+  if (elapsed < 60 * 1000) return "just now";
+  if (elapsed < 60 * 60 * 1000) return `${Math.floor(elapsed / 60_000)}m ago`;
+  return `${Math.floor(elapsed / (60 * 60 * 1000))}h ago`;
+}
+
+function timelineFreshness(data, now) {
+  const end = data.startMs + 24 * 60 * 60 * 1000;
+  const through = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(end);
+  return {
+    delayed: end < expectedTimelineEnd(now) || (
+      end === expectedTimelineEnd(now) && data.readMs < end + REFRESH_OFFSET_MS
+    ),
+    label: `Through ${through} · read ${readAge(data.readMs, now)}`,
+  };
 }
 
 export default function App() {
   const [data, setData] = useState(null);
   const [state, setState] = useState("loading");
   const [message, setMessage] = useState("");
+  const [clock, setClock] = useState(() => Date.now());
   const lastGoodRef = useRef(null);
   const timerRef = useRef(null);
   const requestRef = useRef(null);
   const mountedRef = useRef(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ refresh = "" } = {}) => {
     window.clearTimeout(timerRef.current);
     requestRef.current?.abort();
 
@@ -29,7 +57,7 @@ export default function App() {
     requestRef.current = controller;
 
     try {
-      const response = await fetch("/api/flame", {
+      const response = await fetch(refresh ? `/api/flame?refresh=${refresh}` : "/api/flame", {
         headers: { Accept: "application/json" },
         cache: "no-store",
         signal: controller.signal,
@@ -44,8 +72,13 @@ export default function App() {
       lastGoodRef.current = nextData;
       setData(nextData);
       setMessage("");
-      setState("ready");
-      timerRef.current = window.setTimeout(load, nextRefreshDelay(Date.now()));
+      const delayed = timelineFreshness(nextData, Date.now()).delayed;
+      setClock(Date.now());
+      setState(delayed ? "delayed" : "ready");
+      timerRef.current = window.setTimeout(
+        () => load({ refresh: "wait" }),
+        delayed ? RETRY_MS : nextRefreshDelay(Date.now()),
+      );
     } catch (error) {
       if (!mountedRef.current || controller.signal.aborted) return;
 
@@ -56,7 +89,10 @@ export default function App() {
       } else {
         setState("error");
       }
-      timerRef.current = window.setTimeout(load, RETRY_MS);
+      timerRef.current = window.setTimeout(
+        () => load({ refresh: refresh === "force" ? "force" : "wait" }),
+        RETRY_MS,
+      );
     } finally {
       if (requestRef.current === controller) requestRef.current = null;
     }
@@ -71,6 +107,11 @@ export default function App() {
       requestRef.current?.abort();
     };
   }, [load]);
+
+  useEffect(() => {
+    const ageTimer = window.setInterval(() => setClock(Date.now()), 60 * 1000);
+    return () => window.clearInterval(ageTimer);
+  }, []);
 
   if (!data && state === "loading") {
     return (
@@ -93,16 +134,29 @@ export default function App() {
     );
   }
 
+  const freshness = timelineFreshness(data, clock);
+  const refreshProblem = state === "stale" || freshness.delayed;
+
   return (
     <>
       <PortalHeader />
-      {state === "stale" && (
-        <p className="refresh-warning" role="status">
-          Refresh failed. Showing the last successful read.
-          <span className="visually-hidden"> {message}</span>
-        </p>
+      {refreshProblem && (
+        <span className="visually-hidden" role="status">
+          {state === "stale" ? "Timeline refresh failed." : "Timeline update delayed."}
+        </span>
       )}
-      <FlameGraph data={data} stale={state === "stale"} onRefresh={load} />
+      <p
+        className={`timeline-read${refreshProblem ? " timeline-read--delayed" : ""}`}
+      >
+        {state === "stale" ? "Refresh failed. " : freshness.delayed ? "Update delayed. " : ""}
+        {freshness.label}
+        {state === "stale" && <span className="visually-hidden"> {message}</span>}
+      </p>
+      <FlameGraph
+        data={data}
+        stale={state === "stale" || state === "delayed"}
+        onRefresh={() => load({ refresh: "force" })}
+      />
     </>
   );
 }
@@ -153,4 +207,4 @@ function SemanticLegend() {
   );
 }
 
-export { nextRefreshDelay };
+export { expectedTimelineEnd, nextRefreshDelay, timelineFreshness };
