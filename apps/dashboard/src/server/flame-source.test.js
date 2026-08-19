@@ -9,6 +9,9 @@ import {
   INTERVAL_PROMPTS_SQL,
   INTERVAL_WORK_SQL,
   MAX_WORK_DETAIL_LIMIT,
+  MCP_PROMPT_EVIDENCE_LIMIT,
+  MCP_PEOPLE_PAGE_SQL,
+  MCP_USAGE_SQL,
   PEOPLE_SQL,
   PREFERRED_DASHBOARD_EMAIL_DOMAIN,
   REPLACED_DASHBOARD_EMAIL_DOMAIN,
@@ -20,8 +23,10 @@ import {
   FlameSourceError,
   buildFlamePayload,
   decodeWorkCursor,
+  decodeUsageCursor,
   decodeSnapshotToken,
   encodeWorkCursor,
+  encodeUsageCursor,
   encodeSnapshotToken,
 } from "./flame-source.js";
 
@@ -118,6 +123,18 @@ describe("Sherlock Flame payload", () => {
       mode: "sherlock_backend_aggregate",
     });
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.activity_spans");
+  });
+
+  it("pins every source transaction to the read-only database role", async () => {
+    const unsafe = vi.fn().mockResolvedValue([]);
+    const source = Object.create(DirectFlameSource.prototype);
+    source.sql = { begin: (callback) => callback({ unsafe }) };
+
+    await source.transaction(async () => "ok");
+
+    expect(unsafe.mock.calls.map(([sql]) => sql)).toContain(
+      "set local role sherlock_reader",
+    );
   });
 
   it("rejects incomplete result grids", () => {
@@ -473,6 +490,33 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
   });
 
+  it("selects MCP prompt excerpts from the exact canonical prompt universe", () => {
+    expect(INTERVAL_PROMPTS_SQL).toContain("prompt_candidates as materialized");
+    expect(INTERVAL_PROMPTS_SQL).toContain("e.message_origin = 'human'");
+    expect(INTERVAL_PROMPTS_SQL).toContain("e.message_role = 'user'");
+    expect(INTERVAL_PROMPTS_SQL).toContain("e.actor_role = 'primary'");
+    expect(INTERVAL_PROMPTS_SQL).toContain("where has_submitted");
+    expect(INTERVAL_PROMPTS_SQL).toContain("where canonical_rank = 1");
+    expect(INTERVAL_PROMPTS_SQL).toContain(
+      "pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
+    );
+    expect(INTERVAL_PROMPTS_SQL).toContain("and s.person_id = p.person_id");
+    expect(INTERVAL_PROMPTS_SQL).toContain("count(*) over ()::bigint");
+    expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
+    expect(INTERVAL_PROMPTS_SQL).not.toContain("activity_candidates as materialized");
+    expect(INTERVAL_PROMPTS_SQL).not.toContain("context_before");
+    expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
+  });
+
+  it("pages MCP usage before running the aggregate", () => {
+    expect(MCP_PEOPLE_PAGE_SQL).toContain("pe.id > $2::uuid");
+    expect(MCP_PEOPLE_PAGE_SQL).toContain("order by pe.id");
+    expect(MCP_USAGE_SQL).toContain("pe.id = any($6::uuid[])");
+    expect(MCP_USAGE_SQL).toContain(
+      "s.person_id in (select person_id from roster)",
+    );
+  });
+
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
     expect(ASSISTANT_REPRESENTATION_MATCH_SECONDS).toBe(3);
     for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
@@ -723,5 +767,42 @@ describe("Sherlock Flame payload", () => {
       limit: "101",
     })).rejects.toMatchObject({ code: "flame_work_request_invalid" });
     expect(source.transaction).not.toHaveBeenCalled();
+  });
+
+  it("returns one capped canonical MCP prompt sample", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const rows = Array.from({ length: 5 }, (_, index) => ({
+      content_byte_size: index === 0 ? 20 : 8,
+      content_excerpt: index === 0 ? "Short" : `Prompt ${index}`,
+      eligible_prompt_count: 8,
+    }));
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce(rows);
+    source.transaction = (callback) => callback({ unsafe });
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+    const result = await source.fetchPromptEvidence({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(5);
+    expect(result.eligiblePromptCount).toBe(8);
+    expect(result.prompts).toHaveLength(5);
+    expect(result.prompts[0]).toEqual({
+      excerpt: "Short",
+      excerptTruncated: true,
+    });
+  });
+
+  it("round-trips usage keyset cursors", () => {
+    const personId = "22222222-2222-4222-8222-222222222222";
+    expect(decodeUsageCursor(encodeUsageCursor(personId))).toBe(personId);
+    expect(() => decodeUsageCursor("u1.not+base64")).toThrow(FlameSourceError);
   });
 });

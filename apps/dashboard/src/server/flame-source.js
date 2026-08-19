@@ -3,9 +3,10 @@ import postgres from "postgres";
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
-export const DATABASE_ROLE = "sherlock_normalizer";
+export const DATABASE_ROLE = "sherlock_reader";
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const WORK_CURSOR_VERSION = "v1";
+const USAGE_CURSOR_VERSION = "u1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
 const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
@@ -19,6 +20,8 @@ export const INTERVAL_WORK_LIMIT = 200;
 export const INTERVAL_PROMPT_LIMIT = 200;
 export const DEFAULT_WORK_DETAIL_LIMIT = 50;
 export const MAX_WORK_DETAIL_LIMIT = 100;
+export const MCP_USAGE_PAGE_LIMIT = 20;
+export const MCP_PROMPT_EVIDENCE_LIMIT = 5;
 export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
 export const REPLACED_DASHBOARD_EMAIL_DOMAIN = "coreedgesolution.com";
 
@@ -112,6 +115,18 @@ select pe.id::text as person_id,
    ${dashboardPersonVisibility("pe")}
  order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
+`;
+
+export const MCP_PEOPLE_PAGE_SQL = `
+select pe.id::text as person_id,
+       coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) as display_name
+  from telemetry.people pe
+ where pe.workspace_id = $1
+   and pe.github_id is distinct from 'sherlock-smoke'
+   and ($2::uuid is null or pe.id > $2::uuid)
+   ${dashboardPersonVisibility("pe")}
+ order by pe.id
+ limit $3
 `;
 
 function promptsCte({
@@ -331,7 +346,8 @@ prompt_candidates as materialized (
  )`;
 }
 
-export const FLAME_SQL = `
+function flameSql(rosterPredicate = "") {
+  return `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text normalizer_version,
@@ -342,6 +358,7 @@ with p as materialized (
    from telemetry.people pe cross join p
    where pe.workspace_id = p.workspace_id
      and pe.github_id is distinct from 'sherlock-smoke'
+     ${rosterPredicate}
      ${dashboardPersonVisibility("pe")}
 ), buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
@@ -375,7 +392,9 @@ with p as materialized (
     from roster r
     left join activity_events a using (person_id)
    group by r.person_id
-), ${promptsCte()}, prompt_counts as materialized (
+), ${promptsCte({
+  candidatePredicate: "and s.person_id in (select person_id from roster)",
+})}, prompt_counts as materialized (
   select prompts.person_id,
          date_bin(interval '10 minutes', prompts.observed_at, p.start_at) bucket_start,
          count(*)::bigint prompts
@@ -404,6 +423,10 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
     on pc.person_id = r.person_id and pc.bucket_start = b.bucket_start
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
+}
+
+export const FLAME_SQL = flameSql();
+export const MCP_USAGE_SQL = flameSql("and pe.id = any($6::uuid[])");
 
 function relevantActivitySessionsCte() {
   return `
@@ -721,7 +744,8 @@ with p as materialized (
   visibilityPredicate: "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
 })}
 select prompt_identity, session_id::text session_id, observed_at,
-       content_byte_size, content_excerpt
+       content_byte_size, content_excerpt,
+       count(*) over ()::bigint eligible_prompt_count
   from prompts cross join p
  where prompts.person_id = p.person_id
    and prompts.observed_at >= p.bucket_start
@@ -915,6 +939,31 @@ export function decodeWorkCursor(cursor) {
   }
 }
 
+export function encodeUsageCursor(personId) {
+  if (!UUID_PATTERN.test(personId)) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
+  }
+  return `${USAGE_CURSOR_VERSION}.${Buffer.from(personId, "utf8").toString("base64url")}`;
+}
+
+export function decodeUsageCursor(cursor) {
+  if (cursor === null || cursor === undefined || cursor === "") return null;
+  if (typeof cursor !== "string" || cursor.length > MAX_WORK_CURSOR_LENGTH) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
+  }
+  const [version, body, extra] = cursor.split(".");
+  if (version !== USAGE_CURSOR_VERSION || !body || extra !== undefined ||
+      !/^[A-Za-z0-9_-]+$/.test(body)) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
+  }
+  const decoded = Buffer.from(body, "base64url").toString("utf8");
+  if (Buffer.from(decoded, "utf8").toString("base64url") !== body ||
+      !UUID_PATTERN.test(decoded)) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
+  }
+  return decoded;
+}
+
 function parseWorkLimit(value) {
   if (value === null || value === undefined || value === "") {
     return DEFAULT_WORK_DETAIL_LIMIT;
@@ -1033,6 +1082,17 @@ async function runQuery(tx, text, params, signal) {
   }
 }
 
+function promptEvidenceFromRow(row) {
+  const excerpt = row.content_excerpt === null || row.content_excerpt === undefined
+    ? ""
+    : String(row.content_excerpt);
+  const contentBytes = count(row.content_byte_size ?? 0);
+  return {
+    excerpt,
+    excerptTruncated: contentBytes > Buffer.byteLength(excerpt, "utf8"),
+  };
+}
+
 export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   if (roster.length === 0) throw new FlameSourceError("flame_database_roster_empty");
   if (rows.length !== roster.length * BUCKET_COUNT) {
@@ -1140,7 +1200,7 @@ export class DirectFlameSource {
     try {
       return await this.transaction(async (tx) => {
         const rows = await tx.unsafe(`
-          select current_role = 'sherlock_normalizer' as backend_role,
+          select current_role = '${DATABASE_ROLE}' as backend_role,
                  current_setting('transaction_read_only') = 'on' as read_only,
                  has_table_privilege(current_role, 'telemetry.people', 'select') as can_read_people,
                  has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events
@@ -1186,6 +1246,52 @@ export class DirectFlameSource {
         read.toISOString(),
       ], signal);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
+    }, { signal });
+  }
+
+  async fetchUsageEvidence({ cursor = "", now, signal } = {}) {
+    const afterPersonId = decodeUsageCursor(cursor);
+    return await this.transaction(async (tx) => {
+      const receipt = (await runQuery(
+        tx,
+        "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
+        undefined,
+        signal,
+      ))[0];
+      const read = now ? asDate(now) : asDate(receipt.now);
+      const endMs = Math.floor(read.getTime() / BUCKET_MS) * BUCKET_MS;
+      const start = new Date(endMs - 24 * 60 * 60 * 1000);
+      const end = new Date(endMs);
+      const page = await runQuery(tx, MCP_PEOPLE_PAGE_SQL, [
+        this.workspaceId,
+        afterPersonId,
+        MCP_USAGE_PAGE_LIMIT + 1,
+      ], signal);
+      const hasMore = page.length > MCP_USAGE_PAGE_LIMIT;
+      const roster = hasMore ? page.slice(0, MCP_USAGE_PAGE_LIMIT) : page;
+      if (roster.length === 0) {
+        return {
+          start: start.toISOString(),
+          read: read.toISOString(),
+          snapshot: encodeSnapshotToken({ snapshot: receipt.snapshot, read }),
+          people: [],
+          nextCursor: null,
+        };
+      }
+      const rows = await runQuery(tx, MCP_USAGE_SQL, [
+        this.workspaceId,
+        start.toISOString(),
+        end.toISOString(),
+        NORMALIZER_VERSION,
+        read.toISOString(),
+        roster.map((person) => person.person_id),
+      ], signal);
+      return {
+        ...buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot }),
+        nextCursor: hasMore
+          ? encodeUsageCursor(String(roster.at(-1).person_id))
+          : null,
+      };
     }, { signal });
   }
 
@@ -1312,6 +1418,42 @@ export class DirectFlameSource {
         eventCount: header.eventCount,
         items: pageRows.map(detailItemFromRow),
         nextCursor,
+      };
+    }, { signal });
+  }
+
+  async fetchPromptEvidence({ personId, start, snapshot, signal, now }) {
+    const startAt = requestStart(start, "prompt");
+    const snapshotReceipt = requestSnapshot(snapshot, "prompt");
+    validateIntervalIdentity(personId, startAt, "prompt");
+
+    return await this.transaction(async (tx) => {
+      const databaseRead = asDate((await runQuery(
+        tx, "select transaction_timestamp() as now", undefined, signal,
+      ))[0].now);
+      const read = now ? asDate(now) : databaseRead;
+      const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
+      const rows = await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+        this.workspaceId,
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
+        NORMALIZER_VERSION,
+        snapshotReceipt.read.toISOString(),
+        snapshotReceipt.snapshot,
+        personId,
+        startAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
+        MCP_PROMPT_EVIDENCE_LIMIT,
+      ], signal);
+      const eligiblePromptCount = rows.length === 0
+        ? 0
+        : count(rows[0].eligible_prompt_count);
+      return {
+        personId,
+        start: startAt.toISOString(),
+        snapshot,
+        eligiblePromptCount,
+        prompts: rows.map(promptEvidenceFromRow),
       };
     }, { signal });
   }

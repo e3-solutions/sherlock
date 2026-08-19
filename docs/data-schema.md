@@ -185,6 +185,11 @@ The ingest role cannot write events or spans. The normalizer cannot write spans.
 The reducer cannot read raw receipts or native locators, change session caches
 or events, or update/delete spans. The reader cannot write any fact. These
 grants separate collection, interpretation, reduction, and product reads.
+The `sherlock_worker_login` role has `NOINHERIT` and may explicitly assume the
+reader for the bearer-gated Bonaparte MCP pilot. MCP transactions are
+additionally declared read-only, and any downstream prompt feedback remains an
+ephemeral agent response rather than a database fact. Principal-scoped
+authorization is outside the v1 evidence contract.
 
 ## Implemented rollout drain contract
 

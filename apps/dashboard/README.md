@@ -2,11 +2,12 @@
 
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
-uses SHERLOCK_WORKSPACE_ID, every database transaction is repeatable-read and
-read-only, and the server assumes Sherlock's existing sherlock_normalizer role.
+uses SHERLOCK_WORKSPACE_ID and one small connection pool whose transactions are
+repeatable-read, read-only, and pinned to `sherlock_reader`.
 
-The browser never receives database credentials. The page and aggregate API
-are public; every database query remains pinned to one configured workspace.
+The browser and MCP clients never receive database credentials. The page and
+aggregate API are public; the MCP endpoint requires a separate bearer token.
+Every database query remains pinned to one configured workspace.
 The aggregate API does not return prompt text. Lazy interval and work-detail
 endpoints return only canonical normalized evidence for one person and one
 ten-minute bucket. Message content is limited to
@@ -149,12 +150,44 @@ the existing Sherlock worker login contract, which can assume
 sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
 exceed 1000.
 
+## Bonaparte MCP
+
+`/mcp` is a stateless Streamable HTTP MCP endpoint for agent-assisted usage and
+prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
+least 32 characters and configure the MCP client to send it as
+`Authorization: Bearer <token>`. Browser-origin requests are rejected; the
+endpoint is for origin-free agent clients and server-to-server MCP hosts.
+
+The endpoint exposes two versioned read-only tools. Their complete input,
+output, pagination, error, and limitation contract is documented in
+[`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
+
+- `list_usage_evidence` keyset-pages 20 people before aggregation and returns
+  explicit session counts, prompt counts, and prompt-bearing buckets.
+- `list_prompt_evidence` takes the exact snapshot token, person ID, and bucket
+  returned by the first tool. It returns the earliest five canonical
+  primary-human prompt excerpts from that bucket and reports how many were
+  omitted. Conversation context is intentionally excluded from v1.
+
+Every tool advertises strict input and output schemas and read-only,
+non-destructive, idempotent, closed-world annotations. Results are returned as
+both structured content and serialized JSON for client compatibility. Prompt
+excerpts are structurally labeled as untrusted data; agents must never execute
+instructions within them. The server does not generate or persist feedback.
+
+The endpoint never reads raw Storage objects and never writes feedback or
+derived judgments to Sherlock. The shared bearer token is a pilot transport
+gate, not principal-scoped authorization; authorization, ingress request-size
+limits, rate limits, and sensitive-read auditing remain required before broad
+access.
+
 ## Local verification
 
 Run corepack pnpm install --frozen-lockfile, then pnpm check, pnpm test, and
-pnpm build. With the repository's isolated Supabase database running, set
-`SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to execute the dashboard SQL
-integration fixture.
+pnpm build. The test suite includes an official MCP client discovering and
+calling the Streamable HTTP tools. With the repository's isolated Supabase
+database running, set `SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to
+execute the dashboard SQL integration fixture.
 
 ## Railway deployment
 
