@@ -1,10 +1,9 @@
 import postgres from "postgres";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   BUCKET_MS,
   DirectFlameSource,
-  MCP_DATABASE_ROLE,
   NORMALIZER_VERSION,
 } from "./flame-source.js";
 
@@ -49,11 +48,19 @@ async function cleanup(sql, workspaceId) {
 }
 
 describePostgres("Sherlock Flame PostgreSQL integration", () => {
+  beforeAll(async () => {
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      await sql.unsafe("grant sherlock_reader to postgres");
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+
   it("lets the shared backend login assume the MCP read-only role", async () => {
     const source = new DirectFlameSource({
       databaseUrl: DATABASE_URL,
       workspaceId: crypto.randomUUID(),
-      databaseRole: MCP_DATABASE_ROLE,
     });
     try {
       await expect(source.readiness()).resolves.toEqual({
@@ -446,18 +453,13 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({
-        databaseUrl: DATABASE_URL,
-        workspaceId,
-        databaseRole: MCP_DATABASE_ROLE,
-      });
-      const aggregate = await source.fetchDay({ now: FIXED_NOW });
+      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      const aggregate = await source.fetchUsageEvidence({ now: FIXED_NOW });
       const bucket = aggregate.people[0].buckets[bucketIndex(new Date(bucketStart))];
       const evidence = await source.fetchPromptEvidence({
         personId,
         start: bucketStart,
         snapshot: aggregate.snapshot,
-        cursor: "",
       });
 
       expect(bucket[3]).toBe(2);
@@ -465,13 +467,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         "Fix the cache race and add a regression test.",
         "Also cover cancellation.",
       ]);
-      expect(evidence.prompts[0].contextBefore).toEqual([
-        expect.objectContaining({
-          role: "assistant",
-          excerpt: "I will inspect the cache implementation.",
-        }),
-      ]);
-      expect(evidence.nextCursor).toBeNull();
+      expect(evidence.eligiblePromptCount).toBe(2);
+      expect(aggregate.nextCursor).toBeNull();
     } finally {
       if (source) await source.close();
       try {

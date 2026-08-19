@@ -2,9 +2,8 @@
 
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
-uses SHERLOCK_WORKSPACE_ID, every database transaction is repeatable-read and
-read-only, the dashboard assumes `sherlock_normalizer`, and MCP assumes the
-narrower `sherlock_reader` role.
+uses SHERLOCK_WORKSPACE_ID and one small connection pool whose transactions are
+repeatable-read, read-only, and pinned to `sherlock_reader`.
 
 The browser and MCP clients never receive database credentials. The page and
 aggregate API are public; the MCP endpoint requires a separate bearer token.
@@ -131,29 +130,24 @@ The endpoint exposes two versioned read-only tools. Their complete input,
 output, pagination, error, and limitation contract is documented in
 [`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
 
-- `list_usage_evidence` returns up to 20 people with explicitly named distinct
-  session counts, occupied observed-event bucket counts, canonical primary-human
-  prompt counts, and only the prompt-bearing buckets needed for drilldown. It
-  intentionally omits the dashboard's coarse `activeSeconds`.
+- `list_usage_evidence` keyset-pages 20 people before aggregation and returns
+  explicit session counts, prompt counts, and prompt-bearing buckets.
 - `list_prompt_evidence` takes the exact snapshot token, person ID, and bucket
-  returned by the first tool. It pages ten canonical primary-human prompt
-  excerpts at a time using the same selection as the aggregate count, plus at
-  most four preceding primary-session conversation excerpts for context.
+  returned by the first tool. It returns the earliest five canonical
+  primary-human prompt excerpts from that bucket and reports how many were
+  omitted. Conversation context is intentionally excluded from v1.
 
 Every tool advertises strict input and output schemas and read-only,
 non-destructive, idempotent, closed-world annotations. Results are returned as
 both structured content and serialized JSON for client compatibility. Prompt
-and context excerpts are structurally labeled as untrusted data; agents must
-never execute instructions within them. The server does not generate or persist
-feedback.
+excerpts are structurally labeled as untrusted data; agents must never execute
+instructions within them. The server does not generate or persist feedback.
 
-MCP database work uses a separate connection pool and runs repeatable-read,
-read-only transactions after assuming `sherlock_reader`. That role can select
-private normalized facts but cannot insert, update, or delete them. The endpoint
-never reads raw Storage objects and never writes feedback or derived judgments
-to Sherlock. The shared bearer token is a pilot transport gate, not
-principal-scoped authorization; authorization and sensitive-read auditing remain
-required before broad access.
+The endpoint never reads raw Storage objects and never writes feedback or
+derived judgments to Sherlock. The shared bearer token is a pilot transport
+gate, not principal-scoped authorization; authorization, ingress request-size
+limits, rate limits, and sensitive-read auditing remain required before broad
+access.
 
 ## Local verification
 

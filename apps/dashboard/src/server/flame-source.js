@@ -1,16 +1,12 @@
-import { createHash } from "node:crypto";
-
 import postgres from "postgres";
 
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
-export const DATABASE_ROLE = "sherlock_normalizer";
-export const MCP_DATABASE_ROLE = "sherlock_reader";
-const DATABASE_ROLES = new Set([DATABASE_ROLE, MCP_DATABASE_ROLE]);
+export const DATABASE_ROLE = "sherlock_reader";
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const WORK_CURSOR_VERSION = "v1";
-const PROMPT_CURSOR_VERSION = "p1";
+const USAGE_CURSOR_VERSION = "u1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
 const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
@@ -21,8 +17,8 @@ export const ASSISTANT_REPRESENTATION_MATCH_SECONDS = 3;
 export const INTERVAL_WORK_LIMIT = 200;
 export const DEFAULT_WORK_DETAIL_LIMIT = 50;
 export const MAX_WORK_DETAIL_LIMIT = 100;
-export const MCP_PROMPT_EVIDENCE_LIMIT = 10;
-export const MCP_PROMPT_CONTEXT_LIMIT = 4;
+export const MCP_USAGE_PAGE_LIMIT = 20;
+export const MCP_PROMPT_EVIDENCE_LIMIT = 5;
 export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
 export const REPLACED_DASHBOARD_EMAIL_DOMAIN = "coreedgesolution.com";
 
@@ -124,6 +120,18 @@ select pe.id::text as person_id,
    ${dashboardPersonVisibility("pe")}
  order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
+`;
+
+export const MCP_PEOPLE_PAGE_SQL = `
+select pe.id::text as person_id,
+       coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) as display_name
+  from telemetry.people pe
+ where pe.workspace_id = $1
+   and pe.github_id is distinct from 'sherlock-smoke'
+   and ($2::uuid is null or pe.id > $2::uuid)
+   ${dashboardPersonVisibility("pe")}
+ order by pe.id
+ limit $3
 `;
 
 function promptsCte(contentColumns = "", visibilityPredicate = "", candidatePredicate = "") {
@@ -322,7 +330,8 @@ prompt_candidates as materialized (
  )`;
 }
 
-export const FLAME_SQL = `
+function flameSql(rosterPredicate = "") {
+  return `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text normalizer_version,
@@ -333,6 +342,7 @@ with p as materialized (
    from telemetry.people pe cross join p
    where pe.workspace_id = p.workspace_id
      and pe.github_id is distinct from 'sherlock-smoke'
+     ${rosterPredicate}
      ${dashboardPersonVisibility("pe")}
 ), buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
@@ -395,6 +405,10 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
     on pc.person_id = r.person_id and pc.bucket_start = b.bucket_start
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
+}
+
+export const FLAME_SQL = flameSql();
+export const MCP_USAGE_SQL = flameSql("and pe.id = any($6::uuid[])");
 
 const DETAIL_ACTIVITY_COLUMNS = `,
          e.actor_role stored_actor_role,
@@ -659,71 +673,23 @@ with p as materialized (
          $3::timestamptz end_at, $4::text normalizer_version,
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
-         $9::timestamptz bucket_end, $10::bigint cursor_at_microseconds,
-         $11::bigint cursor_id
+         $9::timestamptz bucket_end
 ), ${promptsCte(
   ", e.content_byte_size, e.content_excerpt",
   "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
   "and s.person_id = p.person_id",
 )}, prompt_page as materialized (
-  select prompts.*,
-         (extract(epoch from prompts.observed_at) * 1000000)::bigint observed_at_microseconds
+  select prompts.*, count(*) over ()::bigint eligible_prompt_count
     from prompts cross join p
    where prompts.person_id = p.person_id
      and prompts.observed_at >= p.bucket_start
      and prompts.observed_at < p.bucket_end
-     and (
-       (extract(epoch from prompts.observed_at) * 1000000)::bigint,
-       prompts.id
-     ) > (p.cursor_at_microseconds, p.cursor_id)
    order by prompts.observed_at, prompts.id
-   limit $12
-), ${activityCte({
-  candidateColumns: DETAIL_ACTIVITY_COLUMNS,
-  candidatePredicate: "and s.person_id = p.person_id",
-  eventColumns: DETAIL_EVENT_COLUMNS,
-  joins: `join telemetry.native_records nr
-      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
-    join telemetry.ingest_batches ib
-      on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id`,
-  visibilityPredicate: `and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
-     and (
-       e.actor_role <> 'unknown'
-       or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)
-     )`,
-})}, ${canonicalActivityEvidenceCte()}
-select prompt_page.id::text id, prompt_page.observed_at,
-       prompt_page.observed_at_microseconds,
-       prompt_page.content_byte_size, prompt_page.content_excerpt,
-       coalesce(context.items, '[]'::jsonb) context_before
+   limit $10
+)
+select prompt_page.content_byte_size, prompt_page.content_excerpt,
+       prompt_page.eligible_prompt_count
   from prompt_page
-  left join lateral (
-    select jsonb_agg(jsonb_build_object(
-             'id', prior.id::text,
-             'role', prior.message_role,
-             'observedAt', to_char(prior.observed_at at time zone 'UTC',
-                                   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
-             'excerpt', coalesce(prior.content_excerpt, ''),
-             'contentBytes', coalesce(prior.content_byte_size, 0)
-           ) order by prior.observed_at, prior.id) items
-      from (
-        select candidate.id, candidate.observed_at, candidate.message_role,
-               candidate.content_byte_size, candidate.content_excerpt
-          from canonical_activity_events candidate
-         where candidate.person_id = prompt_page.person_id
-           and candidate.session_id = prompt_page.session_id
-           and candidate.actor_role = 'primary'
-           and candidate.observed_at < prompt_page.observed_at
-           and candidate.content_excerpt is not null
-           and (
-             candidate.message_role = 'assistant'
-             or candidate.message_role = 'user'
-                and candidate.event_subtype = 'user_message'
-           )
-         order by candidate.observed_at desc, candidate.id desc
-         limit ${MCP_PROMPT_CONTEXT_LIMIT}
-      ) prior
-  ) context on true
  order by prompt_page.observed_at, prompt_page.id
 `;
 
@@ -857,54 +823,29 @@ export function decodeWorkCursor(cursor) {
   }
 }
 
-function promptCursorBinding({ personId, start, snapshot }) {
-  return createHash("sha256")
-    .update(`${personId}\0${start}\0${snapshot}`, "utf8")
-    .digest("base64url");
-}
-
-export function encodePromptCursor({ atMicroseconds, id, personId, start, snapshot }) {
-  const timestamp = cursorInteger(atMicroseconds);
-  const eventId = cursorInteger(id, { positive: true });
-  const binding = promptCursorBinding({ personId, start, snapshot });
-  const body = Buffer.from(
-    JSON.stringify([timestamp, eventId, binding]),
-    "utf8",
-  ).toString("base64url");
-  const cursor = `${PROMPT_CURSOR_VERSION}.${body}`;
-  if (cursor.length > MAX_WORK_CURSOR_LENGTH) {
-    throw new FlameSourceError("flame_prompt_cursor_invalid");
+export function encodeUsageCursor(personId) {
+  if (!UUID_PATTERN.test(personId)) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
   }
-  return cursor;
+  return `${USAGE_CURSOR_VERSION}.${Buffer.from(personId, "utf8").toString("base64url")}`;
 }
 
-export function decodePromptCursor(cursor, { personId, start, snapshot }) {
+export function decodeUsageCursor(cursor) {
   if (cursor === null || cursor === undefined || cursor === "") return null;
   if (typeof cursor !== "string" || cursor.length > MAX_WORK_CURSOR_LENGTH) {
-    throw new FlameSourceError("flame_prompt_cursor_invalid");
+    throw new FlameSourceError("flame_usage_cursor_invalid");
   }
   const [version, body, extra] = cursor.split(".");
-  if (version !== PROMPT_CURSOR_VERSION || !body || extra !== undefined ||
+  if (version !== USAGE_CURSOR_VERSION || !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
-    throw new FlameSourceError("flame_prompt_cursor_invalid");
+    throw new FlameSourceError("flame_usage_cursor_invalid");
   }
-  try {
-    const decoded = Buffer.from(body, "base64url").toString("utf8");
-    if (Buffer.from(decoded, "utf8").toString("base64url") !== body) {
-      throw new Error("noncanonical_cursor");
-    }
-    const value = JSON.parse(decoded);
-    if (!Array.isArray(value) || value.length !== 3 ||
-        value[2] !== promptCursorBinding({ personId, start, snapshot })) {
-      throw new Error("invalid_cursor");
-    }
-    return {
-      atMicroseconds: cursorInteger(value[0]),
-      id: cursorInteger(value[1], { positive: true }),
-    };
-  } catch {
-    throw new FlameSourceError("flame_prompt_cursor_invalid");
+  const decoded = Buffer.from(body, "base64url").toString("utf8");
+  if (Buffer.from(decoded, "utf8").toString("base64url") !== body ||
+      !UUID_PATTERN.test(decoded)) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
   }
+  return decoded;
 }
 
 function parseWorkLimit(value) {
@@ -990,41 +931,14 @@ function detailItemFromRow(row) {
   };
 }
 
-function promptContextItem(value) {
-  if (!value || typeof value !== "object" ||
-      !["user", "assistant"].includes(String(value.role))) {
-    throw new FlameSourceError("flame_database_result_invalid");
-  }
-  const excerpt = value.excerpt === null || value.excerpt === undefined
-    ? ""
-    : String(value.excerpt);
-  const contentBytes = count(value.contentBytes ?? 0);
-  return {
-    id: String(value.id),
-    role: String(value.role),
-    observedAt: asDate(value.observedAt).toISOString(),
-    excerpt,
-    excerptTruncated: contentBytes > Buffer.byteLength(excerpt, "utf8"),
-  };
-}
-
 function promptEvidenceFromRow(row) {
   const excerpt = row.content_excerpt === null || row.content_excerpt === undefined
     ? ""
     : String(row.content_excerpt);
   const contentBytes = count(row.content_byte_size ?? 0);
-  const contextBefore = Array.isArray(row.context_before)
-    ? row.context_before.map(promptContextItem)
-    : [];
-  if (contextBefore.length > MCP_PROMPT_CONTEXT_LIMIT) {
-    throw new FlameSourceError("flame_database_result_invalid");
-  }
   return {
-    id: String(row.id),
-    observedAt: asDate(row.observed_at).toISOString(),
     excerpt,
     excerptTruncated: contentBytes > Buffer.byteLength(excerpt, "utf8"),
-    contextBefore,
   };
 }
 
@@ -1097,20 +1011,10 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   };
 }
 
-function sourceDatabaseRole(source) {
-  const role = source.databaseRole ?? DATABASE_ROLE;
-  if (!DATABASE_ROLES.has(role)) {
-    throw new FlameSourceError("flame_database_reader_unsafe");
-  }
-  return role;
-}
-
 export class DirectFlameSource {
-  constructor({ databaseUrl, workspaceId, maxPeople = 500, databaseRole = DATABASE_ROLE }) {
+  constructor({ databaseUrl, workspaceId, maxPeople = 500 }) {
     this.workspaceId = workspaceId;
     this.maxPeople = maxPeople;
-    this.databaseRole = databaseRole;
-    sourceDatabaseRole(this);
     this.sql = postgres(databaseUrl, {
       prepare: false,
       max: 2,
@@ -1125,11 +1029,10 @@ export class DirectFlameSource {
 
   async transaction(callback) {
     try {
-      const databaseRole = sourceDatabaseRole(this);
       return await this.sql.begin(async (tx) => {
         await tx.unsafe("set transaction isolation level repeatable read, read only");
         await tx.unsafe("select set_config('statement_timeout', '20000', true)");
-        await tx.unsafe(`set local role ${databaseRole}`);
+        await tx.unsafe(`set local role ${DATABASE_ROLE}`);
         return await callback(tx);
       });
     } catch (error) {
@@ -1140,10 +1043,9 @@ export class DirectFlameSource {
 
   async readiness() {
     try {
-      const databaseRole = sourceDatabaseRole(this);
       return await this.transaction(async (tx) => {
         const rows = await tx.unsafe(`
-          select current_role = '${databaseRole}' as backend_role,
+          select current_role = '${DATABASE_ROLE}' as backend_role,
                  current_setting('transaction_read_only') = 'on' as read_only,
                  has_table_privilege(current_role, 'telemetry.people', 'select') as can_read_people,
                  has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events
@@ -1186,6 +1088,49 @@ export class DirectFlameSource {
         read.toISOString(),
       ]);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
+    });
+  }
+
+  async fetchUsageEvidence({ cursor = "", now } = {}) {
+    const afterPersonId = decodeUsageCursor(cursor);
+    return await this.transaction(async (tx) => {
+      const receipt = (await tx.unsafe(
+        "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
+      ))[0];
+      const read = now ? asDate(now) : asDate(receipt.now);
+      const endMs = Math.floor(read.getTime() / BUCKET_MS) * BUCKET_MS;
+      const start = new Date(endMs - 24 * 60 * 60 * 1000);
+      const end = new Date(endMs);
+      const page = await tx.unsafe(MCP_PEOPLE_PAGE_SQL, [
+        this.workspaceId,
+        afterPersonId,
+        MCP_USAGE_PAGE_LIMIT + 1,
+      ]);
+      const hasMore = page.length > MCP_USAGE_PAGE_LIMIT;
+      const roster = hasMore ? page.slice(0, MCP_USAGE_PAGE_LIMIT) : page;
+      if (roster.length === 0) {
+        return {
+          start: start.toISOString(),
+          read: read.toISOString(),
+          snapshot: encodeSnapshotToken({ snapshot: receipt.snapshot, read }),
+          people: [],
+          nextCursor: null,
+        };
+      }
+      const rows = await tx.unsafe(MCP_USAGE_SQL, [
+        this.workspaceId,
+        start.toISOString(),
+        end.toISOString(),
+        NORMALIZER_VERSION,
+        read.toISOString(),
+        roster.map((person) => person.person_id),
+      ]);
+      return {
+        ...buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot }),
+        nextCursor: hasMore
+          ? encodeUsageCursor(String(roster.at(-1).person_id))
+          : null,
+      };
     });
   }
 
@@ -1309,31 +1254,14 @@ export class DirectFlameSource {
     });
   }
 
-  async fetchPromptEvidence({ personId, start, snapshot, cursor }) {
+  async fetchPromptEvidence({ personId, start, snapshot }) {
     const startAt = requestStart(start, "prompt");
     const snapshotReceipt = requestSnapshot(snapshot, "prompt");
     validateIntervalIdentity(personId, startAt, "prompt");
-    const decodedCursor = decodePromptCursor(cursor, {
-      personId,
-      start: startAt.toISOString(),
-      snapshot,
-    });
 
     return await this.transaction(async (tx) => {
       const read = asDate((await tx.unsafe("select transaction_timestamp() as now"))[0].now);
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
-      const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
-      if (decodedCursor) {
-        const cursorMicroseconds = BigInt(decodedCursor.atMicroseconds);
-        if (cursorMicroseconds < bucketStartMicroseconds ||
-            cursorMicroseconds >= bucketEndMicroseconds) {
-          throw new FlameSourceError("flame_prompt_cursor_invalid");
-        }
-      }
-      const cursorAtMicroseconds = decodedCursor?.atMicroseconds ??
-        bucketStartMicroseconds.toString();
-      const cursorId = decodedCursor?.id ?? "0";
       const rows = await tx.unsafe(PROMPT_EVIDENCE_SQL, [
         this.workspaceId,
         bounds.snapshotStart.toISOString(),
@@ -1344,27 +1272,17 @@ export class DirectFlameSource {
         personId,
         startAt.toISOString(),
         bounds.bucketEnd.toISOString(),
-        cursorAtMicroseconds,
-        cursorId,
-        MCP_PROMPT_EVIDENCE_LIMIT + 1,
+        MCP_PROMPT_EVIDENCE_LIMIT,
       ]);
-      const hasMore = rows.length > MCP_PROMPT_EVIDENCE_LIMIT;
-      const pageRows = hasMore ? rows.slice(0, MCP_PROMPT_EVIDENCE_LIMIT) : rows;
-      const nextCursor = hasMore
-        ? encodePromptCursor({
-          atMicroseconds: pageRows.at(-1).observed_at_microseconds,
-          id: pageRows.at(-1).id,
-          personId,
-          start: startAt.toISOString(),
-          snapshot,
-        })
-        : null;
+      const eligiblePromptCount = rows.length === 0
+        ? 0
+        : count(rows[0].eligible_prompt_count);
       return {
         personId,
         start: startAt.toISOString(),
         snapshot,
-        prompts: pageRows.map(promptEvidenceFromRow),
-        nextCursor,
+        eligiblePromptCount,
+        prompts: rows.map(promptEvidenceFromRow),
       };
     });
   }

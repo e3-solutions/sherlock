@@ -4,11 +4,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  DirectFlameSource,
-  FlameSourceError,
-  MCP_DATABASE_ROLE,
-} from "./src/server/flame-source.js";
+import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 
@@ -26,15 +22,7 @@ const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople
 const source = databaseUrl && validWorkspaceId && validMaxPeople
   ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
   : null;
-const mcpSource = databaseUrl && validWorkspaceId && validMaxPeople
-  ? new DirectFlameSource({
-    databaseUrl,
-    workspaceId,
-    maxPeople,
-    databaseRole: MCP_DATABASE_ROLE,
-  })
-  : null;
-const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
+const mcpProtocol = source ? createBonaparteMcpProtocol(source) : null;
 
 const SECURITY_HEADERS = {
   "Content-Security-Policy":
@@ -211,11 +199,10 @@ server.listen(PORT, "0.0.0.0", () => {
 
 async function shutdown(signal) {
   console.log(JSON.stringify({ event: "dashboard_shutdown", signal }));
-  server.close();
+  await new Promise((resolve) => server.close(resolve));
   await Promise.all([
     mcpProtocol?.close(),
     source?.close(),
-    mcpSource?.close(),
   ]);
 }
 

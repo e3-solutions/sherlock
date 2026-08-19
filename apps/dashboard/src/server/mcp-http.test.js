@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { MCP_TOKEN_MIN_LENGTH } from "./mcp-auth.js";
-import { MAX_MCP_REQUEST_BYTES, createMcpHttpRoute } from "./mcp-http.js";
+import { MCP_TOKEN_MIN_LENGTH, createMcpHttpRoute } from "./mcp-http.js";
 
 const TOKEN = "s".repeat(MCP_TOKEN_MIN_LENGTH);
 
@@ -54,7 +53,7 @@ describe("Bonaparte MCP HTTP route", () => {
     });
   });
 
-  it("rejects an oversized declared body before protocol parsing", async () => {
+  it("rejects browser origins before protocol parsing", async () => {
     const protocolHandler = vi.fn();
     const route = createMcpHttpRoute({ protocolHandler, token: TOKEN });
     const response = responseRecorder();
@@ -62,13 +61,13 @@ describe("Bonaparte MCP HTTP route", () => {
     await route({
       headers: {
         authorization: `Bearer ${TOKEN}`,
-        "content-length": String(MAX_MCP_REQUEST_BYTES + 1),
+        origin: "https://example.test",
       },
     }, response);
 
     expect(protocolHandler).not.toHaveBeenCalled();
-    expect(response.status).toBe(413);
-    expect(JSON.parse(response.body)).toEqual({ error: "mcp_request_too_large" });
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toEqual({ error: "mcp_origin_forbidden" });
   });
 
   it("contains unexpected protocol failures behind a safe response", async () => {

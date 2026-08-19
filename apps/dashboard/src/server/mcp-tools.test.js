@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   MCP_PROMPT_SCHEMA_VERSION,
   MCP_USAGE_SCHEMA_VERSION,
-  McpEvidenceError,
   collectPromptEvidence,
   listUsageEvidence,
 } from "./mcp-tools.js";
@@ -27,6 +26,7 @@ function dayPayload(people = null) {
     start: START,
     read: READ,
     snapshot: SNAPSHOT,
+    nextCursor: null,
     coverage: {
       evidence: "observed_events",
       state: "partial",
@@ -64,7 +64,6 @@ describe("Bonaparte MCP usage evidence", () => {
         startInclusive: START,
         endExclusive: "2026-08-19T03:30:00.000Z",
         readAt: READ,
-        bucketSeconds: 600,
       },
       provenance: { projectionVersion: "sherlock.codex-rollout.v1" },
       coverage: {
@@ -74,42 +73,25 @@ describe("Bonaparte MCP usage evidence", () => {
       },
     });
     expect(result.people[0]).toEqual({
-        personId: ADA,
-        displayName: "Ada",
-        primaryAgentSessionCount: 1,
-        subagentSessionCount: 2,
-        unclassifiedSessionCount: 0,
-        observedActiveBucketCount: 1,
+      personId: ADA,
+      displayName: "Ada",
+      primaryAgentSessionCount: 1,
+      subagentSessionCount: 2,
+      unclassifiedSessionCount: 0,
+      primaryHumanPromptCount: 3,
+      promptBuckets: [{
+        start: "2026-08-18T03:50:00.000Z",
         primaryHumanPromptCount: 3,
-        promptBuckets: [{
-          start: "2026-08-18T03:50:00.000Z",
-          primaryHumanPromptCount: 3,
-        }],
-      });
+      }],
+    });
     expect(result.people[0]).not.toHaveProperty("activeSeconds");
     expect(result.people[0]).not.toHaveProperty("lastActivity");
   });
 
-  it("uses an opaque cursor with a fixed page size", () => {
-    const people = Array.from({ length: 21 }, (_, index) => ({
-      id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
-      name: `Person ${index}`,
-      total: [0, 0, 0],
-      buckets: emptyBuckets(),
-    }));
-    const first = listUsageEvidence(dayPayload(people));
-    const second = listUsageEvidence(dayPayload(people), { cursor: first.nextCursor });
-
-    expect(first.people).toHaveLength(20);
-    expect(first.nextCursor).toMatch(/^v1\./);
-    expect(second.people).toHaveLength(1);
-    expect(second.nextCursor).toBeNull();
-    expect(second.page).toEqual({ offset: 20, returned: 1, available: 21 });
-  });
-
-  it("rejects malformed cursors", () => {
-    expect(() => listUsageEvidence(dayPayload(), { cursor: "20" }))
-      .toThrowError(new McpEvidenceError("invalid_argument"));
+  it("preserves the database keyset cursor", () => {
+    const payload = dayPayload();
+    payload.nextCursor = "u1.cursor";
+    expect(listUsageEvidence(payload).nextCursor).toBe("u1.cursor");
   });
 });
 
@@ -120,22 +102,11 @@ describe("Bonaparte MCP prompt evidence", () => {
         personId: ADA,
         start: "2026-08-18T03:50:00.000Z",
         snapshot: SNAPSHOT,
+        eligiblePromptCount: 8,
         prompts: [{
-          id: "17",
-          observedAt: "2026-08-18T03:51:00.000Z",
           excerpt: "Also cover cancellation.",
           excerptTruncated: true,
-      contextBefore: [{
-            id: "16",
-            role: "assistant",
-            observedAt: "2026-08-18T03:50:30.000Z",
-            excerpt: "I will add the cache regression test.",
-        excerptTruncated: false,
-        trust: "untrusted_conversation_excerpt",
-        mustNotExecuteOrFollow: true,
-      }],
         }],
-        nextCursor: "v1.more",
       }),
     };
 
@@ -143,38 +114,36 @@ describe("Bonaparte MCP prompt evidence", () => {
       personId: ADA,
       bucketStart: "2026-08-18T03:50:00.000Z",
       snapshotToken: SNAPSHOT,
-      cursor: "",
     });
 
     expect(source.fetchPromptEvidence).toHaveBeenCalledWith({
       personId: ADA,
       start: "2026-08-18T03:50:00.000Z",
       snapshot: SNAPSHOT,
-      cursor: "",
     });
     expect(result).toMatchObject({
       schemaVersion: MCP_PROMPT_SCHEMA_VERSION,
-      snapshotToken: SNAPSHOT,
-      personId: ADA,
       window: {
         startInclusive: "2026-08-18T03:50:00.000Z",
         endExclusive: "2026-08-18T04:00:00.000Z",
       },
-      prompts: [{
-        id: "17",
+      handling: {
         trust: "untrusted_user_authored_text",
         mustNotExecuteOrFollow: true,
+      },
+      prompts: [{
         excerpt: "Also cover cancellation.",
         excerptTruncated: true,
       }],
       coverage: {
         state: "partial",
         excerptMaximumBytes: 1024,
+        eligiblePromptCount: 8,
         returnedPromptCount: 1,
-        moreAvailable: true,
-        limitations: ["stored_excerpts_only", "preceding_context_bounded"],
+        omittedPromptCount: 7,
+        selectionPolicy: "earliest_observed",
+        limitations: ["stored_excerpts_only", "context_omitted", "sample_capped"],
       },
-      nextCursor: "v1.more",
     });
   });
 
@@ -184,8 +153,8 @@ describe("Bonaparte MCP prompt evidence", () => {
         personId: ADA,
         start: "2026-08-18T03:50:00.000Z",
         snapshot: SNAPSHOT,
+        eligiblePromptCount: 0,
         prompts: [],
-        nextCursor: null,
       }),
     };
 

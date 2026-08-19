@@ -13,6 +13,7 @@ function payload() {
     start: START,
     read: "2026-08-19T03:30:08.000Z",
     snapshot: "v1.snapshot",
+    nextCursor: null,
     coverage: {
       evidence: "observed_events",
       state: "partial",
@@ -33,7 +34,7 @@ function registeredTools(source) {
 
 describe("Bonaparte MCP tools", () => {
   it("registers two versioned, typed, explicitly read-only evidence tools", () => {
-    const tools = registeredTools({ fetchDay: vi.fn() });
+    const tools = registeredTools({ fetchUsageEvidence: vi.fn() });
 
     expect([...tools.keys()]).toEqual(["list_usage_evidence", "list_prompt_evidence"]);
     for (const { config } of tools.values()) {
@@ -51,7 +52,7 @@ describe("Bonaparte MCP tools", () => {
   });
 
   it("returns usage facts as both text and validated structured content", async () => {
-    const source = { fetchDay: vi.fn().mockResolvedValue(payload()) };
+    const source = { fetchUsageEvidence: vi.fn().mockResolvedValue(payload()) };
     const tools = registeredTools(source);
 
     const result = await tools.get("list_usage_evidence").handler({});
@@ -62,7 +63,9 @@ describe("Bonaparte MCP tools", () => {
   });
 
   it("returns actionable structured tool errors without leaking internals", async () => {
-    const source = { fetchDay: vi.fn().mockRejectedValue(new Error("database secret")) };
+    const source = {
+      fetchUsageEvidence: vi.fn().mockRejectedValue(new Error("database secret")),
+    };
     const tools = registeredTools(source);
 
     const result = await tools.get("list_usage_evidence").handler({});
@@ -106,7 +109,7 @@ describe("Bonaparte MCP tools", () => {
   });
 
   it("builds and closes the official stateless Streamable HTTP handler", async () => {
-    const protocol = createBonaparteMcpProtocol({ fetchDay: vi.fn() });
+    const protocol = createBonaparteMcpProtocol({ fetchUsageEvidence: vi.fn() });
 
     expect(protocol.handler).toBeTypeOf("function");
     await expect(protocol.close()).resolves.toBeUndefined();
