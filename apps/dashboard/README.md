@@ -162,8 +162,9 @@ The endpoint exposes two versioned read-only tools. Their complete input,
 output, pagination, error, and limitation contract is documented in
 [`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
 
-- `list_usage_evidence` keyset-pages 20 people before aggregation and returns
-  explicit session counts, prompt counts, and prompt-bearing buckets.
+- `list_usage_evidence` keyset-pages the eagerly refreshed canonical timeline
+  snapshot at 20 people per response and returns explicit session counts,
+  prompt counts, and prompt-bearing buckets without rerunning the aggregate.
 - `list_prompt_evidence` takes the exact snapshot token, person ID, and bucket
   returned by the first tool. It returns the earliest five canonical
   primary-human prompt excerpts from that bucket and reports how many were

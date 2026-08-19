@@ -6,7 +6,6 @@ export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const DATABASE_ROLE = "sherlock_reader";
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const WORK_CURSOR_VERSION = "v1";
-const USAGE_CURSOR_VERSION = "u1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
 const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
@@ -20,7 +19,6 @@ export const INTERVAL_WORK_LIMIT = 200;
 export const INTERVAL_PROMPT_LIMIT = 200;
 export const DEFAULT_WORK_DETAIL_LIMIT = 50;
 export const MAX_WORK_DETAIL_LIMIT = 100;
-export const MCP_USAGE_PAGE_LIMIT = 20;
 export const MCP_PROMPT_EVIDENCE_LIMIT = 5;
 export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
 export const REPLACED_DASHBOARD_EMAIL_DOMAIN = "coreedgesolution.com";
@@ -115,18 +113,6 @@ select pe.id::text as person_id,
    ${dashboardPersonVisibility("pe")}
  order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
-`;
-
-export const MCP_PEOPLE_PAGE_SQL = `
-select pe.id::text as person_id,
-       coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) as display_name
-  from telemetry.people pe
- where pe.workspace_id = $1
-   and pe.github_id is distinct from 'sherlock-smoke'
-   and ($2::uuid is null or pe.id > $2::uuid)
-   ${dashboardPersonVisibility("pe")}
- order by pe.id
- limit $3
 `;
 
 function promptsCte({
@@ -346,7 +332,7 @@ prompt_candidates as materialized (
  )`;
 }
 
-function flameSql(rosterPredicate = "") {
+function flameSql() {
   return `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
@@ -358,7 +344,6 @@ with p as materialized (
    from telemetry.people pe cross join p
    where pe.workspace_id = p.workspace_id
      and pe.github_id is distinct from 'sherlock-smoke'
-     ${rosterPredicate}
      ${dashboardPersonVisibility("pe")}
 ), buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
@@ -426,7 +411,6 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
 }
 
 export const FLAME_SQL = flameSql();
-export const MCP_USAGE_SQL = flameSql("and pe.id = any($6::uuid[])");
 
 function relevantActivitySessionsCte() {
   return `
@@ -939,31 +923,6 @@ export function decodeWorkCursor(cursor) {
   }
 }
 
-export function encodeUsageCursor(personId) {
-  if (!UUID_PATTERN.test(personId)) {
-    throw new FlameSourceError("flame_usage_cursor_invalid");
-  }
-  return `${USAGE_CURSOR_VERSION}.${Buffer.from(personId, "utf8").toString("base64url")}`;
-}
-
-export function decodeUsageCursor(cursor) {
-  if (cursor === null || cursor === undefined || cursor === "") return null;
-  if (typeof cursor !== "string" || cursor.length > MAX_WORK_CURSOR_LENGTH) {
-    throw new FlameSourceError("flame_usage_cursor_invalid");
-  }
-  const [version, body, extra] = cursor.split(".");
-  if (version !== USAGE_CURSOR_VERSION || !body || extra !== undefined ||
-      !/^[A-Za-z0-9_-]+$/.test(body)) {
-    throw new FlameSourceError("flame_usage_cursor_invalid");
-  }
-  const decoded = Buffer.from(body, "base64url").toString("utf8");
-  if (Buffer.from(decoded, "utf8").toString("base64url") !== body ||
-      !UUID_PATTERN.test(decoded)) {
-    throw new FlameSourceError("flame_usage_cursor_invalid");
-  }
-  return decoded;
-}
-
 function parseWorkLimit(value) {
   if (value === null || value === undefined || value === "") {
     return DEFAULT_WORK_DETAIL_LIMIT;
@@ -1246,52 +1205,6 @@ export class DirectFlameSource {
         read.toISOString(),
       ], signal);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
-    }, { signal });
-  }
-
-  async fetchUsageEvidence({ cursor = "", now, signal } = {}) {
-    const afterPersonId = decodeUsageCursor(cursor);
-    return await this.transaction(async (tx) => {
-      const receipt = (await runQuery(
-        tx,
-        "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
-        undefined,
-        signal,
-      ))[0];
-      const read = now ? asDate(now) : asDate(receipt.now);
-      const endMs = Math.floor(read.getTime() / BUCKET_MS) * BUCKET_MS;
-      const start = new Date(endMs - 24 * 60 * 60 * 1000);
-      const end = new Date(endMs);
-      const page = await runQuery(tx, MCP_PEOPLE_PAGE_SQL, [
-        this.workspaceId,
-        afterPersonId,
-        MCP_USAGE_PAGE_LIMIT + 1,
-      ], signal);
-      const hasMore = page.length > MCP_USAGE_PAGE_LIMIT;
-      const roster = hasMore ? page.slice(0, MCP_USAGE_PAGE_LIMIT) : page;
-      if (roster.length === 0) {
-        return {
-          start: start.toISOString(),
-          read: read.toISOString(),
-          snapshot: encodeSnapshotToken({ snapshot: receipt.snapshot, read }),
-          people: [],
-          nextCursor: null,
-        };
-      }
-      const rows = await runQuery(tx, MCP_USAGE_SQL, [
-        this.workspaceId,
-        start.toISOString(),
-        end.toISOString(),
-        NORMALIZER_VERSION,
-        read.toISOString(),
-        roster.map((person) => person.person_id),
-      ], signal);
-      return {
-        ...buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot }),
-        nextCursor: hasMore
-          ? encodeUsageCursor(String(roster.at(-1).person_id))
-          : null,
-      };
     }, { signal });
   }
 

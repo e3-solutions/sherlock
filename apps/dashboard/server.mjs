@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
+import { createCachedMcpSource } from "./src/server/mcp-source.js";
 import { FlameDayCache } from "./src/server/flame-cache.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -23,7 +24,6 @@ const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople
 const source = databaseUrl && validWorkspaceId && validMaxPeople
   ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
   : null;
-const mcpProtocol = source ? createBonaparteMcpProtocol(source) : null;
 
 let databaseVerified = false;
 async function loadTimeline({ signal }) {
@@ -42,6 +42,8 @@ const cache = source
     })
   : null;
 cache?.start();
+const mcpSource = source && cache ? createCachedMcpSource({ cache, source }) : null;
+const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
 
 const SECURITY_HEADERS = {
   "Content-Security-Policy":
