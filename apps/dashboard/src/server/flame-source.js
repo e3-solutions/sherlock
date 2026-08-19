@@ -1172,15 +1172,16 @@ export class DirectFlameSource {
     }, { signal });
   }
 
-  async fetchInterval({ personId, start, snapshot, signal }) {
+  async fetchInterval({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "interval");
     const snapshotReceipt = requestSnapshot(snapshot, "interval");
     validateIntervalIdentity(personId, startAt, "interval");
 
     return await this.transaction(async (tx) => {
-      const read = asDate((await runQuery(
+      const databaseRead = asDate((await runQuery(
         tx, "select transaction_timestamp() as now", undefined, signal,
       ))[0].now);
+      const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = await runQuery(tx, INTERVAL_WORK_SQL, [
@@ -1224,7 +1225,9 @@ export class DirectFlameSource {
     }, { signal });
   }
 
-  async fetchWork({ personId, start, sessionId, role, snapshot, cursor, limit, signal }) {
+  async fetchWork({
+    personId, start, sessionId, role, snapshot, cursor, limit, signal, now,
+  }) {
     const startAt = requestStart(start, "work");
     const snapshotReceipt = requestSnapshot(snapshot, "work");
     validateIntervalIdentity(personId, startAt, "work");
@@ -1236,9 +1239,10 @@ export class DirectFlameSource {
     const pageSize = parseWorkLimit(limit);
 
     return await this.transaction(async (tx) => {
-      const read = asDate((await runQuery(
+      const databaseRead = asDate((await runQuery(
         tx, "select transaction_timestamp() as now", undefined, signal,
       ))[0].now);
+      const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
       const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
       const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;

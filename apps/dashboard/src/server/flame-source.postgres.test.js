@@ -304,6 +304,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         personId,
         start: "2026-08-18T11:20:00.000Z",
         snapshot: payload.snapshot,
+        now: FIXED_NOW,
       });
       expect(canonicalLoserInterval.work).toEqual([]);
       expect(canonicalLoserInterval.prompts).toEqual([]);
@@ -427,6 +428,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         personId,
         start: frameStart.toISOString(),
         snapshot: day.snapshot,
+        now: FIXED_NOW,
       });
       expect(interval.work).toEqual([expect.objectContaining({
         id: `${sessionId}:agent`,
@@ -441,6 +443,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         sessionId,
         role: "agent",
         snapshot: day.snapshot,
+        now: FIXED_NOW,
       });
       expect(detail.items).toEqual([expect.objectContaining({
         role: "assistant",
@@ -575,6 +578,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         personId,
         start: frameStart.toISOString(),
         snapshot: day.snapshot,
+        now: FIXED_NOW,
       });
       expect(interval.prompts).toHaveLength(3);
       expect(interval.prompts.map(({ content }) => content)).toEqual(promptContents);
