@@ -87,7 +87,7 @@ describe("Bonaparte MCP tools", () => {
   it("tells agents how to recover from an expired snapshot", async () => {
     const source = {
       fetchPromptEvidence: vi.fn().mockRejectedValue(
-        new FlameSourceError("flame_prompt_request_out_of_range"),
+        new FlameSourceError("flame_prompt_snapshot_expired"),
       ),
     };
     const tools = registeredTools(source);

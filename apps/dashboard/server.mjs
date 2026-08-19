@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
+import { FlameDayCache } from "./src/server/flame-cache.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -23,6 +24,24 @@ const source = databaseUrl && validWorkspaceId && validMaxPeople
   ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
   : null;
 const mcpProtocol = source ? createBonaparteMcpProtocol(source) : null;
+
+let databaseVerified = false;
+async function loadTimeline({ signal }) {
+  if (!databaseVerified) {
+    const readiness = await source.readiness({ signal });
+    if (readiness.status !== "ok") throw new FlameSourceError(readiness.reason);
+    databaseVerified = true;
+  }
+  return await source.fetchDay({ signal });
+}
+
+const cache = source
+  ? new FlameDayCache({
+      load: loadTimeline,
+      log: (event) => console.log(JSON.stringify(event)),
+    })
+  : null;
+cache?.start();
 
 const SECURITY_HEADERS = {
   "Content-Security-Policy":
@@ -45,6 +64,7 @@ const MIME_TYPES = new Map([
 ]);
 
 function sendJson(response, status, body, headers = {}) {
+  if (response.destroyed || response.writableEnded) return;
   response.writeHead(status, {
     ...SECURITY_HEADERS,
     "Cache-Control": "no-store",
@@ -60,6 +80,23 @@ const mcpRoute = createMcpHttpRoute({
   }),
   token: mcpToken,
 });
+
+function requestAbortSignal(request, response) {
+  const controller = new AbortController();
+  request.once("aborted", () => controller.abort());
+  response.once("close", () => {
+    if (!response.writableEnded) controller.abort();
+  });
+  return controller.signal;
+}
+
+function apiStatus(code, prefix) {
+  if (code === `${prefix}_snapshot_expired`) return 410;
+  if (code === `${prefix}_request_not_found`) return 404;
+  if (code.endsWith("_result_too_large")) return 413;
+  if (code.startsWith(`${prefix}_request_`) || code === "flame_work_cursor_invalid") return 400;
+  return 503;
+}
 
 async function sendFile(response, filePath, cacheControl) {
   try {
@@ -100,7 +137,7 @@ const server = createServer(async (request, response) => {
 
   if (url.pathname === "/healthz") {
     const invalid = configurationStatus();
-    const receipt = invalid ?? await source.readiness();
+    const receipt = invalid ?? cache.readiness();
     sendJson(response, receipt.status === "ok" ? 200 : 503, receipt);
     return;
   }
@@ -110,13 +147,25 @@ const server = createServer(async (request, response) => {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
+    const signal = requestAbortSignal(request, response);
     try {
-      sendJson(response, 200, await source.fetchDay());
+      const refresh = url.searchParams.get("refresh");
+      const result = await cache.read({
+        signal,
+        forceRefresh: refresh === "force",
+        waitForRefresh: refresh === "wait",
+      });
+      sendJson(response, 200, result.payload, {
+        "X-Sherlock-Timeline-Cache": result.state,
+      });
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      sendJson(response, 503, { error: code });
+      if (code !== "flame_request_aborted" || !signal.aborted) {
+        sendJson(response, code === "flame_refresh_throttled" ? 429 : 503, { error: code },
+          code === "flame_refresh_throttled" ? { "Retry-After": "60" } : {});
+      }
     }
     return;
   }
@@ -126,20 +175,21 @@ const server = createServer(async (request, response) => {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
+    const signal = requestAbortSignal(request, response);
     try {
       sendJson(response, 200, await source.fetchInterval({
         personId: url.searchParams.get("personId") ?? "",
         start: url.searchParams.get("start") ?? "",
         snapshot: url.searchParams.get("snapshot") ?? "",
+        signal,
       }));
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      const status = code.endsWith("_result_too_large")
-        ? 413
-        : code.startsWith("flame_interval_request_") ? 400 : 503;
-      sendJson(response, status, { error: code });
+      if (code !== "flame_request_aborted") {
+        sendJson(response, apiStatus(code, "flame_interval"), { error: code });
+      }
     }
     return;
   }
@@ -149,6 +199,7 @@ const server = createServer(async (request, response) => {
       sendJson(response, 503, { error: "dashboard_not_configured" });
       return;
     }
+    const signal = requestAbortSignal(request, response);
     try {
       sendJson(response, 200, await source.fetchWork({
         personId: url.searchParams.get("personId") ?? "",
@@ -158,18 +209,15 @@ const server = createServer(async (request, response) => {
         snapshot: url.searchParams.get("snapshot") ?? "",
         cursor: url.searchParams.get("cursor") ?? "",
         limit: url.searchParams.get("limit") ?? "",
+        signal,
       }));
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      const status = code === "flame_work_request_not_found"
-        ? 404
-        : code.endsWith("_result_too_large") ? 413
-        : code.startsWith("flame_work_request_") || code === "flame_work_cursor_invalid"
-        ? 400
-        : 503;
-      sendJson(response, status, { error: code });
+      if (code !== "flame_request_aborted") {
+        sendJson(response, apiStatus(code, "flame_work"), { error: code });
+      }
     }
     return;
   }
@@ -199,11 +247,10 @@ server.listen(PORT, "0.0.0.0", () => {
 
 async function shutdown(signal) {
   console.log(JSON.stringify({ event: "dashboard_shutdown", signal }));
-  await new Promise((resolve) => server.close(resolve));
-  await Promise.all([
-    mcpProtocol?.close(),
-    source?.close(),
-  ]);
+  const drained = new Promise((resolve) => server.close(resolve));
+  await cache?.close();
+  await drained;
+  await Promise.all([mcpProtocol?.close(), source?.close()]);
 }
 
 process.once("SIGINT", () => shutdown("SIGINT"));

@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  postgres@3.4.7: 60ee50c4090d63a3822917ae4a9ad09d519f3fb48809101c19068a4d75a9b6b2
+
 importers:
 
   .:
@@ -19,7 +22,7 @@ importers:
         version: 2.0.0
       postgres:
         specifier: 3.4.7
-        version: 3.4.7
+        version: 3.4.7(patch_hash=60ee50c4090d63a3822917ae4a9ad09d519f3fb48809101c19068a4d75a9b6b2)
       react:
         specifier: 19.2.8
         version: 19.2.8
@@ -1640,7 +1643,7 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.1
 
-  postgres@3.4.7: {}
+  postgres@3.4.7(patch_hash=60ee50c4090d63a3822917ae4a9ad09d519f3fb48809101c19068a4d75a9b6b2): {}
 
   pretty-format@27.5.1:
     dependencies:

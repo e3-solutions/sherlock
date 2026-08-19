@@ -120,6 +120,7 @@ describe("Bonaparte MCP prompt evidence", () => {
       personId: ADA,
       start: "2026-08-18T03:50:00.000Z",
       snapshot: SNAPSHOT,
+      signal: undefined,
     });
     expect(result).toMatchObject({
       schemaVersion: MCP_PROMPT_SCHEMA_VERSION,

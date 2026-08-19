@@ -11,18 +11,22 @@ vi.mock("./flame-data.js", () => ({
 }));
 
 vi.mock("./FlameGraph.jsx", () => ({
-  default: ({ data, stale }) => (
+  default: ({ data, stale, onRefresh, timelineMeta }) => (
     <div data-testid="flame-graph" data-stale={String(stale)}>
+      {timelineMeta}
       {data.marker}
+      <button type="button" onClick={onRefresh}>Refresh timeline</button>
     </div>
   ),
 }));
 
-import App, { nextRefreshDelay } from "./App.jsx";
+import App, { expectedTimelineEnd, nextRefreshDelay, timelineFreshness } from "./App.jsx";
 
 const payload = { raw: true };
 const model = {
   marker: "adapted timeline",
+  startMs: Date.parse("2026-08-13T12:00:00.000Z"),
+  readMs: Date.parse("2026-08-14T12:02:00.000Z"),
   coverage: {
     evidence: "observed_events",
     state: "partial",
@@ -70,6 +74,7 @@ describe("App", () => {
 
     expect(adaptMock).toHaveBeenCalledWith(payload);
     expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
+    expect(screen.getByText(/Through .* · read 1m ago/)).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith("/api/flame", expect.objectContaining({
       cache: "no-store",
       headers: { Accept: "application/json" },
@@ -78,7 +83,47 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("stacks recency above the role legend beneath the brand", () => {
+  it("lets detail recovery request a fresh timeline snapshot", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh timeline" }));
+    await settle();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/flame?refresh=force", expect.objectContaining({
+      cache: "no-store",
+      signal: expect.any(AbortSignal),
+    }));
+  });
+
+  it("preserves forced recovery intent after a failed forced refresh", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response({ ok: false, status: 503 }))
+      .mockResolvedValueOnce(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh timeline" }));
+    await settle();
+    expect(screen.getByRole("status")).toHaveTextContent("Timeline refresh failed.");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60 * 1000);
+    });
+    await settle();
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/flame?refresh=force",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("orders recency before the role legend in one shared header row", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     const { container } = render(<App />);
     const header = container.querySelector(".portal-header");
@@ -91,6 +136,8 @@ describe("App", () => {
     expect(header.querySelector(".portal-header__brand")).toHaveTextContent("Bonaparte");
     expect(header.querySelector(".portal-header__brand + .portal-header__legend"))
       .toBe(legendRegion);
+    expect(statusLegend.parentElement).toHaveClass("flame-legends");
+    expect(activityLegend.parentElement).toBe(statusLegend.parentElement);
     expect(statusLegend.nextElementSibling).toBe(activityLegend);
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(activityLegend).getByText(label)).toBeInTheDocument();
@@ -135,9 +182,12 @@ describe("App", () => {
     });
     await settle();
 
-    expect(screen.getByText(/Refresh failed\. Showing the last successful read\./)).toHaveTextContent(
-      "Refresh failed. Showing the last successful read.",
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/flame?refresh=wait",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+
+    expect(screen.getByText(/Refresh failed\. Through/)).toBeInTheDocument();
     expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "true");
     expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
   });
@@ -145,6 +195,8 @@ describe("App", () => {
   it("keeps partial coverage chrome out of the visible timeline", async () => {
     adaptMock.mockReturnValue({
       marker: "partial timeline",
+      startMs: model.startMs,
+      readMs: model.readMs,
       coverage: {
         evidence: "observed_events",
         state: "partial",
@@ -162,6 +214,13 @@ describe("App", () => {
   });
 
   it("clears the stale state after a later refresh succeeds", async () => {
+    adaptMock
+      .mockReturnValueOnce(model)
+      .mockReturnValueOnce({
+        ...model,
+        startMs: Date.parse("2026-08-13T12:10:00.000Z"),
+        readMs: Date.parse("2026-08-14T12:11:31.000Z"),
+      });
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response())
       .mockResolvedValueOnce(response({ ok: false, status: 503 }))
@@ -186,6 +245,22 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("updates the visible read age without refetching", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    expect(screen.getByText(/read 1m ago/)).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60 * 1000);
+    });
+
+    expect(screen.getByText(/read 2m ago/)).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("aborts an in-flight request on unmount", () => {
     let requestSignal;
     vi.stubGlobal("fetch", vi.fn((_url, options) => {
@@ -204,5 +279,31 @@ describe("nextRefreshDelay", () => {
   it("targets ninety seconds after the next ten-minute boundary", () => {
     const now = Date.parse("2026-08-14T12:03:00Z");
     expect(nextRefreshDelay(now)).toBe(8.5 * 60 * 1000);
+  });
+
+  it("uses the current boundary grace when the process starts just after a boundary", () => {
+    const now = Date.parse("2026-08-14T12:10:30Z");
+    expect(nextRefreshDelay(now)).toBe(60 * 1000);
+  });
+});
+
+describe("timelineFreshness", () => {
+  it("allows the normalization grace before marking the latest bucket delayed", () => {
+    const now = Date.parse("2026-08-14T12:10:30Z");
+    expect(expectedTimelineEnd(now)).toBe(Date.parse("2026-08-14T12:00:00Z"));
+    expect(timelineFreshness({
+      startMs: Date.parse("2026-08-13T12:00:00Z"),
+      readMs: Date.parse("2026-08-14T12:01:30Z"),
+    }, now).delayed).toBe(false);
+  });
+
+  it("marks the prior bucket delayed after the grace period", () => {
+    expect(timelineFreshness({
+      startMs: Date.parse("2026-08-13T12:00:00Z"),
+      readMs: Date.parse("2026-08-14T12:00:01Z"),
+    }, Date.parse("2026-08-14T12:11:31Z"))).toMatchObject({
+      delayed: true,
+      label: expect.stringContaining("read 11m ago"),
+    });
   });
 });

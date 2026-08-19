@@ -88,7 +88,7 @@ export async function collectPromptEvidence(source, {
   personId,
   bucketStart,
   snapshotToken,
-}) {
+}, { signal } = {}) {
   const startMs = new Date(bucketStart).getTime();
   if (!Number.isFinite(startMs) || startMs % BUCKET_MS !== 0 ||
       new Date(startMs).toISOString() !== bucketStart) {
@@ -98,6 +98,7 @@ export async function collectPromptEvidence(source, {
     personId,
     start: bucketStart,
     snapshot: snapshotToken,
+    signal,
   });
   const prompts = Array.isArray(evidence?.prompts) ? evidence.prompts.map((prompt) => ({
     excerpt: String(prompt.excerpt),

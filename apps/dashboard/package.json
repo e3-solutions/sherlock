@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "vite build --config frontend/vite.config.js",
-    "check": "node --check server.mjs && node --check src/server/flame-source.js && node --check src/server/mcp-http.js && node --check src/server/mcp-server.js && node --check src/server/mcp-tools.js",
+    "check": "node --check server.mjs && node --check src/server/flame-source.js && node --check src/server/flame-cache.js && node --check src/server/mcp-http.js && node --check src/server/mcp-server.js && node --check src/server/mcp-tools.js",
     "dev": "concurrently -k \"node --watch server.mjs\" \"vite --config frontend/vite.config.js\"",
     "start": "node server.mjs",
     "test": "vitest run --config frontend/vitest.config.js",

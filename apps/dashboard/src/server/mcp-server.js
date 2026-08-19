@@ -134,7 +134,8 @@ function errorCode(error) {
     return error.code === "invalid_argument" ? "invalid_argument" : "unavailable";
   }
   if (error instanceof FlameSourceError) {
-    if (error.code.endsWith("_out_of_range")) return "snapshot_expired";
+    if (error.code.endsWith("_snapshot_expired") ||
+        error.code.endsWith("_out_of_range")) return "snapshot_expired";
     if (error.code.endsWith("_not_found")) return "not_found";
     if (error.code.includes("_request_invalid") || error.code.includes("_cursor_invalid")) {
       return "invalid_argument";
@@ -165,9 +166,12 @@ export function registerBonaparteTools(server, source) {
       outputSchema: usageOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async (args) => {
+    async (args, context = {}) => {
       try {
-        return success(listUsageEvidence(await source.fetchUsageEvidence(args)));
+        return success(listUsageEvidence(await source.fetchUsageEvidence({
+          ...args,
+          signal: context.signal,
+        })));
       } catch (error) {
         return failure(error);
       }
@@ -183,9 +187,9 @@ export function registerBonaparteTools(server, source) {
       outputSchema: promptOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async (args) => {
+    async (args, context = {}) => {
       try {
-        return success(await collectPromptEvidence(source, args));
+        return success(await collectPromptEvidence(source, args, context));
       } catch (error) {
         return failure(error);
       }

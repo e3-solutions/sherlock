@@ -83,14 +83,16 @@ objects.
   records, ambiguous candidates, and independently identified turns remain
   distinct evidence.
 - `GET /api/flame/interval?personId=<uuid>&start=<bucket ISO timestamp>&snapshot=<token>`
-  returns at most 200 session/semantic-role work rows. A work row exists only
+  returns at most 200 session/semantic-role work rows and 200 canonical human
+  prompt rows. Prompt rows use the same source-backed identities and MVCC
+  snapshot as the aggregate count, are chronologically ordered, and contain
+  only the stored database excerpt plus an explicit truncation flag. A work row exists only
   when the same canonical activity universe used by the aggregate contains
   visible evidence for that session and role. Its first/last timestamps are the
   observed evidence window, not active duration. Its optional summary is the
   first submitted `user_message` excerpt in the frame; response-only runtime
-  context is excluded and no title is synthesized. Prompt counts remain in the
-  snapshot-pinned aggregate; the interval endpoint does not resend unused prompt
-  excerpts.
+  context is excluded and no title is synthesized. The drawer keeps Active Work
+  primary and exposes prompt excerpts through a compact, collapsed disclosure.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
   excerpts. The default page size is 50 and the maximum is 100. Cursors are
@@ -100,6 +102,9 @@ objects.
   snapshot token. Session-row visibility is additionally required for the
   unknown-role parent fallback. Queries are workspace scoped and parameterized,
   and no endpoint performs per-row database or Storage reads.
+- Client disconnects cancel in-flight PostgreSQL queries. Snapshot expiry,
+  statement timeout, validation, and transient database failures remain distinct
+  API errors so the drawer can explain the appropriate recovery action.
 - The detail drawer states that event presence is not proof of continuous
   attention, stored excerpts may be truncated, and verified file-touch evidence
   is unavailable because tool payloads are not canonical fields.
@@ -110,6 +115,33 @@ objects.
 - Initial page load makes one `GET /api/flame` request and renders the complete
   144-bucket timeline as a single view. The graph never shrinks to a different
   preview window while the full aggregate is loading.
+
+## Initial-load cache
+
+The dashboard process eagerly computes one validated aggregate before it reports
+healthy. `GET /api/flame` then serves that last-good in-memory payload instead of
+running the multi-second aggregate on the request path. Concurrent cold callers
+share one computation, and disconnecting one caller does not cancel work needed
+by the others.
+
+The process refreshes at each ten-minute boundary plus 90 seconds, allowing the
+normalization pipeline to settle. A failed refresh never replaces the last-good
+payload; the API serves it immediately while retrying after 60 seconds. The page
+always displays the timeline's through time and read age, and explicitly marks a
+result delayed once the post-boundary grace has elapsed. A detail-recovery refresh
+may use `GET /api/flame?refresh=force` to request and wait for a new shared
+refresh without starting duplicate work. Delayed polling uses `refresh=wait` to
+wait only when the cached window is behind. Public forced refreshes are limited
+to one per process per minute.
+
+This cache is deliberately process-local and bounded to one payload. It adds no
+copy of raw telemetry or prompt content and does not change aggregate/detail
+snapshot semantics. It is lost on a total process restart; the existing Railway
+health check keeps a new deployment out of service until eager warming succeeds.
+An entry stops being serveable after 24 hours, before its lazy-detail snapshot
+expires; health then reports `timeline_expired` until a refresh succeeds.
+Cross-restart outage survival would require a separate durable publication and
+immutable publication-time session facts.
 
 ## Environment
 
@@ -160,4 +192,6 @@ execute the dashboard SQL integration fixture.
 ## Railway deployment
 
 Deploy apps/dashboard as the service source root so its railway.json and
-Dockerfile are authoritative instead of the repository-level worker config.
+Dockerfile are authoritative instead of the repository-level worker config. The
+configured `/healthz` check remains unavailable with `timeline_warming` until the
+first complete timeline payload is ready.
