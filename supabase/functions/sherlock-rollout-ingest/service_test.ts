@@ -547,7 +547,7 @@ Deno.test("ingest parses Claude transcripts without relabeling them as rollouts"
       codex_version: null,
       source_version: "2.0.59",
     },
-    stored_payload_base64: Uint8Array.from(stored).toBase64(),
+    stored_payload_base64: btoa(String.fromCharCode(...stored)),
   });
 
   assert(value.manifest.source_provider === "claude_code");
