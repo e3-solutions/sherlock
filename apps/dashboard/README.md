@@ -115,6 +115,33 @@ objects.
   144-bucket timeline as a single view. The graph never shrinks to a different
   preview window while the full aggregate is loading.
 
+## Initial-load cache
+
+The dashboard process eagerly computes one validated aggregate before it reports
+healthy. `GET /api/flame` then serves that last-good in-memory payload instead of
+running the multi-second aggregate on the request path. Concurrent cold callers
+share one computation, and disconnecting one caller does not cancel work needed
+by the others.
+
+The process refreshes at each ten-minute boundary plus 90 seconds, allowing the
+normalization pipeline to settle. A failed refresh never replaces the last-good
+payload; the API serves it immediately while retrying after 60 seconds. The page
+always displays the timeline's through time and read age, and explicitly marks a
+result delayed once the post-boundary grace has elapsed. A detail-recovery refresh
+may use `GET /api/flame?refresh=force` to request and wait for a new shared
+refresh without starting duplicate work. Delayed polling uses `refresh=wait` to
+wait only when the cached window is behind. Public forced refreshes are limited
+to one per process per minute.
+
+This cache is deliberately process-local and bounded to one payload. It adds no
+copy of raw telemetry or prompt content and does not change aggregate/detail
+snapshot semantics. It is lost on a total process restart; the existing Railway
+health check keeps a new deployment out of service until eager warming succeeds.
+An entry stops being serveable after 24 hours, before its lazy-detail snapshot
+expires; health then reports `timeline_expired` until a refresh succeeds.
+Cross-restart outage survival would require a separate durable publication and
+immutable publication-time session facts.
+
 ## Environment
 
 SUPABASE_DB_URL and SHERLOCK_WORKSPACE_ID are required. SUPABASE_DB_URL reuses
@@ -132,4 +159,6 @@ integration fixture.
 ## Railway deployment
 
 Deploy apps/dashboard as the service source root so its railway.json and
-Dockerfile are authoritative instead of the repository-level worker config.
+Dockerfile are authoritative instead of the repository-level worker config. The
+configured `/healthz` check remains unavailable with `timeline_warming` until the
+first complete timeline payload is ready.
