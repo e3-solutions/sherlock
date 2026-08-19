@@ -272,6 +272,8 @@ describe("FlameGraph", () => {
     });
 
     expect(active).toHaveClass("flame-person-status--active");
+    expect(active.parentElement).toHaveClass("flame-person-heading");
+    expect(active.previousElementSibling).toHaveTextContent("Ada Lovelace");
     expect(active).toHaveAttribute(
       "title",
       expect.stringContaining("last 10 minutes"),

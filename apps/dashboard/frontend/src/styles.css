@@ -358,17 +358,24 @@ input { font: inherit; }
 .flame-person-rail {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
   padding: 0 16px;
 }
 
 .flame-person-copy {
+  width: 100%;
   min-width: 0;
+}
+
+.flame-person-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
 }
 
 .flame-person-rail h2 {
   min-width: 0;
+  flex: 0 1 auto;
   margin: 0;
   overflow: hidden;
   font-size: 15px;
@@ -389,7 +396,7 @@ input { font: inherit; }
 .flame-person-status {
   width: 10px;
   height: 10px;
-  flex: 0 0 auto;
+  flex: 0 0 10px;
   border-radius: 50%;
   box-shadow: 0 0 0 1px rgb(255 255 255 / 12%);
 }

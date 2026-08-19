@@ -626,7 +626,15 @@ function PersonRail({ person, headingId, readMs, windowMinutes }) {
   return (
     <header className="flame-person-rail">
       <div className="flame-person-copy">
-        <h2 id={headingId} title={person.name}>{person.name}</h2>
+        <div className="flame-person-heading">
+          <h2 id={headingId} title={person.name}>{person.name}</h2>
+          <span
+            className={`flame-person-status flame-person-status--${status}`}
+            role="img"
+            aria-label={`${person.name}: ${label}; ${description}`}
+            title={`${label} — ${description}`}
+          />
+        </div>
         <p
           className="flame-person-active-time"
           aria-label={describeActiveTime(person.activeSeconds, windowMinutes)}
@@ -635,12 +643,6 @@ function PersonRail({ person, headingId, readMs, windowMinutes }) {
           {formatActiveTime(person.activeSeconds)}
         </p>
       </div>
-      <span
-        className={`flame-person-status flame-person-status--${status}`}
-        role="img"
-        aria-label={`${person.name}: ${label}; ${description}`}
-        title={`${label} — ${description}`}
-      />
     </header>
   );
 }
