@@ -123,7 +123,7 @@ describe("App", () => {
     );
   });
 
-  it("stacks recency above the role legend beneath the brand", () => {
+  it("orders recency before the role legend in one shared header row", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     const { container } = render(<App />);
     const header = container.querySelector(".portal-header");
@@ -136,6 +136,8 @@ describe("App", () => {
     expect(header.querySelector(".portal-header__brand")).toHaveTextContent("Bonaparte");
     expect(header.querySelector(".portal-header__brand + .portal-header__legend"))
       .toBe(legendRegion);
+    expect(statusLegend.parentElement).toHaveClass("flame-legends");
+    expect(activityLegend.parentElement).toBe(statusLegend.parentElement);
     expect(statusLegend.nextElementSibling).toBe(activityLegend);
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(activityLegend).getByText(label)).toBeInTheDocument();

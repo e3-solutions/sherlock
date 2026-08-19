@@ -81,6 +81,7 @@ input { font: inherit; }
 }
 
 .portal-header__legend {
+  width: 100%;
   min-width: 0;
   margin-left: 0;
 }
@@ -147,9 +148,11 @@ input { font: inherit; }
   flex: 0 0 auto;
   margin: 0;
   color: var(--flame-muted);
-  font-size: 11px;
-  letter-spacing: .04em;
-  line-height: 1.35;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: normal;
+  line-height: inherit;
+  white-space: nowrap;
 }
 
 .timeline-read--delayed {
@@ -192,18 +195,19 @@ input { font: inherit; }
 .flame-meta-rail {
   z-index: 7;
   display: flex;
-  align-items: center;
-  padding: 0 16px;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 0 28px 17px 0;
   background: var(--flame-page);
 }
 
 .flame-legends {
   display: flex;
+  width: 100%;
   min-width: 0;
-  flex-direction: column;
-  align-items: flex-start;
-  justify-content: flex-start;
-  gap: 7px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
 }
 
 .flame-legend {
@@ -211,7 +215,7 @@ input { font: inherit; }
   flex-wrap: nowrap;
   justify-content: flex-start;
   gap: 12px;
-  margin: 0;
+  margin: 0 0 0 auto;
   padding: 0;
   color: var(--flame-muted);
   list-style: none;
@@ -1039,7 +1043,8 @@ input { font: inherit; }
   .flame-person-rail h2 { font-size: 14px; }
 
   .flame-legends {
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 8px 16px;
   }
   .flame-legend {
     gap: 8px;
@@ -1050,6 +1055,8 @@ input { font: inherit; }
     padding: 0;
     font-size: 8px;
   }
+  .flame-meta-rail { padding-right: 16px; }
+  .timeline-read { white-space: normal; }
 
   .flame-time-axis time { display: none; }
   .flame-time-axis time:first-child,
