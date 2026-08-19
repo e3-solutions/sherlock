@@ -1033,6 +1033,42 @@ async function runQuery(tx, text, params, signal) {
   }
 }
 
+async function fetchIntervalPartRows({
+  tx, part, workspaceId, personId, startAt, snapshotReceipt, bounds, signal,
+}) {
+  const specifications = {
+    work: {
+      sql: INTERVAL_WORK_SQL,
+      limit: INTERVAL_WORK_LIMIT,
+      tooLarge: "flame_interval_work_result_too_large",
+    },
+    prompts: {
+      sql: INTERVAL_PROMPTS_SQL,
+      limit: INTERVAL_PROMPT_LIMIT,
+      tooLarge: "flame_interval_prompt_result_too_large",
+    },
+  };
+  const specification = specifications[part];
+  if (!specification) throw new FlameSourceError("flame_database_result_invalid");
+  const queryLimit = specification.limit + 1;
+  const rows = await runQuery(tx, specification.sql, [
+    workspaceId,
+    bounds.snapshotStart.toISOString(),
+    bounds.snapshotEnd.toISOString(),
+    NORMALIZER_VERSION,
+    snapshotReceipt.read.toISOString(),
+    snapshotReceipt.snapshot,
+    personId,
+    startAt.toISOString(),
+    bounds.bucketEnd.toISOString(),
+    queryLimit,
+  ], signal);
+  if (rows.length === queryLimit) {
+    throw new FlameSourceError(specification.tooLarge);
+  }
+  return rows;
+}
+
 export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   if (roster.length === 0) throw new FlameSourceError("flame_database_roster_empty");
   if (rows.length !== roster.length * BUCKET_COUNT) {
@@ -1200,44 +1236,71 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
-      const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const work = await runQuery(tx, INTERVAL_WORK_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
+      const work = await fetchIntervalPartRows({
+        tx,
+        part: "work",
+        workspaceId: this.workspaceId,
         personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        workLimit,
-      ], signal);
-      if (work.length === workLimit) {
-        throw new FlameSourceError("flame_interval_work_result_too_large");
-      }
-      const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
-      const prompts = await runQuery(tx, INTERVAL_PROMPTS_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
+        startAt,
+        snapshotReceipt,
+        bounds,
+        signal,
+      });
+      const prompts = await fetchIntervalPartRows({
+        tx,
+        part: "prompts",
+        workspaceId: this.workspaceId,
         personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        promptLimit,
-      ], signal);
-      if (prompts.length === promptLimit) {
-        throw new FlameSourceError("flame_interval_prompt_result_too_large");
-      }
+        startAt,
+        snapshotReceipt,
+        bounds,
+        signal,
+      });
       return {
         personId,
         start: startAt.toISOString(),
         snapshot,
         work: work.map(workFromRow),
         prompts: prompts.map(promptFromRow),
+      };
+    }, { signal });
+  }
+
+  async fetchIntervalWork(options) {
+    return await this.fetchIntervalPart({ ...options, part: "work" });
+  }
+
+  async fetchIntervalPrompts(options) {
+    return await this.fetchIntervalPart({ ...options, part: "prompts" });
+  }
+
+  async fetchIntervalPart({ personId, start, snapshot, signal, now, part }) {
+    const startAt = requestStart(start, "interval");
+    const snapshotReceipt = requestSnapshot(snapshot, "interval");
+    validateIntervalIdentity(personId, startAt, "interval");
+
+    return await this.transaction(async (tx) => {
+      const databaseRead = asDate((await runQuery(
+        tx, "select transaction_timestamp() as now", undefined, signal,
+      ))[0].now);
+      const read = now ? asDate(now) : databaseRead;
+      const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
+      const rows = await fetchIntervalPartRows({
+        tx,
+        part,
+        workspaceId: this.workspaceId,
+        personId,
+        startAt,
+        snapshotReceipt,
+        bounds,
+        signal,
+      });
+      const evidence = part === "work" ? rows.map(workFromRow) : rows.map(promptFromRow);
+      return {
+        personId,
+        start: startAt.toISOString(),
+        snapshot,
+        [part]: evidence,
       };
     }, { signal });
   }

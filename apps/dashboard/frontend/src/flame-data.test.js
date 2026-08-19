@@ -6,6 +6,8 @@ import {
   FlameDataError,
   adaptFlamePayload,
   adaptIntervalEvidence,
+  adaptIntervalPromptEvidence,
+  adaptIntervalWorkEvidence,
   adaptWorkEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
@@ -318,6 +320,31 @@ describe("interval and work evidence adapters", () => {
     expect(result.prompts).toEqual([expect.objectContaining({
       id: "native:msg-1", content: "Investigate the cursor",
     })]);
+  });
+
+  it("validates split work and prompt envelopes with the combined adapter invariants", () => {
+    const envelope = {
+      personId: expected.personId,
+      start: new Date(startMs).toISOString(),
+      snapshot: expected.snapshot,
+    };
+    expect(adaptIntervalWorkEvidence({
+      ...envelope,
+      work: [{
+        id: "s1:agent", sessionId: "s1", role: "agent",
+        firstAt: new Date(startMs + 1000).toISOString(),
+        lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
+        summary: null,
+      }],
+    }, expected).work).toHaveLength(1);
+    expect(adaptIntervalPromptEvidence({
+      ...envelope,
+      prompts: [{
+        id: "native:msg-1", sessionId: "s1",
+        at: new Date(startMs + 1500).toISOString(),
+        content: "Investigate the cursor", truncated: false,
+      }],
+    }, expected).prompts).toHaveLength(1);
   });
 
   it("rejects prompt rows whose identities do not match the aggregate count", () => {

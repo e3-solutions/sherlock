@@ -179,6 +179,34 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (url.pathname === "/api/flame/interval/work" ||
+      url.pathname === "/api/flame/interval/prompts") {
+    if (!source) {
+      sendJson(response, 503, { error: "dashboard_not_configured" });
+      return;
+    }
+    const signal = requestAbortSignal(request, response);
+    const fetchEvidence = url.pathname.endsWith("/work")
+      ? source.fetchIntervalWork.bind(source)
+      : source.fetchIntervalPrompts.bind(source);
+    try {
+      sendJson(response, 200, await fetchEvidence({
+        personId: url.searchParams.get("personId") ?? "",
+        start: url.searchParams.get("start") ?? "",
+        snapshot: url.searchParams.get("snapshot") ?? "",
+        signal,
+      }));
+    } catch (error) {
+      const code = error instanceof FlameSourceError
+        ? error.code
+        : "flame_database_unavailable";
+      if (code !== "flame_request_aborted") {
+        sendJson(response, apiStatus(code, "flame_interval"), { error: code });
+      }
+    }
+    return;
+  }
+
   if (url.pathname === "/api/flame/work") {
     if (!source) {
       sendJson(response, 503, { error: "dashboard_not_configured" });

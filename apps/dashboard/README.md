@@ -92,6 +92,13 @@ objects.
   first submitted `user_message` excerpt in the frame; response-only runtime
   context is excluded and no title is synthesized. The drawer keeps Active Work
   primary and exposes prompt excerpts through a compact, collapsed disclosure.
+- `GET /api/flame/interval/work?...` and `GET /api/flame/interval/prompts?...`
+  expose the same bounded work and prompt evidence independently. The dashboard
+  requests them sequentially so Active Work can render before prompt
+  canonicalization completes, skips a section whose aggregate count is zero,
+  and falls back to the combined interval endpoint when an older server does
+  not expose the split routes. The combined endpoint remains unchanged for
+  compatibility and rollback.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
   excerpts. The default page size is 50 and the maximum is 100. Cursors are

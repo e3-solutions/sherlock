@@ -557,6 +557,106 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
+  it("returns independently bounded work and prompt interval evidence", async () => {
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+    const createSource = (rows) => {
+      const source = Object.create(DirectFlameSource.prototype);
+      source.workspaceId = "11111111-1111-4111-8111-111111111111";
+      const unsafe = vi.fn()
+        .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+        .mockResolvedValueOnce(rows);
+      source.transaction = (callback) => callback({ unsafe });
+      return { source, unsafe };
+    };
+
+    const work = createSource([{
+      session_id: sessionId,
+      semantic_role: "agent",
+      first_at: new Date("2026-08-16T12:00:09.000Z"),
+      last_at: new Date("2026-08-16T12:04:00.000Z"),
+      event_count: 4,
+      summary: "Inspect the query",
+    }]);
+    await expect(work.source.fetchIntervalWork({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+    })).resolves.toMatchObject({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+      work: [{
+        id: `${sessionId}:agent`,
+        sessionId,
+        role: "agent",
+        eventCount: 4,
+        summary: "Inspect the query",
+      }],
+    });
+    expect(work.unsafe).toHaveBeenCalledTimes(2);
+    expect(work.unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(work.unsafe.mock.calls[1][1].at(-1)).toBe(201);
+
+    const prompts = createSource([{
+      prompt_identity: "native:msg_1",
+      session_id: sessionId,
+      observed_at: new Date("2026-08-16T12:00:10.000Z"),
+      content_byte_size: 17,
+      content_excerpt: "Inspect the query",
+    }]);
+    await expect(prompts.source.fetchIntervalPrompts({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+    })).resolves.toMatchObject({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+      prompts: [{
+        id: "native:msg_1",
+        sessionId,
+        content: "Inspect the query",
+        truncated: false,
+      }],
+    });
+    expect(prompts.unsafe).toHaveBeenCalledTimes(2);
+    expect(prompts.unsafe.mock.calls[1][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(prompts.unsafe.mock.calls[1][1].at(-1)).toBe(201);
+  });
+
+  it("preserves interval validation and overflow errors for split evidence", async () => {
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+    for (const [method, code] of [
+      ["fetchIntervalWork", "flame_interval_work_result_too_large"],
+      ["fetchIntervalPrompts", "flame_interval_prompt_result_too_large"],
+    ]) {
+      const source = Object.create(DirectFlameSource.prototype);
+      source.workspaceId = "11111111-1111-4111-8111-111111111111";
+      const unsafe = vi.fn()
+        .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+        .mockResolvedValueOnce(Array.from({ length: 201 }, () => ({})));
+      source.transaction = (callback) => callback({ unsafe });
+      await expect(source[method]({
+        personId,
+        start: START.toISOString(),
+        snapshot,
+      })).rejects.toMatchObject({ code });
+      expect(unsafe).toHaveBeenCalledTimes(2);
+    }
+
+    const invalidSource = Object.create(DirectFlameSource.prototype);
+    invalidSource.transaction = vi.fn();
+    await expect(invalidSource.fetchIntervalPrompts({
+      personId: "invalid",
+      start: START.toISOString(),
+      snapshot,
+    })).rejects.toMatchObject({ code: "flame_interval_request_invalid" });
+    expect(invalidSource.transaction).not.toHaveBeenCalled();
+  });
+
   it("distinguishes an expired snapshot from an invalid frame range", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
