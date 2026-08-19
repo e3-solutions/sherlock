@@ -215,10 +215,14 @@ prompt_candidates as materialized (
     from prompt_candidates
    where event_subtype = 'message'
      and native_item_id is not null
-), prompt_representation_suppressed as materialized (
-  select distinct duplicate.id suppressed_id
+-- PostgreSQL has no row-count statistics for these materialized CTEs and otherwise
+-- chooses quadratic nested loops. The materialize-then-filter full joins below keep
+-- every original predicate while giving the planner bounded hash/merge paths; each
+-- following CTE restores the original inner- or left-join semantics.
+), prompt_representation_pairs as materialized (
+  select duplicate.id suppressed_id, previous.id previous_id
     from canonical_prompt_candidates duplicate
-    join canonical_prompt_candidates previous
+    full join canonical_prompt_candidates previous
       on previous.session_id = duplicate.session_id
      and previous.event_kind = duplicate.event_kind
      and previous.event_subtype = duplicate.event_subtype
@@ -227,7 +231,7 @@ prompt_candidates as materialized (
      and previous.source_record_index = duplicate.source_record_index - 1
      and previous.source_end_offset = duplicate.source_start_offset
      and previous.canonical_scope_key is not distinct from duplicate.canonical_scope_key
-   where duplicate.event_subtype = 'user_message'
+     and duplicate.event_subtype = 'user_message'
      and previous.source_native_type = 'event_msg'
      and previous.source_native_payload_type = 'user_message'
      and duplicate.source_native_type = 'event_msg'
@@ -241,6 +245,10 @@ prompt_candidates as materialized (
      and abs(extract(epoch from (
            duplicate.source_observed_at - previous.source_observed_at
          ))) <= ${UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS} / 1000.0
+), prompt_representation_suppressed as materialized (
+  select distinct suppressed_id
+    from prompt_representation_pairs
+   where suppressed_id is not null and previous_id is not null
 ), unkeyed_submitted_prompts as materialized (
   select canonical_prompt_candidates.*
     from canonical_prompt_candidates
@@ -249,12 +257,12 @@ prompt_candidates as materialized (
    where (canonical_scope_key is null or logical_event_key is null)
      and event_subtype = 'user_message'
      and prompt_representation_suppressed.suppressed_id is null
-), unkeyed_prompt_pair_candidates as materialized (
+), unkeyed_prompt_pair_rows as materialized (
   select submitted.id submitted_id, native.id native_event_id,
          native.native_item_id matched_native_item_id,
          native.native_observed_at matched_native_observed_at
     from unkeyed_submitted_prompts submitted
-    join native_identity_candidates native
+    full join native_identity_candidates native
       on native.session_id = submitted.session_id
      and native.content_sha256 = submitted.content_sha256
      and native.source_collector_key = submitted.source_collector_key
@@ -262,13 +270,18 @@ prompt_candidates as materialized (
      and native.source_stream_key = submitted.source_stream_key
      and native.generation_key = submitted.generation_key
      and native.generation_seq = submitted.generation_seq
-   where submitted.logical_event_key is null
+     and submitted.logical_event_key is null
      and submitted.turn_id is null
      and native.logical_event_key is null
      and native.turn_id is null
      and abs(extract(epoch from (
            native.native_source_observed_at - submitted.source_observed_at
          ))) <= ${UNKEYED_PROMPT_MATCH_SECONDS}
+), unkeyed_prompt_pair_candidates as materialized (
+  select submitted_id, native_event_id, matched_native_item_id,
+         matched_native_observed_at
+    from unkeyed_prompt_pair_rows
+   where submitted_id is not null and native_event_id is not null
 ), unkeyed_prompt_pair_degrees as materialized (
   select unkeyed_prompt_pair_candidates.*,
          count(*) over (partition by submitted_id) submitted_degree,
@@ -278,7 +291,7 @@ prompt_candidates as materialized (
   select submitted_id, matched_native_item_id, matched_native_observed_at
     from unkeyed_prompt_pair_degrees
    where submitted_degree = 1 and native_degree = 1
-), unkeyed_prompt_sources as materialized (
+), unkeyed_prompt_source_rows as materialized (
   select submitted.*,
          coalesce(
            'native:' || submitted.native_item_id,
@@ -292,7 +305,11 @@ prompt_candidates as materialized (
            submitted.source_observed_at
          ) observed_at
     from unkeyed_submitted_prompts submitted
-    left join unkeyed_prompt_pairs paired on paired.submitted_id = submitted.id
+    full join unkeyed_prompt_pairs paired on paired.submitted_id = submitted.id
+), unkeyed_prompt_sources as materialized (
+  select *
+    from unkeyed_prompt_source_rows
+   where id is not null
 ), prompt_identities as materialized (
   select * from keyed_prompt_sources
   union all

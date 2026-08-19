@@ -337,6 +337,47 @@ describe("Sherlock Flame payload", () => {
     );
   });
 
+  it("materializes set-based prompt joins before restoring their original semantics", () => {
+    const promptSql = FLAME_SQL.slice(
+      FLAME_SQL.indexOf("prompt_candidates as materialized"),
+      FLAME_SQL.indexOf("prompt_counts as materialized"),
+    );
+
+    expect(promptSql).toContain("prompt_representation_pairs as materialized");
+    expect(promptSql).toContain(
+      "full join canonical_prompt_candidates previous",
+    );
+    expect(promptSql).toContain(
+      "from prompt_representation_pairs\n   where suppressed_id is not null and previous_id is not null",
+    );
+
+    expect(promptSql).toContain("unkeyed_prompt_pair_rows as materialized");
+    expect(promptSql).toContain(
+      "full join native_identity_candidates native",
+    );
+    expect(promptSql).toContain(
+      "from unkeyed_prompt_pair_rows\n   where submitted_id is not null and native_event_id is not null",
+    );
+
+    expect(promptSql).toContain("unkeyed_prompt_source_rows as materialized");
+    expect(promptSql).toContain(
+      "full join unkeyed_prompt_pairs paired on paired.submitted_id = submitted.id",
+    );
+    expect(promptSql).toContain(
+      "from unkeyed_prompt_source_rows\n   where id is not null",
+    );
+
+    expect(promptSql).not.toContain(
+      "\n    join canonical_prompt_candidates previous\n      on",
+    );
+    expect(promptSql).not.toContain(
+      "\n    join native_identity_candidates native\n      on",
+    );
+    expect(promptSql).not.toContain(
+      "left join unkeyed_prompt_pairs paired",
+    );
+  });
+
   it("collapses only adjacent native-ID-less copies of one submitted prompt", () => {
     expect(UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS).toBe(100);
     expect(FLAME_SQL).toContain("join telemetry.native_records nr");
