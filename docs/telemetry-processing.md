@@ -23,6 +23,13 @@ latency.
 6. PostgreSQL fills the generated message `tsvector` and GIN index when the
    normalized event rows are inserted. There is no separate search worker.
 
+Claude Code transcripts and terminal-hook observations remain distinct raw
+sources. Transcript batches use `claude_code/transcript`; exact Stop,
+SubagentStop, and SessionEnd observations use `claude_code/hook`. Both are
+interpreted by the Claude normalizer, while the immutable source bytes and
+provider/kind facts remain separate and auditable. Only an anchored Stop or
+SubagentStop projects a completed turn.
+
 `processing` is private mutable operational state. Immutable receipts and
 record locators stay in `telemetry`; rebuildable product projections stay in
 `analytics`.

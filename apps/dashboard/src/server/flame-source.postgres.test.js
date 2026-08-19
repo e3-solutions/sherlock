@@ -129,12 +129,18 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     const collectorKey = `claude-${workspaceId}`;
     const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
     let source;
+    const now = new Date();
+    const bucketStartDate = new Date(
+      Math.floor(now.getTime() / BUCKET_MS) * BUCKET_MS - BUCKET_MS,
+    );
+    const at = (milliseconds) =>
+      new Date(bucketStartDate.getTime() + milliseconds).toISOString();
 
     const eventFixtures = [{
       batchId: primaryBatchId,
       sessionId: primarySessionId,
       recordIndex: 0,
-      at: "2026-08-18T11:00:00.500Z",
+      at: at(500),
       nativeType: "user",
       subtype: "user_message",
       actorRole: "primary",
@@ -145,7 +151,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       batchId: primaryBatchId,
       sessionId: primarySessionId,
       recordIndex: 1,
-      at: "2026-08-18T11:00:01.000Z",
+      at: at(1_000),
       nativeType: "user",
       subtype: "user_message",
       actorRole: "primary",
@@ -156,7 +162,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       batchId: primaryBatchId,
       sessionId: primarySessionId,
       recordIndex: 2,
-      at: "2026-08-18T11:00:02.000Z",
+      at: at(2_000),
       nativeType: "assistant",
       subtype: "message",
       actorRole: "primary",
@@ -167,7 +173,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       batchId: primaryBatchId,
       sessionId: primarySessionId,
       recordIndex: 3,
-      at: "2026-08-18T11:00:03.000Z",
+      at: at(3_000),
       nativeType: "assistant",
       subtype: "tool_use",
       actorRole: "primary",
@@ -177,7 +183,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       batchId: workerBatchId,
       sessionId: workerSessionId,
       recordIndex: 0,
-      at: "2026-08-18T11:00:04.000Z",
+      at: at(4_000),
       nativeType: "user",
       subtype: "user_message",
       actorRole: "worker",
@@ -188,7 +194,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       batchId: workerBatchId,
       sessionId: workerSessionId,
       recordIndex: 1,
-      at: "2026-08-18T11:00:05.000Z",
+      at: at(5_000),
       nativeType: "assistant",
       subtype: "message",
       actorRole: "worker",
@@ -216,10 +222,17 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            role_version, started_at
          ) values
            ($1, $3, $4, $5, 'claude-primary', null, null, 'primary',
-            'sherlock.claude-code-role.v1', '2026-08-18T11:00:00Z'),
+            'sherlock.claude-code-role.v1', $6),
            ($2, $3, $4, $5, 'claude-worker', $1, 'claude-primary', 'worker',
-            'sherlock.claude-code-role.v1', '2026-08-18T11:00:00Z')`,
-        [primarySessionId, workerSessionId, workspaceId, personId, collectorKey],
+            'sherlock.claude-code-role.v1', $6)`,
+        [
+          primarySessionId,
+          workerSessionId,
+          workspaceId,
+          personId,
+          collectorKey,
+          bucketStartDate.toISOString(),
+        ],
       );
       for (const [batchId, stream, nativeSessionId, parentId, recordCount] of [[
         primaryBatchId,
@@ -317,10 +330,13 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       }
 
       source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
-      const payload = await source.fetchDay({ now: FIXED_NOW });
+      const payload = await source.fetchDay({ now });
       const person = payload.people[0];
-      const bucketStart = "2026-08-18T11:00:00.000Z";
-      const bucket = person.buckets[bucketIndex(new Date(bucketStart))];
+      const bucketStart = bucketStartDate.toISOString();
+      const payloadStart = new Date(payload.start).getTime();
+      const bucket = person.buckets[
+        Math.floor((bucketStartDate.getTime() - payloadStart) / BUCKET_MS)
+      ];
 
       expect(person.total).toEqual([1, 1, 0]);
       expect(bucket).toEqual([1, 1, 0, 1]);

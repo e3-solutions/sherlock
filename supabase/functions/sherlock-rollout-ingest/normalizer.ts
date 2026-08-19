@@ -9,6 +9,11 @@ export const ROLE_VERSION = "sherlock.codex-role.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 export const CLAUDE_ROLE_VERSION = "sherlock.claude-code-role.v1";
 
+const CLAUDE_HOOK_SCHEMA_VERSION = "sherlock.claude-hook.v1";
+const CANONICAL_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+
 type JsonValue =
   | null
   | string
@@ -94,7 +99,9 @@ export async function projectBatch(
   source: Uint8Array,
 ): Promise<BatchProjection> {
   return manifest.source_provider === "claude_code"
-    ? await projectClaudeBatch(manifest, source)
+    ? manifest.source_kind === "hook"
+      ? await projectClaudeHookBatch(manifest, source)
+      : await projectClaudeBatch(manifest, source)
     : await projectCodexBatch(manifest, source);
 }
 
@@ -102,6 +109,284 @@ export function normalizerVersionFor(manifest: BatchManifest): string {
   return manifest.source_provider === "claude_code"
     ? CLAUDE_NORMALIZER_VERSION
     : NORMALIZER_VERSION;
+}
+
+async function projectClaudeHookBatch(
+  manifest: BatchManifest,
+  source: Uint8Array,
+): Promise<BatchProjection> {
+  const records = manifest.records.map((locator) => ({
+    locator,
+    envelope: parseEnvelope(recordBytes(manifest, source, locator)),
+  }));
+  const nativeSessionId = manifest.observed_native_session_id;
+  const parentNativeSessionId = manifest.observed_parent_native_session_id;
+  const actorRole: ActorRole = parentNativeSessionId
+    ? "worker"
+    : nativeSessionId
+    ? "primary"
+    : "unknown";
+  const session = nativeSessionId
+    ? {
+      native_session_id: nativeSessionId,
+      native_thread_id: null,
+      parent_native_session_id: parentNativeSessionId,
+      actor_role: actorRole,
+      role_version: CLAUDE_ROLE_VERSION,
+      title: null,
+      project_key: null,
+      repo_remote: null,
+      branch: null,
+      cwd: null,
+      model: null,
+      started_at: manifest.first_occurred_at,
+    } satisfies SessionProjection
+    : null;
+  const canonicalScopeKey = session
+    ? `session:${session.native_session_id}`
+    : `stream:${manifest.source_stream_key}`;
+  const projected = await Promise.all(
+    records.map((record) =>
+      projectClaudeHookRecord(record, session, canonicalScopeKey)
+    ),
+  );
+  return { session, events: projected };
+}
+
+async function projectClaudeHookRecord(
+  record: ParsedRecord,
+  session: SessionProjection | null,
+  canonicalScopeKey: string,
+): Promise<EventProjection> {
+  const { locator, envelope } = record;
+  const base: EventProjection = {
+    record_index: locator.record_index,
+    projection_index: 0,
+    canonical_scope_key: canonicalScopeKey,
+    logical_event_key: null,
+    source_priority: 120,
+    event_kind: "lifecycle",
+    event_subtype: "hook_invalid",
+    phase: null,
+    actor_role: session?.actor_role ?? "unknown",
+    occurred_at: locator.occurred_at,
+    observed_at: locator.occurred_at,
+    native_item_id: null,
+    parent_native_item_id: null,
+    turn_id: null,
+    tool_call_id: null,
+    message_role: null,
+    message_origin: null,
+    tool_name: null,
+    tool_status: null,
+    model: null,
+    project_key: null,
+    repo_remote: null,
+    branch: null,
+    cwd: null,
+    usage_stream_key: null,
+    usage_scope: null,
+    usage_is_cumulative: null,
+    input_tokens: null,
+    cached_input_tokens: null,
+    output_tokens: null,
+    reasoning_tokens: null,
+    total_tokens: null,
+    error_code: null,
+    content_sha256: null,
+    content_byte_size: null,
+    content_excerpt: null,
+    attributes: null,
+  };
+  if (locator.parse_status !== "ok" || envelope === null) {
+    return { ...base, error_code: `native_${locator.parse_status}` };
+  }
+
+  const validation = await validateClaudeHookEnvelope(envelope, session);
+  if (!validation.valid) {
+    return { ...base, error_code: validation.error };
+  }
+  const {
+    dispatchEventName,
+    payloadSha256,
+    payload,
+    collectorObservedAt,
+    transcriptByteCount,
+    transcriptSha256,
+  } = validation;
+  const attributes: JsonObject = {
+    dispatch_event_name: dispatchEventName,
+    payload_sha256: payloadSha256,
+  };
+  if (transcriptByteCount !== null) {
+    attributes.transcript_byte_count = transcriptByteCount;
+  }
+  if (transcriptSha256 !== null) {
+    attributes.transcript_sha256 = transcriptSha256;
+  }
+  if (dispatchEventName === "SessionEnd") {
+    const reason = stringValue(payload.reason);
+    if (
+      reason && [
+        "clear",
+        "resume",
+        "logout",
+        "prompt_input_exit",
+        "bypass_permissions_disabled",
+        "other",
+      ].includes(reason)
+    ) attributes.reason = reason;
+    return {
+      ...base,
+      observed_at: collectorObservedAt,
+      event_subtype: "session_end",
+      logical_event_key: `claude:hook:${payloadSha256}`,
+      native_item_id: null,
+      attributes,
+    };
+  }
+
+  const terminalAssistantUuid = stringValue(envelope.terminal_assistant_uuid);
+  const turnAnchorId = stringValue(envelope.turn_anchor_id);
+  const hasAuditableTurnBinding = terminalAssistantUuid !== null &&
+    CANONICAL_UUID.test(terminalAssistantUuid) &&
+    turnAnchorId !== null && CANONICAL_UUID.test(turnAnchorId) &&
+    transcriptByteCount !== null && transcriptSha256 !== null;
+  if (!hasAuditableTurnBinding) {
+    return {
+      ...base,
+      observed_at: collectorObservedAt,
+      event_subtype: "response_complete_unlinked",
+      logical_event_key: `claude:hook:${payloadSha256}`,
+      native_item_id: CANONICAL_UUID.test(terminalAssistantUuid ?? "")
+        ? terminalAssistantUuid
+        : null,
+      attributes,
+    };
+  }
+  return {
+    ...base,
+    observed_at: collectorObservedAt,
+    event_subtype: "turn_complete",
+    logical_event_key:
+      `claude:lifecycle:${terminalAssistantUuid}:turn_complete`,
+    native_item_id: terminalAssistantUuid,
+    turn_id: `claude:prompt:${turnAnchorId}`,
+    attributes,
+  };
+}
+
+type ClaudeHookValidation = {
+  valid: true;
+  dispatchEventName: "Stop" | "SubagentStop" | "SessionEnd";
+  payloadSha256: string;
+  payload: JsonObject;
+  collectorObservedAt: string;
+  transcriptByteCount: number | null;
+  transcriptSha256: string | null;
+} | { valid: false; error: string };
+
+async function validateClaudeHookEnvelope(
+  envelope: JsonObject,
+  session: SessionProjection | null,
+): Promise<ClaudeHookValidation> {
+  if (
+    stringValue(envelope.type) !== "claude_hook" ||
+    stringValue(envelope.schema_version) !== CLAUDE_HOOK_SCHEMA_VERSION
+  ) return { valid: false, error: "invalid_claude_hook_schema" };
+  const collectorObservedAt = utcTimestamp(envelope.collector_observed_at);
+  if (collectorObservedAt === null) {
+    return { valid: false, error: "invalid_claude_hook_observed_at" };
+  }
+  const dispatchEventName = stringValue(envelope.dispatch_event_name);
+  if (
+    dispatchEventName !== "Stop" && dispatchEventName !== "SubagentStop" &&
+    dispatchEventName !== "SessionEnd"
+  ) return { valid: false, error: "invalid_claude_hook_event" };
+  const payloadSha256 = stringValue(envelope.payload_sha256);
+  const payloadBase64 = stringValue(envelope.payload_base64);
+  if (!payloadSha256 || !SHA256.test(payloadSha256) || !payloadBase64) {
+    return { valid: false, error: "invalid_claude_hook_payload" };
+  }
+  const payloadBytes = decodeBase64Bytes(payloadBase64);
+  if (!payloadBytes || await sha256Hex(payloadBytes) !== payloadSha256) {
+    return { valid: false, error: "invalid_claude_hook_payload_hash" };
+  }
+  const payload = parseEnvelope(payloadBytes);
+  if (!payload || stringValue(payload.hook_event_name) !== dispatchEventName) {
+    return { valid: false, error: "invalid_claude_hook_payload_event" };
+  }
+  const nativeSessionId = stringValue(envelope.native_session_id);
+  const parentNativeSessionId = stringValue(envelope.parent_native_session_id);
+  const payloadSessionId = stringValue(payload.session_id);
+  const expectedNativeSessionId = dispatchEventName === "SubagentStop"
+    ? stringValue(payload.agent_id)
+    : payloadSessionId;
+  const expectedParentSessionId = dispatchEventName === "SubagentStop"
+    ? payloadSessionId
+    : null;
+  if (
+    nativeSessionId === null || nativeSessionId !== expectedNativeSessionId ||
+    parentNativeSessionId !== expectedParentSessionId ||
+    nativeSessionId !== session?.native_session_id ||
+    parentNativeSessionId !== session.parent_native_session_id
+  ) return { valid: false, error: "invalid_claude_hook_session" };
+  const transcriptByteCount = nonNegativeInteger(
+    envelope.transcript_byte_count,
+  );
+  const transcriptSha256 = stringValue(envelope.transcript_sha256);
+  if (
+    (transcriptByteCount === null) !== (transcriptSha256 === null) ||
+    (transcriptSha256 !== null && !SHA256.test(transcriptSha256))
+  ) return { valid: false, error: "invalid_claude_hook_transcript" };
+  const terminalAssistantUuid = stringValue(envelope.terminal_assistant_uuid);
+  const turnAnchorId = stringValue(envelope.turn_anchor_id);
+  if (
+    (terminalAssistantUuid !== null &&
+      !CANONICAL_UUID.test(terminalAssistantUuid)) ||
+    (turnAnchorId !== null && !CANONICAL_UUID.test(turnAnchorId)) ||
+    dispatchEventName === "SessionEnd" &&
+      (terminalAssistantUuid !== null || turnAnchorId !== null)
+  ) return { valid: false, error: "invalid_claude_hook_anchor" };
+  if (
+    terminalAssistantUuid !== null &&
+    (transcriptByteCount === null || transcriptByteCount === 0)
+  ) return { valid: false, error: "invalid_claude_hook_transcript" };
+  return {
+    valid: true,
+    dispatchEventName,
+    payloadSha256,
+    payload,
+    collectorObservedAt,
+    transcriptByteCount,
+    transcriptSha256,
+  };
+}
+
+function utcTimestamp(value: unknown): string | null {
+  const candidate = stringValue(value);
+  const match = candidate &&
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?Z$/
+      .exec(candidate);
+  if (!match) return null;
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (
+    year < 1 || parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day ||
+    parsed.getUTCHours() !== hour || parsed.getUTCMinutes() !== minute ||
+    parsed.getUTCSeconds() !== second
+  ) return null;
+  return candidate;
+}
+
+function decodeBase64Bytes(value: string): Uint8Array | null {
+  try {
+    const decoded = atob(value);
+    return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+  } catch {
+    return null;
+  }
 }
 
 async function projectCodexBatch(

@@ -52,6 +52,14 @@ confirms plugin enablement, configuration, and queue health, but does not prove
 that an upload was committed, normalized, or displayed by the dashboard.
 Dead-lettered batches make this local check fail with `"status":"degraded"`.
 
+Sherlock preserves `Stop`, `SubagentStop`, and `SessionEnd` input as separate,
+immutable `claude_code/hook` evidence; it never appends hook data to a Claude
+transcript. The evidence includes the exact hook stdin bytes and their digest.
+Only a transcript-anchored `Stop` or `SubagentStop` can close a turn;
+`SessionEnd` records session termination but cannot infer turn completion.
+Terminal observations remain in the collector's owner-only telemetry state for
+audit and retry. They are currently retained until that state is removed.
+
 Hook and plugin behavior follows Anthropic's official
 [hooks](https://code.claude.com/docs/en/hooks) and
 [plugins](https://code.claude.com/docs/en/plugins) specifications.

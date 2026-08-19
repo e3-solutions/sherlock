@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import gzip
 import json
 import os
 import threading
@@ -162,6 +162,23 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(item.manifest.source_kind, "transcript")
         self.assertEqual(item.manifest.source_version, "2.0.59")
         self.assertEqual(receipt(item.manifest)["source_kind"], "transcript")
+
+    def test_claude_hook_is_a_distinct_supported_source_kind(self):
+        source = b'{"type":"claude_hook","schema_version":"sherlock.claude-hook.v1"}\n'
+        manifest, stored = build_source_batch(
+            source,
+            source_provider="claude_code",
+            source_kind="hook",
+            source_stream_key="claude-hook-stream",
+            generation_key="claude-hook-generation",
+            generation_seq=0,
+            start_offset=0,
+        )
+
+        self.assertEqual(manifest.source_provider, "claude_code")
+        self.assertEqual(manifest.source_kind, "hook")
+        self.assertEqual(manifest.records[0].native_type, "claude_hook")
+        self.assertEqual(gzip.decompress(stored), source)
 
 
 class CollectorDrainTests(unittest.TestCase):

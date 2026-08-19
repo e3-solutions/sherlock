@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from .claude_hook import (
+    TERMINAL_EVENTS,
+    observation_identity,
+    referenced_transcript,
+    write_observation,
+)
 from .config import default_claude_home, default_codex_home, default_state_root
 from .discovery import discover_claude_transcripts, discover_rollouts
 from .rollout import CaptureResult, RolloutCapturer
@@ -55,6 +61,29 @@ def is_coordination_tool(name: str) -> bool:
     return normalized.rsplit(".", 1)[-1] in COORDINATION_TOOLS
 
 
+def _spawn_drain(
+    drain_command: Sequence[str],
+    drain_environment: Mapping[str, str] | None,
+) -> None:
+    try:
+        subprocess.Popen(
+            list(drain_command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=(
+                dict(drain_environment)
+                if drain_environment is not None
+                else None
+            ),
+        )
+    except OSError:
+        # Capture is already durable. A later hook is a recovery signal.
+        pass
+
+
 def capture_and_spawn_drain(
     capturer: RolloutCapturer,
     rollout_paths: Iterable[Path | str],
@@ -85,23 +114,7 @@ def capture_and_spawn_drain(
         if outcome is None or (
             not outcome.locked and (outcome.enqueued > 0 or queued_work)
         ):
-            try:
-                subprocess.Popen(
-                    list(drain_command),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                    close_fds=True,
-                    env=(
-                        dict(drain_environment)
-                        if drain_environment is not None
-                        else None
-                    ),
-                )
-            except OSError:
-                # Capture is already durable. A later hook is a recovery signal.
-                pass
+            _spawn_drain(drain_command, drain_environment)
     return outcome
 
 
@@ -113,6 +126,7 @@ def run_hook(
     claude_home: Path | str | None = None,
     state_root: Path | str | None = None,
     provider: str = "codex",
+    raw_payload: bytes | None = None,
     drain_command: Sequence[str],
     drain_environment: Mapping[str, str] | None = None,
 ) -> HookResult:
@@ -140,6 +154,56 @@ def run_hook(
     environment = os.environ.copy()
     if drain_environment:
         environment.update(drain_environment)
+    hook_outcome = CaptureResult()
+    hook_observation: Path | None = None
+    hook_errors = 0
+    if (
+        provider == "claude_code"
+        and event_name in TERMINAL_EVENTS
+        and raw_payload
+    ):
+        try:
+            hook_observation = write_observation(
+                root,
+                event_name,
+                payload,
+                raw_payload,
+                transcript_path=referenced_transcript(home, event_name, payload),
+            )
+            observation_paths = [
+                hook_observation,
+                *(
+                    path
+                    for path in sorted(
+                        (root / "claude-hook-events").glob("*.jsonl")
+                    )
+                    if path != hook_observation
+                ),
+            ]
+            native_ids: dict[str, str] = {}
+            parent_ids: dict[str, str] = {}
+            for path in observation_paths:
+                native_id, parent_id = observation_identity(path)
+                if native_id is not None:
+                    native_ids[str(path.resolve())] = native_id
+                if parent_id is not None:
+                    parent_ids[str(path.resolve())] = parent_id
+            hook_outcome = RolloutCapturer(
+                root,
+                DurableSpool(root / "queue"),
+                source_provider="claude_code",
+                source_kind="hook",
+                state_name="claude-hook",
+                capture_unterminated_tail=False,
+            ).capture(
+                observation_paths,
+                native_session_ids=native_ids,
+                parent_native_session_ids=parent_ids,
+                best_effort=True,
+                priority_count=1,
+            )
+        except (OSError, ValueError):
+            hook_errors += 1
     outcome = capture_and_spawn_drain(
         RolloutCapturer(
             root,
@@ -159,12 +223,18 @@ def run_hook(
         best_effort=True,
         priority_count=discovery.priority_count,
     )
+    if (
+        outcome.locked
+        and not hook_outcome.locked
+        and hook_outcome.enqueued > 0
+    ):
+        _spawn_drain(drain_command, environment)
     return HookResult(
         event_name=event_name,
-        discovered=len(discovery.paths),
-        enqueued=outcome.enqueued,
-        captured_bytes=outcome.captured_bytes,
+        discovered=len(discovery.paths) + (1 if hook_observation else 0),
+        enqueued=outcome.enqueued + hook_outcome.enqueued,
+        captured_bytes=outcome.captured_bytes + hook_outcome.captured_bytes,
         discovery_errors=len(discovery.errors),
-        capture_errors=outcome.errors,
-        locked=outcome.locked,
+        capture_errors=outcome.errors + hook_outcome.errors + hook_errors,
+        locked=outcome.locked or hook_outcome.locked,
     )

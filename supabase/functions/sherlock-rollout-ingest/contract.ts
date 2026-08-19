@@ -37,7 +37,7 @@ export interface RecordLocator {
 export interface BatchManifest {
   contract_version: typeof CONTRACT_VERSION;
   source_provider: "codex" | "claude_code";
-  source_kind: "rollout" | "transcript";
+  source_kind: "rollout" | "transcript" | "hook";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -76,7 +76,7 @@ export interface CommittedReceipt extends Attribution {
   receipt_version: typeof RECEIPT_VERSION;
   status: "committed";
   batch_id: string;
-  source_kind: "rollout" | "transcript";
+  source_kind: "rollout" | "transcript" | "hook";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -455,9 +455,10 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
   if (
     contractVersion !== CONTRACT_VERSION ||
     !(["codex", "claude_code"] as string[]).includes(sourceProvider) ||
-    !(["rollout", "transcript"] as string[]).includes(sourceKind) ||
+    !(["rollout", "transcript", "hook"] as string[]).includes(sourceKind) ||
     (sourceProvider === "codex" && sourceKind !== "rollout") ||
-    (sourceProvider === "claude_code" && sourceKind !== "transcript")
+    (sourceProvider === "claude_code" &&
+      !(["transcript", "hook"] as string[]).includes(sourceKind))
   ) {
     throw new IngestError(
       "unsupported_contract",
@@ -535,7 +536,7 @@ export function validateManifest(manifest: BatchManifest): void {
     (manifest.source_provider === "codex" &&
       manifest.source_kind !== "rollout") ||
     (manifest.source_provider === "claude_code" &&
-      manifest.source_kind !== "transcript")
+      !(["transcript", "hook"] as string[]).includes(manifest.source_kind))
   ) {
     throw new IngestError(
       "unsupported_contract",

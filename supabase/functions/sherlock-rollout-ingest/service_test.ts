@@ -561,3 +561,41 @@ Deno.test("ingest parses Claude transcripts without relabeling them as rollouts"
     }, value.manifest).includes("/transcript/"),
   );
 });
+
+Deno.test("ingest accepts Claude hook evidence but rejects Codex hook batches", async () => {
+  const { manifest, stored } = await fixture();
+  const hookManifest = {
+    ...manifest,
+    source_provider: "claude_code",
+    source_kind: "hook",
+    observed_native_session_id: "claude-session",
+    observed_parent_native_session_id: null,
+    codex_version: null,
+    source_version: "2.0.59",
+  };
+  const value = parseEnvelope({
+    collector: COLLECTOR,
+    manifest: hookManifest,
+    stored_payload_base64: btoa(String.fromCharCode(...stored)),
+  });
+  assert(value.manifest.source_kind === "hook");
+  assert(
+    storagePath({
+      workspace_id: "00000000-0000-4000-8000-000000000001",
+      person_id: "00000000-0000-4000-8000-000000000002",
+      collector_key: "collector-test",
+    }, value.manifest).includes("/hook/"),
+  );
+
+  try {
+    parseEnvelope({
+      collector: COLLECTOR,
+      manifest: { ...hookManifest, source_provider: "codex" },
+      stored_payload_base64: btoa(String.fromCharCode(...stored)),
+    });
+    assert(false, "Codex hook batches must remain unsupported");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "unsupported_contract");
+  }
+});

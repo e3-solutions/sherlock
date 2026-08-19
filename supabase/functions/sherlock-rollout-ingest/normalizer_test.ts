@@ -6,6 +6,41 @@ import {
   projectBatch,
 } from "./normalizer.ts";
 
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function claudeHookEnvelope(input: {
+  dispatchEventName: "Stop" | "SubagentStop" | "SessionEnd";
+  payload: Record<string, unknown>;
+  nativeSessionId: string;
+  parentNativeSessionId?: string | null;
+  terminalAssistantUuid?: string | null;
+  turnAnchorId?: string | null;
+  transcript?: Uint8Array | null;
+}): Promise<Record<string, unknown>> {
+  const payloadBytes = new TextEncoder().encode(JSON.stringify(input.payload));
+  const transcript = input.transcript === undefined
+    ? new TextEncoder().encode("sanitized immutable Claude transcript\n")
+    : input.transcript;
+  return {
+    type: "claude_hook",
+    schema_version: "sherlock.claude-hook.v1",
+    collector_observed_at: "2026-08-19T00:00:02.000000Z",
+    dispatch_event_name: input.dispatchEventName,
+    payload_sha256: await sha256Hex(payloadBytes),
+    payload_base64: encodeBase64(payloadBytes),
+    native_session_id: input.nativeSessionId,
+    parent_native_session_id: input.parentNativeSessionId ?? null,
+    terminal_assistant_uuid: input.terminalAssistantUuid ?? null,
+    turn_anchor_id: input.turnAnchorId ?? null,
+    transcript_byte_count: transcript?.byteLength ?? null,
+    transcript_sha256: transcript ? await sha256Hex(transcript) : null,
+  };
+}
+
 function assert(
   condition: unknown,
   message = "assertion failed",
@@ -768,4 +803,181 @@ Deno.test("Claude response-only batches use request identity conservatively", as
         "session:claude-primary:message:message-later-batch"
     ),
   );
+});
+
+Deno.test("legacy Claude Stop hooks close only with a collector-derived anchor", async () => {
+  const sessionId = "0e80d9f3-de3e-498d-91b1-18beb3790278";
+  const promptUuid = "1d1ab296-9746-4cca-bceb-768359d37b30";
+  const assistantUuid = "d6d138fa-1ec7-4991-828d-fb3d672db7de";
+  const hook = await claudeHookEnvelope({
+    dispatchEventName: "Stop",
+    nativeSessionId: sessionId,
+    terminalAssistantUuid: assistantUuid,
+    turnAnchorId: promptUuid,
+    payload: {
+      session_id: sessionId,
+      transcript_path: "/sanitized/0e80.jsonl",
+      cwd: "/repo",
+      permission_mode: "default",
+      hook_event_name: "Stop",
+      stop_hook_active: false,
+    },
+  });
+  const { manifest, source } = await fixture([hook]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "hook";
+  manifest.codex_version = null;
+  manifest.source_version = "2.0.59";
+  manifest.observed_native_session_id = sessionId;
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(normalizerVersionFor(manifest) === CLAUDE_NORMALIZER_VERSION);
+  assert(projection.session?.native_session_id === sessionId);
+  assert(projection.events.length === 1);
+  const completion = projection.events[0];
+  assert(completion.event_kind === "lifecycle");
+  assert(completion.event_subtype === "turn_complete");
+  assert(completion.turn_id === `claude:prompt:${promptUuid}`);
+  assert(completion.native_item_id === assistantUuid);
+  assert(
+    completion.logical_event_key ===
+      `claude:lifecycle:${assistantUuid}:turn_complete`,
+  );
+  assert(completion.content_sha256 === null);
+  assert(completion.content_excerpt === null);
+  assert(completion.attributes?.dispatch_event_name === "Stop");
+  assert(typeof completion.attributes?.payload_sha256 === "string");
+  assert(typeof completion.attributes?.transcript_sha256 === "string");
+});
+
+Deno.test("Claude SessionEnd is session evidence and never turn completion", async () => {
+  const sessionId = "0e80d9f3-de3e-498d-91b1-18beb3790278";
+  const hook = await claudeHookEnvelope({
+    dispatchEventName: "SessionEnd",
+    nativeSessionId: sessionId,
+    payload: {
+      session_id: sessionId,
+      transcript_path: "/sanitized/0e80.jsonl",
+      cwd: "/repo",
+      permission_mode: "default",
+      hook_event_name: "SessionEnd",
+      reason: "prompt_input_exit",
+    },
+  });
+  const { manifest, source } = await fixture([hook]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "hook";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = sessionId;
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(projection.events.length === 1);
+  assert(projection.events[0].event_subtype === "session_end");
+  assert(projection.events[0].turn_id === null);
+  assert(projection.events[0].native_item_id === null);
+  assert(projection.events[0].attributes?.reason === "prompt_input_exit");
+  assert(
+    !projection.events.some((event) => event.event_subtype === "turn_complete"),
+  );
+});
+
+Deno.test("legacy Claude Stop hooks stay unlinked without a verified prompt anchor", async () => {
+  const sessionId = "0e80d9f3-de3e-498d-91b1-18beb3790278";
+  const assistantUuid = "d6d138fa-1ec7-4991-828d-fb3d672db7de";
+  const hook = await claudeHookEnvelope({
+    dispatchEventName: "Stop",
+    nativeSessionId: sessionId,
+    terminalAssistantUuid: assistantUuid,
+    turnAnchorId: null,
+    payload: {
+      session_id: sessionId,
+      hook_event_name: "Stop",
+    },
+  });
+  const { manifest, source } = await fixture([hook]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "hook";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = sessionId;
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(projection.events[0].event_subtype === "response_complete_unlinked");
+  assert(projection.events[0].turn_id === null);
+  assert(projection.events[0].native_item_id === assistantUuid);
+});
+
+Deno.test("Claude hook projections reject tampered payloads and identity", async () => {
+  const sessionId = "0e80d9f3-de3e-498d-91b1-18beb3790278";
+  const promptUuid = "1d1ab296-9746-4cca-bceb-768359d37b30";
+  const assistantUuid = "d6d138fa-1ec7-4991-828d-fb3d672db7de";
+  const valid = await claudeHookEnvelope({
+    dispatchEventName: "Stop",
+    nativeSessionId: sessionId,
+    terminalAssistantUuid: assistantUuid,
+    turnAnchorId: promptUuid,
+    payload: {
+      session_id: sessionId,
+      hook_event_name: "Stop",
+      last_assistant_message: "Sanitized response",
+    },
+  });
+  const cases = [
+    { ...valid, payload_sha256: "0".repeat(64) },
+    { ...valid, dispatch_event_name: "SubagentStop" },
+    { ...valid, native_session_id: "wrong-session" },
+    { ...valid, turn_anchor_id: "not-a-uuid" },
+  ];
+  for (const hook of cases) {
+    const { manifest, source } = await fixture([hook]);
+    manifest.source_provider = "claude_code";
+    manifest.source_kind = "hook";
+    manifest.codex_version = null;
+    manifest.observed_native_session_id = sessionId;
+    const projection = await projectBatch(manifest, source);
+    assert(
+      projection.events.every((event) =>
+        event.event_subtype !== "turn_complete" && event.turn_id === null
+      ),
+      "untrusted hook fields must never close a turn",
+    );
+  }
+});
+
+Deno.test("Claude SubagentStop hooks anchor worker turns to the child session", async () => {
+  const parentSessionId = "0e80d9f3-de3e-498d-91b1-18beb3790278";
+  const agentId = "6b349eef-2637-45f9-bb0f-2cf02a9f9d60";
+  const promptUuid = "5bf222ad-299f-46c9-9d0f-9f0d54e12487";
+  const assistantUuid = "9684045b-c770-4ee0-b395-14d3e60b13d3";
+  const hook = await claudeHookEnvelope({
+    dispatchEventName: "SubagentStop",
+    nativeSessionId: agentId,
+    parentNativeSessionId: parentSessionId,
+    terminalAssistantUuid: assistantUuid,
+    turnAnchorId: promptUuid,
+    payload: {
+      session_id: parentSessionId,
+      agent_id: agentId,
+      agent_transcript_path: "/sanitized/agent.jsonl",
+      hook_event_name: "SubagentStop",
+      stop_hook_active: false,
+      last_assistant_message: "Sanitized worker result",
+    },
+  });
+  const { manifest, source } = await fixture([hook]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "hook";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = agentId;
+  manifest.observed_parent_native_session_id = parentSessionId;
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(projection.session?.actor_role === "worker");
+  assert(projection.session?.parent_native_session_id === parentSessionId);
+  assert(projection.events[0].actor_role === "worker");
+  assert(projection.events[0].event_subtype === "turn_complete");
+  assert(projection.events[0].turn_id === `claude:prompt:${promptUuid}`);
 });

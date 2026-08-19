@@ -40,12 +40,19 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _payload_from_stdin() -> dict[str, object]:
+def _payload_from_stdin() -> tuple[dict[str, object], bytes]:
+    source = getattr(sys.stdin, "buffer", sys.stdin)
     try:
-        value = json.load(sys.stdin)
+        raw = source.read()
+    except (OSError, UnicodeError):
+        return {}, b""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    try:
+        value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
+        return {}, raw
+    return (value if isinstance(value, dict) else {}), raw
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,9 +117,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(outcome), sort_keys=True))
         return 0 if not outcome.locked else 75
     if args.command == "hook":
+        payload, raw_payload = _payload_from_stdin()
         outcome = run_hook(
             args.event_name,
-            _payload_from_stdin(),
+            payload,
+            raw_payload=raw_payload,
             codex_home=source_home if args.provider == "codex" else None,
             claude_home=source_home if args.provider == "claude_code" else None,
             state_root=state_root,

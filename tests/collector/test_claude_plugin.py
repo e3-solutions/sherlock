@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import base64
 import gzip
+import hashlib
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from sherlock_collector.claude_hook import write_observation
 from sherlock_collector.discovery import discover_claude_transcripts
 from sherlock_collector.hook import run_hook
 
@@ -172,15 +174,16 @@ class ClaudePluginTests(unittest.TestCase):
                 "CLAUDE_CONFIG_DIR": str(claude_home),
                 "SHERLOCK_COLLECTOR_SOURCE": str(SOURCE),
             }
+            hook_input = json.dumps(
+                {
+                    "session_id": "session-detached",
+                    "transcript_path": str(transcript),
+                }
+            )
             started = time.monotonic()
             completed = subprocess.run(
                 [sys.executable, str(LAUNCHER), "Stop"],
-                input=json.dumps(
-                    {
-                        "session_id": "session-detached",
-                        "transcript_path": str(transcript),
-                    }
-                ),
+                input=hook_input,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -194,14 +197,36 @@ class ClaudePluginTests(unittest.TestCase):
             paths = []
             while time.monotonic() < deadline:
                 paths = list(pending.glob("*.json")) if pending.is_dir() else []
-                if paths:
+                if len(paths) >= 2:
                     break
                 time.sleep(0.02)
-            self.assertEqual(len(paths), 1)
-            item = json.loads(paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(len(paths), 2)
+            items = [
+                json.loads(path.read_text(encoding="utf-8")) for path in paths
+            ]
+            item = next(
+                value
+                for value in items
+                if value["manifest"]["source_kind"] == "transcript"
+            )
             self.assertEqual(item["manifest"]["source_provider"], "claude_code")
             stored = base64.b64decode(item["stored_payload_base64"], validate=True)
             self.assertEqual(gzip.decompress(stored), source)
+            hook = next(
+                value
+                for value in items
+                if value["manifest"]["source_kind"] == "hook"
+            )
+            hook_source = gzip.decompress(
+                base64.b64decode(
+                    hook["stored_payload_base64"], validate=True
+                )
+            )
+            observation = json.loads(hook_source)
+            self.assertEqual(
+                base64.b64decode(observation["payload_base64"]),
+                hook_input.encode(),
+            )
 
     def test_terminal_launcher_waits_for_asynchronous_transcript_tail(self):
         with TemporaryDirectory() as temporary:
@@ -240,14 +265,231 @@ class ClaudePluginTests(unittest.TestCase):
             paths = []
             while time.monotonic() < deadline:
                 paths = list(pending.glob("*.json")) if pending.is_dir() else []
-                if paths:
+                if len(paths) >= 2:
                     break
                 time.sleep(0.02)
-            self.assertEqual(len(paths), 1)
-            item = json.loads(paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(len(paths), 2)
+            items = [
+                json.loads(path.read_text(encoding="utf-8")) for path in paths
+            ]
+            item = next(
+                value
+                for value in items
+                if value["manifest"]["source_kind"] == "transcript"
+            )
             self.assertEqual(item["manifest"]["record_count"], 2)
             stored = base64.b64decode(item["stored_payload_base64"], validate=True)
             self.assertEqual(gzip.decompress(stored), first + partial + completed_tail)
+
+    def test_stop_spools_an_order_independent_immutable_hook_fact(self):
+        with TemporaryDirectory() as temporary:
+            claude_home = Path(temporary) / "claude"
+            transcript = claude_home / "projects" / "repo" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            session_id = "0e80d9f3-de3e-498d-91b1-18beb3790278"
+            prompt_uuid = "1d1ab296-9746-4cca-bceb-768359d37b30"
+            assistant_uuid = "d6d138fa-1ec7-4991-828d-fb3d672db7de"
+            source = (
+                json.dumps(
+                    {
+                        "parentUuid": None,
+                        "sessionId": session_id,
+                        "type": "user",
+                        "uuid": prompt_uuid,
+                        "message": {"role": "user", "content": "hello"},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "parentUuid": prompt_uuid,
+                        "sessionId": session_id,
+                        "type": "assistant",
+                        "uuid": assistant_uuid,
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "done"}],
+                            "stop_reason": None,
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+            transcript.write_bytes(source)
+            payload = {
+                "session_id": session_id,
+                "transcript_path": str(transcript),
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+                "last_assistant_message": "done",
+            }
+            raw_payload = json.dumps(payload, separators=(",", ":")).encode()
+            state_root = claude_home / "sherlock" / "telemetry"
+
+            with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+                initial = run_hook(
+                    "PostToolUse",
+                    payload,
+                    provider="claude_code",
+                    claude_home=claude_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                terminal = run_hook(
+                    "Stop",
+                    payload,
+                    raw_payload=raw_payload,
+                    provider="claude_code",
+                    claude_home=claude_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertEqual(initial.enqueued, 1)
+            self.assertEqual(terminal.enqueued, 1)
+            pending = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (state_root / "queue" / "pending").glob("*.json")
+            ]
+            self.assertEqual(len(pending), 2)
+            hook = next(
+                item
+                for item in pending
+                if item["manifest"]["source_kind"] == "hook"
+            )
+            self.assertEqual(
+                hook["manifest"]["observed_native_session_id"], session_id
+            )
+            self.assertIsNone(
+                hook["manifest"]["observed_parent_native_session_id"]
+            )
+            stored = base64.b64decode(
+                hook["stored_payload_base64"], validate=True
+            )
+            observation = json.loads(gzip.decompress(stored))
+            self.assertEqual(observation["type"], "claude_hook")
+            self.assertEqual(
+                observation["schema_version"], "sherlock.claude-hook.v1"
+            )
+            self.assertEqual(
+                base64.b64decode(observation["payload_base64"]), raw_payload
+            )
+            self.assertEqual(observation["native_session_id"], session_id)
+            self.assertEqual(observation["turn_anchor_id"], prompt_uuid)
+            self.assertEqual(
+                observation["terminal_assistant_uuid"], assistant_uuid
+            )
+            self.assertEqual(observation["transcript_byte_count"], len(source))
+            self.assertEqual(
+                observation["transcript_sha256"],
+                hashlib.sha256(source).hexdigest(),
+            )
+            self.assertNotIn("transcript_path", observation)
+            self.assertNotIn("transcript", observation)
+            self.assertEqual(popen.call_count, 2)
+
+    def test_legacy_stop_payload_anchors_only_the_final_non_tool_assistant(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            transcript = claude_home / "projects" / "repo" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            session_id = "0e80d9f3-de3e-498d-91b1-18beb3790278"
+            prompt_uuid = "1d1ab296-9746-4cca-bceb-768359d37b30"
+            assistant_uuid = "d6d138fa-1ec7-4991-828d-fb3d672db7de"
+            records = [
+                {
+                    "parentUuid": None,
+                    "sessionId": session_id,
+                    "type": "user",
+                    "uuid": prompt_uuid,
+                    "message": {"role": "user", "content": "hello"},
+                },
+                {
+                    "parentUuid": prompt_uuid,
+                    "sessionId": session_id,
+                    "type": "assistant",
+                    "uuid": assistant_uuid,
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "done"}],
+                        "stop_reason": None,
+                    },
+                },
+            ]
+            source = b"".join(
+                (
+                    json.dumps(record, separators=(",", ":")) + "\n"
+                ).encode()
+                for record in records
+            )
+            transcript.write_bytes(source)
+            payload = {
+                "cwd": str(root),
+                "hook_event_name": "Stop",
+                "permission_mode": "default",
+                "session_id": session_id,
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            }
+            raw_payload = json.dumps(payload, separators=(",", ":")).encode()
+
+            path = write_observation(
+                root / "state",
+                "Stop",
+                payload,
+                raw_payload,
+                transcript_path=transcript,
+            )
+            observation = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(observation["turn_anchor_id"], prompt_uuid)
+            self.assertEqual(
+                observation["terminal_assistant_uuid"], assistant_uuid
+            )
+            self.assertEqual(
+                base64.b64decode(observation["payload_base64"]), raw_payload
+            )
+
+            records.append(
+                {
+                    "parentUuid": assistant_uuid,
+                    "sessionId": session_id,
+                    "type": "assistant",
+                    "uuid": "6b799f2b-720a-4be2-9abf-a9e575893e0c",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "using a tool"},
+                            {
+                                "type": "tool_use",
+                                "id": "tool-1",
+                                "name": "Read",
+                            },
+                        ],
+                    },
+                }
+            )
+            transcript.write_bytes(
+                b"".join(
+                    (
+                        json.dumps(record, separators=(",", ":")) + "\n"
+                    ).encode()
+                    for record in records
+                )
+            )
+            rejected_path = write_observation(
+                root / "state",
+                "Stop",
+                payload,
+                raw_payload,
+                transcript_path=transcript,
+            )
+            rejected = json.loads(rejected_path.read_text(encoding="utf-8"))
+            self.assertIsNone(rejected["turn_anchor_id"])
+            self.assertIsNone(rejected["terminal_assistant_uuid"])
 
     def test_manual_claude_capture_uses_transcript_contract(self):
         with TemporaryDirectory() as temporary:

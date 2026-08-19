@@ -23,7 +23,10 @@ VERSION_HINT_BYTES = 128
 MAX_RECORDS = 20_000
 MAX_SOURCE_BYTES = 5 * 1024 * 1024
 MAX_STORED_BYTES = 6 * 1024 * 1024
-SOURCE_KINDS = {"codex": "rollout", "claude_code": "transcript"}
+SOURCE_KINDS = {
+    "codex": frozenset({"rollout"}),
+    "claude_code": frozenset({"transcript", "hook"}),
+}
 
 
 class ContractError(ValueError):
@@ -246,7 +249,7 @@ class BatchManifest:
             raise ContractError("unsupported contract_version")
         if self.source_provider not in SOURCE_KINDS:
             raise ContractError("source_provider is unsupported")
-        if self.source_kind != SOURCE_KINDS[self.source_provider]:
+        if self.source_kind not in SOURCE_KINDS[self.source_provider]:
             raise ContractError("source_kind does not match source_provider")
         if self.storage_encoding != "gzip":
             raise ContractError("the stable rollout encoding must be gzip")

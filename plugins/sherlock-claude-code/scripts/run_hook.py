@@ -49,9 +49,13 @@ def capture(event_name: str) -> int:
         os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")
     ).expanduser().resolve()
     if event_name in TERMINAL_EVENTS:
-        payload_text = sys.stdin.read()
+        source_input = getattr(sys.stdin, "buffer", sys.stdin)
+        payload_bytes = source_input.read()
+        if isinstance(payload_bytes, str):
+            payload_bytes = payload_bytes.encode("utf-8")
+        payload_text = payload_bytes.decode("utf-8", errors="replace")
         _wait_for_terminal_transcripts(claude_home, payload_text)
-        sys.stdin = io.StringIO(payload_text)
+        sys.stdin = io.TextIOWrapper(io.BytesIO(payload_bytes), encoding="utf-8")
     arguments = [
         "--provider",
         "claude_code",
