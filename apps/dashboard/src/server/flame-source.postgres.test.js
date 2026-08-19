@@ -739,7 +739,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       }
 
       source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
-      const aggregate = await source.fetchUsageEvidence({ now: FIXED_NOW });
+      const aggregate = await source.fetchDay({ now: FIXED_NOW });
       const bucket = aggregate.people[0].buckets[bucketIndex(new Date(bucketStart))];
       const evidence = await source.fetchPromptEvidence({
         personId,
@@ -754,7 +754,6 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         "Also cover cancellation.",
       ]);
       expect(evidence.eligiblePromptCount).toBe(2);
-      expect(aggregate.nextCursor).toBeNull();
     } finally {
       if (source) await source.close();
       try {

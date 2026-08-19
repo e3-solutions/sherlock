@@ -10,8 +10,6 @@ import {
   INTERVAL_WORK_SQL,
   MAX_WORK_DETAIL_LIMIT,
   MCP_PROMPT_EVIDENCE_LIMIT,
-  MCP_PEOPLE_PAGE_SQL,
-  MCP_USAGE_SQL,
   PEOPLE_SQL,
   PREFERRED_DASHBOARD_EMAIL_DOMAIN,
   REPLACED_DASHBOARD_EMAIL_DOMAIN,
@@ -23,10 +21,8 @@ import {
   FlameSourceError,
   buildFlamePayload,
   decodeWorkCursor,
-  decodeUsageCursor,
   decodeSnapshotToken,
   encodeWorkCursor,
-  encodeUsageCursor,
   encodeSnapshotToken,
 } from "./flame-source.js";
 
@@ -508,15 +504,6 @@ describe("Sherlock Flame payload", () => {
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
   });
 
-  it("pages MCP usage before running the aggregate", () => {
-    expect(MCP_PEOPLE_PAGE_SQL).toContain("pe.id > $2::uuid");
-    expect(MCP_PEOPLE_PAGE_SQL).toContain("order by pe.id");
-    expect(MCP_USAGE_SQL).toContain("pe.id = any($6::uuid[])");
-    expect(MCP_USAGE_SQL).toContain(
-      "s.person_id in (select person_id from roster)",
-    );
-  });
-
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
     expect(ASSISTANT_REPRESENTATION_MATCH_SECONDS).toBe(3);
     for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
@@ -800,9 +787,4 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
-  it("round-trips usage keyset cursors", () => {
-    const personId = "22222222-2222-4222-8222-222222222222";
-    expect(decodeUsageCursor(encodeUsageCursor(personId))).toBe(personId);
-    expect(() => decodeUsageCursor("u1.not+base64")).toThrow(FlameSourceError);
-  });
 });

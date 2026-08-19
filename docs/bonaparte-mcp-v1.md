@@ -19,8 +19,12 @@ Input is an optional opaque keyset cursor:
 { "cursor": "nextCursor from the preceding page" }
 ```
 
-The database selects at most 20 people before running the 24-hour aggregate.
-Each page has its own snapshot and window.
+The service eagerly computes one canonical 24-hour aggregate for the dashboard
+and keyset-pages that cached snapshot at 20 people per MCP response.
+This keeps the multi-second aggregate off the request path without changing its
+facts or snapshot receipt. A delayed refresh leaves the last-good snapshot on the
+request path while retrying in the background. A refresh may advance the snapshot
+between page calls; every response declares the exact window and `readAt` it used.
 
 ```json
 {

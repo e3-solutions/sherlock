@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MCP_TOKEN_MIN_LENGTH, createMcpHttpRoute } from "./mcp-http.js";
 import { createBonaparteMcpProtocol } from "./mcp-server.js";
+import { createCachedMcpSource } from "./mcp-source.js";
 
 const openClients = [];
 const openServers = [];
@@ -25,24 +26,28 @@ describe("Bonaparte MCP protocol", () => {
     const buckets = Array.from({ length: 144 }, () => [0, 0, 0, 0]);
     buckets[2] = [1, 0, 0, 1];
     const token = "t".repeat(MCP_TOKEN_MIN_LENGTH);
-    const source = {
-      fetchUsageEvidence: vi.fn().mockResolvedValue({
-        start: "2026-08-18T03:30:00.000Z",
-        read: "2026-08-19T03:30:08.000Z",
-        snapshot: "v1.snapshot",
-        nextCursor: null,
-        coverage: {
-          evidence: "observed_events",
-          state: "partial",
-          reason: "event_presence_not_continuous_attention",
+    const cache = {
+      read: vi.fn().mockResolvedValue({
+        state: "hit",
+        payload: {
+          start: "2026-08-18T03:30:00.000Z",
+          read: "2026-08-19T03:30:08.000Z",
+          snapshot: "v1.snapshot",
+          coverage: {
+            evidence: "observed_events",
+            state: "partial",
+            reason: "event_presence_not_continuous_attention",
+          },
+          people: [{
+            id: personId,
+            name: "Ada",
+            total: [1, 0, 0],
+            buckets,
+          }],
         },
-        people: [{
-          id: personId,
-          name: "Ada",
-          total: [1, 0, 0],
-          buckets,
-        }],
       }),
+    };
+    const directSource = {
       fetchPromptEvidence: vi.fn().mockResolvedValue({
         personId,
         start: bucketStart,
@@ -54,6 +59,7 @@ describe("Bonaparte MCP protocol", () => {
         }],
       }),
     };
+    const source = createCachedMcpSource({ cache, source: directSource });
     const protocol = createBonaparteMcpProtocol(source);
     openProtocols.push(protocol);
     const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token });
@@ -85,6 +91,9 @@ describe("Bonaparte MCP protocol", () => {
     expect(result.structuredContent).toMatchObject({
       schemaVersion: "bonaparte.usage-evidence.v1",
       people: [{ personId, promptBuckets: [{ start: bucketStart }] }],
+    });
+    expect(cache.read).toHaveBeenCalledWith({
+      signal: undefined,
     });
     const promptResult = await client.callTool({
       name: "list_prompt_evidence",
