@@ -171,6 +171,114 @@ Deno.test("completed turn and paired tool retain deterministic evidence", () => 
   assert(tool.span_key.includes("call-1"));
 });
 
+Deno.test("Claude prompt identity reduces reasoning and tools into one turn", () => {
+  const turnId = "claude:prompt:prompt-1";
+  const events = [
+    event(1, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "message",
+      event_subtype: "user_message",
+      message_origin: "human",
+      turn_id: turnId,
+      logical_event_key: "claude:message:user-1",
+    }),
+    event(2, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "reasoning",
+      event_subtype: "thinking",
+      turn_id: turnId,
+      logical_event_key: "claude:reasoning:thinking-record-1:block:0",
+    }),
+    event(3, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "tool_call",
+      event_subtype: "tool_use",
+      turn_id: turnId,
+      tool_call_id: "tool-1",
+    }),
+    event(4, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "tool_result",
+      event_subtype: "tool_result",
+      turn_id: turnId,
+      tool_call_id: "tool-1",
+    }),
+    event(5, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "message",
+      event_subtype: "message",
+      message_origin: "unknown",
+      turn_id: turnId,
+      logical_event_key: "claude:message:answer-1",
+    }),
+    event(6, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "lifecycle",
+      event_subtype: "turn_complete",
+      turn_id: turnId,
+    }),
+  ];
+
+  const spans = reduceActivity(SESSION, events);
+  const turn = spans.find((span) => span.activity_kind === "turn");
+  const tool = spans.find((span) => span.activity_kind === "tool");
+  assert(turn);
+  assertEquals({
+    start: turn.start_event_id,
+    end: turn.end_event_id,
+    basis: turn.timing_basis,
+    estimatedStart: turn.estimated_start,
+    estimatedEnd: turn.estimated_end,
+  }, {
+    start: 1n,
+    end: 6n,
+    basis: "paired_events",
+    estimatedStart: true,
+    estimatedEnd: true,
+  });
+  assert(tool);
+  assertEquals(
+    [tool.start_event_id, tool.end_event_id],
+    [3n, 4n],
+  );
+});
+
+Deno.test("a response-only Claude request remains a conservative open turn", () => {
+  const turnId = "claude:request:request-later-batch";
+  const spans = reduceActivity(SESSION, [
+    event(1, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "reasoning",
+      event_subtype: "thinking",
+      turn_id: turnId,
+      logical_event_key: "claude:reasoning:thinking-later-batch:block:0",
+    }),
+    event(2, {
+      normalizer_version: "sherlock.claude-code-transcript.v1",
+      event_kind: "message",
+      event_subtype: "message",
+      message_origin: "unknown",
+      turn_id: turnId,
+      logical_event_key: "claude:message:answer-later-batch",
+    }),
+  ]);
+
+  assertEquals(spans.length, 1);
+  assertEquals({
+    kind: spans[0].activity_kind,
+    state: spans[0].span_state,
+    basis: spans[0].timing_basis,
+    start: spans[0].start_event_id,
+    end: spans[0].end_event_id,
+  }, {
+    kind: "turn",
+    state: "detected_open",
+    basis: "provisional",
+    start: 1n,
+    end: null,
+  });
+});
+
 Deno.test("open, unpaired, missing, and out-of-order evidence stays conservative", () => {
   const spans = reduceActivity(SESSION, [
     event(1, {

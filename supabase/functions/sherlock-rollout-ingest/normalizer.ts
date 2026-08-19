@@ -52,6 +52,7 @@ export interface EventProjection {
   occurred_at: string | null;
   observed_at: string | null;
   native_item_id: string | null;
+  parent_native_item_id: string | null;
   turn_id: string | null;
   tool_call_id: string | null;
   message_role: string | null;
@@ -220,9 +221,15 @@ async function projectClaudeBatch(
   const canonicalScopeKey = session
     ? `session:${session.native_session_id}`
     : `stream:${manifest.source_stream_key}`;
+  const turnIds = claudeTurnIds(records);
   const projected = await Promise.all(
     records.map((record) =>
-      projectClaudeRecord(record, session, canonicalScopeKey)
+      projectClaudeRecord(
+        record,
+        session,
+        canonicalScopeKey,
+        turnIds.get(record.locator.record_index) ?? null,
+      )
     ),
   );
   return { session, events: projected.flat() };
@@ -232,6 +239,7 @@ async function projectClaudeRecord(
   record: ParsedRecord,
   session: SessionProjection | null,
   canonicalScopeKey: string,
+  turnId: string | null,
 ): Promise<EventProjection[]> {
   const { locator, envelope } = record;
   const message = objectValue(envelope?.message);
@@ -249,7 +257,9 @@ async function projectClaudeRecord(
     occurred_at: locator.occurred_at,
     observed_at: locator.occurred_at,
     native_item_id: stringValue(envelope?.uuid) ?? stringValue(message?.id),
-    turn_id: null,
+    parent_native_item_id: stringValue(envelope?.parentUuid) ??
+      stringValue(envelope?.parent_uuid),
+    turn_id: turnId,
     tool_call_id: null,
     message_role: null,
     message_origin: null,
@@ -278,15 +288,25 @@ async function projectClaudeRecord(
     return [{ ...base, error_code: `native_${locator.parse_status}` }];
   }
   if ((nativeType !== "user" && nativeType !== "assistant") || !message) {
+    const nativeSubtype = stringValue(envelope.subtype);
+    const turnComplete = nativeType === "system" &&
+      nativeSubtype === "turn_duration";
     return [{
       ...base,
       event_kind: nativeType === "system" || nativeType === "progress"
         ? "lifecycle"
         : "unknown",
+      event_subtype: turnComplete
+        ? "turn_complete"
+        : nativeSubtype ?? base.event_subtype,
+      attributes: turnComplete ? durationAttributes(envelope.durationMs) : null,
     }];
   }
 
   const role = stringValue(message.role) ?? nativeType;
+  const messageId = stringValue(message.id);
+  const stopReason = stringValue(message.stop_reason) ??
+    stringValue(message.stopReason);
   const content = message.content;
   const events: EventProjection[] = [];
   const text = messageText(content);
@@ -296,21 +316,29 @@ async function projectClaudeRecord(
       ...(await messageFields(text)),
       projection_index: events.length,
       event_kind: "message",
-      event_subtype: nativeType,
+      event_subtype: nativeType === "user" ? "user_message" : "message",
       message_role: role,
-      message_origin: role === "user"
-        ? (base.actor_role === "primary" ? "human" : "parent_agent")
-        : assistantMessageOrigin(base.actor_role),
+      message_origin: claudeMessageOrigin(envelope, role, base.actor_role),
       logical_event_key: base.native_item_id
         ? `claude:message:${base.native_item_id}`
         : null,
     });
   }
   if (Array.isArray(content)) {
-    for (const item of content) {
+    for (const [blockIndex, item] of content.entries()) {
       const block = objectValue(item);
       const blockType = stringValue(block?.type);
-      if (blockType === "tool_use") {
+      if (blockType === "thinking" || blockType === "redacted_thinking") {
+        events.push({
+          ...base,
+          projection_index: events.length,
+          event_kind: "reasoning",
+          event_subtype: blockType,
+          logical_event_key: base.native_item_id
+            ? `claude:reasoning:${base.native_item_id}:block:${blockIndex}`
+            : null,
+        });
+      } else if (blockType === "tool_use") {
         events.push({
           ...base,
           projection_index: events.length,
@@ -339,9 +367,24 @@ async function projectClaudeRecord(
       projection_index: events.length,
       event_kind: "usage",
       event_subtype: "message_usage",
-      usage_stream_key: canonicalScopeKey,
+      usage_stream_key: messageId
+        ? `${canonicalScopeKey}:message:${messageId}`
+        : canonicalScopeKey,
       usage_scope: "message",
       usage_is_cumulative: false,
+      logical_event_key: messageId ? `claude:usage:${messageId}` : null,
+      source_priority: stopReason === null ? base.source_priority : 110,
+    });
+  }
+  if (stopReason !== null && stopReason !== "tool_use") {
+    events.push({
+      ...base,
+      projection_index: events.length,
+      event_kind: "lifecycle",
+      event_subtype: "turn_complete",
+      logical_event_key: base.native_item_id
+        ? `claude:lifecycle:${base.native_item_id}:turn_complete`
+        : null,
     });
   }
   return events.length ? events : [{
@@ -349,6 +392,85 @@ async function projectClaudeRecord(
     event_kind: "ignored",
     event_subtype: `${nativeType}:empty_content`,
   }];
+}
+
+function claudeTurnIds(records: readonly ParsedRecord[]): Map<number, string> {
+  const byUuid = new Map<string, JsonObject>();
+  for (const record of records) {
+    const envelope = record.envelope;
+    const uuid = stringValue(envelope?.uuid);
+    if (uuid && envelope) byUuid.set(uuid, envelope);
+  }
+  const memo = new Map<JsonObject, string | null>();
+  const resolve = (
+    envelope: JsonObject,
+    visiting = new Set<JsonObject>(),
+  ): string | null => {
+    if (memo.has(envelope)) return memo.get(envelope) ?? null;
+    const promptId = stringValue(envelope.promptId) ??
+      stringValue(envelope.prompt_id);
+    if (promptId) {
+      const value = `claude:prompt:${promptId}`;
+      memo.set(envelope, value);
+      return value;
+    }
+    if (visiting.has(envelope)) return null;
+    visiting.add(envelope);
+    const parentUuid = stringValue(envelope.parentUuid) ??
+      stringValue(envelope.parent_uuid);
+    const parent = parentUuid ? byUuid.get(parentUuid) : undefined;
+    const inherited = parent ? resolve(parent, visiting) : null;
+    visiting.delete(envelope);
+    if (inherited) {
+      memo.set(envelope, inherited);
+      return inherited;
+    }
+    const requestId = stringValue(envelope.requestId) ??
+      stringValue(envelope.request_id);
+    if (requestId) {
+      const value = `claude:request:${requestId}`;
+      memo.set(envelope, value);
+      return value;
+    }
+    const message = objectValue(envelope.message);
+    const content = message?.content;
+    const isSubmittedUserMessage = stringValue(envelope.type) === "user" &&
+      envelope.isMeta !== true && messageText(content) !== null &&
+      !hasContentBlock(content, "tool_result");
+    const uuid = stringValue(envelope.uuid);
+    const fallback = isSubmittedUserMessage && uuid
+      ? `claude:prompt:${uuid}`
+      : null;
+    memo.set(envelope, fallback);
+    return fallback;
+  };
+
+  return new Map(records.flatMap((record) => {
+    const turnId = record.envelope ? resolve(record.envelope) : null;
+    return turnId === null
+      ? []
+      : [[record.locator.record_index, turnId] as const];
+  }));
+}
+
+function hasContentBlock(content: unknown, type: string): boolean {
+  return Array.isArray(content) &&
+    content.some((item) => stringValue(objectValue(item)?.type) === type);
+}
+
+function durationAttributes(value: unknown): JsonObject | null {
+  const durationMs = nonNegativeInteger(value);
+  return durationMs === null ? null : { duration_ms: durationMs };
+}
+
+function claudeMessageOrigin(
+  envelope: JsonObject,
+  role: string,
+  actorRole: ActorRole,
+): "human" | "parent_agent" | "system" | "worker" | "unknown" {
+  if (role !== "user") return assistantMessageOrigin(actorRole);
+  if (envelope.isMeta === true) return "system";
+  return actorRole === "primary" ? "human" : "parent_agent";
 }
 
 function claudeUsage(
@@ -403,6 +525,7 @@ async function projectRecord(
     occurred_at: locator.occurred_at,
     observed_at: locator.occurred_at,
     native_item_id: stringValue(payload?.id),
+    parent_native_item_id: null,
     turn_id: stringValue(payload?.turn_id),
     tool_call_id: stringValue(payload?.call_id),
     message_role: null,

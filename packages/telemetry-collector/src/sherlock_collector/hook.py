@@ -67,8 +67,9 @@ def capture_and_spawn_drain(
     priority_count: int = 0,
 ) -> CaptureResult:
     """Durably capture local bytes, then detach a drain without awaiting network."""
+    outcome: CaptureResult | None = None
     try:
-        return capturer.capture(
+        outcome = capturer.capture(
             rollout_paths,
             native_session_ids=native_session_ids,
             parent_native_session_ids=parent_native_session_ids,
@@ -76,23 +77,32 @@ def capture_and_spawn_drain(
             priority_count=priority_count,
         )
     finally:
-        try:
-            subprocess.Popen(
-                list(drain_command),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                close_fds=True,
-                env=(
-                    dict(drain_environment)
-                    if drain_environment is not None
-                    else None
-                ),
-            )
-        except OSError:
-            # Capture is already durable. A later hook is a recovery signal.
-            pass
+        # A concurrent capture winner already starts its own drain. Avoid a
+        # process fan-out when tool-heavy sessions trigger overlapping hooks.
+        queued_work = bool(capturer.spool.list_pending()) or any(
+            capturer.spool.processing.glob("*.json")
+        )
+        if outcome is None or (
+            not outcome.locked and (outcome.enqueued > 0 or queued_work)
+        ):
+            try:
+                subprocess.Popen(
+                    list(drain_command),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                    env=(
+                        dict(drain_environment)
+                        if drain_environment is not None
+                        else None
+                    ),
+                )
+            except OSError:
+                # Capture is already durable. A later hook is a recovery signal.
+                pass
+    return outcome
 
 
 def run_hook(

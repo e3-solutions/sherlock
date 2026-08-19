@@ -6,6 +6,8 @@ import {
 } from "./contract.ts";
 import {
   type ActorRole,
+  CLAUDE_NORMALIZER_VERSION,
+  type EventProjection,
   normalizerVersionFor,
   projectBatch,
   type SessionProjection,
@@ -107,7 +109,16 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
       const normalizedSession = projection.session
         ? await upsertSession(tx, receipt, projection.session)
         : null;
-      const events = projection.events.map((event) => ({
+      const projectedEvents = normalizedSession &&
+          normalizerVersion === CLAUDE_NORMALIZER_VERSION
+        ? await rebindClaudePromptTurns(
+          tx,
+          receipt.workspace_id,
+          normalizedSession.id,
+          projection.events,
+        )
+        : projection.events;
+      const events = projectedEvents.map((event) => ({
         workspace_id: receipt.workspace_id,
         session_id: normalizedSession?.id ?? null,
         source_record_id: sourceRecords[event.record_index].id,
@@ -187,6 +198,58 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
       };
     });
   }
+}
+
+async function rebindClaudePromptTurns(
+  tx: TransactionSql,
+  workspaceId: string,
+  sessionId: string,
+  events: readonly EventProjection[],
+): Promise<EventProjection[]> {
+  const referencedParents = [
+    ...new Set(
+      events.flatMap((event) =>
+        event.turn_id?.startsWith("claude:request:") &&
+          event.parent_native_item_id
+          ? [event.parent_native_item_id]
+          : []
+      ),
+    ),
+  ];
+  const prior = referencedParents.length === 0 ? [] : await tx.unsafe(
+    `select distinct on (native_item_id) native_item_id, turn_id
+         from telemetry.events
+        where workspace_id = $1 and session_id = $2
+          and normalizer_version = $3 and not is_replay
+          and native_item_id = any($4::text[])
+          and turn_id like 'claude:prompt:%'
+        order by native_item_id, source_priority desc,
+                 occurred_at asc nulls last, id`,
+    [
+      workspaceId,
+      sessionId,
+      CLAUDE_NORMALIZER_VERSION,
+      referencedParents,
+    ],
+  );
+  const promptTurnByNativeItem = new Map<string, string>(
+    prior.map((row) => [String(row.native_item_id), String(row.turn_id)]),
+  );
+
+  return events.map((event) => {
+    const inherited = event.parent_native_item_id
+      ? promptTurnByNativeItem.get(event.parent_native_item_id)
+      : undefined;
+    const turnId = inherited && event.turn_id?.startsWith("claude:request:")
+      ? inherited
+      : event.turn_id;
+    if (
+      event.native_item_id && turnId?.startsWith("claude:prompt:")
+    ) {
+      promptTurnByNativeItem.set(event.native_item_id, turnId);
+    }
+    return turnId === event.turn_id ? event : { ...event, turn_id: turnId };
+  });
 }
 
 async function upsertSession(

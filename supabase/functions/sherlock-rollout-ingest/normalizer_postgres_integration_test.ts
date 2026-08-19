@@ -1,4 +1,6 @@
 import postgres from "npm:postgres@3.4.7";
+import { PostgresActivityReducer } from "../sherlock-activity-reducer/postgres.ts";
+import { CLAUDE_NORMALIZER_VERSION } from "./normalizer.ts";
 import {
   type BatchManifest,
   type CommittedReceipt,
@@ -28,6 +30,11 @@ interface BatchFixture {
   manifest: BatchManifest;
   source: Uint8Array;
 }
+
+type ClaudeNativeRecord = Record<string, unknown> & {
+  type: string;
+  timestamp: string;
+};
 
 async function seedBatch(
   sql: ReturnType<typeof postgres>,
@@ -162,6 +169,217 @@ async function seedBatch(
   return { receipt, manifest, source };
 }
 
+async function seedClaudeBatch(
+  sql: ReturnType<typeof postgres>,
+  input: {
+    workspaceId: string;
+    personId: string;
+    collectorKey: string;
+    nativeSessionId: string;
+    parentNativeSessionId?: string;
+    nativeRecords?: ClaudeNativeRecord[];
+  },
+): Promise<BatchFixture> {
+  const batchId = crypto.randomUUID();
+  const promptId = `prompt-${input.nativeSessionId}`;
+  const sessionId = input.parentNativeSessionId ?? input.nativeSessionId;
+  const providerFields = input.parentNativeSessionId
+    ? {
+      agentId: input.nativeSessionId,
+      isSidechain: true,
+    }
+    : {};
+  const terminalUsage = {
+    input_tokens: 8,
+    cache_read_input_tokens: 2,
+    output_tokens: 3,
+  };
+  const partialUsage = { ...terminalUsage, output_tokens: 1 };
+  const native: ClaudeNativeRecord[] = input.nativeRecords ?? [
+    {
+      ...providerFields,
+      sessionId,
+      promptId,
+      type: "user",
+      uuid: `${input.nativeSessionId}-user`,
+      parentUuid: null,
+      timestamp: "2026-08-17T00:00:00.000Z",
+      message: { role: "user", content: "Sanitized Claude prompt" },
+    },
+    {
+      ...providerFields,
+      sessionId,
+      type: "assistant",
+      uuid: `${input.nativeSessionId}-thinking`,
+      parentUuid: `${input.nativeSessionId}-user`,
+      requestId: `${input.nativeSessionId}-request`,
+      timestamp: "2026-08-17T00:00:01.000Z",
+      message: {
+        id: `${input.nativeSessionId}-message`,
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{ type: "thinking", thinking: "not projected" }],
+        usage: partialUsage,
+      },
+    },
+    {
+      ...providerFields,
+      sessionId,
+      type: "assistant",
+      uuid: `${input.nativeSessionId}-answer`,
+      parentUuid: `${input.nativeSessionId}-thinking`,
+      requestId: `${input.nativeSessionId}-request`,
+      timestamp: "2026-08-17T00:00:02.000Z",
+      message: {
+        id: `${input.nativeSessionId}-message`,
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{ type: "text", text: "Sanitized Claude answer" }],
+        stop_reason: "end_turn",
+        usage: terminalUsage,
+      },
+    },
+    {
+      ...providerFields,
+      sessionId,
+      promptId,
+      type: "system",
+      subtype: "turn_duration",
+      uuid: `${input.nativeSessionId}-duration`,
+      parentUuid: `${input.nativeSessionId}-answer`,
+      durationMs: 2_000,
+      timestamp: "2026-08-17T00:00:03.000Z",
+    },
+  ];
+  const encoder = new TextEncoder();
+  const lines = native.map((record) =>
+    encoder.encode(`${JSON.stringify(record)}\n`)
+  );
+  const source = new Uint8Array(
+    lines.reduce((total, line) => total + line.byteLength, 0),
+  );
+  const records: BatchManifest["records"] = [];
+  let offset = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    source.set(line, offset);
+    records.push({
+      record_index: index,
+      source_start_offset: offset,
+      source_end_offset: offset + line.byteLength,
+      record_sha256: await sha256Hex(line),
+      native_type: native[index].type,
+      native_payload_type: null,
+      occurred_at: native[index].timestamp,
+      parse_status: "ok",
+    });
+    offset += line.byteLength;
+  }
+  const sourceSha256 = await sha256Hex(source);
+  const storagePath = `normalizer-integration/${batchId}.jsonl.gz`;
+  const sourceStreamKey = `stream-${batchId}`;
+  const generationKey = `generation-${batchId}`;
+  const manifest: BatchManifest = {
+    contract_version: CONTRACT_VERSION,
+    source_provider: "claude_code",
+    source_kind: "transcript",
+    source_stream_key: sourceStreamKey,
+    generation_key: generationKey,
+    generation_seq: 0,
+    start_offset: 0,
+    end_offset: source.byteLength,
+    source_byte_count: source.byteLength,
+    source_sha256: sourceSha256,
+    storage_encoding: "gzip",
+    stored_byte_count: 1,
+    stored_sha256: "b".repeat(64),
+    record_count: records.length,
+    records,
+    observed_native_session_id: input.nativeSessionId,
+    observed_parent_native_session_id: input.parentNativeSessionId ?? null,
+    first_occurred_at: native[0].timestamp,
+    last_occurred_at: native.at(-1)!.timestamp,
+    codex_version: null,
+    source_version: "2.0.59",
+    collector_version: "integration-test",
+  };
+  const receipt: CommittedReceipt = {
+    receipt_version: RECEIPT_VERSION,
+    status: "committed",
+    batch_id: batchId,
+    workspace_id: input.workspaceId,
+    person_id: input.personId,
+    collector_key: input.collectorKey,
+    source_kind: "transcript",
+    source_stream_key: sourceStreamKey,
+    generation_key: generationKey,
+    generation_seq: 0,
+    start_offset: 0,
+    end_offset: source.byteLength,
+    source_byte_count: source.byteLength,
+    source_sha256: sourceSha256,
+    storage_path: storagePath,
+    stored_byte_count: 1,
+    stored_sha256: "b".repeat(64),
+    record_count: records.length,
+    contract_version: CONTRACT_VERSION,
+    committed_at: native.at(-1)!.timestamp,
+  };
+  await sql.unsafe(
+    `insert into telemetry.ingest_batches (
+       id, workspace_id, person_id, collector_key,
+       observed_native_session_id, observed_parent_native_session_id,
+       source_provider, source_kind, source_stream_key, generation_key,
+       generation_seq, start_offset, end_offset, source_byte_count,
+       source_sha256, storage_path, storage_encoding, stored_byte_count,
+       stored_sha256, record_count, first_occurred_at, last_occurred_at,
+       source_version, collector_version, contract_version, committed_at
+     ) values (
+       $1, $2, $3, $4, $5, $6, 'claude_code', 'transcript', $7, $8,
+       0, 0, $9, $9, $10, $11, 'gzip', 1, $12, $13, $14, $15,
+       '2.0.59', 'integration-test', $16, $15
+     )`,
+    [
+      batchId,
+      input.workspaceId,
+      input.personId,
+      input.collectorKey,
+      input.nativeSessionId,
+      input.parentNativeSessionId ?? null,
+      sourceStreamKey,
+      generationKey,
+      source.byteLength,
+      sourceSha256,
+      storagePath,
+      "b".repeat(64),
+      records.length,
+      native[0].timestamp,
+      native.at(-1)!.timestamp,
+      CONTRACT_VERSION,
+    ],
+  );
+  for (const record of records) {
+    await sql.unsafe(
+      `insert into telemetry.native_records (
+         workspace_id, batch_id, record_index, source_start_offset,
+         source_end_offset, record_sha256, native_type, occurred_at,
+         parse_status
+       ) values ($1, $2, $3, $4, $5, $6, $7, $8, 'ok')`,
+      [
+        input.workspaceId,
+        batchId,
+        record.record_index,
+        record.source_start_offset,
+        record.source_end_offset,
+        record.record_sha256,
+        record.native_type,
+        record.occurred_at,
+      ],
+    );
+  }
+  return { receipt, manifest, source };
+}
+
 async function normalize(
   normalizer: PostgresBatchNormalizer,
   fixture: BatchFixture,
@@ -219,6 +437,7 @@ Deno.test({
     const sql = postgres(databaseUrl!, { prepare: false, max: 8 });
     const firstNormalizer = PostgresBatchNormalizer.connect(databaseUrl!);
     const secondNormalizer = PostgresBatchNormalizer.connect(databaseUrl!);
+    const reducer = PostgresActivityReducer.connect(databaseUrl!);
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
     const otherPersonId = crypto.randomUUID();
@@ -327,6 +546,234 @@ Deno.test({
         "concurrent-parent",
       );
 
+      const claudeChild = await seedClaudeBatch(sql, {
+        workspaceId,
+        personId,
+        collectorKey,
+        nativeSessionId: "claude-child",
+        parentNativeSessionId: "claude-parent",
+      });
+      const claudeParent = await seedClaudeBatch(sql, {
+        workspaceId,
+        personId,
+        collectorKey,
+        nativeSessionId: "claude-parent",
+      });
+      const claudeChildSessionId = await normalize(
+        firstNormalizer,
+        claudeChild,
+      );
+      await normalize(firstNormalizer, claudeParent);
+      await assertParentLink(
+        sql,
+        workspaceId,
+        collectorKey,
+        "claude-child",
+        "claude-parent",
+      );
+      const claudeSession = await sql.unsafe(
+        `select actor_role, parent_native_session_id
+           from telemetry.sessions
+          where workspace_id = $1 and id = $2`,
+        [workspaceId, claudeChildSessionId],
+      );
+      assert(claudeSession[0].actor_role === "worker");
+      assert(
+        claudeSession[0].parent_native_session_id === "claude-parent",
+      );
+      const claudeEvents = await sql.unsafe(
+        `select event_kind, event_subtype, turn_id, logical_event_key,
+                source_priority, output_tokens,
+                usage_stream_key, content_sha256, content_byte_size,
+                content_excerpt, attributes
+           from telemetry.events
+          where workspace_id = $1 and session_id = $2
+            and normalizer_version = $3
+          order by id`,
+        [workspaceId, claudeChildSessionId, CLAUDE_NORMALIZER_VERSION],
+      );
+      assert(
+        claudeEvents.some((event) =>
+          event.event_kind === "message" &&
+          event.event_subtype === "user_message" &&
+          event.turn_id === "claude:prompt:prompt-claude-child"
+        ),
+        "Claude user messages must use provider-neutral semantics",
+      );
+      const reasoning = claudeEvents.find((event) =>
+        event.event_kind === "reasoning"
+      );
+      assert(reasoning, "Claude thinking must produce structural evidence");
+      assert(
+        reasoning.content_sha256 === null &&
+          reasoning.content_byte_size === null &&
+          reasoning.content_excerpt === null && reasoning.attributes === null,
+        "Claude reasoning content must not enter derived database columns",
+      );
+      const usage = claudeEvents.filter((event) =>
+        event.event_kind === "usage"
+      );
+      assert(usage.length === 2, "raw usage projections remain auditable");
+      assert(
+        new Set(usage.map((event) => event.logical_event_key)).size === 1 &&
+          new Set(usage.map((event) => event.usage_stream_key)).size === 1,
+        "repeated Claude usage must share one canonical message identity",
+      );
+      assert(
+        usage.some((event) =>
+          event.source_priority === 110 && Number(event.output_tokens) === 3
+        ),
+        "the terminal Claude usage snapshot must win canonical selection",
+      );
+      assert(
+        claudeEvents.some((event) =>
+          event.event_kind === "lifecycle" &&
+          event.event_subtype === "turn_complete" &&
+          event.turn_id === "claude:prompt:prompt-claude-child"
+        ),
+        "Claude native turn duration must close the projected prompt turn",
+      );
+
+      const crossBatchSession = "claude-cross-batch";
+      const crossBatchPrompt = await seedClaudeBatch(sql, {
+        workspaceId,
+        personId,
+        collectorKey,
+        nativeSessionId: crossBatchSession,
+        nativeRecords: [{
+          sessionId: crossBatchSession,
+          type: "user",
+          uuid: "cross-batch-user",
+          parentUuid: null,
+          timestamp: "2026-08-17T01:00:00.000Z",
+          message: { role: "user", content: "Sanitized prompt" },
+        }],
+      });
+      const crossBatchTool = await seedClaudeBatch(sql, {
+        workspaceId,
+        personId,
+        collectorKey,
+        nativeSessionId: crossBatchSession,
+        nativeRecords: [{
+          sessionId: crossBatchSession,
+          type: "assistant",
+          uuid: "cross-batch-thinking",
+          parentUuid: "cross-batch-user",
+          requestId: "cross-batch-request-1",
+          timestamp: "2026-08-17T01:00:01.000Z",
+          message: {
+            id: "cross-batch-message-1",
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "not projected" }],
+            usage: { input_tokens: 5, output_tokens: 1 },
+          },
+        }, {
+          sessionId: crossBatchSession,
+          type: "assistant",
+          uuid: "cross-batch-tool-call",
+          parentUuid: "cross-batch-thinking",
+          requestId: "cross-batch-request-1",
+          timestamp: "2026-08-17T01:00:02.000Z",
+          message: {
+            id: "cross-batch-message-1",
+            role: "assistant",
+            stop_reason: "tool_use",
+            content: [{
+              type: "tool_use",
+              id: "cross-batch-tool",
+              name: "Read",
+              input: {},
+            }],
+            usage: { input_tokens: 5, output_tokens: 4 },
+          },
+        }, {
+          sessionId: crossBatchSession,
+          promptId: "cross-batch-user",
+          type: "user",
+          uuid: "cross-batch-tool-result",
+          parentUuid: "cross-batch-tool-call",
+          timestamp: "2026-08-17T01:00:03.000Z",
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "cross-batch-tool",
+              content: "Sanitized result",
+            }],
+          },
+        }],
+      });
+      const crossBatchTerminal = await seedClaudeBatch(sql, {
+        workspaceId,
+        personId,
+        collectorKey,
+        nativeSessionId: crossBatchSession,
+        nativeRecords: [{
+          sessionId: crossBatchSession,
+          type: "assistant",
+          uuid: "cross-batch-answer",
+          parentUuid: "cross-batch-tool-result",
+          requestId: "cross-batch-request-2",
+          timestamp: "2026-08-17T01:00:04.000Z",
+          message: {
+            id: "cross-batch-message-2",
+            role: "assistant",
+            stop_reason: "end_turn",
+            content: [{ type: "text", text: "Sanitized answer" }],
+            usage: { input_tokens: 3, output_tokens: 2 },
+          },
+        }],
+      });
+      const crossBatchSessionId = await normalize(
+        firstNormalizer,
+        crossBatchPrompt,
+      );
+      await normalize(firstNormalizer, crossBatchTool);
+      await normalize(firstNormalizer, crossBatchTerminal);
+      const crossBatchTurns = await sql.unsafe(
+        `select distinct turn_id
+           from telemetry.events
+          where workspace_id = $1 and session_id = $2
+            and normalizer_version = $3 and turn_id is not null
+          order by turn_id`,
+        [workspaceId, crossBatchSessionId, CLAUDE_NORMALIZER_VERSION],
+      );
+      assert(
+        crossBatchTurns.length === 1 &&
+          crossBatchTurns[0].turn_id === "claude:prompt:cross-batch-user",
+        "later Claude hook batches must rejoin the persisted prompt turn",
+      );
+      const crossBatchCutoff = await sql.unsafe(
+        `select max(id)::text cutoff
+           from telemetry.events
+          where workspace_id = $1 and session_id = $2
+            and normalizer_version = $3`,
+        [workspaceId, crossBatchSessionId, CLAUDE_NORMALIZER_VERSION],
+      );
+      const activityVersion = "test.claude-cross-batch.v1";
+      await reducer.reduceSession({
+        workspaceId,
+        sessionId: crossBatchSessionId,
+        normalizerVersion: CLAUDE_NORMALIZER_VERSION,
+        activityVersion,
+        throughEventId: BigInt(String(crossBatchCutoff[0].cutoff)),
+      });
+      const crossBatchSpans = await sql.unsafe(
+        `select activity_kind, span_state, timing_basis, end_event_id
+           from analytics.activity_spans
+          where workspace_id = $1 and session_id = $2
+            and activity_version = $3 and not is_tombstone
+            and activity_kind = 'turn'`,
+        [workspaceId, crossBatchSessionId, activityVersion],
+      );
+      assert(
+        crossBatchSpans.length === 1 &&
+          crossBatchSpans[0].span_state === "active" &&
+          crossBatchSpans[0].timing_basis === "paired_events" &&
+          crossBatchSpans[0].end_event_id !== null,
+        "the cross-batch Claude prompt must reduce to one closed turn",
+      );
+
       const attributedParent = await seedBatch(sql, {
         workspaceId,
         personId,
@@ -355,6 +802,10 @@ Deno.test({
         "a matching native id owned by another person must not become a parent",
       );
     } finally {
+      await sql.unsafe(
+        "delete from analytics.activity_spans where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
       await sql.unsafe(
         "delete from processing.telemetry_jobs where workspace_id = $1",
         [workspaceId],
@@ -385,6 +836,7 @@ Deno.test({
       await Promise.allSettled([
         firstNormalizer.close(),
         secondNormalizer.close(),
+        reducer.close(),
         sql.end(),
       ]);
     }

@@ -15,6 +15,7 @@ usage() {
 Usage: ./install-claude.sh --name NAME --github-id LOGIN --email EMAIL
 
 Installs Sherlock's Claude Code plugin and its owner-only collector runtime.
+Supported platforms: macOS and Linux.
 
 Environment overrides:
   CLAUDE_BIN            Claude executable to use
@@ -86,6 +87,8 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
 
 "$CLAUDE_BIN" plugin validate "$REPO_ROOT/plugins/sherlock-claude-code"
 "$CLAUDE_BIN" plugin validate "$REPO_ROOT"
+# Refresh the local marketplace registration so reruns update an existing install.
+"$CLAUDE_BIN" plugin marketplace remove sherlock >/dev/null 2>&1 || true
 "$CLAUDE_BIN" plugin marketplace add "$REPO_ROOT"
 "$CLAUDE_BIN" plugin install sherlock-claude-code@sherlock
 

@@ -26,7 +26,8 @@ After installation, start a new Codex task so the hooks load.
 
 ## Install for Claude Code
 
-You need Git, Python 3, and the Claude Code CLI. From the same checkout, run:
+You need macOS or Linux, Git, Python 3, and the Claude Code CLI. Native Windows
+is not currently supported. From the same checkout, run:
 
 ```sh
 ./install-claude.sh \
@@ -54,9 +55,15 @@ For Claude Code, run the complete local verification:
 ```
 
 This runs `claude plugin validate` for both the plugin and marketplace, lists
-configured marketplaces, and checks the installed collector configuration and
-local queue without making a network request. The final JSON should report
-`"status":"ok"` and `"provider":"claude_code"`.
+configured marketplaces, asserts that the Sherlock plugin is enabled, and
+checks the installed collector configuration and local queue without making a
+network request. The final JSON normally reports `"status":"ok"`; it may
+report `"status":"recovering"` while an upload is actively being recovered.
+Both healthy states report `"provider":"claude_code"`. This is deliberately a
+local check; it does not claim that an upload, normalization pass, or dashboard
+projection completed.
+Dead-lettered batches report `"status":"degraded"` and make verification fail
+so a local capture or delivery problem cannot be mistaken for a healthy queue.
 
 For implementation and operations details, see:
 

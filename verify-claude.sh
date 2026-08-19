@@ -11,6 +11,7 @@ RUNTIME="$CLAUDE_CONFIG_DIR/sherlock/runtime"
 "$CLAUDE_BIN" plugin validate "$REPO_ROOT/plugins/sherlock-claude-code"
 "$CLAUDE_BIN" plugin validate "$REPO_ROOT"
 "$CLAUDE_BIN" plugin marketplace list
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock-claude-code/scripts/verify_install.py"
 
 PYTHONPATH="$RUNTIME${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON_BIN" -m sherlock_collector.cli \
@@ -19,3 +20,5 @@ PYTHONPATH="$RUNTIME${PYTHONPATH:+:$PYTHONPATH}" \
   --state-root "$CLAUDE_CONFIG_DIR/sherlock/telemetry" \
   --config "$CLAUDE_CONFIG_DIR/sherlock/collector.json" \
   health
+
+echo "Local verification only: this does not prove upload, normalization, or dashboard visibility."

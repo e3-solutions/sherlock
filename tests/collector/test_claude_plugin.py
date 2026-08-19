@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import gzip
 import os
 import subprocess
 import sys
@@ -49,7 +51,8 @@ class ClaudePluginTests(unittest.TestCase):
         for event, entries in hooks.items():
             handler = entries[0]["hooks"][0]
             self.assertEqual(handler["type"], "command", event)
-            self.assertTrue(handler["async"], event)
+            self.assertNotIn("async", handler, event)
+            self.assertEqual(handler["timeout"], 2, event)
             self.assertIn("${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py", handler["command"])
 
     def test_discovery_prioritizes_main_and_subagent_transcripts(self):
@@ -153,6 +156,168 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertLess(time.monotonic() - started, 1.0)
 
+    def test_launcher_detaches_capture_and_preserves_hook_stdin(self):
+        with TemporaryDirectory() as temporary:
+            claude_home = Path(temporary) / "claude"
+            transcript = claude_home / "projects" / "repo" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            source = (
+                b'{"sessionId":"session-detached","type":"assistant",'
+                b'"timestamp":"2026-08-19T00:00:00Z",'
+                b'"message":{"role":"assistant","content":"done"}}\n'
+            )
+            transcript.write_bytes(source)
+            environment = {
+                **os.environ,
+                "CLAUDE_CONFIG_DIR": str(claude_home),
+                "SHERLOCK_COLLECTOR_SOURCE": str(SOURCE),
+            }
+            started = time.monotonic()
+            completed = subprocess.run(
+                [sys.executable, str(LAUNCHER), "Stop"],
+                input=json.dumps(
+                    {
+                        "session_id": "session-detached",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertLess(time.monotonic() - started, 1.0)
+            pending = claude_home / "sherlock" / "telemetry" / "queue" / "pending"
+            deadline = time.monotonic() + 3
+            paths = []
+            while time.monotonic() < deadline:
+                paths = list(pending.glob("*.json")) if pending.is_dir() else []
+                if paths:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(len(paths), 1)
+            item = json.loads(paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(item["manifest"]["source_provider"], "claude_code")
+            stored = base64.b64decode(item["stored_payload_base64"], validate=True)
+            self.assertEqual(gzip.decompress(stored), source)
+
+    def test_terminal_launcher_waits_for_asynchronous_transcript_tail(self):
+        with TemporaryDirectory() as temporary:
+            claude_home = Path(temporary) / "claude"
+            transcript = claude_home / "projects" / "repo" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            first = b'{"sessionId":"session-late","type":"user"}\n'
+            partial = b'{"sessionId":"session-late","type":"assistant","message":'
+            completed_tail = b'{"role":"assistant","content":"done"}}\n'
+            transcript.write_bytes(first + partial)
+            environment = {
+                **os.environ,
+                "CLAUDE_CONFIG_DIR": str(claude_home),
+                "SHERLOCK_COLLECTOR_SOURCE": str(SOURCE),
+            }
+            launched = subprocess.run(
+                [sys.executable, str(LAUNCHER), "SessionEnd"],
+                input=json.dumps(
+                    {
+                        "session_id": "session-late",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(launched.returncode, 0)
+            with transcript.open("ab") as handle:
+                handle.write(completed_tail)
+
+            pending = claude_home / "sherlock" / "telemetry" / "queue" / "pending"
+            deadline = time.monotonic() + 3
+            paths = []
+            while time.monotonic() < deadline:
+                paths = list(pending.glob("*.json")) if pending.is_dir() else []
+                if paths:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(len(paths), 1)
+            item = json.loads(paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(item["manifest"]["record_count"], 2)
+            stored = base64.b64decode(item["stored_payload_base64"], validate=True)
+            self.assertEqual(gzip.decompress(stored), first + partial + completed_tail)
+
+    def test_manual_claude_capture_uses_transcript_contract(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            transcript = root / "explicit-transcript.jsonl"
+            transcript.write_bytes(b'{"type":"user","sessionId":"manual"}\n')
+            state_root = root / "state"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sherlock_collector.cli",
+                    "--provider",
+                    "claude_code",
+                    "--claude-home",
+                    str(claude_home),
+                    "--state-root",
+                    str(state_root),
+                    "capture",
+                    str(transcript),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            pending = list((state_root / "queue" / "pending").glob("*.json"))
+            self.assertEqual(len(pending), 1)
+            manifest = json.loads(pending[0].read_text(encoding="utf-8"))["manifest"]
+            self.assertEqual(manifest["source_provider"], "claude_code")
+            self.assertEqual(manifest["source_kind"], "transcript")
+            self.assertTrue((state_root / "claude-transcript-state.json").is_file())
+
+    def test_install_verifier_requires_enabled_plugin(self):
+        verifier = PLUGIN / "scripts" / "verify_install.py"
+        with TemporaryDirectory() as temporary:
+            claude_home = Path(temporary) / "claude"
+            claude_home.mkdir()
+            settings = claude_home / "settings.json"
+            settings.write_text('{"enabledPlugins":{}}\n', encoding="utf-8")
+            environment = {**os.environ, "CLAUDE_CONFIG_DIR": str(claude_home)}
+
+            disabled = subprocess.run(
+                [sys.executable, str(verifier)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(disabled.returncode, 0)
+
+            settings.write_text(
+                json.dumps(
+                    {"enabledPlugins": {"sherlock-claude-code@sherlock": True}}
+                ),
+                encoding="utf-8",
+            )
+            enabled = subprocess.run(
+                [sys.executable, str(verifier)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            self.assertEqual(json.loads(enabled.stdout)["check"], "local_plugin_enabled")
+
     def test_hook_defers_a_transcript_tail_until_the_record_is_complete(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -241,6 +406,28 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertEqual(health["status"], "ok")
             self.assertEqual(health["provider"], "claude_code")
             self.assertEqual(health["pending_batches"], 0)
+            self.assertEqual(health["processing_batches"], 0)
+
+            dead_letter = (
+                claude_home
+                / "sherlock"
+                / "telemetry"
+                / "queue"
+                / "dead-letter"
+                / "failed.json"
+            )
+            dead_letter.write_text("{}\n", encoding="utf-8")
+            degraded = subprocess.run(
+                completed.args,
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+            self.assertEqual(degraded.returncode, 1)
+            degraded_health = json.loads(degraded.stdout)
+            self.assertEqual(degraded_health["status"], "degraded")
+            self.assertEqual(degraded_health["dead_letter_batches"], 1)
 
 
 if __name__ == "__main__":

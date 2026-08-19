@@ -99,6 +99,8 @@ import sys
 from pathlib import Path
 
 capture = Path(os.environ["SHERLOCK_FAKE_CAPTURE"])
+claude_home = Path(os.environ["CLAUDE_CONFIG_DIR"])
+marketplace = claude_home / "fake-marketplace-installed"
 
 def record(value):
     with capture.open("a", encoding="utf-8") as handle:
@@ -112,11 +114,23 @@ if sys.argv[1:3] == ["plugin", "validate"]:
     record({"argv": sys.argv[1:]})
     print("Validation passed")
     raise SystemExit(0)
-if sys.argv[1:4] == ["plugin", "marketplace", "add"]:
+if sys.argv[1:4] == ["plugin", "marketplace", "remove"]:
     record({"argv": sys.argv[1:]})
+    marketplace.unlink(missing_ok=True)
+    raise SystemExit(0)
+if sys.argv[1:4] == ["plugin", "marketplace", "add"]:
+    if marketplace.exists():
+        raise SystemExit(1)
+    record({"argv": sys.argv[1:]})
+    marketplace.parent.mkdir(parents=True, exist_ok=True)
+    marketplace.touch()
     raise SystemExit(0)
 if sys.argv[1:3] == ["plugin", "install"]:
     record({"argv": sys.argv[1:]})
+    settings = claude_home / "settings.json"
+    settings.write_text(json.dumps({
+        "enabledPlugins": {"sherlock-claude-code@sherlock": True}
+    }), encoding="utf-8")
     raise SystemExit(0)
 raise SystemExit(2)
 '''
@@ -226,17 +240,26 @@ class TeamInstallerTests(unittest.TestCase):
                 }
             )
 
+            command = [
+                "sh",
+                str(CLAUDE_INSTALLER),
+                "--name",
+                "Test User",
+                "--github-id",
+                "test-user",
+                "--email",
+                "TEST@example.com",
+            ]
             completed = subprocess.run(
-                [
-                    "sh",
-                    str(CLAUDE_INSTALLER),
-                    "--name",
-                    "Test User",
-                    "--github-id",
-                    "test-user",
-                    "--email",
-                    "TEST@example.com",
-                ],
+                command,
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            repeated = subprocess.run(
+                command,
                 cwd=ROOT,
                 env=environment,
                 check=False,
@@ -245,6 +268,7 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
             config = claude_home / "sherlock" / "collector.json"
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             configured = json.loads(config.read_text(encoding="utf-8"))
@@ -261,10 +285,22 @@ class TeamInstallerTests(unittest.TestCase):
             calls = [json.loads(line)["argv"] for line in capture.read_text().splitlines()]
             self.assertEqual(calls[0][:2], ["plugin", "validate"])
             self.assertEqual(calls[1][:2], ["plugin", "validate"])
-            self.assertEqual(calls[2][:3], ["plugin", "marketplace", "add"])
+            self.assertEqual(calls[2][:3], ["plugin", "marketplace", "remove"])
             self.assertEqual(
-                calls[3],
+                calls[3][:3],
+                ["plugin", "marketplace", "add"],
+            )
+            self.assertEqual(
+                calls[4],
                 ["plugin", "install", "sherlock-claude-code@sherlock"],
+            )
+            self.assertEqual(
+                sum(call[:3] == ["plugin", "marketplace", "remove"] for call in calls),
+                2,
+            )
+            self.assertEqual(
+                sum(call[:2] == ["plugin", "install"] for call in calls),
+                2,
             )
 
 

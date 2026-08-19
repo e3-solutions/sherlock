@@ -78,7 +78,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.command == "capture":
         outcome = capture_and_spawn_drain(
-            RolloutCapturer(state_root, spool),
+            RolloutCapturer(
+                state_root,
+                spool,
+                source_provider=args.provider,
+                source_kind=(
+                    "transcript" if args.provider == "claude_code" else "rollout"
+                ),
+                state_name=(
+                    "claude-transcript" if args.provider == "claude_code" else "rollout"
+                ),
+                capture_unterminated_tail=args.provider != "claude_code",
+            ),
             args.rollout,
             [
                 sys.executable,
@@ -130,22 +141,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sherlock collector is not configured: {error}", file=sys.stderr)
         return 78
     if args.command == "health":
+        pending_batches = len(spool.list_pending())
+        processing_batches = len(list(spool.processing.glob("*.json")))
+        dead_letter_batches = len(list(spool.dead_letter.glob("*.json")))
+        status = (
+            "degraded"
+            if dead_letter_batches
+            else "recovering" if processing_batches else "ok"
+        )
         print(
             json.dumps(
                 {
-                    "status": "ok",
+                    "status": status,
                     "provider": args.provider,
                     "source_home": str(source_home),
                     "state_root": str(state_root),
-                    "pending_batches": len(spool.list_pending()),
-                    "dead_letter_batches": len(
-                        list(spool.dead_letter.glob("*.json"))
-                    ),
+                    "pending_batches": pending_batches,
+                    "processing_batches": processing_batches,
+                    "dead_letter_batches": dead_letter_batches,
                 },
                 sort_keys=True,
             )
         )
-        return 0
+        return 1 if dead_letter_batches else 0
     outcome = Drain(
         spool,
         HttpTransport(

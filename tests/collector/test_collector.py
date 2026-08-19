@@ -30,6 +30,7 @@ from sherlock_collector.drain import (
 from sherlock_collector.hook import capture_and_spawn_drain
 from sherlock_collector.http import HttpTransport
 from sherlock_collector.rollout import (
+    CaptureResult,
     DEFAULT_MAX_FILES,
     RolloutCapturer,
 )
@@ -507,6 +508,36 @@ class RolloutCaptureTests(unittest.TestCase):
             )
 
         popen.assert_called_once()
+
+    def test_hook_does_not_fan_out_drains_when_capture_lock_is_held(self):
+        with (
+            patch.object(
+                self.capturer,
+                "capture",
+                return_value=CaptureResult(locked=True),
+            ),
+            patch("sherlock_collector.hook.subprocess.Popen") as popen,
+        ):
+            result = capture_and_spawn_drain(
+                self.capturer, [self.rollout], ["sherlock-collector", "drain"]
+            )
+
+        self.assertTrue(result.locked)
+        popen.assert_not_called()
+
+    def test_hook_does_not_spawn_a_drain_for_an_empty_healthy_queue(self):
+        self.rollout.write_bytes(b'{"type":"already-captured"}\n')
+        self.capturer.capture([self.rollout])
+        for path in self.spool.list_pending():
+            path.unlink()
+
+        with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+            result = capture_and_spawn_drain(
+                self.capturer, [self.rollout], ["sherlock-collector", "drain"]
+            )
+
+        self.assertEqual(result.enqueued, 0)
+        popen.assert_not_called()
 
     def test_append_does_not_advance_generation(self):
         first_source = b'{"type":"first"}\n'

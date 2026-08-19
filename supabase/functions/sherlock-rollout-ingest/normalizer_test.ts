@@ -436,3 +436,336 @@ Deno.test("Claude subagent identity remains linked to its parent session", async
   assert(projection.session?.actor_role === "worker");
   assert(projection.events[0].message_origin === "worker");
 });
+
+Deno.test("realistic Claude records keep semantic turns and canonical usage", async () => {
+  const promptId = "prompt-primary-1";
+  const terminalUsage = {
+    input_tokens: 20,
+    cache_read_input_tokens: 5,
+    cache_creation_input_tokens: 3,
+    output_tokens: 7,
+  };
+  const partialUsage = { ...terminalUsage, output_tokens: 2 };
+  const { manifest, source } = await fixture([
+    {
+      sessionId: "claude-primary",
+      promptId,
+      type: "user",
+      uuid: "user-1",
+      parentUuid: null,
+      timestamp: "2026-08-19T00:00:00Z",
+      message: { role: "user", content: "Inspect the repository" },
+    },
+    {
+      sessionId: "claude-primary",
+      type: "assistant",
+      uuid: "thinking-1",
+      parentUuid: "user-1",
+      requestId: "request-1",
+      timestamp: "2026-08-19T00:00:01Z",
+      message: {
+        id: "message-1",
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{
+          type: "thinking",
+          thinking: "sensitive reasoning that must not be projected",
+          signature: "opaque-signature",
+        }],
+        usage: partialUsage,
+      },
+    },
+    {
+      sessionId: "claude-primary",
+      type: "assistant",
+      uuid: "thinking-2",
+      parentUuid: "thinking-1",
+      requestId: "request-1",
+      timestamp: "2026-08-19T00:00:01.500Z",
+      message: {
+        id: "message-1",
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{
+          type: "thinking",
+          thinking: "a distinct reasoning chunk that also stays private",
+        }],
+        usage: partialUsage,
+      },
+    },
+    {
+      sessionId: "claude-primary",
+      type: "assistant",
+      uuid: "tool-call-1",
+      parentUuid: "thinking-2",
+      requestId: "request-1",
+      timestamp: "2026-08-19T00:00:02Z",
+      message: {
+        id: "message-1",
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{ type: "tool_use", id: "tool-1", name: "Read", input: {} }],
+        stop_reason: "tool_use",
+        usage: terminalUsage,
+      },
+    },
+    {
+      sessionId: "claude-primary",
+      promptId,
+      type: "user",
+      uuid: "tool-result-1",
+      parentUuid: "tool-call-1",
+      timestamp: "2026-08-19T00:00:03Z",
+      message: {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          content: "source bytes stay only in the immutable transcript",
+        }],
+      },
+    },
+    {
+      sessionId: "claude-primary",
+      type: "assistant",
+      uuid: "answer-1",
+      parentUuid: "tool-result-1",
+      requestId: "request-2",
+      timestamp: "2026-08-19T00:00:04Z",
+      message: {
+        id: "message-2",
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{ type: "text", text: "The repository is healthy." }],
+        stop_reason: "end_turn",
+        usage: {
+          input_tokens: 4,
+          cache_read_input_tokens: 1,
+          output_tokens: 3,
+        },
+      },
+    },
+    {
+      sessionId: "claude-primary",
+      promptId,
+      type: "system",
+      subtype: "turn_duration",
+      uuid: "turn-duration-1",
+      parentUuid: "answer-1",
+      durationMs: 4_500,
+      timestamp: "2026-08-19T00:00:05Z",
+    },
+  ]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "transcript";
+  manifest.codex_version = null;
+  manifest.source_version = "2.0.59";
+  manifest.observed_native_session_id = "claude-primary";
+
+  const projection = await projectBatch(manifest, source);
+  const turnId = `claude:prompt:${promptId}`;
+  const user = projection.events.find((event) =>
+    event.event_kind === "message" && event.message_role === "user"
+  );
+  assert(user?.event_subtype === "user_message");
+  assert(user.turn_id === turnId);
+  const answer = projection.events.find((event) =>
+    event.event_kind === "message" && event.message_role === "assistant"
+  );
+  assert(answer?.event_subtype === "message");
+  assert(answer.turn_id === turnId);
+
+  const reasoning = projection.events.filter((event) =>
+    event.event_kind === "reasoning"
+  );
+  assert(reasoning.length === 2);
+  assert(
+    new Set(reasoning.map((event) => event.logical_event_key)).size === 2,
+    "distinct thinking records must remain distinct derived evidence",
+  );
+  assert(reasoning.every((event) => event.event_subtype === "thinking"));
+  assert(reasoning.every((event) => event.turn_id === turnId));
+  assert(reasoning.every((event) => event.content_sha256 === null));
+  assert(reasoning.every((event) => event.content_byte_size === null));
+  assert(reasoning.every((event) => event.content_excerpt === null));
+  assert(reasoning.every((event) => event.attributes === null));
+  assert(
+    reasoning.every((event) => event.logical_event_key?.endsWith(":block:0")),
+  );
+
+  const repeated = projection.events.filter((event) =>
+    event.event_kind === "usage" &&
+    event.logical_event_key === "claude:usage:message-1"
+  );
+  assert(repeated.length === 3, "raw record projections remain auditable");
+  assert(
+    new Set(repeated.map((event) => event.logical_event_key)).size === 1,
+    "repeated message usage must have one cross-batch canonical identity",
+  );
+  assert(
+    repeated.every((event) =>
+      event.usage_stream_key ===
+        "session:claude-primary:message:message-1"
+    ),
+  );
+  assert(repeated.every((event) => event.turn_id === turnId));
+  assert(repeated.every((event) => event.cached_input_tokens === 8));
+  const terminalUsageEvent = repeated.find((event) =>
+    event.source_priority === 110
+  );
+  assert(terminalUsageEvent?.output_tokens === 7);
+  assert(
+    repeated.filter((event) => event.source_priority === 100).length === 2,
+  );
+
+  const completions = projection.events.filter((event) =>
+    event.event_kind === "lifecycle" && event.event_subtype === "turn_complete"
+  );
+  assert(completions.length === 2);
+  assert(completions.every((event) => event.turn_id === turnId));
+  assert(
+    completions.some((event) =>
+      event.logical_event_key ===
+        "claude:lifecycle:answer-1:turn_complete"
+    ),
+    "a native end_turn response must close the projected turn",
+  );
+  assert(
+    completions.some((event) => event.attributes?.duration_ms === 4_500),
+  );
+});
+
+Deno.test("Claude meta messages are system-originated, not human prompts", async () => {
+  const { manifest, source } = await fixture([{
+    sessionId: "claude-primary",
+    promptId: "prompt-meta-1",
+    type: "user",
+    isMeta: true,
+    uuid: "meta-user-1",
+    parentUuid: "answer-before-meta",
+    timestamp: "2026-08-19T00:00:06Z",
+    message: { role: "user", content: "Sanitized injected context" },
+  }]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "transcript";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = "claude-primary";
+
+  const projection = await projectBatch(manifest, source);
+  assert(projection.events.length === 1);
+  assert(projection.events[0].event_subtype === "user_message");
+  assert(projection.events[0].message_origin === "system");
+  assert(projection.events[0].turn_id === "claude:prompt:prompt-meta-1");
+});
+
+Deno.test("realistic Claude subagent records inherit their prompt turn", async () => {
+  const { manifest, source } = await fixture([
+    {
+      sessionId: "parent-session",
+      agentId: "agent-worker",
+      isSidechain: true,
+      promptId: "worker-prompt",
+      type: "user",
+      uuid: "worker-user",
+      timestamp: "2026-08-19T00:00:00Z",
+      message: { role: "user", content: "Inspect in parallel" },
+    },
+    {
+      sessionId: "parent-session",
+      agentId: "agent-worker",
+      isSidechain: true,
+      type: "assistant",
+      uuid: "worker-answer",
+      parentUuid: "worker-user",
+      timestamp: "2026-08-19T00:00:01Z",
+      message: {
+        id: "worker-message",
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{ type: "text", text: "Worker result" }],
+        usage: { input_tokens: 2, output_tokens: 2 },
+      },
+    },
+  ]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "transcript";
+  manifest.codex_version = null;
+  manifest.source_version = "2.0.59";
+  manifest.observed_native_session_id = "agent-worker";
+  manifest.observed_parent_native_session_id = "parent-session";
+
+  const projection = await projectBatch(manifest, source);
+  assert(projection.session?.actor_role === "worker");
+  assert(projection.session?.parent_native_session_id === "parent-session");
+  assert(
+    projection.events.every((event) =>
+      event.turn_id === "claude:prompt:worker-prompt"
+    ),
+  );
+  assert(
+    projection.events.find((event) => event.event_kind === "message")
+      ?.message_origin === "parent_agent",
+  );
+});
+
+Deno.test("Claude response-only batches use request identity conservatively", async () => {
+  const { manifest, source } = await fixture([
+    {
+      sessionId: "claude-primary",
+      type: "assistant",
+      uuid: "thinking-later-batch",
+      parentUuid: "user-record-from-an-earlier-batch",
+      requestId: "request-later-batch",
+      timestamp: "2026-08-19T00:00:10Z",
+      message: {
+        id: "message-later-batch",
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{ type: "thinking", thinking: "not projected" }],
+        usage: { input_tokens: 3, output_tokens: 1 },
+      },
+    },
+    {
+      sessionId: "claude-primary",
+      type: "assistant",
+      uuid: "answer-later-batch",
+      parentUuid: "thinking-later-batch",
+      requestId: "request-later-batch",
+      timestamp: "2026-08-19T00:00:11Z",
+      message: {
+        id: "message-later-batch",
+        role: "assistant",
+        model: "claude-sonnet-4",
+        content: [{ type: "text", text: "Later-batch response" }],
+        usage: { input_tokens: 3, output_tokens: 1 },
+      },
+    },
+  ]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "transcript";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = "claude-primary";
+
+  const projection = await projectBatch(manifest, source);
+  assert(
+    projection.events.find((event) =>
+      event.native_item_id === "thinking-later-batch"
+    )?.parent_native_item_id === "user-record-from-an-earlier-batch",
+  );
+  assert(
+    projection.events.every((event) =>
+      event.turn_id === "claude:request:request-later-batch"
+    ),
+  );
+  const usage = projection.events.filter((event) =>
+    event.event_kind === "usage"
+  );
+  assert(usage.length === 2);
+  assert(
+    usage.every((event) =>
+      event.logical_event_key === "claude:usage:message-later-batch" &&
+      event.usage_stream_key ===
+        "session:claude-primary:message:message-later-batch"
+    ),
+  );
+});
