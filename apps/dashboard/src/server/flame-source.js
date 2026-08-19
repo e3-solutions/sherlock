@@ -19,6 +19,22 @@ export const INTERVAL_WORK_LIMIT = 200;
 export const INTERVAL_PROMPT_LIMIT = 200;
 export const DEFAULT_WORK_DETAIL_LIMIT = 50;
 export const MAX_WORK_DETAIL_LIMIT = 100;
+export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
+export const REPLACED_DASHBOARD_EMAIL_DOMAIN = "coreedgesolution.com";
+
+function dashboardPersonVisibility(alias) {
+  return `
+   and not exists (
+     select 1
+       from telemetry.people preferred
+      where preferred.workspace_id = ${alias}.workspace_id
+        and preferred.id <> ${alias}.id
+        and preferred.github_id = ${alias}.github_id
+        and ${alias}.github_id is not null
+        and split_part(${alias}.email, '@', 2) = '${REPLACED_DASHBOARD_EMAIL_DOMAIN}'
+        and split_part(preferred.email, '@', 2) = '${PREFERRED_DASHBOARD_EMAIL_DOMAIN}'
+   )`;
+}
 
 function nativeItemTimestamp(column) {
   return `case
@@ -88,12 +104,13 @@ activity_candidates as materialized (
 }
 
 export const PEOPLE_SQL = `
-select id::text as person_id,
-       coalesce(nullif(btrim(display_name), ''), identity_key) as display_name
-  from telemetry.people
- where workspace_id = $1
-   and github_id is distinct from 'sherlock-smoke'
- order by lower(coalesce(nullif(btrim(display_name), ''), identity_key)), id
+select pe.id::text as person_id,
+       coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) as display_name
+  from telemetry.people pe
+ where pe.workspace_id = $1
+   and pe.github_id is distinct from 'sherlock-smoke'
+   ${dashboardPersonVisibility("pe")}
+ order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
 `;
 
@@ -308,6 +325,7 @@ with p as materialized (
    from telemetry.people pe cross join p
    where pe.workspace_id = p.workspace_id
      and pe.github_id is distinct from 'sherlock-smoke'
+     ${dashboardPersonVisibility("pe")}
 ), buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start

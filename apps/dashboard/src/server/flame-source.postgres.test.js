@@ -48,6 +48,52 @@ async function cleanup(sql, workspaceId) {
 }
 
 describePostgres("Sherlock Flame PostgreSQL integration", () => {
+  it("shows the E3 identity instead of a matching Core Edge identity", async () => {
+    const workspaceId = crypto.randomUUID();
+    const coreEdgeId = crypto.randomUUID();
+    const e3Id = crypto.randomUUID();
+    const unmatchedId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let source;
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, $3)`,
+        [workspaceId, `roster-${workspaceId}`, "Roster preference fixture"],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (
+           id, workspace_id, identity_key, display_name, email, github_id
+         ) values
+           ($1, $4, $5, 'Silin', 'silin@coreedgesolution.com', 'silin144'),
+           ($2, $4, $6, 'Silin', 'silin@e3group.ai', 'silin144'),
+           ($3, $4, $7, 'Unmatched', 'unmatched@coreedgesolution.com', 'unmatched')`,
+        [
+          coreEdgeId,
+          e3Id,
+          unmatchedId,
+          workspaceId,
+          `email:silin-core-${workspaceId}`,
+          `email:silin-e3-${workspaceId}`,
+          `email:unmatched-${workspaceId}`,
+        ],
+      );
+
+      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      const payload = await source.fetchDay({ now: FIXED_NOW });
+
+      expect(payload.people.map(({ id }) => id)).toEqual([e3Id, unmatchedId]);
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
   it("excludes copied pre-start history after canonical selection", async () => {
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
