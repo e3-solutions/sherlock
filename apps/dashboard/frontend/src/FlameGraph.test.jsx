@@ -21,7 +21,8 @@ function model() {
   adaBuckets[72] = [0, 0, 0, 2];
   adaBuckets[143] = [1, 0, 0, 0];
 
-  return adaptFlamePayload({
+  return {
+    ...adaptFlamePayload({
     start: "2026-08-14T07:00:00.000Z",
     read: "2026-08-15T07:01:00.000Z",
     snapshot: "v1.snapshot-token",
@@ -49,7 +50,9 @@ function model() {
         buckets: emptyBuckets(),
       },
     ],
-  });
+    }),
+    intervalEvidenceSplit: true,
+  };
 }
 
 function deferred() {
@@ -624,7 +627,7 @@ describe("FlameGraph", () => {
     );
   });
 
-  it("renders work before requesting and rendering prompt evidence", async () => {
+  it("starts split evidence concurrently and reveals the validated frame atomically", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
     const releaseWork = deferred();
     const releasePrompts = deferred();
@@ -646,24 +649,28 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(fetch).mock.calls[0][0]).toContain("/api/flame/interval/work?");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => new URL(url, "http://dashboard.test").pathname))
+      .toEqual(["/api/flame/interval/work", "/api/flame/interval/prompts"]);
 
     releaseWork.resolve();
-    expect(await screen.findByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-    expect(screen.getByText("Loading prompt evidence…")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(fetch).mock.calls[1][0]).toContain("/api/flame/interval/prompts?");
+    await act(() => Promise.resolve());
+    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("3 human prompts")).not.toBeInTheDocument();
 
     releasePrompts.resolve();
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
   });
 
   it("falls back once and remembers combined compatibility for later frames", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    let splitRouteMissing = true;
     vi.mocked(fetch).mockImplementation((url, options) => {
       const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work") {
+      if (request.pathname === "/api/flame/interval/work" && splitRouteMissing) {
+        splitRouteMissing = false;
         return Promise.resolve({
           ok: false,
           status: 404,
@@ -672,7 +679,7 @@ describe("FlameGraph", () => {
       }
       return defaultFetch(url, options);
     });
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const { container, rerender } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
     vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
       bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
@@ -682,13 +689,43 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
 
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(3);
     expect(vi.mocked(fetch).mock.calls.map(([url]) => new URL(url, "http://dashboard.test").pathname))
-      .toEqual(["/api/flame/interval/work", "/api/flame/interval"]);
+      .toEqual([
+        "/api/flame/interval/work",
+        "/api/flame/interval/prompts",
+        "/api/flame/interval",
+      ]);
 
     fireEvent.click(wrapper, { clientX: 508, clientY: 34 });
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
-    expect(new URL(vi.mocked(fetch).mock.calls[2][0], "http://dashboard.test").pathname)
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+    expect(new URL(vi.mocked(fetch).mock.calls[3][0], "http://dashboard.test").pathname)
+      .toBe("/api/flame/interval");
+
+    const refreshed = model();
+    rerender(<FlameGraph data={refreshed} chartWidth={1008} />);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
+    expect(vi.mocked(fetch).mock.calls.slice(4).map(([url]) =>
+      new URL(url, "http://dashboard.test").pathname)).toEqual([
+      "/api/flame/interval/prompts",
+    ]);
+  });
+
+  it("uses the combined endpoint immediately when the aggregate capability is absent", async () => {
+    const legacy = model();
+    legacy.intervalEvidenceSplit = false;
+    const { container } = render(<FlameGraph data={legacy} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+
+    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(new URL(vi.mocked(fetch).mock.calls[0][0], "http://dashboard.test").pathname)
       .toBe("/api/flame/interval");
   });
 
@@ -711,9 +748,10 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
 
     expect(await screen.findByRole("button", { name: "Refresh timeline" })).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(new URL(vi.mocked(fetch).mock.calls[0][0], "http://dashboard.test").pathname)
-      .toBe("/api/flame/interval/work");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(fetch).mock.calls.every(([url]) =>
+      new URL(url, "http://dashboard.test").pathname !== "/api/flame/interval"))
+      .toBe(true);
   });
 
   it("keeps successful work visible when prompt evidence fails", async () => {
@@ -751,8 +789,10 @@ describe("FlameGraph", () => {
     expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
+    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledTimes(3);
     expect(vi.mocked(fetch).mock.calls.slice(1).every(([url]) =>
       new URL(url, "http://dashboard.test").pathname === "/api/flame/interval/prompts"))
@@ -763,14 +803,14 @@ describe("FlameGraph", () => {
     rerender(<FlameGraph data={refreshed} chartWidth={1008} />);
 
     expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
     expect(new URL(vi.mocked(fetch).mock.calls[3][0], "http://dashboard.test").pathname)
       .toBe("/api/flame/interval/work");
-
-    refreshedWork.resolve();
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
     expect(new URL(vi.mocked(fetch).mock.calls[4][0], "http://dashboard.test").pathname)
       .toBe("/api/flame/interval/prompts");
+    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
+
+    refreshedWork.resolve();
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
   });
 
@@ -945,7 +985,7 @@ describe("FlameGraph", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Refresh timeline" }));
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("refreshes the timeline instead of retrying mismatched interval evidence", async () => {

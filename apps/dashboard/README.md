@@ -94,11 +94,11 @@ objects.
   primary and exposes prompt excerpts through a compact, collapsed disclosure.
 - `GET /api/flame/interval/work?...` and `GET /api/flame/interval/prompts?...`
   expose the same bounded work and prompt evidence independently. The dashboard
-  requests them sequentially so Active Work can render before prompt
-  canonicalization completes, skips a section whose aggregate count is zero,
-  and falls back to the combined interval endpoint when an older server does
-  not expose the split routes. The combined endpoint remains unchanged for
-  compatibility and rollback.
+  requests the nonempty sections concurrently, validates both, and reveals the
+  frame evidence together. The aggregate response header
+  `X-Sherlock-Interval-Evidence: split-v1` selects this path; an older server
+  without it uses the combined interval endpoint directly. The combined endpoint
+  remains unchanged for compatibility and rollback.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
   excerpts. The default page size is 50 and the maximum is 100. Cursors are

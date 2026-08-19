@@ -142,6 +142,7 @@ const server = createServer(async (request, response) => {
       });
       sendJson(response, 200, result.payload, {
         "X-Sherlock-Timeline-Cache": result.state,
+        "X-Sherlock-Interval-Evidence": "split-v1",
       });
     } catch (error) {
       const code = error instanceof FlameSourceError
