@@ -386,6 +386,20 @@ describe("Sherlock Flame payload", () => {
     }
     expect(INTERVAL_WORK_SQL).toContain("group by session_id, semantic_role");
     expect(INTERVAL_WORK_SQL).toContain("and s.person_id = p.person_id");
+    expect(INTERVAL_WORK_SQL).toContain("relevant_activity_sessions as materialized");
+    expect(INTERVAL_WORK_SQL).toContain(
+      "and e.session_id in (select session_id from relevant_activity_sessions)",
+    );
+    expect(INTERVAL_WORK_SQL).toContain(
+      "p.bucket_start - interval '6 seconds'",
+    );
+    expect(INTERVAL_WORK_SQL).toContain(
+      "$8::timestamptz - interval '6 seconds'",
+    );
+    expect(INTERVAL_WORK_SQL).toContain(
+      ") >= date_trunc('milliseconds', s.started_at)",
+    );
+    expect(INTERVAL_WORK_SQL).toContain("select distinct e.session_id");
     expect(INTERVAL_WORK_SQL).toContain("limit $10");
     expect(WORK_DETAIL_SQL).toContain("and e.session_id = p.session_id");
     expect(ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS).toBe(6);

@@ -30,13 +30,7 @@ function nativeItemTimestamp(column) {
   end`;
 }
 
-function activityCte({
-  candidateColumns = "",
-  candidatePredicate = "",
-  eventColumns = "",
-  joins = "",
-  visibilityPredicate = "",
-} = {}) {
+function activityCte({ joins = "" } = {}) {
   return `
 activity_candidates as materialized (
   select s.person_id, e.id, e.session_id,
@@ -54,7 +48,7 @@ activity_candidates as materialized (
                              e.normalizer_version, e.logical_event_key, e.event_kind
                 order by e.source_priority desc, e.occurred_at asc nulls last, e.id
               )
-              else 1 end canonical_rank${candidateColumns}
+              else 1 end canonical_rank
     from telemetry.events e
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
@@ -64,7 +58,6 @@ activity_candidates as materialized (
      and e.normalizer_version = p.normalizer_version
      and not e.is_replay
      and e.actor_role <> 'automation'
-     ${candidatePredicate}
      and e.event_kind in (
        'message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
        'agent_message', 'lifecycle', 'error'
@@ -78,7 +71,6 @@ activity_candidates as materialized (
        e.event_kind <> 'lifecycle'
        or e.event_subtype in ('task_started', 'task_complete', 'turn_started', 'turn_complete')
      )
-     ${visibilityPredicate}
      and coalesce(
        ${nativeItemTimestamp("e.native_item_id")},
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
@@ -88,7 +80,7 @@ activity_candidates as materialized (
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
      ) < p.read_at
 ), activity_events as materialized (
-  select person_id, session_id, actor_role, observed_at${eventColumns}
+  select person_id, session_id, actor_role, observed_at
     from activity_candidates
    where canonical_rank = 1
      and observed_at >= date_trunc('milliseconds', session_started_at)
@@ -378,6 +370,57 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
 
+function relevantActivitySessionsCte() {
+  return `
+relevant_activity_sessions as materialized (
+  select distinct e.session_id
+    from telemetry.events e
+    join telemetry.sessions s
+      on s.workspace_id = e.workspace_id and s.id = e.session_id
+   where e.workspace_id = $1::uuid
+     and e.normalizer_version = $4::text
+     and s.person_id = $7::uuid
+     and not e.is_replay
+     and e.actor_role <> 'automation'
+     and e.event_kind in (
+       'message', 'reasoning', 'tool_call', 'tool_result', 'agent_spawn',
+       'agent_message', 'lifecycle', 'error'
+     )
+     and (
+       e.event_kind <> 'message'
+       or e.native_item_id is not null
+       or e.event_subtype = 'user_message'
+     )
+     and (
+       e.event_kind <> 'lifecycle'
+       or e.event_subtype in ('task_started', 'task_complete', 'turn_started', 'turn_complete')
+     )
+     and pg_visible_in_snapshot(e.xmin::text::xid8, $6::pg_snapshot)
+     and (
+       e.actor_role <> 'unknown'
+       or pg_visible_in_snapshot(s.xmin::text::xid8, $6::pg_snapshot)
+     )
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) >= greatest(
+       $2::timestamptz,
+       $8::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+     )
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) >= date_trunc('milliseconds', s.started_at)
+     and coalesce(
+       ${nativeItemTimestamp("e.native_item_id")},
+       coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+     ) < least(
+       $5::timestamptz,
+       $9::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+     )
+)`;
+}
+
 // Canonical ranking must see the full snapshot window. Mutual-unique representation
 // matching also needs each direct match's alternative partners, so enrichment keeps two
 // hops of the largest pairing tolerance around the selected frame. This preserves degree
@@ -460,9 +503,6 @@ activity_candidates as materialized (
          ib.collector_key source_collector_key,
          ib.source_kind, ib.source_stream_key,
          ib.generation_key, ib.generation_seq,
-         ib.start_offset source_batch_start_offset,
-         ib.end_offset source_batch_end_offset,
-         ib.record_count source_batch_record_count,
          e.content_byte_size, e.content_excerpt
     from activity_event_ids ids
     join telemetry.events e on e.id = ids.id
@@ -605,7 +645,8 @@ with p as materialized (
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end
-), ${detailActivityCte("and s.person_id = p.person_id")}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
+), ${relevantActivitySessionsCte()}, ${detailActivityCte(`and s.person_id = p.person_id
+     and e.session_id in (select session_id from relevant_activity_sessions)`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
               when actor_role in ('worker', 'guardian') then 'subagent'

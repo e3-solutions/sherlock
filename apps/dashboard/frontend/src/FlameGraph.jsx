@@ -88,7 +88,8 @@ function evidenceFailureReason(error) {
 }
 
 function needsTimelineRefresh(reason) {
-  return reason?.endsWith("_snapshot_expired") || reason?.endsWith("_request_not_found");
+  return reason?.endsWith("_snapshot_expired") || reason?.endsWith("_request_not_found") ||
+    reason === "flame_evidence_mismatch";
 }
 
 export function formatActiveTime(seconds) {

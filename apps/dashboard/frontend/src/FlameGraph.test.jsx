@@ -676,6 +676,37 @@ describe("FlameGraph", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("refreshes the timeline instead of retrying mismatched interval evidence", async () => {
+    vi.mocked(fetch).mockImplementation((url) => {
+      const request = new URL(url, "http://dashboard.test");
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          personId: request.searchParams.get("personId"),
+          start: request.searchParams.get("start"),
+          snapshot: request.searchParams.get("snapshot"),
+          work: [],
+          prompts: [],
+        }),
+      });
+    });
+    const onRefresh = vi.fn();
+    const { container } = render(
+      <FlameGraph data={model()} chartWidth={1008} onRefresh={onRefresh} />,
+    );
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh timeline" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps prompt text out of busy frame overviews and resets extra sessions by frame", async () => {
     const busyModel = model();
     busyModel.people[0].buckets[0].prompts = 7;

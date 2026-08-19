@@ -253,6 +253,14 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         .toEqual([0, 0, 0, 0]);
       expect(person.buckets[bucketIndex(new Date("2026-08-18T12:00:00.000Z"))])
         .toEqual([0, 0, 0, 0]);
+
+      const canonicalLoserInterval = await source.fetchInterval({
+        personId,
+        start: "2026-08-18T11:20:00.000Z",
+        snapshot: payload.snapshot,
+      });
+      expect(canonicalLoserInterval.work).toEqual([]);
+      expect(canonicalLoserInterval.prompts).toEqual([]);
     } finally {
       if (source) await source.close();
       try {

@@ -371,6 +371,11 @@ describe("interval and work evidence adapters", () => {
       start: new Date(startMs).toISOString(),
       snapshot: expected.snapshot,
       work: [{ ...work, ...mutation }],
+      prompts: [{
+        id: "native:msg-1", sessionId: "s1",
+        at: new Date(startMs + 1500).toISOString(),
+        content: "Investigate the cursor", truncated: false,
+      }],
     };
     expect(() => adaptIntervalEvidence(source, expected)).toThrow(FlameDataError);
   });
