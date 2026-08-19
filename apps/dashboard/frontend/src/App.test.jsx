@@ -11,8 +11,9 @@ vi.mock("./flame-data.js", () => ({
 }));
 
 vi.mock("./FlameGraph.jsx", () => ({
-  default: ({ data, stale, onRefresh }) => (
+  default: ({ data, stale, onRefresh, timelineMeta }) => (
     <div data-testid="flame-graph" data-stale={String(stale)}>
+      {timelineMeta}
       {data.marker}
       <button type="button" onClick={onRefresh}>Refresh timeline</button>
     </div>

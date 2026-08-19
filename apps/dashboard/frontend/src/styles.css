@@ -145,10 +145,11 @@ input { font: inherit; }
 
 .timeline-read {
   flex: 0 0 auto;
-  margin: 0 0 8px;
+  margin: 0;
   color: var(--flame-muted);
   font-size: 11px;
   letter-spacing: .04em;
+  line-height: 1.35;
 }
 
 .timeline-read--delayed {

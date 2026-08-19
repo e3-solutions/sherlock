@@ -188,7 +188,13 @@ describe("FlameGraph", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("renders every ordered bucket on a shared semantic time axis", () => {
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const { container } = render(
+      <FlameGraph
+        data={model()}
+        chartWidth={1008}
+        timelineMeta={<p>Through 12:10 PM · read 2m ago</p>}
+      />,
+    );
 
     expect(screen.getByLabelText("Code activity over the last 24 hours")).toBeInTheDocument();
     expect(container.querySelectorAll(".flame-time-axis time")).toHaveLength(13);
@@ -211,6 +217,8 @@ describe("FlameGraph", () => {
     expect(peopleScroll).toHaveAttribute("aria-label", "People activity timelines, 2 people");
     expect(peopleScroll).toHaveAttribute("tabindex", "0");
     expect(axis.parentElement).toHaveClass("flame-meta-row");
+    expect(screen.getByText("Through 12:10 PM · read 2m ago").parentElement)
+      .toHaveClass("flame-meta-rail");
     expect(peopleScroll.previousElementSibling).toBe(axis.parentElement);
     expect(peopleScroll).not.toContainElement(axis);
     expect(peopleScroll.querySelectorAll(".flame-person")).toHaveLength(2);
