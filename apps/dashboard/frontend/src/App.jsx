@@ -145,17 +145,19 @@ export default function App() {
           {state === "stale" ? "Timeline refresh failed." : "Timeline update delayed."}
         </span>
       )}
-      <p
-        className={`timeline-read${refreshProblem ? " timeline-read--delayed" : ""}`}
-      >
-        {state === "stale" ? "Refresh failed. " : freshness.delayed ? "Update delayed. " : ""}
-        {freshness.label}
-        {state === "stale" && <span className="visually-hidden"> {message}</span>}
-      </p>
       <FlameGraph
         data={data}
         stale={state === "stale" || state === "delayed"}
         onRefresh={() => load({ refresh: "force" })}
+        timelineMeta={(
+          <p
+            className={`timeline-read${refreshProblem ? " timeline-read--delayed" : ""}`}
+          >
+            {state === "stale" ? "Refresh failed. " : freshness.delayed ? "Update delayed. " : ""}
+            {freshness.label}
+            {state === "stale" && <span className="visually-hidden"> {message}</span>}
+          </p>
+        )}
       />
     </>
   );

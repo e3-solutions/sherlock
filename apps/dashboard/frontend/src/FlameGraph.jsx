@@ -853,7 +853,7 @@ function useSharedChartWidth(scrollportRef, requestedWidth) {
   return Math.max(1, measuredWidth);
 }
 
-export default function FlameGraph({ data, chartWidth, stale = false, onRefresh }) {
+export default function FlameGraph({ data, chartWidth, stale = false, onRefresh, timelineMeta }) {
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
@@ -1143,7 +1143,7 @@ export default function FlameGraph({ data, chartWidth, stale = false, onRefresh 
       aria-label={`Code activity over the last ${windowLabel}`}
     >
       <div className="flame-meta-row">
-        <div className="flame-meta-rail" aria-hidden="true" />
+        <div className="flame-meta-rail">{timelineMeta}</div>
         <div
           className="flame-time-axis"
           style={{ width }}
