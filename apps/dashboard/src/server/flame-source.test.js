@@ -118,6 +118,19 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.activity_spans");
   });
 
+  it("can pin MCP queries to the dedicated read-only database role", async () => {
+    const unsafe = vi.fn().mockResolvedValue([]);
+    const source = Object.create(DirectFlameSource.prototype);
+    source.databaseRole = "sherlock_reader";
+    source.sql = { begin: (callback) => callback({ unsafe }) };
+
+    await source.transaction(async () => "ok");
+
+    expect(unsafe.mock.calls.map(([sql]) => sql)).toContain(
+      "set local role sherlock_reader",
+    );
+  });
+
   it("rejects incomplete result grids", () => {
     expect(() => buildFlamePayload({
       rows: rowsFor("ada").slice(1),

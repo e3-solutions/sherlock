@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(87);
+select plan(88);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -101,6 +101,10 @@ select ok(
 select ok(
   pg_has_role('sherlock_worker_login', 'sherlock_reducer', 'member'),
   'Railway login can assume the reducer role for activity revisions'
+);
+select ok(
+  pg_has_role('sherlock_worker_login', 'sherlock_reader', 'member'),
+  'Bonaparte backend can assume the read-only role for MCP evidence'
 );
 
 select ok(

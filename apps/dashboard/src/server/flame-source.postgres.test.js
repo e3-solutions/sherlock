@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   BUCKET_MS,
   DirectFlameSource,
+  MCP_DATABASE_ROLE,
   NORMALIZER_VERSION,
 } from "./flame-source.js";
 
@@ -48,6 +49,22 @@ async function cleanup(sql, workspaceId) {
 }
 
 describePostgres("Sherlock Flame PostgreSQL integration", () => {
+  it("lets the shared backend login assume the MCP read-only role", async () => {
+    const source = new DirectFlameSource({
+      databaseUrl: DATABASE_URL,
+      workspaceId: crypto.randomUUID(),
+      databaseRole: MCP_DATABASE_ROLE,
+    });
+    try {
+      await expect(source.readiness()).resolves.toEqual({
+        status: "ok",
+        mode: "sherlock_backend_aggregate",
+      });
+    } finally {
+      await source.close();
+    }
+  }, 30_000);
+
   it("shows the E3 identity instead of a matching Core Edge identity", async () => {
     const workspaceId = crypto.randomUUID();
     const coreEdgeId = crypto.randomUUID();

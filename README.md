@@ -34,3 +34,4 @@ For implementation and operations details, see:
 - [Data schema](docs/data-schema.md)
 - [Telemetry processing](docs/telemetry-processing.md)
 - [CodeActivity dashboard](apps/dashboard/README.md)
+- [Bonaparte MCP usage and prompt coaching](apps/dashboard/README.md#bonaparte-mcp)

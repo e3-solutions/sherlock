@@ -3,10 +3,12 @@
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
 uses SHERLOCK_WORKSPACE_ID, every database transaction is repeatable-read and
-read-only, and the server assumes Sherlock's existing sherlock_normalizer role.
+read-only, the dashboard assumes `sherlock_normalizer`, and MCP assumes the
+narrower `sherlock_reader` role.
 
-The browser never receives database credentials. The page and aggregate API
-are public; every database query remains pinned to one configured workspace.
+The browser and MCP clients never receive database credentials. The page and
+aggregate API are public; the MCP endpoint requires a separate bearer token.
+Every database query remains pinned to one configured workspace.
 The aggregate API does not return prompt text. Lazy interval and work-detail
 endpoints return only canonical normalized evidence for one person and one
 ten-minute bucket. Message content is limited to
@@ -117,12 +119,47 @@ the existing Sherlock worker login contract, which can assume
 sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
 exceed 1000.
 
+## Bonaparte MCP
+
+`/mcp` is a stateless Streamable HTTP MCP endpoint for agent-assisted usage
+analysis and prompt coaching. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
+least 32 characters and configure the MCP client to send it as
+`Authorization: Bearer <token>`. Browser-origin requests are rejected; the
+endpoint is for origin-free agent clients and server-to-server MCP hosts.
+
+The endpoint exposes two read-only tools:
+
+- `analyze_usage` returns up to 20 people at a time with distinct Agent,
+  Subagent, and Unclassified session evidence, prompt counts, coarse active
+  buckets, and the source coverage receipt. Follow `roster.nextOffset` to page
+  through the roster. Set `includeBuckets` to find an exact ten-minute interval
+  for deeper analysis.
+- `get_prompt_feedback_context` takes a person ID and bucket start from the
+  usage result plus its opaque `analysisReceipt`, which pins prompt evidence to
+  the exact aggregate snapshot. It returns at most 20 canonical primary human
+  prompt excerpts, simple measurements, truncation metadata, and a coaching
+  rubric for the calling agent. It does not generate or persist a personnel
+  score.
+
+The expected agent workflow is to call `analyze_usage`, select evidence and a
+bucket, then call `get_prompt_feedback_context` and produce constructive
+feedback grounded in the returned excerpts. Agents must state that observed
+events are not proof of continuous attention and that a truncated 1,024-byte
+excerpt cannot support conclusions about omitted text.
+
+MCP database work uses a separate connection pool and runs repeatable-read,
+read-only transactions after assuming `sherlock_reader`. That role can select
+private normalized facts but cannot insert, update, or delete them. The endpoint
+never reads raw Storage objects and never writes feedback or derived judgments
+to Sherlock.
+
 ## Local verification
 
 Run corepack pnpm install --frozen-lockfile, then pnpm check, pnpm test, and
-pnpm build. With the repository's isolated Supabase database running, set
-`SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to execute the dashboard SQL
-integration fixture.
+pnpm build. The test suite includes an official MCP client discovering and
+calling the Streamable HTTP tools. With the repository's isolated Supabase
+database running, set `SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to
+execute the dashboard SQL integration fixture.
 
 ## Railway deployment
 

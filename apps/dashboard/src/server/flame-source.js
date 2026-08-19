@@ -4,6 +4,8 @@ export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const DATABASE_ROLE = "sherlock_normalizer";
+export const MCP_DATABASE_ROLE = "sherlock_reader";
+const DATABASE_ROLES = new Set([DATABASE_ROLE, MCP_DATABASE_ROLE]);
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
@@ -927,10 +929,20 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   };
 }
 
+function sourceDatabaseRole(source) {
+  const role = source.databaseRole ?? DATABASE_ROLE;
+  if (!DATABASE_ROLES.has(role)) {
+    throw new FlameSourceError("flame_database_reader_unsafe");
+  }
+  return role;
+}
+
 export class DirectFlameSource {
-  constructor({ databaseUrl, workspaceId, maxPeople = 500 }) {
+  constructor({ databaseUrl, workspaceId, maxPeople = 500, databaseRole = DATABASE_ROLE }) {
     this.workspaceId = workspaceId;
     this.maxPeople = maxPeople;
+    this.databaseRole = databaseRole;
+    sourceDatabaseRole(this);
     this.sql = postgres(databaseUrl, {
       prepare: false,
       max: 2,
@@ -945,10 +957,11 @@ export class DirectFlameSource {
 
   async transaction(callback) {
     try {
+      const databaseRole = sourceDatabaseRole(this);
       return await this.sql.begin(async (tx) => {
         await tx.unsafe("set transaction isolation level repeatable read, read only");
         await tx.unsafe("select set_config('statement_timeout', '20000', true)");
-        await tx.unsafe(`set local role ${DATABASE_ROLE}`);
+        await tx.unsafe(`set local role ${databaseRole}`);
         return await callback(tx);
       });
     } catch (error) {
@@ -959,9 +972,10 @@ export class DirectFlameSource {
 
   async readiness() {
     try {
+      const databaseRole = sourceDatabaseRole(this);
       return await this.transaction(async (tx) => {
         const rows = await tx.unsafe(`
-          select current_role = 'sherlock_normalizer' as backend_role,
+          select current_role = '${databaseRole}' as backend_role,
                  current_setting('transaction_read_only') = 'on' as read_only,
                  has_table_privilege(current_role, 'telemetry.people', 'select') as can_read_people,
                  has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events

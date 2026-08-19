@@ -4,13 +4,20 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
+import {
+  DirectFlameSource,
+  FlameSourceError,
+  MCP_DATABASE_ROLE,
+} from "./src/server/flame-source.js";
+import { createMcpHttpRoute } from "./src/server/mcp-http.js";
+import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
 const PORT = Number.parseInt(process.env.PORT ?? "8000", 10);
 const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
 const databaseUrl = process.env.SUPABASE_DB_URL ?? "";
+const mcpToken = process.env.SHERLOCK_MCP_TOKEN ?? "";
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
 const validWorkspaceId =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -19,6 +26,15 @@ const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople
 const source = databaseUrl && validWorkspaceId && validMaxPeople
   ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
   : null;
+const mcpSource = databaseUrl && validWorkspaceId && validMaxPeople
+  ? new DirectFlameSource({
+    databaseUrl,
+    workspaceId,
+    maxPeople,
+    databaseRole: MCP_DATABASE_ROLE,
+  })
+  : null;
+const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
 
 const SECURITY_HEADERS = {
   "Content-Security-Policy":
@@ -50,6 +66,13 @@ function sendJson(response, status, body, headers = {}) {
   response.end(JSON.stringify(body));
 }
 
+const mcpRoute = createMcpHttpRoute({
+  protocolHandler: mcpProtocol?.handler ?? ((request, response) => {
+    sendJson(response, 503, { error: "mcp_not_configured" });
+  }),
+  token: mcpToken,
+});
+
 async function sendFile(response, filePath, cacheControl) {
   try {
     const info = await stat(filePath);
@@ -78,6 +101,10 @@ function configurationStatus() {
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", "http://dashboard.internal");
+  if (url.pathname === "/mcp") {
+    await mcpRoute(request, response);
+    return;
+  }
   if (request.method !== "GET") {
     sendJson(response, 405, { error: "method_not_allowed" }, { Allow: "GET" });
     return;
@@ -185,7 +212,11 @@ server.listen(PORT, "0.0.0.0", () => {
 async function shutdown(signal) {
   console.log(JSON.stringify({ event: "dashboard_shutdown", signal }));
   server.close();
-  await source?.close();
+  await Promise.all([
+    mcpProtocol?.close(),
+    source?.close(),
+    mcpSource?.close(),
+  ]);
 }
 
 process.once("SIGINT", () => shutdown("SIGINT"));
