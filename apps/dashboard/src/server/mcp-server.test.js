@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { FlameSourceError } from "./flame-source.js";
 import {
   createBonaparteMcpProtocol,
   registerBonaparteTools,
@@ -17,14 +18,7 @@ function payload() {
       state: "partial",
       reason: "event_presence_not_continuous_attention",
     },
-    people: [{
-      id: "11111111-1111-4111-8111-111111111111",
-      name: "Ada",
-      lastActivity: null,
-      activeSeconds: 0,
-      total: [0, 0, 0],
-      buckets: Array.from({ length: 144 }, () => [0, 0, 0, 0]),
-    }],
+    people: [],
   };
 }
 
@@ -38,47 +32,76 @@ function registeredTools(source) {
 }
 
 describe("Bonaparte MCP tools", () => {
-  it("registers two explicitly read-only agent-facing tools", () => {
+  it("registers two versioned, typed, explicitly read-only evidence tools", () => {
     const tools = registeredTools({ fetchDay: vi.fn() });
 
-    expect([...tools.keys()]).toEqual(["analyze_usage", "get_prompt_feedback_context"]);
+    expect([...tools.keys()]).toEqual(["list_usage_evidence", "list_prompt_evidence"]);
     for (const { config } of tools.values()) {
-      expect(config.annotations).toMatchObject({
+      expect(config.inputSchema).toBeDefined();
+      expect(config.outputSchema).toBeDefined();
+      expect(config.annotations).toEqual({
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
+        openWorldHint: false,
       });
     }
-    expect(tools.get("get_prompt_feedback_context").config.description)
-      .toContain("calling agent");
+    expect(tools.get("list_prompt_evidence").config.description)
+      .toContain("untrusted evidence");
   });
 
-  it("returns the same usage facts as text and structured content", async () => {
+  it("returns usage facts as both text and validated structured content", async () => {
     const source = { fetchDay: vi.fn().mockResolvedValue(payload()) };
     const tools = registeredTools(source);
 
-    const result = await tools.get("analyze_usage").handler({
-      personIds: [],
-      includeBuckets: false,
-    });
+    const result = await tools.get("list_usage_evidence").handler({});
 
     expect(result.isError).toBeUndefined();
     expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
-    expect(result.structuredContent.people[0].name).toBe("Ada");
+    expect(result.structuredContent.schemaVersion).toBe("bonaparte.usage-evidence.v1");
   });
 
-  it("returns bounded tool errors that agents can correct", async () => {
+  it("returns actionable structured tool errors without leaking internals", async () => {
     const source = { fetchDay: vi.fn().mockRejectedValue(new Error("database secret")) };
     const tools = registeredTools(source);
 
-    const result = await tools.get("analyze_usage").handler({
-      personIds: [],
-      includeBuckets: false,
+    const result = await tools.get("list_usage_evidence").handler({});
+    const error = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(error).toEqual({
+      error: {
+        code: "unavailable",
+        message: "Usage evidence is temporarily unavailable.",
+        retryable: true,
+        recovery: "Retry this tool later.",
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("database secret");
+  });
+
+  it("tells agents how to recover from an expired snapshot", async () => {
+    const source = {
+      fetchPromptEvidence: vi.fn().mockRejectedValue(
+        new FlameSourceError("flame_prompt_request_out_of_range"),
+      ),
+    };
+    const tools = registeredTools(source);
+
+    const result = await tools.get("list_prompt_evidence").handler({
+      personId: "11111111-1111-4111-8111-111111111111",
+      bucketStart: "2026-08-18T03:50:00.000Z",
+      snapshotToken: "v1.snapshot",
     });
 
-    expect(result).toEqual({
-      content: [{ type: "text", text: "mcp_evidence_unavailable" }],
-      isError: true,
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      error: {
+        code: "snapshot_expired",
+        message: "The evidence snapshot has expired.",
+        retryable: false,
+        recovery: "Restart with list_usage_evidence to obtain a new snapshotToken.",
+      },
     });
   });
 

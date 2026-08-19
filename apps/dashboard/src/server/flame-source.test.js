@@ -7,10 +7,13 @@ import {
   FLAME_SQL,
   INTERVAL_WORK_SQL,
   MAX_WORK_DETAIL_LIMIT,
+  MCP_PROMPT_CONTEXT_LIMIT,
+  MCP_PROMPT_EVIDENCE_LIMIT,
   PEOPLE_SQL,
   PREFERRED_DASHBOARD_EMAIL_DOMAIN,
   REPLACED_DASHBOARD_EMAIL_DOMAIN,
   WORK_DETAIL_SQL,
+  PROMPT_EVIDENCE_SQL,
   ASSISTANT_REPRESENTATION_MATCH_SECONDS,
   DirectFlameSource,
   UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS,
@@ -18,6 +21,7 @@ import {
   FlameSourceError,
   buildFlamePayload,
   decodeWorkCursor,
+  decodePromptCursor,
   decodeSnapshotToken,
   encodeWorkCursor,
   encodeSnapshotToken,
@@ -420,6 +424,26 @@ describe("Sherlock Flame payload", () => {
     expect(WORK_DETAIL_SQL).toContain("limit $14");
   });
 
+  it("selects MCP prompt excerpts from the exact canonical prompt universe", () => {
+    expect(PROMPT_EVIDENCE_SQL).toContain("prompt_candidates as materialized");
+    expect(PROMPT_EVIDENCE_SQL).toContain("e.message_origin = 'human'");
+    expect(PROMPT_EVIDENCE_SQL).toContain("e.message_role = 'user'");
+    expect(PROMPT_EVIDENCE_SQL).toContain("e.actor_role = 'primary'");
+    expect(PROMPT_EVIDENCE_SQL).toContain("where has_submitted");
+    expect(PROMPT_EVIDENCE_SQL).toContain("where canonical_rank = 1");
+    expect(PROMPT_EVIDENCE_SQL).toContain(
+      "pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
+    );
+    expect(PROMPT_EVIDENCE_SQL).toContain("and s.person_id = p.person_id");
+    expect(PROMPT_EVIDENCE_SQL).toContain(
+      ") > (p.cursor_at_microseconds, p.cursor_id)",
+    );
+    expect(PROMPT_EVIDENCE_SQL).toContain("limit $12");
+    expect(PROMPT_EVIDENCE_SQL).toContain("limit 4");
+    expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(10);
+    expect(MCP_PROMPT_CONTEXT_LIMIT).toBe(4);
+  });
+
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
     expect(ASSISTANT_REPRESENTATION_MATCH_SECONDS).toBe(3);
     for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
@@ -578,5 +602,68 @@ describe("Sherlock Flame payload", () => {
       limit: "101",
     })).rejects.toMatchObject({ code: "flame_work_request_invalid" });
     expect(source.transaction).not.toHaveBeenCalled();
+  });
+
+  it("pages canonical MCP prompt evidence without session caps", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const rows = Array.from({ length: 11 }, (_, index) => ({
+      id: String(100 + index),
+      observed_at: new Date(START.getTime() + (index + 1) * 1000),
+      observed_at_microseconds: String(BigInt(START.getTime() + (index + 1) * 1000) * 1000n),
+      content_byte_size: index === 0 ? 20 : 8,
+      content_excerpt: index === 0 ? "Short" : `Prompt ${index}`,
+      context_before: index === 0 ? [{
+        id: "90",
+        role: "assistant",
+        observedAt: "2026-08-16T11:59:59.000000Z",
+        excerpt: "Prior response",
+        contentBytes: 14,
+      }] : [],
+    }));
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce(rows);
+    source.transaction = (callback) => callback({ unsafe });
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+    const result = await source.fetchPromptEvidence({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+      cursor: "",
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROMPT_EVIDENCE_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(11);
+    expect(result.prompts).toHaveLength(10);
+    expect(result.prompts[0]).toEqual({
+      id: "100",
+      observedAt: "2026-08-16T12:00:01.000Z",
+      excerpt: "Short",
+      excerptTruncated: true,
+      contextBefore: [{
+        id: "90",
+        role: "assistant",
+        observedAt: "2026-08-16T11:59:59.000Z",
+        excerpt: "Prior response",
+        excerptTruncated: false,
+      }],
+    });
+    expect(result.nextCursor).toMatch(/^p1\./);
+    expect(decodePromptCursor(result.nextCursor, {
+      personId,
+      start: START.toISOString(),
+      snapshot,
+    })).toEqual({
+      atMicroseconds: rows[9].observed_at_microseconds,
+      id: rows[9].id,
+    });
+    expect(() => decodePromptCursor(result.nextCursor, {
+      personId: "44444444-4444-4444-8444-444444444444",
+      start: START.toISOString(),
+      snapshot,
+    })).toThrowError(expect.objectContaining({ code: "flame_prompt_cursor_invalid" }));
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { MCP_TOKEN_MIN_LENGTH } from "./mcp-auth.js";
-import { createMcpHttpRoute } from "./mcp-http.js";
+import { MAX_MCP_REQUEST_BYTES, createMcpHttpRoute } from "./mcp-http.js";
 
 const TOKEN = "s".repeat(MCP_TOKEN_MIN_LENGTH);
 
@@ -52,5 +52,34 @@ describe("Bonaparte MCP HTTP route", () => {
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     });
+  });
+
+  it("rejects an oversized declared body before protocol parsing", async () => {
+    const protocolHandler = vi.fn();
+    const route = createMcpHttpRoute({ protocolHandler, token: TOKEN });
+    const response = responseRecorder();
+
+    await route({
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-length": String(MAX_MCP_REQUEST_BYTES + 1),
+      },
+    }, response);
+
+    expect(protocolHandler).not.toHaveBeenCalled();
+    expect(response.status).toBe(413);
+    expect(JSON.parse(response.body)).toEqual({ error: "mcp_request_too_large" });
+  });
+
+  it("contains unexpected protocol failures behind a safe response", async () => {
+    const protocolHandler = vi.fn().mockRejectedValue(new Error("database secret"));
+    const route = createMcpHttpRoute({ protocolHandler, token: TOKEN });
+    const response = responseRecorder();
+
+    await route({ headers: { authorization: `Bearer ${TOKEN}` } }, response);
+
+    expect(response.status).toBe(503);
+    expect(JSON.parse(response.body)).toEqual({ error: "mcp_unavailable" });
+    expect(response.body).not.toContain("database secret");
   });
 });

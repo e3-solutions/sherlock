@@ -325,4 +325,160 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       }
     }
   }, 30_000);
+
+  it("returns the same canonical primary-human prompts counted by the aggregate", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let source;
+    const bucketStart = "2026-08-18T11:00:00.000Z";
+    const messages = [
+      {
+        at: "2026-08-18T11:01:00.000Z",
+        kind: "agent_message",
+        subtype: "agent_message",
+        role: "assistant",
+        origin: "system",
+        nativePayloadType: "agent_message",
+        excerpt: "I will inspect the cache implementation.",
+        hash: "d".repeat(64),
+      },
+      {
+        at: "2026-08-18T11:02:00.000Z",
+        kind: "message",
+        subtype: "user_message",
+        role: "user",
+        origin: "human",
+        nativePayloadType: "user_message",
+        excerpt: "Fix the cache race and add a regression test.",
+        hash: "e".repeat(64),
+      },
+      {
+        at: "2026-08-18T11:03:00.000Z",
+        kind: "message",
+        subtype: "user_message",
+        role: "user",
+        origin: "human",
+        nativePayloadType: "user_message",
+        excerpt: "Also cover cancellation.",
+        hash: "f".repeat(64),
+      },
+    ];
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'MCP prompt fixture')`,
+        [workspaceId, `mcp-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
+         values ($1, $2, $3, 'Prompt Person')`,
+        [personId, workspaceId, `person-${personId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         ) values ($1, $2, $3, 'fixture', $5, 'primary', 'fixture.v1', $4)`,
+        [sessionId, workspaceId, personId, bucketStart, sessionId],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_kind,
+           source_stream_key, generation_key, generation_seq, start_offset,
+           end_offset, source_byte_count, source_sha256, storage_path,
+           storage_encoding, stored_byte_count, stored_sha256, record_count,
+           contract_version
+         ) values (
+           $1, $2, $3, 'fixture', 'rollout', $4, 'fixture-generation', 0, 0,
+           300, 300, repeat('a', 64), $5, 'identity', 300, repeat('b', 64), 3,
+           'fixture.v1'
+         )`,
+        [batchId, workspaceId, personId, `stream-${batchId}`, `fixture/${batchId}`],
+      );
+
+      for (const [index, message] of messages.entries()) {
+        const [record] = await sql.unsafe(
+          `insert into telemetry.native_records (
+             workspace_id, batch_id, record_index, source_start_offset,
+             source_end_offset, record_sha256, native_type,
+             native_payload_type, occurred_at, parse_status
+           ) values ($1, $2, $3, $4, $5, repeat('c', 64), 'event_msg', $6, $7, 'ok')
+           returning id`,
+          [
+            workspaceId,
+            batchId,
+            index,
+            index * 100,
+            index * 100 + 100,
+            message.nativePayloadType,
+            message.at,
+          ],
+        );
+        await sql.unsafe(
+          `insert into telemetry.events (
+             workspace_id, session_id, source_record_id, normalizer_version,
+             projection_index, source_priority, event_kind, event_subtype,
+             actor_role, occurred_at, observed_at, server_received_at,
+             message_role, message_origin, content_sha256, content_byte_size,
+             content_excerpt
+           ) values (
+             $1, $2, $3, $4, 0, 50, $5, $6, 'primary', $7, $7, $7,
+             $8, $9, $10, $11, $12
+           )`,
+          [
+            workspaceId,
+            sessionId,
+            record.id,
+            NORMALIZER_VERSION,
+            message.kind,
+            message.subtype,
+            message.at,
+            message.role,
+            message.origin,
+            message.hash,
+            Buffer.byteLength(message.excerpt, "utf8"),
+            message.excerpt,
+          ],
+        );
+      }
+
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        databaseRole: MCP_DATABASE_ROLE,
+      });
+      const aggregate = await source.fetchDay({ now: FIXED_NOW });
+      const bucket = aggregate.people[0].buckets[bucketIndex(new Date(bucketStart))];
+      const evidence = await source.fetchPromptEvidence({
+        personId,
+        start: bucketStart,
+        snapshot: aggregate.snapshot,
+        cursor: "",
+      });
+
+      expect(bucket[3]).toBe(2);
+      expect(evidence.prompts.map(({ excerpt }) => excerpt)).toEqual([
+        "Fix the cache race and add a regression test.",
+        "Also cover cancellation.",
+      ]);
+      expect(evidence.prompts[0].contextBefore).toEqual([
+        expect.objectContaining({
+          role: "assistant",
+          excerpt: "I will inspect the cache implementation.",
+        }),
+      ]);
+      expect(evidence.nextCursor).toBeNull();
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
 });
