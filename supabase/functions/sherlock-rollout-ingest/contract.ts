@@ -36,7 +36,8 @@ export interface RecordLocator {
 
 export interface BatchManifest {
   contract_version: typeof CONTRACT_VERSION;
-  source_kind: "rollout";
+  source_provider: "codex" | "claude_code";
+  source_kind: "rollout" | "transcript";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -50,9 +51,11 @@ export interface BatchManifest {
   record_count: number;
   records: RecordLocator[];
   observed_native_session_id: string | null;
+  observed_parent_native_session_id: string | null;
   first_occurred_at: string | null;
   last_occurred_at: string | null;
   codex_version: string | null;
+  source_version: string | null;
   collector_version: string | null;
 }
 
@@ -73,7 +76,7 @@ export interface CommittedReceipt extends Attribution {
   receipt_version: typeof RECEIPT_VERSION;
   status: "committed";
   batch_id: string;
-  source_kind: "rollout";
+  source_kind: "rollout" | "transcript";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -444,12 +447,21 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
     );
   }
   const contractVersion = text(raw.contract_version, "contract_version");
+  const sourceProvider = raw.source_provider === undefined
+    ? "codex"
+    : text(raw.source_provider, "source_provider");
   const sourceKind = text(raw.source_kind, "source_kind");
   const storageEncoding = text(raw.storage_encoding, "storage_encoding");
-  if (contractVersion !== CONTRACT_VERSION || sourceKind !== "rollout") {
+  if (
+    contractVersion !== CONTRACT_VERSION ||
+    !(["codex", "claude_code"] as string[]).includes(sourceProvider) ||
+    !(["rollout", "transcript"] as string[]).includes(sourceKind) ||
+    (sourceProvider === "codex" && sourceKind !== "rollout") ||
+    (sourceProvider === "claude_code" && sourceKind !== "transcript")
+  ) {
     throw new IngestError(
       "unsupported_contract",
-      "only rollout batch v1 is accepted",
+      "source provider and kind are not supported by batch v1",
       400,
     );
   }
@@ -462,7 +474,8 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
   }
   const manifest: BatchManifest = {
     contract_version: CONTRACT_VERSION,
-    source_kind: "rollout",
+    source_provider: sourceProvider as BatchManifest["source_provider"],
+    source_kind: sourceKind as BatchManifest["source_kind"],
     source_stream_key: safeSegment(raw.source_stream_key, "source_stream_key"),
     generation_key: safeSegment(raw.generation_key, "generation_key"),
     generation_seq: integer(raw.generation_seq, "generation_seq"),
@@ -480,6 +493,11 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
       "observed_native_session_id",
       IDENTITY_HINT_BYTES,
     ),
+    observed_parent_native_session_id: boundedNullableText(
+      raw.observed_parent_native_session_id,
+      "observed_parent_native_session_id",
+      IDENTITY_HINT_BYTES,
+    ),
     first_occurred_at: nullableTimestamp(
       raw.first_occurred_at,
       "first_occurred_at",
@@ -491,6 +509,11 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
     codex_version: boundedNullableText(
       raw.codex_version,
       "codex_version",
+      VERSION_HINT_BYTES,
+    ),
+    source_version: boundedNullableText(
+      raw.source_version ?? raw.codex_version,
+      "source_version",
       VERSION_HINT_BYTES,
     ),
     collector_version: boundedNullableText(
@@ -508,6 +531,18 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
 }
 
 export function validateManifest(manifest: BatchManifest): void {
+  if (
+    (manifest.source_provider === "codex" &&
+      manifest.source_kind !== "rollout") ||
+    (manifest.source_provider === "claude_code" &&
+      manifest.source_kind !== "transcript")
+  ) {
+    throw new IngestError(
+      "unsupported_contract",
+      "source provider and kind do not match",
+      400,
+    );
+  }
   if (
     manifest.source_byte_count > MAX_SOURCE_BYTES ||
     manifest.stored_byte_count > MAX_STORED_BYTES ||
@@ -700,7 +735,7 @@ export function receiptFromRow(row: Record<string, unknown>): CommittedReceipt {
     workspace_id: String(row.workspace_id),
     person_id: String(row.person_id),
     collector_key: String(row.collector_key),
-    source_kind: "rollout",
+    source_kind: String(row.source_kind) as CommittedReceipt["source_kind"],
     source_stream_key: String(row.source_stream_key),
     generation_key: String(row.generation_key),
     generation_seq: Number(row.generation_seq),

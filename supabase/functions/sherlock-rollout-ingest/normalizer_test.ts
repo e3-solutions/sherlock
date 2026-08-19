@@ -1,5 +1,10 @@
 import { type BatchManifest, CONTRACT_VERSION, sha256Hex } from "./contract.ts";
-import { NORMALIZER_VERSION, projectBatch } from "./normalizer.ts";
+import {
+  CLAUDE_NORMALIZER_VERSION,
+  NORMALIZER_VERSION,
+  normalizerVersionFor,
+  projectBatch,
+} from "./normalizer.ts";
 
 function assert(
   condition: unknown,
@@ -69,6 +74,7 @@ async function fixture(
     source,
     manifest: {
       contract_version: CONTRACT_VERSION,
+      source_provider: "codex",
       source_kind: "rollout",
       source_stream_key: "stream-normalizer",
       generation_key: "generation-normalizer",
@@ -83,9 +89,11 @@ async function fixture(
       record_count: locators.length,
       records: locators,
       observed_native_session_id: "child-session",
+      observed_parent_native_session_id: null,
       first_occurred_at: occurred[0] ?? null,
       last_occurred_at: occurred.at(-1) ?? null,
       codex_version: "test",
+      source_version: "test",
       collector_version: "test",
     },
   };
@@ -309,4 +317,122 @@ Deno.test("a chunk without session metadata does not invent a primary role", asy
   assert(projection.session?.actor_role === "unknown");
   assert(projection.events[0].actor_role === "unknown");
   assert(projection.events[0].message_origin === "unknown");
+});
+
+Deno.test("Claude transcripts use a provider-specific projection", async () => {
+  const { manifest, source } = await fixture([
+    {
+      parentUuid: null,
+      sessionId: "claude-session",
+      cwd: "/repo",
+      gitBranch: "arya/claude",
+      version: "2.0.59",
+      type: "user",
+      uuid: "user-message",
+      timestamp: "2026-08-19T00:00:00Z",
+      message: { role: "user", content: "Hello from Claude" },
+    },
+    {
+      parentUuid: "user-message",
+      sessionId: "claude-session",
+      cwd: "/repo",
+      gitBranch: "arya/claude",
+      type: "assistant",
+      uuid: "assistant-message",
+      timestamp: "2026-08-19T00:00:01Z",
+      message: {
+        id: "message-1",
+        role: "assistant",
+        model: "claude-opus-4-1",
+        content: [
+          { type: "text", text: "I will inspect it." },
+          { type: "tool_use", id: "tool-1", name: "Read", input: {} },
+        ],
+        usage: {
+          input_tokens: 10,
+          cache_read_input_tokens: 4,
+          output_tokens: 6,
+        },
+      },
+    },
+    {
+      parentUuid: "assistant-message",
+      sessionId: "claude-session",
+      type: "user",
+      uuid: "tool-result-message",
+      timestamp: "2026-08-19T00:00:02Z",
+      message: {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          content: "file contents",
+        }],
+      },
+    },
+  ]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "transcript";
+  manifest.source_version = "2.0.59";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = "claude-session";
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(normalizerVersionFor(manifest) === CLAUDE_NORMALIZER_VERSION);
+  assert(projection.session?.native_session_id === "claude-session");
+  assert(projection.session?.actor_role === "primary");
+  assert(projection.session?.model === "claude-opus-4-1");
+  assert(projection.session?.branch === "arya/claude");
+  assert(
+    projection.events.some((event) =>
+      event.event_kind === "message" && event.message_role === "user" &&
+      event.content_excerpt === "Hello from Claude"
+    ),
+  );
+  assert(
+    projection.events.some((event) =>
+      event.event_kind === "tool_call" && event.tool_call_id === "tool-1" &&
+      event.tool_name === "Read"
+    ),
+  );
+  assert(
+    projection.events.some((event) =>
+      event.event_kind === "tool_result" && event.tool_call_id === "tool-1"
+    ),
+  );
+  const usage = projection.events.find((event) => event.event_kind === "usage");
+  assert(usage?.input_tokens === 10);
+  assert(usage?.cached_input_tokens === 4);
+  assert(usage?.output_tokens === 6);
+  assert(usage?.total_tokens === 20);
+  assert(usage?.usage_is_cumulative === false);
+});
+
+Deno.test("Claude subagent identity remains linked to its parent session", async () => {
+  const { manifest, source } = await fixture([{
+    sessionId: "parent-session",
+    agentId: "agent-worker",
+    isSidechain: true,
+    type: "assistant",
+    timestamp: "2026-08-19T00:00:00Z",
+    message: {
+      role: "assistant",
+      model: "claude-sonnet-4",
+      content: [{ type: "text", text: "Subagent result" }],
+    },
+  }]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "transcript";
+  manifest.source_version = "2.0.59";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = "agent-worker";
+  manifest.observed_parent_native_session_id = "parent-session";
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(projection.session?.native_session_id === "agent-worker");
+  assert(projection.session?.parent_native_session_id === "parent-session");
+  assert(projection.session?.actor_role === "worker");
+  assert(projection.events[0].message_origin === "worker");
 });

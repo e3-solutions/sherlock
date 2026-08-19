@@ -40,6 +40,7 @@ function assertExact(
   manifest: BatchManifest,
 ): void {
   const expected: Record<string, unknown> = {
+    source_provider: manifest.source_provider,
     source_sha256: manifest.source_sha256,
     source_byte_count: manifest.source_byte_count,
     storage_encoding: manifest.storage_encoding,
@@ -48,9 +49,12 @@ function assertExact(
     record_count: manifest.record_count,
     contract_version: manifest.contract_version,
     observed_native_session_id: manifest.observed_native_session_id,
+    observed_parent_native_session_id:
+      manifest.observed_parent_native_session_id,
     first_occurred_at: manifest.first_occurred_at,
     last_occurred_at: manifest.last_occurred_at,
     codex_version: manifest.codex_version,
+    source_version: manifest.source_version,
     collector_version: manifest.collector_version,
     storage_path: storagePath(attribution, manifest),
   };
@@ -150,10 +154,11 @@ async function findExactBatch(
   manifest: BatchManifest,
 ): Promise<Record<string, unknown> | null> {
   const rows = await sql.unsafe(
-    `select ${RECEIPT_COLUMNS}, storage_encoding, observed_native_session_id,
+    `select ${RECEIPT_COLUMNS}, source_provider, storage_encoding,
+            observed_native_session_id, observed_parent_native_session_id,
             to_char(first_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as first_occurred_at,
             to_char(last_occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as last_occurred_at,
-            codex_version, collector_version
+            codex_version, source_version, collector_version
        from telemetry.ingest_batches
       where workspace_id = $1 and collector_key = $2 and source_kind = $3
         and source_stream_key = $4 and generation_seq = $5
@@ -339,14 +344,17 @@ export class PostgresBatchRepository implements BatchRepository {
       const inserted = await tx.unsafe(
         `insert into telemetry.ingest_batches (
            id, workspace_id, person_id, collector_key, observed_native_session_id,
-           source_kind, source_stream_key, generation_key, generation_seq,
+           observed_parent_native_session_id, source_provider, source_kind,
+           source_stream_key, generation_key, generation_seq,
            start_offset, end_offset, source_byte_count, source_sha256,
            storage_path, storage_encoding, stored_byte_count, stored_sha256,
            record_count, first_occurred_at, last_occurred_at, codex_version,
-           collector_version, contract_version, processing_class_hint
+           source_version, collector_version, contract_version,
+           processing_class_hint
          ) values (
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-           $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+           $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
+           $26, $27
          ) returning ${RECEIPT_COLUMNS}`,
         [
           batchId,
@@ -354,6 +362,8 @@ export class PostgresBatchRepository implements BatchRepository {
           attribution.person_id,
           attribution.collector_key,
           manifest.observed_native_session_id,
+          manifest.observed_parent_native_session_id,
+          manifest.source_provider,
           manifest.source_kind,
           manifest.source_stream_key,
           manifest.generation_key,
@@ -370,6 +380,7 @@ export class PostgresBatchRepository implements BatchRepository {
           manifest.first_occurred_at,
           manifest.last_occurred_at,
           manifest.codex_version,
+          manifest.source_version,
           manifest.collector_version,
           manifest.contract_version,
           workloadClassHint,

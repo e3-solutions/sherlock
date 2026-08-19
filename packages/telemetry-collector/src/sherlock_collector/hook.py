@@ -6,13 +6,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from .config import default_codex_home, default_state_root
-from .discovery import discover_rollouts
+from .config import default_claude_home, default_codex_home, default_state_root
+from .discovery import discover_claude_transcripts, discover_rollouts
 from .rollout import CaptureResult, RolloutCapturer
 from .spool import DurableSpool
 
 
-HOOK_EVENTS = {"SessionStart", "UserPromptSubmit", "Stop", "PostToolUse"}
+HOOK_EVENTS = {
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "PostToolUse",
+    "SubagentStart",
+    "SubagentStop",
+    "SessionEnd",
+}
 COORDINATION_TOOLS = {
     "spawn_agent",
     "wait_agent",
@@ -53,6 +61,7 @@ def capture_and_spawn_drain(
     drain_command: Sequence[str],
     *,
     native_session_ids: Mapping[str, str] | None = None,
+    parent_native_session_ids: Mapping[str, str] | None = None,
     drain_environment: Mapping[str, str] | None = None,
     best_effort: bool = False,
     priority_count: int = 0,
@@ -62,6 +71,7 @@ def capture_and_spawn_drain(
         return capturer.capture(
             rollout_paths,
             native_session_ids=native_session_ids,
+            parent_native_session_ids=parent_native_session_ids,
             best_effort=best_effort,
             priority_count=priority_count,
         )
@@ -90,25 +100,51 @@ def run_hook(
     payload: Mapping[str, object],
     *,
     codex_home: Path | str | None = None,
+    claude_home: Path | str | None = None,
     state_root: Path | str | None = None,
+    provider: str = "codex",
     drain_command: Sequence[str],
     drain_environment: Mapping[str, str] | None = None,
 ) -> HookResult:
     if event_name not in HOOK_EVENTS:
         return HookResult(event_name, skipped="unsupported_hook")
-    if event_name == "PostToolUse" and not is_coordination_tool(_tool_name(payload)):
+    if provider not in {"codex", "claude_code"}:
+        return HookResult(event_name, skipped="unsupported_provider")
+    if (
+        provider == "codex"
+        and event_name == "PostToolUse"
+        and not is_coordination_tool(_tool_name(payload))
+    ):
         return HookResult(event_name, skipped="ordinary_tool")
-    home = Path(codex_home or default_codex_home()).expanduser().resolve()
+    home = Path(
+        (claude_home or default_claude_home())
+        if provider == "claude_code"
+        else (codex_home or default_codex_home())
+    ).expanduser().resolve()
     root = Path(state_root or default_state_root(home)).expanduser().resolve()
-    discovery = discover_rollouts(home, hook_payload=payload)
+    discovery = (
+        discover_claude_transcripts(home, hook_payload=payload)
+        if provider == "claude_code"
+        else discover_rollouts(home, hook_payload=payload)
+    )
     environment = os.environ.copy()
     if drain_environment:
         environment.update(drain_environment)
     outcome = capture_and_spawn_drain(
-        RolloutCapturer(root, DurableSpool(root / "queue")),
+        RolloutCapturer(
+            root,
+            DurableSpool(root / "queue"),
+            source_provider=provider,
+            source_kind="transcript" if provider == "claude_code" else "rollout",
+            state_name=(
+                "claude-transcript" if provider == "claude_code" else "rollout"
+            ),
+            capture_unterminated_tail=provider != "claude_code",
+        ),
         discovery.paths,
         drain_command,
         native_session_ids=discovery.native_session_ids,
+        parent_native_session_ids=discovery.parent_native_session_ids,
         drain_environment=environment,
         best_effort=True,
         priority_count=discovery.priority_count,

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 from uuid import UUID
 
-from .config import default_codex_home
+from .config import default_claude_home, default_codex_home
 
 
 DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
@@ -19,6 +19,7 @@ DEFAULT_ROWS_PER_DATABASE = 128
 class DiscoveryResult:
     paths: tuple[Path, ...]
     native_session_ids: Mapping[str, str]
+    parent_native_session_ids: Mapping[str, str] = field(default_factory=dict)
     priority_count: int = 0
     errors: tuple[str, ...] = ()
 
@@ -174,10 +175,48 @@ def discover_rollouts(
         if session_id is not None
     }
     return DiscoveryResult(
-        tuple(prioritized),
-        native_ids,
-        len(set(payload_paths)),
-        tuple(errors),
+        paths=tuple(prioritized),
+        native_session_ids=native_ids,
+        priority_count=len(set(payload_paths)),
+        errors=tuple(errors),
+    )
+
+
+def discover_claude_transcripts(
+    claude_home: Path | str | None = None,
+    *,
+    hook_payload: Mapping[str, object] | None = None,
+) -> DiscoveryResult:
+    """Resolve only transcript paths explicitly supplied by Claude Code hooks."""
+    home = Path(claude_home or default_claude_home()).expanduser().resolve()
+    payload = hook_payload or {}
+    session_id = _text_identity(payload.get("session_id"))
+    agent_id = _text_identity(payload.get("agent_id"))
+    paths: list[Path] = []
+    native_ids: dict[str, str] = {}
+    parent_ids: dict[str, str] = {}
+
+    candidates = (
+        (payload.get("transcript_path"), session_id, None),
+        (payload.get("agent_transcript_path"), agent_id, session_id),
+    )
+    for raw_path, native_id, parent_id in candidates:
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        path = _claude_transcript_path(home, raw_path)
+        if path is None or path in paths:
+            continue
+        paths.append(path)
+        if native_id is not None:
+            native_ids[str(path)] = native_id
+        if parent_id is not None and parent_id != native_id:
+            parent_ids[str(path)] = parent_id
+
+    return DiscoveryResult(
+        paths=tuple(paths),
+        native_session_ids=native_ids,
+        parent_native_session_ids=parent_ids,
+        priority_count=len(paths),
     )
 
 
@@ -188,6 +227,17 @@ def _native_session_id(value: object) -> str | None:
         return str(UUID(value))
     except ValueError:
         return None
+
+
+def _text_identity(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return (
+        normalized
+        if normalized and len(normalized.encode("utf-8")) <= 512
+        else None
+    )
 
 
 def _rollout_path(codex_home: Path, value: str) -> Path | None:
@@ -204,3 +254,14 @@ def _rollout_path(codex_home: Path, value: str) -> Path | None:
             continue
         return path if path.is_file() else None
     return None
+
+
+def _claude_transcript_path(claude_home: Path, value: str) -> Path | None:
+    try:
+        path = Path(value).expanduser().resolve()
+        path.relative_to(claude_home / "projects")
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if path.suffix != ".jsonl" or not path.is_file():
+        return None
+    return path

@@ -1,0 +1,19 @@
+{
+  "name": "sherlock",
+  "owner": {
+    "name": "E3 Solutions",
+    "url": "https://github.com/e3-solutions"
+  },
+  "description": "Sherlock telemetry integrations for coding agents.",
+  "metadata": {
+    "description": "Sherlock telemetry integrations for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "sherlock-claude-code",
+      "source": "./plugins/sherlock-claude-code",
+      "description": "Durable, fail-open Claude Code transcript telemetry capture.",
+      "category": "Productivity"
+    }
+  ]
+}

@@ -6,6 +6,8 @@ import {
 
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const ROLE_VERSION = "sherlock.codex-role.v1";
+export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
+export const CLAUDE_ROLE_VERSION = "sherlock.claude-code-role.v1";
 
 type JsonValue =
   | null
@@ -27,7 +29,7 @@ export interface SessionProjection {
   native_thread_id: string | null;
   parent_native_session_id: string | null;
   actor_role: ActorRole;
-  role_version: typeof ROLE_VERSION;
+  role_version: string;
   title: string | null;
   project_key: string | null;
   repo_remote: string | null;
@@ -90,6 +92,21 @@ export async function projectBatch(
   manifest: BatchManifest,
   source: Uint8Array,
 ): Promise<BatchProjection> {
+  return manifest.source_provider === "claude_code"
+    ? await projectClaudeBatch(manifest, source)
+    : await projectCodexBatch(manifest, source);
+}
+
+export function normalizerVersionFor(manifest: BatchManifest): string {
+  return manifest.source_provider === "claude_code"
+    ? CLAUDE_NORMALIZER_VERSION
+    : NORMALIZER_VERSION;
+}
+
+async function projectCodexBatch(
+  manifest: BatchManifest,
+  source: Uint8Array,
+): Promise<BatchProjection> {
   const records = manifest.records.map((locator) => ({
     locator,
     // A transport fragment is deliberately not a JSON record. Preserve an
@@ -144,6 +161,226 @@ export async function projectBatch(
     records.map((record) => projectRecord(record, session, canonicalScopeKey)),
   );
   return { session, events };
+}
+
+async function projectClaudeBatch(
+  manifest: BatchManifest,
+  source: Uint8Array,
+): Promise<BatchProjection> {
+  const records = manifest.records.map((locator) => ({
+    locator,
+    envelope: parseEnvelope(recordBytes(manifest, source, locator)),
+  }));
+  const envelopes = records.flatMap((record) =>
+    record.envelope ? [record.envelope] : []
+  );
+  const first = envelopes[0] ?? null;
+  const latest =
+    [...envelopes].reverse().find((envelope) =>
+      stringValue(envelope.cwd) !== null ||
+      stringValue(envelope.gitBranch) !== null
+    ) ?? first;
+  const assistant = envelopes.find((envelope) =>
+    stringValue(envelope.type) === "assistant" &&
+    objectValue(envelope.message) !== null
+  );
+  const assistantMessage = objectValue(assistant?.message);
+  const declaredSessionId = stringValue(first?.sessionId) ??
+    stringValue(first?.session_id);
+  const declaredAgentId = stringValue(first?.agentId) ??
+    stringValue(first?.agent_id);
+  const nativeSessionId = manifest.observed_native_session_id ??
+    declaredAgentId ?? declaredSessionId;
+  const parentNativeSessionId = manifest.observed_parent_native_session_id ??
+    (declaredAgentId && declaredSessionId !== nativeSessionId
+      ? declaredSessionId
+      : null);
+  const actorRole: ActorRole =
+    parentNativeSessionId || first?.isSidechain === true
+      ? "worker"
+      : nativeSessionId
+      ? "primary"
+      : "unknown";
+  const session = nativeSessionId
+    ? {
+      native_session_id: nativeSessionId,
+      native_thread_id: null,
+      parent_native_session_id: parentNativeSessionId,
+      actor_role: actorRole,
+      role_version: CLAUDE_ROLE_VERSION,
+      title: stringValue(first?.customTitle),
+      project_key: null,
+      repo_remote: null,
+      branch: stringValue(latest?.gitBranch),
+      cwd: stringValue(latest?.cwd),
+      model: stringValue(assistantMessage?.model),
+      started_at: manifest.first_occurred_at,
+    } satisfies SessionProjection
+    : null;
+  const canonicalScopeKey = session
+    ? `session:${session.native_session_id}`
+    : `stream:${manifest.source_stream_key}`;
+  const projected = await Promise.all(
+    records.map((record) =>
+      projectClaudeRecord(record, session, canonicalScopeKey)
+    ),
+  );
+  return { session, events: projected.flat() };
+}
+
+async function projectClaudeRecord(
+  record: ParsedRecord,
+  session: SessionProjection | null,
+  canonicalScopeKey: string,
+): Promise<EventProjection[]> {
+  const { locator, envelope } = record;
+  const message = objectValue(envelope?.message);
+  const nativeType = stringValue(envelope?.type);
+  const base: EventProjection = {
+    record_index: locator.record_index,
+    projection_index: 0,
+    canonical_scope_key: canonicalScopeKey,
+    logical_event_key: null,
+    source_priority: 100,
+    event_kind: "unknown",
+    event_subtype: nativeType ?? locator.native_type,
+    phase: null,
+    actor_role: session?.actor_role ?? "unknown",
+    occurred_at: locator.occurred_at,
+    observed_at: locator.occurred_at,
+    native_item_id: stringValue(envelope?.uuid) ?? stringValue(message?.id),
+    turn_id: null,
+    tool_call_id: null,
+    message_role: null,
+    message_origin: null,
+    tool_name: null,
+    tool_status: null,
+    model: stringValue(message?.model) ?? session?.model ?? null,
+    project_key: session?.project_key ?? null,
+    repo_remote: session?.repo_remote ?? null,
+    branch: stringValue(envelope?.gitBranch) ?? session?.branch ?? null,
+    cwd: stringValue(envelope?.cwd) ?? session?.cwd ?? null,
+    usage_stream_key: null,
+    usage_scope: null,
+    usage_is_cumulative: null,
+    input_tokens: null,
+    cached_input_tokens: null,
+    output_tokens: null,
+    reasoning_tokens: null,
+    total_tokens: null,
+    error_code: null,
+    content_sha256: null,
+    content_byte_size: null,
+    content_excerpt: null,
+    attributes: null,
+  };
+  if (locator.parse_status !== "ok" || envelope === null) {
+    return [{ ...base, error_code: `native_${locator.parse_status}` }];
+  }
+  if ((nativeType !== "user" && nativeType !== "assistant") || !message) {
+    return [{
+      ...base,
+      event_kind: nativeType === "system" || nativeType === "progress"
+        ? "lifecycle"
+        : "unknown",
+    }];
+  }
+
+  const role = stringValue(message.role) ?? nativeType;
+  const content = message.content;
+  const events: EventProjection[] = [];
+  const text = messageText(content);
+  if (text) {
+    events.push({
+      ...base,
+      ...(await messageFields(text)),
+      projection_index: events.length,
+      event_kind: "message",
+      event_subtype: nativeType,
+      message_role: role,
+      message_origin: role === "user"
+        ? (base.actor_role === "primary" ? "human" : "parent_agent")
+        : assistantMessageOrigin(base.actor_role),
+      logical_event_key: base.native_item_id
+        ? `claude:message:${base.native_item_id}`
+        : null,
+    });
+  }
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      const block = objectValue(item);
+      const blockType = stringValue(block?.type);
+      if (blockType === "tool_use") {
+        events.push({
+          ...base,
+          projection_index: events.length,
+          event_kind: "tool_call",
+          event_subtype: blockType,
+          tool_call_id: stringValue(block?.id),
+          tool_name: stringValue(block?.name),
+        });
+      } else if (blockType === "tool_result") {
+        events.push({
+          ...base,
+          projection_index: events.length,
+          event_kind: "tool_result",
+          event_subtype: blockType,
+          tool_call_id: stringValue(block?.tool_use_id),
+          tool_status: block?.is_error === true ? "failed" : "completed",
+        });
+      }
+    }
+  }
+  const usage = claudeUsage(objectValue(message.usage));
+  if (usage) {
+    events.push({
+      ...base,
+      ...usage,
+      projection_index: events.length,
+      event_kind: "usage",
+      event_subtype: "message_usage",
+      usage_stream_key: canonicalScopeKey,
+      usage_scope: "message",
+      usage_is_cumulative: false,
+    });
+  }
+  return events.length ? events : [{
+    ...base,
+    event_kind: "ignored",
+    event_subtype: `${nativeType}:empty_content`,
+  }];
+}
+
+function claudeUsage(
+  usage: JsonObject | null,
+): Partial<EventProjection> | null {
+  if (!usage) return null;
+  const input = nonNegativeInteger(usage.input_tokens);
+  const cacheRead = optionalNonNegativeInteger(
+    usage,
+    "cache_read_input_tokens",
+  );
+  const cacheCreate = optionalNonNegativeInteger(
+    usage,
+    "cache_creation_input_tokens",
+  );
+  const output = nonNegativeInteger(usage.output_tokens);
+  if (
+    input === null || cacheRead === null || cacheCreate === null ||
+    output === null
+  ) {
+    return null;
+  }
+  return {
+    input_tokens: input,
+    cached_input_tokens: cacheRead + cacheCreate,
+    output_tokens: output,
+    reasoning_tokens: 0,
+    total_tokens: input + cacheRead + cacheCreate + output,
+    attributes: cacheCreate > 0
+      ? { cache_creation_input_tokens: cacheCreate }
+      : null,
+  };
 }
 
 async function projectRecord(

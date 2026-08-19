@@ -8,14 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .contract import (
-    FRAGMENT_BYTES,
-    MAX_LOGICAL_RECORD_BYTES,
-    MAX_RECORDS,
-    MAX_SOURCE_BYTES,
-    ContractError,
-    build_rollout_batch,
-)
+from .contract import ContractError, MAX_RECORDS, MAX_SOURCE_BYTES, build_source_batch
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
@@ -89,6 +82,11 @@ class RolloutCapturer:
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
         max_record_bytes: int = MAX_LOGICAL_RECORD_BYTES,
         collector_version: str = "0.1.0",
+        source_provider: str = "codex",
+        source_kind: str = "rollout",
+        source_version: str | None = None,
+        state_name: str = "rollout",
+        capture_unterminated_tail: bool = True,
     ):
         if not (
             0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES
@@ -100,20 +98,25 @@ class RolloutCapturer:
         self.state_root = Path(state_root)
         self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.state_root, 0o700)
-        self.state_path = self.state_root / "rollout-state.json"
-        self.state_backup_path = self.state_root / "rollout-state.previous.json"
-        self.lock_path = self.state_root / "rollout-sync.lock"
         self.spool = spool
         self.chunk_bytes = chunk_bytes
         self.max_object_bytes = max_object_bytes
         self.max_record_bytes = max_record_bytes
         self.collector_version = collector_version
+        self.source_provider = source_provider
+        self.source_kind = source_kind
+        self.source_version = source_version
+        self.capture_unterminated_tail = capture_unterminated_tail
+        self.state_path = self.state_root / f"{state_name}-state.json"
+        self.state_backup_path = self.state_root / f"{state_name}-state.previous.json"
+        self.lock_path = self.state_root / f"{state_name}-sync.lock"
 
     def capture(
         self,
         paths: Iterable[Path | str],
         *,
         native_session_ids: Mapping[str, str] | None = None,
+        parent_native_session_ids: Mapping[str, str] | None = None,
         max_files: int = DEFAULT_MAX_FILES,
         max_sync_bytes: int = DEFAULT_MAX_SYNC_BYTES,
         best_effort: bool = False,
@@ -150,6 +153,7 @@ class RolloutCapturer:
                         path,
                         states,
                         native_session_ids or {},
+                        parent_native_session_ids or {},
                         max_sync_bytes - captured,
                         candidate_cursor,
                     )
@@ -173,6 +177,7 @@ class RolloutCapturer:
         path: Path,
         states: dict[str, StreamState],
         native_session_ids: Mapping[str, str],
+        parent_native_session_ids: Mapping[str, str],
         byte_budget: int,
         candidate_cursor: int,
     ) -> tuple[int, int]:
@@ -267,13 +272,24 @@ class RolloutCapturer:
                     continue
                 if not source:
                     break
-                manifest, stored = build_rollout_batch(
+                manifest, stored = build_source_batch(
                     source,
                     source_stream_key=key,
                     generation_key=state.generation_key,
                     generation_seq=state.generation_seq,
                     start_offset=state.offset,
+                    source_provider=self.source_provider,
+                    source_kind=self.source_kind,
                     observed_native_session_id=native_session_ids.get(str(path)),
+                    observed_parent_native_session_id=parent_native_session_ids.get(
+                        str(path)
+                    ),
+                    source_version=self.source_version,
+                    codex_version=(
+                        self.source_version
+                        if self.source_provider == "codex"
+                        else None
+                    ),
                     collector_version=self.collector_version,
                 )
                 self.spool.enqueue(manifest, stored)
@@ -379,7 +395,16 @@ class RolloutCapturer:
         handle.seek(start)
         remaining = stable_end - start
         candidate = handle.read(min(limit, remaining))
-        if len(candidate) == remaining or candidate.endswith(b"\n"):
+        if len(candidate) == remaining:
+            if self.capture_unterminated_tail or candidate.endswith(b"\n"):
+                return self._limit_records(candidate)
+            newline = candidate.rfind(b"\n")
+            return (
+                self._limit_records(candidate[: newline + 1])
+                if newline >= 0
+                else b""
+            )
+        if candidate.endswith(b"\n"):
             return self._limit_records(candidate)
         newline = candidate.rfind(b"\n")
         if newline >= 0:

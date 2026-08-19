@@ -7,8 +7,8 @@ latency.
 
 ## Data flow
 
-1. `sherlock-rollout-ingest` validates the compressed bytes, decompressed
-   source, and every record hash.
+1. `sherlock-rollout-ingest` validates the provider/kind contract, compressed
+   bytes, decompressed source, and every record hash.
 2. It creates the immutable object with overwrite disabled.
 3. One Postgres transaction inserts `telemetry.ingest_batches` and
    `telemetry.native_records`. An `AFTER INSERT` trigger creates exactly one
@@ -16,10 +16,10 @@ latency.
 4. The existing committed receipt returns immediately.
 5. Railway claims a job with `FOR UPDATE SKIP LOCKED`, a visibility deadline,
    and a random fencing token. It downloads the object directly from Supabase,
-   revalidates it, and runs the idempotent normalizer. A successful
-   normalization upserts one dirty cutoff per affected session into the same
-   queue. Duplicate and concurrent batches therefore coalesce before Railway
-   reduces only those targeted sessions.
+   revalidates it, and runs the idempotent provider-specific normalizer. A
+   successful normalization upserts one dirty cutoff per affected session into
+   the same queue. Duplicate and concurrent batches therefore coalesce before
+   Railway reduces only those targeted sessions.
 6. PostgreSQL fills the generated message `tsvector` and GIN index when the
    normalized event rows are inserted. There is no separate search worker.
 

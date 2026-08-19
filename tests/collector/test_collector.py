@@ -19,7 +19,7 @@ from sherlock_collector.contract import (
     ContractError,
     RECEIPT_VERSION,
     build_rollout_batch,
-    validate_stored_payload,
+    build_source_batch,
 )
 from sherlock_collector.config import CollectorIdentity
 from sherlock_collector.drain import (
@@ -78,7 +78,8 @@ def receipt(manifest, **overrides):
         "source_byte_count": manifest.source_byte_count,
         "source_sha256": manifest.source_sha256,
         "storage_path": (
-            f"workspaces/{WORKSPACE_ID}/collectors/{COLLECTOR_KEY}/rollout/"
+            f"workspaces/{WORKSPACE_ID}/collectors/{COLLECTOR_KEY}/"
+            f"{manifest.source_kind}/"
             f"{manifest.source_stream_key}/generations/"
             f"{manifest.generation_seq}-{manifest.generation_key}/"
             f"{manifest.start_offset}-{manifest.end_offset}-{manifest.source_sha256}.jsonl.gz"
@@ -137,6 +138,29 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(body["collector"]["email"], "test@example.com")
         self.assertEqual(body["collector"]["github_id"], "test-user")
         self.assertEqual(value["status"], "committed")
+
+    def test_claude_manifest_round_trip_keeps_provider_identity(self):
+        source = b'{"type":"user","sessionId":"session-1"}\n'
+        manifest, stored = build_source_batch(
+            source,
+            source_provider="claude_code",
+            source_kind="transcript",
+            source_stream_key="claude-stream",
+            generation_key="claude-generation",
+            generation_seq=0,
+            start_offset=0,
+            observed_native_session_id="session-1",
+            source_version="2.0.59",
+        )
+
+        item = SpoolItem.from_dict(
+            json.loads(json.dumps(SpoolItem(manifest, stored, {}).to_dict()))
+        )
+
+        self.assertEqual(item.manifest.source_provider, "claude_code")
+        self.assertEqual(item.manifest.source_kind, "transcript")
+        self.assertEqual(item.manifest.source_version, "2.0.59")
+        self.assertEqual(receipt(item.manifest)["source_kind"], "transcript")
 
 
 class CollectorDrainTests(unittest.TestCase):

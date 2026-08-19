@@ -6,7 +6,7 @@ import {
 } from "./contract.ts";
 import {
   type ActorRole,
-  NORMALIZER_VERSION,
+  normalizerVersionFor,
   projectBatch,
   type SessionProjection,
 } from "./normalizer.ts";
@@ -83,6 +83,7 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
     source: Uint8Array,
   ): Promise<NormalizationResult> {
     const projection = await projectBatch(manifest, source);
+    const normalizerVersion = normalizerVersionFor(manifest);
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_normalizer");
       const sourceRecords = await tx.unsafe(
@@ -110,7 +111,7 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
         workspace_id: receipt.workspace_id,
         session_id: normalizedSession?.id ?? null,
         source_record_id: sourceRecords[event.record_index].id,
-        normalizer_version: NORMALIZER_VERSION,
+        normalizer_version: normalizerVersion,
         projection_index: event.projection_index,
         canonical_scope_key: event.canonical_scope_key,
         logical_event_key: event.logical_event_key,
@@ -171,7 +172,7 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
                where e.source_record_id = r.id
                  and e.normalizer_version = $3
             )`,
-        [receipt.workspace_id, receipt.batch_id, NORMALIZER_VERSION],
+        [receipt.workspace_id, receipt.batch_id, normalizerVersion],
       );
       if (Number(missing[0]?.count ?? 0) !== 0) {
         throw new IngestError(
@@ -182,6 +183,7 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
       }
       return {
         session_ids: normalizedSession ? [normalizedSession.id] : [],
+        normalizer_version: normalizerVersion,
       };
     });
   }

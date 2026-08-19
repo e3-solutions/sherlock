@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "install.sh"
+CLAUDE_INSTALLER = ROOT / "install-claude.sh"
 
 
 FAKE_CODEX = r'''#!/usr/bin/env python3
@@ -88,6 +89,36 @@ for line in sys.stdin:
     else:
         raise SystemExit(3)
     print(json.dumps({"id": request_id, "result": result}), flush=True)
+'''
+
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+capture = Path(os.environ["SHERLOCK_FAKE_CAPTURE"])
+
+def record(value):
+    with capture.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, separators=(",", ":")) + "\n")
+
+if sys.argv[1:] == ["--version"]:
+    print("2.0.59 (Claude Code)")
+    raise SystemExit(0)
+if sys.argv[1:3] == ["plugin", "validate"]:
+    assert Path(sys.argv[3]).exists()
+    record({"argv": sys.argv[1:]})
+    print("Validation passed")
+    raise SystemExit(0)
+if sys.argv[1:4] == ["plugin", "marketplace", "add"]:
+    record({"argv": sys.argv[1:]})
+    raise SystemExit(0)
+if sys.argv[1:3] == ["plugin", "install"]:
+    record({"argv": sys.argv[1:]})
+    raise SystemExit(0)
+raise SystemExit(2)
 '''
 
 
@@ -175,6 +206,66 @@ class TeamInstallerTests(unittest.TestCase):
                 )
             )
             self.assertNotIn("other@market", json.dumps(edits))
+
+    def test_one_command_installs_claude_plugin_and_runtime(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            fake_claude = root / "fake-claude"
+            capture = root / "claude-calls.jsonl"
+            fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CLAUDE_BIN": str(fake_claude),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "PYTHON_BIN": sys.executable,
+                    "SHERLOCK_FAKE_CAPTURE": str(capture),
+                    "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(CLAUDE_INSTALLER),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "TEST@example.com",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            config = claude_home / "sherlock" / "collector.json"
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            configured = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(configured["email"], "test@example.com")
+            self.assertTrue(
+                (
+                    claude_home
+                    / "sherlock"
+                    / "runtime"
+                    / "sherlock_collector"
+                    / "cli.py"
+                ).is_file()
+            )
+            calls = [json.loads(line)["argv"] for line in capture.read_text().splitlines()]
+            self.assertEqual(calls[0][:2], ["plugin", "validate"])
+            self.assertEqual(calls[1][:2], ["plugin", "validate"])
+            self.assertEqual(calls[2][:3], ["plugin", "marketplace", "add"])
+            self.assertEqual(
+                calls[3],
+                ["plugin", "install", "sherlock-claude-code@sherlock"],
+            )
 
 
 if __name__ == "__main__":

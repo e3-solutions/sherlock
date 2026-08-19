@@ -64,6 +64,7 @@ async function seedBatch(
   const generationKey = `generation-${batchId}`;
   const manifest: BatchManifest = {
     contract_version: CONTRACT_VERSION,
+    source_provider: "codex",
     source_kind: "rollout",
     source_stream_key: sourceStreamKey,
     generation_key: generationKey,
@@ -87,9 +88,11 @@ async function seedBatch(
       parse_status: "ok",
     }],
     observed_native_session_id: input.nativeSessionId,
+    observed_parent_native_session_id: input.parentNativeSessionId ?? null,
     first_occurred_at: timestamp,
     last_occurred_at: timestamp,
     codex_version: "integration-test",
+    source_version: "integration-test",
     collector_version: "integration-test",
   };
   const receipt: CommittedReceipt = {

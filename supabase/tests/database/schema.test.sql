@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(88);
+select plan(91);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -21,6 +21,22 @@ select has_column('telemetry', 'people', 'github_id', 'people records GitHub ide
 select has_column(
   'telemetry', 'ingest_batches', 'processing_class_hint',
   'transport workload class is an auditable ingest fact'
+);
+select has_column(
+  'telemetry', 'ingest_batches', 'source_provider',
+  'ingest batches preserve the native provider identity'
+);
+select has_column(
+  'telemetry', 'ingest_batches', 'source_version',
+  'ingest batches preserve a provider-neutral source version'
+);
+select has_column(
+  'telemetry', 'ingest_batches', 'observed_parent_native_session_id',
+  'ingest batches preserve hook-observed parent identity'
+);
+select has_check(
+  'telemetry', 'ingest_batches', 'ingest_batches_provider_kind_check',
+  'source provider and source kind cannot be conflated'
 );
 select has_column(
   'telemetry', 'events', 'message_search',
