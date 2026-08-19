@@ -84,6 +84,7 @@ input { font: inherit; }
   width: 100%;
   min-width: 0;
   margin-left: 0;
+  padding-right: 15px;
 }
 
 .flame-graph {
@@ -196,8 +197,8 @@ input { font: inherit; }
   z-index: 7;
   display: flex;
   align-items: flex-end;
-  justify-content: flex-end;
-  padding: 0 28px 17px 0;
+  justify-content: flex-start;
+  padding: 0 0 17px;
   background: var(--flame-page);
 }
 
@@ -1055,7 +1056,6 @@ input { font: inherit; }
     padding: 0;
     font-size: 8px;
   }
-  .flame-meta-rail { padding-right: 16px; }
   .timeline-read { white-space: normal; }
 
   .flame-time-axis time { display: none; }
