@@ -58,6 +58,7 @@ export class FlameDayCache {
     this.refreshPromise = null;
     this.refreshController = null;
     this.lastForcedAt = null;
+    this.retryNotBefore = null;
     this.timer = null;
     this.closed = false;
   }
@@ -126,6 +127,9 @@ export class FlameDayCache {
         return Promise.reject(new FlameSourceError("flame_refresh_throttled"));
       }
       this.lastForcedAt = refreshNow;
+    } else if (trigger !== "scheduled" && this.retryNotBefore !== null &&
+        refreshNow < this.retryNotBefore) {
+      return Promise.reject(new FlameSourceError("flame_database_unavailable"));
     }
 
     if (this.timer !== null) {
@@ -148,6 +152,7 @@ export class FlameDayCache {
           throw new FlameSourceError("flame_database_result_stale");
         }
         this.entry = candidate;
+        this.retryNotBefore = null;
         succeeded = true;
         this.log({
           event: "timeline_refresh_success",
@@ -158,6 +163,7 @@ export class FlameDayCache {
         return payload;
       })
       .catch((error) => {
+        this.retryNotBefore = this.now() + REFRESH_RETRY_MS;
         this.log({
           event: "timeline_refresh_failure",
           trigger,

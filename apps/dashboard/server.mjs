@@ -147,7 +147,7 @@ const server = createServer(async (request, response) => {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      if (code !== "flame_request_aborted") {
+      if (code !== "flame_request_aborted" || !signal.aborted) {
         sendJson(response, code === "flame_refresh_throttled" ? 429 : 503, { error: code },
           code === "flame_refresh_throttled" ? { "Retry-After": "60" } : {});
       }

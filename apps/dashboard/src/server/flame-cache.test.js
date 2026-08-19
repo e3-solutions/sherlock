@@ -5,6 +5,7 @@ import {
   expectedTimelineEnd,
   nextTimelineRefreshDelay,
 } from "./flame-cache.js";
+import { FlameSourceError } from "./flame-source.js";
 
 function payload(read = "2026-08-19T12:00:30.000Z") {
   return {
@@ -62,6 +63,46 @@ describe("FlameDayCache", () => {
     expect(stale.state).toBe("stale");
     expect(load).toHaveBeenCalledTimes(2);
     expect(cache.readiness()).toEqual({ status: "ok", mode: "sherlock_cached_aggregate" });
+    await cache.close();
+  });
+
+  it("keeps stale requests on the failure backoff instead of rerunning the aggregate", async () => {
+    let now = Date.parse("2026-08-19T12:00:30.000Z");
+    const good = payload();
+    const load = vi.fn()
+      .mockResolvedValueOnce(good)
+      .mockRejectedValueOnce(new Error("database unavailable"));
+    const cache = new FlameDayCache({ load, now: () => now });
+
+    await cache.read();
+    now = Date.parse("2026-08-19T12:11:31.000Z");
+    await expect(cache.read({ waitForRefresh: true })).resolves.toMatchObject({
+      payload: good,
+      state: "stale",
+    });
+    await expect(cache.read()).resolves.toMatchObject({ payload: good, state: "stale" });
+    await expect(cache.read({ waitForRefresh: true })).resolves.toMatchObject({
+      payload: good,
+      state: "stale",
+    });
+
+    expect(load).toHaveBeenCalledTimes(2);
+    await cache.close();
+  });
+
+  it("rejects cold requests during failure backoff without rerunning the aggregate", async () => {
+    let now = Date.parse("2026-08-19T12:00:30.000Z");
+    const load = vi.fn().mockRejectedValue(new Error("database unavailable"));
+    const cache = new FlameDayCache({ load, now: () => now });
+
+    await expect(cache.read()).rejects.toThrow("database unavailable");
+    await expect(cache.read()).rejects.toMatchObject({ code: "flame_database_unavailable" });
+    await expect(cache.read()).rejects.toMatchObject({ code: "flame_database_unavailable" });
+    expect(load).toHaveBeenCalledTimes(1);
+
+    now += 60_000;
+    await expect(cache.read()).rejects.toThrow("database unavailable");
+    expect(load).toHaveBeenCalledTimes(2);
     await cache.close();
   });
 
@@ -195,6 +236,23 @@ describe("FlameDayCache", () => {
     await cache.close();
 
     expect(refreshSignal.aborted).toBe(true);
+  });
+
+  it("rejects an active cold waiter when shutdown aborts the shared refresh", async () => {
+    const load = vi.fn(({ signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new FlameSourceError("flame_request_aborted")),
+        { once: true },
+      );
+    }));
+    const cache = new FlameDayCache({ load });
+
+    const waiting = cache.read();
+    await Promise.resolve();
+    await cache.close();
+
+    await expect(waiting).rejects.toMatchObject({ code: "flame_request_aborted" });
   });
 
   it("warms eagerly, schedules the boundary grace refresh, and clears it on close", async () => {
