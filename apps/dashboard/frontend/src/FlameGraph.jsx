@@ -51,6 +51,47 @@ function formatPromptCount(value) {
   return `${value} ${value === 1 ? "prompt" : "prompts"}`;
 }
 
+async function apiFailure(response, fallback) {
+  let code = fallback;
+  try {
+    const body = await response.json();
+    if (typeof body?.error === "string") code = body.error;
+  } catch {
+    // The status-specific fallback still gives the drawer actionable copy.
+  }
+  const error = new Error(code);
+  error.apiCode = code;
+  return error;
+}
+
+function evidenceErrorCopy(subject, reason) {
+  if (reason?.endsWith("_snapshot_expired")) {
+    return `This timeline snapshot has expired. Refresh the timeline to load ${subject} evidence.`;
+  }
+  if (reason === "flame_database_timeout") {
+    return `${subject[0].toUpperCase()}${subject.slice(1)} evidence took too long to load. Try again.`;
+  }
+  if (reason === "flame_evidence_mismatch") {
+    return `${subject[0].toUpperCase()}${subject.slice(1)} evidence did not match this timeline snapshot. Refresh the timeline and try again.`;
+  }
+  if (reason?.endsWith("_request_not_found")) {
+    return `This ${subject} is no longer present in the selected snapshot.`;
+  }
+  return `${subject[0].toUpperCase()}${subject.slice(1)} evidence is temporarily unavailable. Try again.`;
+}
+
+function evidenceFailureReason(error) {
+  if (error?.apiCode) return error.apiCode;
+  return error?.name === "FlameDataError" || /does not match|overlap|out of order/.test(error?.message)
+    ? "flame_evidence_mismatch"
+    : "flame_database_unavailable";
+}
+
+function needsTimelineRefresh(reason) {
+  return reason?.endsWith("_snapshot_expired") || reason?.endsWith("_request_not_found") ||
+    reason === "flame_evidence_mismatch";
+}
+
 export function formatActiveTime(seconds) {
   if (seconds === 0) return "0m active";
   if (seconds < 60) return "<1m active";
@@ -342,6 +383,7 @@ function IntervalOverview({
   onClose,
   evidence,
   onRetry,
+  onRefresh,
   onOpenWork,
   showAdditionalWork,
   onToggleAdditionalWork,
@@ -410,11 +452,33 @@ function IntervalOverview({
         <p className="flame-detail__state" role="status">Loading frame evidence…</p>
       ) : evidence.state === "error" ? (
         <div className="flame-detail__state flame-detail__error" role="alert">
-          <p>Frame evidence could not be loaded from this timeline snapshot.</p>
-          <button type="button" onClick={onRetry}>Retry</button>
+          <p>{evidenceErrorCopy("frame", evidence.reason)}</p>
+          <button
+            type="button"
+            onClick={needsTimelineRefresh(evidence.reason) ? onRefresh : onRetry}
+          >
+            {needsTimelineRefresh(evidence.reason) ? "Refresh timeline" : "Retry"}
+          </button>
         </div>
       ) : evidence.state === "ready" && (
         <div className="flame-detail__body">
+          {evidence.prompts.length > 0 && (
+            <details className="flame-detail__prompts">
+              <summary>{evidence.prompts.length} human {evidence.prompts.length === 1 ? "prompt" : "prompts"}</summary>
+              <ol>
+                {evidence.prompts.map((prompt) => (
+                  <li key={prompt.id}>
+                    <header>
+                      <strong>Submitted prompt</strong>
+                      <time dateTime={new Date(prompt.atMs).toISOString()}>{formatTime(prompt.atMs)}</time>
+                      {prompt.truncated && <span>Excerpt</span>}
+                    </header>
+                    <p>{prompt.content || "Stored prompt excerpt was empty."}</p>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
           <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
             <h3 id={`${headingId}-work`}>Active work</h3>
             {evidence.workIncomplete && (
@@ -455,6 +519,7 @@ function WorkDetail({
   onBack,
   onClose,
   onRetry,
+  onRefresh,
   onLoadMore,
   stale,
   closing,
@@ -488,8 +553,13 @@ function WorkDetail({
         <p className="flame-detail__state" role="status">Loading session evidence…</p>
       ) : evidence.state === "error" ? (
         <div className="flame-detail__state flame-detail__error" role="alert">
-          <p>Session evidence could not be loaded from this timeline snapshot.</p>
-          <button type="button" onClick={onRetry}>Retry</button>
+          <p>{evidenceErrorCopy("session", evidence.reason)}</p>
+          <button
+            type="button"
+            onClick={needsTimelineRefresh(evidence.reason) ? onRefresh : onRetry}
+          >
+            {needsTimelineRefresh(evidence.reason) ? "Refresh timeline" : "Retry"}
+          </button>
         </div>
       ) : evidence.state === "ready" && (
         <div className="flame-detail__body">
@@ -783,7 +853,7 @@ function useSharedChartWidth(scrollportRef, requestedWidth) {
   return Math.max(1, measuredWidth);
 }
 
-export default function FlameGraph({ data, chartWidth, stale = false }) {
+export default function FlameGraph({ data, chartWidth, stale = false, onRefresh }) {
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
@@ -796,7 +866,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   const [intervalRevision, setIntervalRevision] = useState(0);
   const [workRevision, setWorkRevision] = useState(0);
   const [intervalEvidence, setIntervalEvidence] = useState({
-    state: "idle", work: [], workIncomplete: false,
+    state: "idle", work: [], prompts: [], workIncomplete: false,
   });
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], nextCursor: null,
@@ -868,14 +938,14 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
       setIntervalEvidence({
-        state: "idle", work: [], workIncomplete: false,
+        state: "idle", work: [], prompts: [], workIncomplete: false,
       });
       return undefined;
     }
 
     const controller = new AbortController();
     setIntervalEvidence({
-      state: "loading", work: [], workIncomplete: false,
+      state: "loading", work: [], prompts: [], workIncomplete: false,
     });
     const query = new URLSearchParams({
       personId: selectedPerson.id,
@@ -888,7 +958,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       signal: controller.signal,
     })
       .then(async (response) => {
-        if (!response.ok) throw new Error(`Interval request failed with HTTP ${response.status}`);
+        if (!response.ok) throw await apiFailure(response, `flame_interval_http_${response.status}`);
         return response.json();
       })
       .then((value) => {
@@ -897,6 +967,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
           personId: selectedPerson.id,
           startMs: selectedPoint.startMs,
           snapshot: data.snapshot,
+          promptCount: selectedPoint.prompts,
         });
         if (evidence.work.length > selectedPoint.activity) {
           throw new Error("Work evidence count does not match the timeline snapshot");
@@ -907,10 +978,11 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
           workIncomplete: evidence.work.length < selectedPoint.activity,
         });
       })
-      .catch(() => {
+      .catch((error) => {
         if (!controller.signal.aborted) {
           setIntervalEvidence({
-            state: "error", work: [], workIncomplete: false,
+            state: "error", work: [], prompts: [], workIncomplete: false,
+            reason: evidenceFailureReason(error),
           });
         }
       });
@@ -941,7 +1013,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
       signal: controller.signal,
     })
       .then(async (response) => {
-        if (!response.ok) throw new Error(`Work request failed with HTTP ${response.status}`);
+        if (!response.ok) throw await apiFailure(response, `flame_work_http_${response.status}`);
         return response.json();
       })
       .then((value) => {
@@ -956,9 +1028,12 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
         });
         setWorkEvidence({ state: "ready", ...evidence, loadingMore: false, moreError: false });
       })
-      .catch(() => {
+      .catch((error) => {
         if (!controller.signal.aborted) {
-          setWorkEvidence({ state: "error", items: [], nextCursor: null });
+          setWorkEvidence({
+            state: "error", items: [], nextCursor: null,
+            reason: evidenceFailureReason(error),
+          });
         }
       });
     return () => controller.abort();
@@ -1001,6 +1076,17 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
 
   const backToOverview = () => {
     setDrawerView({ screen: "overview" });
+  };
+
+  const refreshIntervalTimeline = () => {
+    if (onRefresh) onRefresh();
+    else setIntervalRevision((revision) => revision + 1);
+  };
+
+  const refreshWorkTimeline = () => {
+    if (workEvidence.reason?.endsWith("_request_not_found")) backToOverview();
+    if (onRefresh) onRefresh();
+    else setWorkRevision((revision) => revision + 1);
   };
 
   const loadMoreWork = async () => {
@@ -1123,6 +1209,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
               onBack={backToOverview}
               onClose={beginCloseDetail}
               onRetry={() => setWorkRevision((revision) => revision + 1)}
+              onRefresh={refreshWorkTimeline}
               onLoadMore={loadMoreWork}
             />
           ) : (
@@ -1135,6 +1222,7 @@ export default function FlameGraph({ data, chartWidth, stale = false }) {
               closing={detailClosing}
               onClose={beginCloseDetail}
               onRetry={() => setIntervalRevision((revision) => revision + 1)}
+              onRefresh={refreshIntervalTimeline}
               onOpenWork={openWork}
               showAdditionalWork={showAdditionalWork}
               onToggleAdditionalWork={() => setShowAdditionalWork((shown) => !shown)}

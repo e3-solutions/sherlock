@@ -164,6 +164,22 @@ describe("FlameGraph", () => {
               eventCount: 1, summary: null,
             },
           ],
+          prompts: [
+            {
+              id: "native:prompt-1", sessionId: "session-1", at: start,
+              content: "First exact prompt", truncated: false,
+            },
+            {
+              id: "native:prompt-2", sessionId: "session-3",
+              at: new Date(Date.parse(start) + 1000).toISOString(),
+              content: "Second prompt excerpt", truncated: true,
+            },
+            {
+              id: "native:prompt-3", sessionId: "session-4",
+              at: new Date(Date.parse(start) + 2000).toISOString(),
+              content: "Repeat the exact request", truncated: false,
+            },
+          ],
         }),
       });
     }));
@@ -564,14 +580,19 @@ describe("FlameGraph", () => {
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
     expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
 
-    await waitFor(() => expect(screen.getByText("First exact prompt")).toBeInTheDocument());
+    const promptDisclosure = await screen.findByText("3 human prompts");
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
     expect(detail).not.toHaveTextContent("prompts recorded in this interval");
-    expect(within(detail).getAllByRole("listitem")).toHaveLength(1);
+    expect(detail.querySelectorAll(".flame-detail__work li")).toHaveLength(1);
     expect(detail).not.toHaveTextContent("What happened");
-    expect(detail).not.toHaveTextContent("Second prompt excerpt");
+    expect(promptDisclosure.closest("details")).not.toHaveAttribute("open");
     expect(detail).not.toHaveTextContent("Stored excerpt");
     expect(detail).toHaveTextContent("Active work");
+    fireEvent.click(promptDisclosure);
+    expect(promptDisclosure.closest("details")).toHaveAttribute("open");
+    expect(screen.getByText("Second prompt excerpt")).toBeInTheDocument();
+    expect(screen.getByText("Repeat the exact request")).toBeInTheDocument();
+    expect(screen.getByText("Excerpt")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Subagent session evidence/ })).not.toBeInTheDocument();
     expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();
@@ -580,7 +601,7 @@ describe("FlameGraph", () => {
     expect(workExpander).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(workExpander);
     expect(workExpander).toHaveAttribute("aria-expanded", "true");
-    expect(within(detail).getAllByRole("listitem")).toHaveLength(4);
+    expect(detail.querySelectorAll(".flame-detail__work li")).toHaveLength(4);
     expect(screen.getByText("Subagent session")).toBeInTheDocument();
     expect(screen.getByText("Agent session")).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith(
@@ -608,6 +629,82 @@ describe("FlameGraph", () => {
     expect(screen.getByText("Active work")).toBeInTheDocument();
     expect(screen.queryByText("What happened")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["flame_database_timeout", /Frame evidence took too long to load/],
+    ["flame_interval_snapshot_expired", /timeline snapshot has expired/],
+    ["flame_database_unavailable", /temporarily unavailable/],
+  ])("explains interval failure %s", async (error, copy) => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: error.endsWith("snapshot_expired") ? 410 : 503,
+      json: () => Promise.resolve({ error }),
+    });
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(copy);
+  });
+
+  it("refreshes the timeline instead of retrying an expired interval snapshot", async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 410,
+      json: () => Promise.resolve({ error: "flame_interval_snapshot_expired" }),
+    });
+    const onRefresh = vi.fn();
+    const { container } = render(
+      <FlameGraph data={model()} chartWidth={1008} onRefresh={onRefresh} />,
+    );
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh timeline" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the timeline instead of retrying mismatched interval evidence", async () => {
+    vi.mocked(fetch).mockImplementation((url) => {
+      const request = new URL(url, "http://dashboard.test");
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          personId: request.searchParams.get("personId"),
+          start: request.searchParams.get("start"),
+          snapshot: request.searchParams.get("snapshot"),
+          work: [],
+          prompts: [],
+        }),
+      });
+    });
+    const onRefresh = vi.fn();
+    const { container } = render(
+      <FlameGraph data={model()} chartWidth={1008} onRefresh={onRefresh} />,
+    );
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh timeline" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("keeps prompt text out of busy frame overviews and resets extra sessions by frame", async () => {
@@ -638,6 +735,13 @@ describe("FlameGraph", () => {
             eventCount: 1,
             summary: null,
           })),
+          prompts: Array.from({ length: 7 }, (_, index) => ({
+            id: `native:prompt-${index + 1}`,
+            sessionId: `session-${(index % 4) + 1}`,
+            at: new Date(Date.parse(start) + index).toISOString(),
+            content: `Prompt ${index + 1}`,
+            truncated: false,
+          })),
         }),
       });
     });
@@ -650,7 +754,7 @@ describe("FlameGraph", () => {
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
     const expander = await screen.findByRole("button", { name: "Show 4 more sessions" });
-    expect(screen.queryByText("Prompt 1")).not.toBeInTheDocument();
+    expect(screen.getByText("7 human prompts").closest("details")).not.toHaveAttribute("open");
     expect(screen.queryByText("What happened")).not.toBeInTheDocument();
 
     fireEvent.click(expander);
@@ -701,6 +805,39 @@ describe("FlameGraph", () => {
     expect(backButton.querySelector("svg")).toBeInTheDocument();
     fireEvent.click(backButton);
     expect(await screen.findByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
+  });
+
+  it("returns to the refreshed frame when a selected session is no longer present", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation((url, options) => {
+      const request = new URL(url, "http://dashboard.test");
+      if (request.pathname !== "/api/flame/work") return defaultFetch(url, options);
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({ error: "flame_work_request_not_found" }),
+      });
+    });
+    const onRefresh = vi.fn();
+    const { container } = render(
+      <FlameGraph data={model()} chartWidth={1008} onRefresh={onRefresh} />,
+    );
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: /First exact prompt/ }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "This session is no longer present in the selected snapshot.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refresh timeline" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Active work")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("loads later conversation turns", async () => {

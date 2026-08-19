@@ -102,7 +102,7 @@ export default function App() {
           <span className="visually-hidden"> {message}</span>
         </p>
       )}
-      <FlameGraph data={data} stale={state === "stale"} />
+      <FlameGraph data={data} stale={state === "stale"} onRefresh={load} />
     </>
   );
 }

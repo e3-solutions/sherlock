@@ -290,7 +290,9 @@ describe("getPersonActivityStatus", () => {
 
 describe("interval and work evidence adapters", () => {
   const startMs = Date.parse("2026-08-17T16:10:00.000Z");
-  const expected = { personId: "person-1", startMs, snapshot: "v1.snapshot-token" };
+  const expected = {
+    personId: "person-1", startMs, snapshot: "v1.snapshot-token", promptCount: 1,
+  };
 
   it("validates source-backed work rows", () => {
     const result = adaptIntervalEvidence({
@@ -303,11 +305,29 @@ describe("interval and work evidence adapters", () => {
         lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
         summary: "Investigate the cursor",
       }],
+      prompts: [{
+        id: "native:msg-1", sessionId: "s1",
+        at: new Date(startMs + 1500).toISOString(),
+        content: "Investigate the cursor", truncated: false,
+      }],
     }, expected);
 
     expect(result.work[0]).toMatchObject({
       id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2,
     });
+    expect(result.prompts).toEqual([expect.objectContaining({
+      id: "native:msg-1", content: "Investigate the cursor",
+    })]);
+  });
+
+  it("rejects prompt rows whose identities do not match the aggregate count", () => {
+    expect(() => adaptIntervalEvidence({
+      personId: expected.personId,
+      start: new Date(startMs).toISOString(),
+      snapshot: expected.snapshot,
+      work: [],
+      prompts: [],
+    }, expected)).toThrow(/exactly 1 canonical prompt rows/);
   });
 
   it("preserves equal conversation text under distinct source event ids", () => {
@@ -351,6 +371,11 @@ describe("interval and work evidence adapters", () => {
       start: new Date(startMs).toISOString(),
       snapshot: expected.snapshot,
       work: [{ ...work, ...mutation }],
+      prompts: [{
+        id: "native:msg-1", sessionId: "s1",
+        at: new Date(startMs + 1500).toISOString(),
+        content: "Investigate the cursor", truncated: false,
+      }],
     };
     expect(() => adaptIntervalEvidence(source, expected)).toThrow(FlameDataError);
   });

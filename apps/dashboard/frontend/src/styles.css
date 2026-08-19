@@ -763,6 +763,52 @@ input { font: inherit; }
   line-height: 1.45;
 }
 
+.flame-detail__prompts {
+  border-bottom: 1px solid var(--flame-rule);
+  color: var(--flame-muted);
+}
+
+.flame-detail__prompts summary {
+  min-height: 42px;
+  padding: 14px 24px;
+  color: var(--flame-ink);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.flame-detail__prompts summary:hover { background: var(--flame-surface-selected); }
+
+.flame-detail__prompts ol {
+  margin: 0;
+  padding: 0 24px 16px 42px;
+}
+
+.flame-detail__prompts li { padding: 10px 0; }
+
+.flame-detail__prompts header {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.flame-detail__prompts header time { margin-left: auto; }
+.flame-detail__prompts header span { color: var(--flame-partial); }
+
+.flame-detail__prompts p {
+  margin: 7px 0 0;
+  color: var(--flame-ink);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .flame-detail__work {
   margin: 14px 0 0;
   padding: 0;
@@ -1014,6 +1060,9 @@ input { font: inherit; }
 
   .flame-detail__header,
   .flame-detail__section { padding-right: 18px; padding-left: 18px; }
+
+  .flame-detail__prompts summary { padding-right: 18px; padding-left: 18px; }
+  .flame-detail__prompts ol { padding-right: 18px; }
 
   .flame-detail__disclosure summary { padding-right: 18px; padding-left: 18px; }
   .flame-detail__disclosure > div { padding-right: 18px; padding-left: 18px; }

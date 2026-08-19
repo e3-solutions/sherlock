@@ -11,9 +11,10 @@ vi.mock("./flame-data.js", () => ({
 }));
 
 vi.mock("./FlameGraph.jsx", () => ({
-  default: ({ data, stale }) => (
+  default: ({ data, stale, onRefresh }) => (
     <div data-testid="flame-graph" data-stale={String(stale)}>
       {data.marker}
+      <button type="button" onClick={onRefresh}>Refresh timeline</button>
     </div>
   ),
 }));
@@ -76,6 +77,22 @@ describe("App", () => {
       signal: expect.any(AbortSignal),
     }));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets detail recovery request a fresh timeline snapshot", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh timeline" }));
+    await settle();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/flame", expect.objectContaining({
+      cache: "no-store",
+      signal: expect.any(AbortSignal),
+    }));
   });
 
   it("stacks recency above the role legend beneath the brand", () => {
