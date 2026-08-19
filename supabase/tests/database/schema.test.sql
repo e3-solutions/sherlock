@@ -34,8 +34,14 @@ select has_column(
   'telemetry', 'ingest_batches', 'observed_parent_native_session_id',
   'ingest batches preserve hook-observed parent identity'
 );
-select has_check(
-  'telemetry', 'ingest_batches', 'ingest_batches_provider_kind_check',
+select ok(
+  exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'telemetry.ingest_batches'::regclass
+      and conname = 'ingest_batches_provider_kind_check'
+      and contype = 'c'
+  ),
   'source provider and source kind cannot be conflated'
 );
 select has_column(
