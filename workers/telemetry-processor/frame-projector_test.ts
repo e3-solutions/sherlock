@@ -197,6 +197,10 @@ Deno.test("receipt writes preserve the exact session revision timestamp", () => 
     projector.includes("$11::text::timestamptz"),
     "session_updated_at must bypass the client timestamptz serializer",
   );
+  assert(
+    projector.includes("session_updated_at = $8::text::timestamptz"),
+    "exact reruns must compare the same unrounded session timestamp",
+  );
 });
 
 Deno.test("projector reads only bounded source metadata and never copies content", () => {

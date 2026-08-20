@@ -395,7 +395,8 @@ export class PostgresFrameEvidenceProjector {
           where workspace_id = $1 and session_id = $2 and frame_version = $3
             and through_event_id is not distinct from $4::bigint
             and source_event_count = $5 and source_state_sha256 = $6
-            and request_generation = $7 and session_updated_at = $8
+            and request_generation = $7
+            and session_updated_at = $8::text::timestamptz
           order by id desc limit 1`,
             [
               options.workspaceId,
