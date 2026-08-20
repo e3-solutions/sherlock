@@ -3,6 +3,7 @@ import {
   diffEvidence,
   type EvidenceState,
   FRAME_SOURCE_EVENTS_SQL,
+  revisionInsertBatches,
   type SourceEvent,
 } from "./frame-projector.ts";
 
@@ -150,4 +151,13 @@ Deno.test("projector reads only bounded source metadata and never copies content
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("storage_path"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("record_sha256"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $4"));
+});
+
+Deno.test("large revision writes are split below PostgreSQL's parameter limit", () => {
+  const batches = revisionInsertBatches(
+    Array.from({ length: 3_001 }, (_, i) => i),
+  );
+  assert(batches.length === 2);
+  assert(batches[0].length === 3_000);
+  assert(batches[1].length === 1);
 });
