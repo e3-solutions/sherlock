@@ -4,7 +4,11 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DirectFlameSource, FlameSourceError } from "./src/server/flame-source.js";
+import {
+  DirectFlameSource,
+  FlameSourceError,
+  validateDashboardEmailDomain,
+} from "./src/server/flame-source.js";
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
@@ -14,6 +18,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
 const PORT = Number.parseInt(process.env.PORT ?? "8000", 10);
 const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
+const dashboardEmailDomain = process.env.SHERLOCK_DASHBOARD_EMAIL_DOMAIN ?? "";
 const databaseUrl = process.env.SUPABASE_DB_URL ?? "";
 const mcpToken = process.env.SHERLOCK_MCP_TOKEN ?? "";
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
@@ -21,8 +26,20 @@ const validWorkspaceId =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
     .test(workspaceId);
 const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople <= 1000;
-const source = databaseUrl && validWorkspaceId && validMaxPeople
-  ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
+let validDashboardEmailDomain = false;
+try {
+  validateDashboardEmailDomain(dashboardEmailDomain);
+  validDashboardEmailDomain = true;
+} catch {
+  validDashboardEmailDomain = false;
+}
+const source = databaseUrl && validWorkspaceId && validMaxPeople && validDashboardEmailDomain
+  ? new DirectFlameSource({
+      databaseUrl,
+      workspaceId,
+      expectedEmailDomain: dashboardEmailDomain,
+      maxPeople,
+    })
   : null;
 
 let databaseVerified = false;
@@ -120,6 +137,7 @@ function configurationStatus() {
   const missing = [];
   if (!databaseUrl) missing.push("SUPABASE_DB_URL");
   if (!validWorkspaceId) missing.push("SHERLOCK_WORKSPACE_ID");
+  if (!validDashboardEmailDomain) missing.push("SHERLOCK_DASHBOARD_EMAIL_DOMAIN");
   if (!validMaxPeople) missing.push("SHERLOCK_DASHBOARD_MAX_PEOPLE");
   return missing.length === 0
     ? null

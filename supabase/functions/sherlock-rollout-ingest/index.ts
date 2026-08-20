@@ -1,11 +1,16 @@
-import { publicCollectorGrant } from "./attribution.ts";
+import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
 import { IngestService, type WorkloadClassHint } from "./service.ts";
 import { SupabaseImmutableStorage } from "./storage.ts";
 
-function required(name: string): string {
-  const value = Deno.env.get(name);
+type EnvironmentReader = (name: string) => string | undefined;
+
+function required(
+  name: string,
+  environment: EnvironmentReader = (key) => Deno.env.get(key),
+): string {
+  const value = environment(name);
   if (!value) {
     throw new IngestError("invalid_configuration", `${name} is required`, 500);
   }
@@ -37,16 +42,33 @@ function ingestBackend(): {
 }
 
 export async function handler(request: Request): Promise<Response> {
+  return await handleRequest(request);
+}
+
+export async function handleRequest(
+  request: Request,
+  {
+    environment = (name) => Deno.env.get(name),
+    backendFactory = ingestBackend,
+  }: {
+    environment?: EnvironmentReader;
+    backendFactory?: typeof ingestBackend;
+  } = {},
+): Promise<Response> {
   try {
     if (request.method !== "POST") {
       return Response.json({ error: { code: "method_not_allowed" } }, {
         status: 405,
       });
     }
-    const grant = publicCollectorGrant(required("SHERLOCK_WORKSPACE_ID"));
     const body = await readJsonBounded(request);
     const envelope = parseEnvelope(body);
-    const current = ingestBackend();
+    const routing = workspaceRoutingConfig(
+      required("SHERLOCK_E3_WORKSPACE_ID", environment),
+      required("SHERLOCK_SIXTYFOUR_WORKSPACE_ID", environment),
+    );
+    const grant = publicCollectorGrant(routing, envelope.collector);
+    const current = backendFactory();
     const attribution = await current.batches.resolveAttribution(
       grant,
       envelope.collector,

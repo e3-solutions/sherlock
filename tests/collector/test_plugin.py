@@ -13,7 +13,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from sherlock_collector.config import ConfigurationError, load_config
+from sherlock_collector.config import (
+    ConfigurationError,
+    load_config,
+    validate_install_email,
+    validate_install_email_for_home,
+)
 from sherlock_collector.discovery import discover_rollouts
 from sherlock_collector.hook import (
     CODEX_HOOK_EVENTS,
@@ -244,6 +249,179 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_install_email_domain_accepts_only_e3_and_sixtyfour(self):
+        self.assertEqual(validate_install_email("Ada@E3GROUP.AI"), "ada@e3group.ai")
+        self.assertEqual(
+            validate_install_email("Dev@SixtyFour.AI"), "dev@sixtyfour.ai"
+        )
+        for email in (
+            "outsider@example.com",
+            "user@sub.e3group.ai",
+            "user@e3group.ai.example",
+        ):
+            with self.subTest(email=email):
+                with self.assertRaisesRegex(ConfigurationError, "work domain"):
+                    validate_install_email(email)
+
+    def test_install_email_change_requires_a_separate_clean_collector_home(self):
+        with TemporaryDirectory() as temporary:
+            collector_home = Path(temporary) / "codex"
+            config = collector_home / "sherlock" / "collector.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps({**IDENTITY_CONFIG, "email": "user@e3group.ai"}),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+
+            self.assertEqual(
+                validate_install_email_for_home("USER@E3GROUP.AI", collector_home),
+                "user@e3group.ai",
+            )
+            with self.assertRaisesRegex(ConfigurationError, "separate clean"):
+                validate_install_email_for_home("user@sixtyfour.ai", collector_home)
+
+    def test_install_rejects_orphaned_pending_and_processing_spool_items(self):
+        for state in ("pending", "processing"):
+            with self.subTest(state=state), TemporaryDirectory() as temporary:
+                collector_home = Path(temporary) / "codex"
+                artifact = (
+                    collector_home
+                    / "sherlock"
+                    / "telemetry"
+                    / "queue"
+                    / state
+                    / "orphaned.json"
+                )
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text('{"immutable":"telemetry"}\n', encoding="utf-8")
+
+                with self.assertRaisesRegex(ConfigurationError, "recover the config"):
+                    validate_install_email_for_home("user@e3group.ai", collector_home)
+                self.assertEqual(
+                    artifact.read_text(encoding="utf-8"),
+                    '{"immutable":"telemetry"}\n',
+                )
+
+    def test_installed_config_pins_drain_email_and_installation_id(self):
+        with TemporaryDirectory() as temporary:
+            collector_home = Path(temporary) / "codex"
+            config = collector_home / "sherlock" / "collector.json"
+            pending = (
+                collector_home
+                / "sherlock"
+                / "telemetry"
+                / "queue"
+                / "pending"
+                / "queued.json"
+            )
+            config.parent.mkdir(parents=True)
+            pending.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps(
+                    {
+                        "endpoint": "https://example.test/functions/v1/ingest",
+                        **IDENTITY_CONFIG,
+                        "email": "user@e3group.ai",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            pending.write_text('{"immutable":"telemetry"}\n', encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"SHERLOCK_EMAIL": "USER@E3GROUP.AI"},
+                clear=True,
+            ):
+                self.assertEqual(load_config(config).identity.email, "user@e3group.ai")
+            with patch.dict(
+                os.environ,
+                {"SHERLOCK_EMAIL": "user@sixtyfour.ai"},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ConfigurationError, "must match"):
+                    load_config(config)
+            with patch.dict(
+                os.environ,
+                {
+                    "SHERLOCK_INSTALLATION_ID":
+                        "00000000-0000-4000-8000-000000000002"
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ConfigurationError, "must match"):
+                    load_config(config)
+            self.assertEqual(
+                pending.read_text(encoding="utf-8"),
+                '{"immutable":"telemetry"}\n',
+            )
+
+    def test_env_only_drain_rejects_orphaned_source_home_spool(self):
+        environment = {
+            "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+            "SHERLOCK_NAME": "Moved User",
+            "SHERLOCK_GITHUB_ID": "moved-user",
+            "SHERLOCK_EMAIL": "user@sixtyfour.ai",
+            "SHERLOCK_INSTALLATION_ID":
+                "00000000-0000-4000-8000-000000000002",
+        }
+        for state in ("pending", "processing"):
+            with self.subTest(state=state), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source_home = root / "codex"
+                custom_config = root / "custom" / "missing.json"
+                artifact = (
+                    source_home
+                    / "sherlock"
+                    / "telemetry"
+                    / "queue"
+                    / state
+                    / "orphaned.json"
+                )
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text(
+                    '{"immutable":"telemetry"}\n', encoding="utf-8"
+                )
+
+                with patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(
+                        ConfigurationError, "recover the config"
+                    ):
+                        load_config(custom_config, codex_home=source_home)
+
+                self.assertEqual(
+                    artifact.read_text(encoding="utf-8"),
+                    '{"immutable":"telemetry"}\n',
+                )
+
+    def test_env_only_config_loads_when_source_home_has_no_spool(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "codex"
+            custom_config = root / "custom" / "missing.json"
+            with patch.dict(
+                os.environ,
+                {
+                    "SHERLOCK_INGEST_URL":
+                        "https://example.test/functions/v1/ingest",
+                    "SHERLOCK_NAME": "Clean User",
+                    "SHERLOCK_GITHUB_ID": "clean-user",
+                    "SHERLOCK_EMAIL": "user@e3group.ai",
+                    "SHERLOCK_INSTALLATION_ID":
+                        "00000000-0000-4000-8000-000000000001",
+                },
+                clear=True,
+            ):
+                loaded = load_config(custom_config, codex_home=source_home)
+
+            self.assertEqual(loaded.identity.email, "user@e3group.ai")
+            self.assertEqual(
+                loaded.identity.installation_id,
+                "00000000-0000-4000-8000-000000000001",
+            )
+
     def test_owner_only_config_loads_and_group_readable_config_is_rejected(self):
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "collector.json"
@@ -300,7 +478,7 @@ class ConfigurationTests(unittest.TestCase):
                     "--github-id",
                     "test-user",
                     "--email",
-                    "TEST@example.com",
+                    "TEST@e3group.ai",
                 ],
                 check=True,
                 capture_output=True,
@@ -320,7 +498,7 @@ class ConfigurationTests(unittest.TestCase):
             )
             installed = json.loads(config.read_text(encoding="utf-8"))
             self.assertNotIn("token", installed)
-            self.assertEqual(installed["email"], "test@example.com")
+            self.assertEqual(installed["email"], "test@e3group.ai")
             self.assertEqual(installed["github_id"], "test-user")
             self.assertEqual(
                 uuid.UUID(installed["installation_id"]).version,
@@ -343,7 +521,7 @@ class ConfigurationTests(unittest.TestCase):
                     "--github-id",
                     "test-user",
                     "--email",
-                    "test@example.com",
+                    "test@e3group.ai",
                 ],
                 check=False,
                 capture_output=True,
@@ -368,16 +546,147 @@ class ConfigurationTests(unittest.TestCase):
                 "--github-id",
                 "test-user",
                 "--email",
-                "test@example.com",
+                "test@e3group.ai",
             ]
 
             subprocess.run(command, check=True, capture_output=True)
             config = codex_home / "sherlock" / "collector.json"
             first = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
+            command[-1] = "TEST@E3GROUP.AI"
             subprocess.run(command, check=True, capture_output=True)
             second = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
 
             self.assertEqual(first, second)
+
+    def test_installer_rejects_email_change_without_mutating_collector_home(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            sherlock_root = codex_home / "sherlock"
+            runtime_marker = sherlock_root / "runtime" / "existing.txt"
+            spool_marker = (
+                sherlock_root
+                / "telemetry"
+                / "queue"
+                / "pending"
+                / "pending.json"
+            )
+            config = sherlock_root / "collector.json"
+            runtime_marker.parent.mkdir(parents=True)
+            spool_marker.parent.mkdir(parents=True)
+            runtime_marker.write_text("existing runtime", encoding="utf-8")
+            spool_marker.write_text("pending telemetry", encoding="utf-8")
+            config.write_text(
+                json.dumps(
+                    {
+                        "endpoint": "https://example.test/functions/v1/ingest",
+                        "name": "Existing User",
+                        "github_id": "existing-user",
+                        "email": "user@e3group.ai",
+                        "installation_id": "00000000-0000-4000-8000-000000000001",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            before = {
+                path: path.read_bytes()
+                for path in (config, runtime_marker, spool_marker)
+            }
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--endpoint",
+                    "https://example.test/functions/v1/ingest",
+                    "--codex-home",
+                    str(codex_home),
+                    "--name",
+                    "Moved User",
+                    "--github-id",
+                    "moved-user",
+                    "--email",
+                    "user@sixtyfour.ai",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("separate clean collector home", completed.stderr)
+            for path, contents in before.items():
+                self.assertEqual(path.read_bytes(), contents)
+
+    def test_installer_rejects_orphaned_spool_without_mutation(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            pending = (
+                codex_home
+                / "sherlock"
+                / "telemetry"
+                / "queue"
+                / "processing"
+                / "orphaned.json"
+            )
+            pending.parent.mkdir(parents=True)
+            pending.write_text('{"immutable":"telemetry"}\n', encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--endpoint",
+                    "https://example.test/functions/v1/ingest",
+                    "--codex-home",
+                    str(codex_home),
+                    "--name",
+                    "Recovered User",
+                    "--github-id",
+                    "recovered-user",
+                    "--email",
+                    "user@e3group.ai",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("recover the config", completed.stderr)
+            self.assertEqual(
+                pending.read_text(encoding="utf-8"),
+                '{"immutable":"telemetry"}\n',
+            )
+            self.assertFalse((codex_home / "sherlock" / "runtime").exists())
+            self.assertFalse((codex_home / "sherlock" / "collector.json").exists())
+
+    def test_installer_rejects_unapproved_domain_before_writing_runtime_or_config(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--endpoint",
+                    "https://example.test/functions/v1/ingest",
+                    "--codex-home",
+                    str(codex_home),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "outsider@example.com",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("work domain", completed.stderr)
+            self.assertFalse((codex_home / "sherlock").exists())
 
 
 class HookCompanionTests(unittest.TestCase):

@@ -18,6 +18,7 @@ import {
 import {
   collectorKeyForIdentity,
   publicCollectorGrant,
+  workspaceRoutingConfig,
 } from "./attribution.ts";
 import {
   type BatchRepository,
@@ -297,14 +298,69 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
   }
 });
 
-Deno.test("public ingest is scoped to the configured workspace", () => {
-  const grant = publicCollectorGrant(
+Deno.test("approved collector domains resolve to configured workspaces", () => {
+  const routing = workspaceRoutingConfig(
     "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002",
   );
+  const grant = publicCollectorGrant(routing, {
+    ...COLLECTOR,
+    email: "test@e3group.ai",
+  });
+  const sixtyfourGrant = publicCollectorGrant(routing, {
+    ...COLLECTOR,
+    email: "test@sixtyfour.ai",
+  });
 
   assert(grant.workspace_id === "00000000-0000-4000-8000-000000000001");
+  assert(
+    sixtyfourGrant.workspace_id === "00000000-0000-4000-8000-000000000002",
+  );
   assert(grant.collector_key_prefix === "team");
   assert(!("person_id" in grant), "configuration must not fix person identity");
+});
+
+Deno.test("workspace routing rejects invalid configuration and unknown domains", () => {
+  for (
+    const values of [
+      ["", "00000000-0000-4000-8000-000000000002"],
+      ["invalid", "00000000-0000-4000-8000-000000000002"],
+      [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000001",
+      ],
+    ]
+  ) {
+    try {
+      workspaceRoutingConfig(values[0], values[1]);
+      assert(false, "invalid routing configuration must fail");
+    } catch (error) {
+      assert(error instanceof IngestError);
+      assert(error.code === "invalid_configuration");
+      assert(error.status === 500);
+    }
+  }
+
+  const routing = workspaceRoutingConfig(
+    "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002",
+  );
+  for (
+    const email of [
+      "test@example.com",
+      "test@sub.e3group.ai",
+      "test@e3group.ai.example",
+    ]
+  ) {
+    try {
+      publicCollectorGrant(routing, { ...COLLECTOR, email });
+      assert(false, "unknown collector domain must fail");
+    } catch (error) {
+      assert(error instanceof IngestError);
+      assert(error.code === "collector_domain_forbidden");
+      assert(error.status === 403);
+    }
+  }
 });
 
 Deno.test("collector keys distinguish machines while email remains the person key", async () => {

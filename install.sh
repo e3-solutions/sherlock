@@ -64,6 +64,10 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/validate_install_email.py" \
+  --email "$EMAIL" \
+  --collector-home "$CODEX_HOME"
+
 if [ -n "${CODEX_BIN:-}" ]; then
   if [ ! -x "$CODEX_BIN" ]; then
     echo "CODEX_BIN is not executable: $CODEX_BIN" >&2

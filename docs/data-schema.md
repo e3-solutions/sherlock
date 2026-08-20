@@ -198,8 +198,9 @@ authorization is outside the v1 evidence contract.
 `sherlock.rollout-batch.v1` and `sherlock.committed-receipt.v1` implement these
 application rules without changing the seven-table schema:
 
-1. Scope the public endpoint to its server-configured `workspace_id`. Normalize
-   the declared email, resolve one `person_id` per workspace/email, and derive a
+1. Scope the public endpoint from the normalized declared email using the
+   server-configured E3 and Sixty Four workspace IDs. Reject every other exact
+   domain, resolve one `person_id` per workspace/email, and derive a
    machine-specific `collector_key` from the email plus persistent installation
    UUID. Never accept client-supplied IDs.
 2. Durably spool a source chunk and its encoded object once. Retries must reuse

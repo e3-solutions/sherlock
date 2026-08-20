@@ -28,20 +28,13 @@ export const DEFAULT_WORK_DETAIL_LIMIT = 50;
 export const MAX_WORK_DETAIL_LIMIT = 100;
 export const MCP_PROMPT_EVIDENCE_LIMIT = 5;
 export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
-export const REPLACED_DASHBOARD_EMAIL_DOMAIN = "coreedgesolution.com";
+export const SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN = "sixtyfour.ai";
 
-function dashboardPersonVisibility(alias) {
-  return `
-   and not exists (
-     select 1
-       from telemetry.people preferred
-      where preferred.workspace_id = ${alias}.workspace_id
-        and preferred.id <> ${alias}.id
-        and preferred.github_id = ${alias}.github_id
-        and ${alias}.github_id is not null
-        and split_part(${alias}.email, '@', 2) = '${REPLACED_DASHBOARD_EMAIL_DOMAIN}'
-        and split_part(preferred.email, '@', 2) = '${PREFERRED_DASHBOARD_EMAIL_DOMAIN}'
-   )`;
+export function validateDashboardEmailDomain(value) {
+  if (![PREFERRED_DASHBOARD_EMAIL_DOMAIN, SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN].includes(value)) {
+    throw new TypeError("SHERLOCK_DASHBOARD_EMAIL_DOMAIN must be e3group.ai or sixtyfour.ai");
+  }
+  return value;
 }
 
 function nativeItemTimestamp(column) {
@@ -117,7 +110,8 @@ select pe.id::text as person_id,
   from telemetry.people pe
  where pe.workspace_id = $1
    and pe.github_id is distinct from 'sherlock-smoke'
-   ${dashboardPersonVisibility("pe")}
+   and split_part(pe.email, '@', 2) = $3
+   and split_part(pe.email, '@', 3) = ''
  order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
 `;
@@ -173,6 +167,8 @@ prompt_candidates as materialized (
      and e.content_sha256 is not null and e.content_byte_size > 0
      and e.error_code is null and not e.is_replay and e.actor_role = 'primary'
      and pe.github_id is distinct from 'sherlock-smoke'
+     and split_part(pe.email, '@', 2) = p.expected_email_domain
+     and split_part(pe.email, '@', 3) = ''
      ${candidatePredicate}
      ${visibilityPredicate}
      and (
@@ -344,14 +340,15 @@ function flameSql() {
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text[] normalizer_versions,
-         $5::timestamptz read_at
+         $5::timestamptz read_at, $6::text expected_email_domain
 ), roster as materialized (
   select pe.id person_id,
          coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) display_name
    from telemetry.people pe cross join p
    where pe.workspace_id = p.workspace_id
      and pe.github_id is distinct from 'sherlock-smoke'
-     ${dashboardPersonVisibility("pe")}
+     and split_part(pe.email, '@', 2) = p.expected_email_domain
+     and split_part(pe.email, '@', 3) = ''
 ), buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start
@@ -515,8 +512,12 @@ activity_candidates as materialized (
     from telemetry.events e
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
+    join telemetry.people pe
+      on pe.workspace_id = s.workspace_id and pe.id = s.person_id
     cross join p
    where e.workspace_id = p.workspace_id
+     and split_part(pe.email, '@', 2) = p.expected_email_domain
+     and split_part(pe.email, '@', 3) = ''
      and e.normalizer_version = any(p.normalizer_versions)
      and not e.is_replay
      and e.actor_role <> 'automation'
@@ -710,7 +711,7 @@ with p as materialized (
          $3::timestamptz end_at, $4::text[] normalizer_versions,
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
-         $9::timestamptz bucket_end
+         $9::timestamptz bucket_end, $10::text expected_email_domain
 ), ${relevantActivitySessionsCte()}, ${detailActivityCte(`and s.person_id = p.person_id
      and e.session_id in (select session_id from relevant_activity_sessions)`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
@@ -738,7 +739,7 @@ select session_id::text session_id, semantic_role, first_at, last_at,
        event_count, summary
   from grouped
  order by first_at, session_id, semantic_role
- limit $10
+ limit $11
 `;
 
 export const INTERVAL_PROMPTS_SQL = `
@@ -747,7 +748,7 @@ with p as materialized (
          $3::timestamptz end_at, $4::text[] normalizer_versions,
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
-         $9::timestamptz bucket_end
+         $9::timestamptz bucket_end, $10::text expected_email_domain
 ), ${promptsCte({
   candidatePredicate: "and s.person_id = p.person_id",
   contentColumns: ", e.content_byte_size, e.content_excerpt",
@@ -761,7 +762,7 @@ select prompt_identity, session_id::text session_id, observed_at,
    and prompts.observed_at >= p.bucket_start
    and prompts.observed_at < p.bucket_end
  order by prompts.observed_at, prompt_identity
- limit $10
+ limit $11
 `;
 
 export const WORK_DETAIL_SQL = `
@@ -772,7 +773,7 @@ with p as materialized (
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end, $10::uuid session_id,
          $11::text semantic_role, $12::bigint cursor_at_microseconds,
-         $13::bigint cursor_id
+         $13::bigint cursor_id, $14::text expected_email_domain
 ), ${detailActivityCte(`and s.person_id = p.person_id
      and e.session_id = p.session_id`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
@@ -813,7 +814,7 @@ with p as materialized (
        bucket_events.id
      ) > (p.cursor_at_microseconds, p.cursor_id)
    order by bucket_events.observed_at, bucket_events.id
-   limit $14
+   limit $15
 )
 select header.session_id::text session_id, header.semantic_role,
        header.first_at, header.last_at, header.event_count, header.summary,
@@ -1084,7 +1085,6 @@ function promptEvidenceFromRow(row) {
 }
 
 export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
-  if (roster.length === 0) throw new FlameSourceError("flame_database_roster_empty");
   if (rows.length !== roster.length * BUCKET_COUNT) {
     throw new FlameSourceError("flame_database_result_incomplete");
   }
@@ -1153,8 +1153,9 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
 }
 
 export class DirectFlameSource {
-  constructor({ databaseUrl, workspaceId, maxPeople = 500 }) {
+  constructor({ databaseUrl, workspaceId, expectedEmailDomain, maxPeople = 500 }) {
     this.workspaceId = workspaceId;
+    this.expectedEmailDomain = validateDashboardEmailDomain(expectedEmailDomain);
     this.maxPeople = maxPeople;
     this.sql = postgres(databaseUrl, {
       prepare: false,
@@ -1230,7 +1231,7 @@ export class DirectFlameSource {
       const end = new Date(endMs);
       const roster = await runQuery(tx,
         PEOPLE_SQL,
-        [this.workspaceId, this.maxPeople + 1],
+        [this.workspaceId, this.maxPeople + 1, this.expectedEmailDomain],
         signal,
       );
       if (roster.length > this.maxPeople) {
@@ -1242,6 +1243,7 @@ export class DirectFlameSource {
         end.toISOString(),
         tx.array(NORMALIZER_VERSIONS),
         read.toISOString(),
+        this.expectedEmailDomain,
       ], signal);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
@@ -1269,6 +1271,7 @@ export class DirectFlameSource {
         personId,
         startAt.toISOString(),
         bounds.bucketEnd.toISOString(),
+        this.expectedEmailDomain,
         workLimit,
       ], signal);
       if (work.length === workLimit) {
@@ -1285,6 +1288,7 @@ export class DirectFlameSource {
         personId,
         startAt.toISOString(),
         bounds.bucketEnd.toISOString(),
+        this.expectedEmailDomain,
         promptLimit,
       ], signal);
       if (prompts.length === promptLimit) {
@@ -1339,6 +1343,7 @@ export class DirectFlameSource {
         personId,
         startAt.toISOString(),
         bounds.bucketEnd.toISOString(),
+        this.expectedEmailDomain,
         workLimit,
       ], signal);
       if (workRows.length === workLimit) {
@@ -1366,6 +1371,7 @@ export class DirectFlameSource {
         role,
         cursorAtMicroseconds,
         cursorId,
+        this.expectedEmailDomain,
         pageSize + 1,
       ], signal);
       if (resultRows.length === 0) throw new FlameSourceError("flame_work_request_not_found");
@@ -1415,6 +1421,7 @@ export class DirectFlameSource {
         personId,
         startAt.toISOString(),
         bounds.bucketEnd.toISOString(),
+        this.expectedEmailDomain,
         MCP_PROMPT_EVIDENCE_LIMIT,
       ], signal);
       const eligiblePromptCount = rows.length === 0

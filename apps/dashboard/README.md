@@ -2,15 +2,17 @@
 
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
-uses SHERLOCK_WORKSPACE_ID and one small connection pool whose transactions are
-repeatable-read, read-only, and pinned to `sherlock_reader`.
+uses SHERLOCK_WORKSPACE_ID, requires the service's approved
+SHERLOCK_DASHBOARD_EMAIL_DOMAIN, and uses one small connection pool whose
+transactions are repeatable-read, read-only, and pinned to `sherlock_reader`.
 
 The browser and MCP clients never receive database credentials. The page and
-aggregate API are public; the MCP endpoint requires a separate bearer token.
-Every database query remains pinned to one configured workspace.
-The aggregate API does not return prompt text. Lazy interval and work-detail
-endpoints return only canonical normalized evidence for one person and one
-ten-minute bucket. Message content is limited to
+all browser APIs are public and unauthenticated, including lazy interval and
+work-detail endpoints that can return prompt excerpts. Only the MCP endpoint
+requires a separate bearer token. Every database query remains pinned to one
+configured workspace. The aggregate API does not return prompt text. Lazy
+interval and work-detail endpoints return only canonical normalized evidence
+for one person and one ten-minute bucket. Message content is limited to
 `telemetry.events.content_excerpt`; the dashboard never reads full raw Storage
 objects.
 
@@ -160,7 +162,10 @@ immutable publication-time session facts.
 
 ## Environment
 
-SUPABASE_DB_URL and SHERLOCK_WORKSPACE_ID are required. SUPABASE_DB_URL reuses
+SUPABASE_DB_URL, SHERLOCK_WORKSPACE_ID, and SHERLOCK_DASHBOARD_EMAIL_DOMAIN are
+required. The email domain must be exactly `e3group.ai` or `sixtyfour.ai`; it
+filters every roster, detail, and MCP evidence read for that one-workspace
+service. SUPABASE_DB_URL reuses
 the existing Sherlock worker login contract, which can assume
 sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
 exceed 1000.
