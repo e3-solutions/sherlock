@@ -94,7 +94,8 @@ Deno.test({
              workspace_id, batch_id, record_index, source_start_offset,
              source_end_offset, record_sha256, native_type,
              native_payload_type, occurred_at, parse_status
-           ) values ($1,$2,$3,$3,$4,$5,'event_msg','user_message',$6,'ok')
+           ) values ($1,$2,$3::integer,$3::bigint,$4,$5,
+                     'event_msg','user_message',$6,'ok')
            returning id::text id`,
           [
             workspaceId,
