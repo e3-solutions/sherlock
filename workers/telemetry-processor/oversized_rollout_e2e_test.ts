@@ -114,6 +114,7 @@ async function assertClaudeDashboard(
       databaseUrl,
       workspaceId,
     ],
+    clearEnv: true,
     stdout: "piped",
     stderr: "piped",
   });
