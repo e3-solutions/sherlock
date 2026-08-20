@@ -361,6 +361,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
             personId,
             bucketStart.toISOString(),
             new Date(bucketStart.getTime() + BUCKET_MS).toISOString(),
+            "e3group.ai",
             201,
           ],
         );
