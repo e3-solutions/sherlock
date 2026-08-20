@@ -7,8 +7,8 @@ latency.
 
 ## Data flow
 
-1. `sherlock-rollout-ingest` validates the compressed bytes, decompressed
-   source, and every record hash.
+1. `sherlock-rollout-ingest` validates the provider/kind contract, compressed
+   bytes, decompressed source, and every record hash.
 2. It creates the immutable object with overwrite disabled.
 3. One Postgres transaction inserts `telemetry.ingest_batches` and
    `telemetry.native_records`. An `AFTER INSERT` trigger creates exactly one
@@ -16,12 +16,19 @@ latency.
 4. The existing committed receipt returns immediately.
 5. Railway claims a job with `FOR UPDATE SKIP LOCKED`, a visibility deadline,
    and a random fencing token. It downloads the object directly from Supabase,
-   revalidates it, and runs the idempotent normalizer. A successful
-   normalization upserts one dirty cutoff per affected session into the same
-   queue. Duplicate and concurrent batches therefore coalesce before Railway
-   reduces only those targeted sessions.
+   revalidates it, and runs the idempotent provider-specific normalizer. A
+   successful normalization upserts one dirty cutoff per affected session into
+   the same queue. Duplicate and concurrent batches therefore coalesce before
+   Railway reduces only those targeted sessions.
 6. PostgreSQL fills the generated message `tsvector` and GIN index when the
    normalized event rows are inserted. There is no separate search worker.
+
+Claude Code transcripts and terminal-hook observations remain distinct raw
+sources. Transcript batches use `claude_code/transcript`; exact Stop,
+SubagentStop, and SessionEnd observations use `claude_code/hook`. Both are
+interpreted by the Claude normalizer, while the immutable source bytes and
+provider/kind facts remain separate and auditable. Only an anchored Stop or
+SubagentStop projects a completed turn.
 
 `processing` is private mutable operational state. Immutable receipts and
 record locators stay in `telemetry`; rebuildable product projections stay in
@@ -147,22 +154,28 @@ disables automatic activity reduction; this is a degraded emergency mode, not
 a steady state. Do not stop Railway with backlog present, delete queue/raw rows,
 or re-enable the full-workspace Cron as a permanent design.
 
-## Oversized rollout records
+## Oversized native records
 
 Deploy the ingest function and Railway worker before collectors that can emit
-fragments. A rollout JSONL record over 16 MiB and up to 100 MiB is transported
-as deterministic 4 MiB v1 fragments using the fragment columns already present
-on `telemetry.native_records`. Each fragment remains an immutable, independently
-verifiable raw fact. The normalizer emits a bounded `unknown/native_fragment`
-coverage event instead of parsing a partial JSON document, so the oversized
-record itself does not create product activity while later records in the same
-stream continue normally. The complete raw record remains reconstructable from
-its ordered fragments and full-record hash.
+fragments. A Codex rollout or Claude transcript JSONL record over 16 MiB and up
+to 100 MiB is transported as deterministic 4 MiB v1 fragments using the
+fragment columns already present on `telemetry.native_records`. Each fragment
+remains an immutable, independently verifiable raw fact. The normalizer emits a
+bounded `unknown/native_fragment` coverage event instead of parsing a partial
+JSON document, so the oversized record itself does not create product activity
+while later records in the same stream continue normally. The complete raw
+record remains reconstructable from its ordered fragments and full-record hash.
 
 The collector's synchronous byte budget may be exceeded by one logical record:
 all fragments of that record are published durably before its cursor advances.
 This keeps crash replay stateless and idempotent at the cost of one bounded
 100 MiB worst-case capture.
+
+Official collectors upload each stream in generation and source-offset order.
+The worker additionally blocks a committed later range while an earlier
+committed range is queued or leased, but it cannot infer a predecessor that has
+not reached ingest. Direct producers must therefore preserve the same per-stream
+upload order; concurrency remains available across independent streams.
 
 Rolling collectors back stops new fragments. Rolling the server back first can
 reject already-spooled fragments; collectors retain that head and block only

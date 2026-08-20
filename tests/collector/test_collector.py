@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ from sherlock_collector.contract import (
     ContractError,
     RECEIPT_VERSION,
     build_rollout_batch,
+    build_source_batch,
     validate_stored_payload,
 )
 from sherlock_collector.config import CollectorIdentity
@@ -30,6 +32,7 @@ from sherlock_collector.drain import (
 from sherlock_collector.hook import capture_and_spawn_drain
 from sherlock_collector.http import HttpTransport
 from sherlock_collector.rollout import (
+    CaptureResult,
     DEFAULT_MAX_FILES,
     RolloutCapturer,
 )
@@ -78,7 +81,8 @@ def receipt(manifest, **overrides):
         "source_byte_count": manifest.source_byte_count,
         "source_sha256": manifest.source_sha256,
         "storage_path": (
-            f"workspaces/{WORKSPACE_ID}/collectors/{COLLECTOR_KEY}/rollout/"
+            f"workspaces/{WORKSPACE_ID}/collectors/{COLLECTOR_KEY}/"
+            f"{manifest.source_kind}/"
             f"{manifest.source_stream_key}/generations/"
             f"{manifest.generation_seq}-{manifest.generation_key}/"
             f"{manifest.start_offset}-{manifest.end_offset}-{manifest.source_sha256}.jsonl.gz"
@@ -137,6 +141,80 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(body["collector"]["email"], "test@example.com")
         self.assertEqual(body["collector"]["github_id"], "test-user")
         self.assertEqual(value["status"], "committed")
+
+    def test_backfill_spool_fact_sets_workload_header(self):
+        manifest, stored = batch("stream-backfill-http")
+        item = SpoolItem(manifest, stored, {"workload_class": "backfill"})
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _limit):
+                return json.dumps(receipt(manifest)).encode()
+
+        with patch(
+            "sherlock_collector.http.urllib.request.urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            HttpTransport(
+                "https://example.test/ingest",
+                CollectorIdentity(
+                    name="Test User",
+                    github_id="test-user",
+                    email="test@example.com",
+                    installation_id="00000000-0000-4000-8000-000000000001",
+                ),
+            ).upload(item)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.get_header("X-sherlock-workload-class"),
+            "backfill",
+        )
+
+    def test_claude_manifest_round_trip_keeps_provider_identity(self):
+        source = b'{"type":"user","sessionId":"session-1"}\n'
+        manifest, stored = build_source_batch(
+            source,
+            source_provider="claude_code",
+            source_kind="transcript",
+            source_stream_key="claude-stream",
+            generation_key="claude-generation",
+            generation_seq=0,
+            start_offset=0,
+            observed_native_session_id="session-1",
+            source_version="2.0.59",
+        )
+
+        item = SpoolItem.from_dict(
+            json.loads(json.dumps(SpoolItem(manifest, stored, {}).to_dict()))
+        )
+
+        self.assertEqual(item.manifest.source_provider, "claude_code")
+        self.assertEqual(item.manifest.source_kind, "transcript")
+        self.assertEqual(item.manifest.source_version, "2.0.59")
+        self.assertEqual(receipt(item.manifest)["source_kind"], "transcript")
+
+    def test_claude_hook_is_a_distinct_supported_source_kind(self):
+        source = b'{"type":"claude_hook","schema_version":"sherlock.claude-hook.v1"}\n'
+        manifest, stored = build_source_batch(
+            source,
+            source_provider="claude_code",
+            source_kind="hook",
+            source_stream_key="claude-hook-stream",
+            generation_key="claude-hook-generation",
+            generation_seq=0,
+            start_offset=0,
+        )
+
+        self.assertEqual(manifest.source_provider, "claude_code")
+        self.assertEqual(manifest.source_kind, "hook")
+        self.assertEqual(manifest.records[0].native_type, "claude_hook")
+        self.assertEqual(gzip.decompress(stored), source)
 
 
 class CollectorDrainTests(unittest.TestCase):
@@ -202,7 +280,8 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(len(transport.items), 1)
 
     def test_transient_failure_is_requeued_once_per_drain(self):
-        self.enqueue()
+        manifest, stored = batch("stream-backfill-retry")
+        self.spool.enqueue(manifest, stored, workload_class="backfill")
 
         class Transient:
             calls = 0
@@ -218,6 +297,7 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(transport.calls, 1)
         queued = self.spool.load(self.spool.list_pending()[0])
         self.assertEqual(queued.metadata["last_upload_error"], "try later")
+        self.assertEqual(queued.metadata["workload_class"], "backfill")
 
     def test_permanent_failure_is_retained_and_blocks_only_its_stream(self):
         first, _ = self.enqueue("stream-a")
@@ -377,6 +457,134 @@ class RolloutCaptureTests(unittest.TestCase):
                 max_object_bytes=1024,
             )
 
+    def test_allowed_root_captures_nested_regular_file_by_descriptor(self):
+        projects = self.root / "projects"
+        transcript = projects / "project" / "session" / "subagents" / "agent.jsonl"
+        transcript.parent.mkdir(parents=True)
+        source = b'{"type":"assistant"}\n'
+        transcript.write_bytes(source)
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            chunk_bytes=128,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([transcript])
+
+        self.assertEqual(result.captured_bytes, len(source))
+        self.assertEqual(result.errors, 0)
+        item = self.spool.load(self.spool.list_pending()[0])
+        self.assertEqual(item.manifest.source_byte_count, len(source))
+        state = json.loads(
+            (self.root / "confined-state" / "rollout-state.json").read_text()
+        )
+        only = next(iter(state["streams"].values()))
+        self.assertEqual(
+            only["path"],
+            str(projects.resolve() / transcript.relative_to(projects)),
+        )
+
+    def test_allowed_root_rejects_lexically_external_path(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        outside = self.root / "outside.jsonl"
+        outside.write_bytes(b'{"type":"outside"}\n')
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside allowed_root"):
+            capturer.capture([outside], best_effort=True)
+        with self.assertRaisesRegex(ValueError, "outside allowed_root"):
+            capturer.capture([Path("..") / outside.name], best_effort=True)
+
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_does_not_follow_final_file_symlink(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        outside = self.root / "outside.jsonl"
+        outside.write_bytes(b'{"type":"outside"}\n')
+        linked = projects / "linked.jsonl"
+        linked.symlink_to(outside)
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([linked], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_does_not_follow_directory_symlink(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "session.jsonl").write_bytes(b'{"type":"outside"}\n')
+        (projects / "linked-project").symlink_to(outside, target_is_directory=True)
+        candidate = projects / "linked-project" / "session.jsonl"
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([candidate], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_rejects_fifo_without_blocking(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        candidate = projects / "session.jsonl"
+        os.mkfifo(candidate)
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([candidate], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_rejects_file_swapped_to_symlink_before_open(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        candidate = projects / "session.jsonl"
+        candidate.write_bytes(b'{"type":"inside"}\n')
+        outside = self.root / "outside.jsonl"
+        outside.write_bytes(b'{"type":"outside"}\n')
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+        original_open = capturer._open_source
+
+        def swap_before_open(path):
+            path.unlink()
+            path.symlink_to(outside)
+            return original_open(path)
+
+        with patch.object(capturer, "_open_source", side_effect=swap_before_open):
+            result = capturer.capture([candidate], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+
     def test_offsets_advance_only_after_durable_enqueue(self):
         source = b'{"type":"one"}\n{"type":"two"}\n'
         self.rollout.write_bytes(source)
@@ -483,6 +691,36 @@ class RolloutCaptureTests(unittest.TestCase):
             )
 
         popen.assert_called_once()
+
+    def test_hook_does_not_fan_out_drains_when_capture_lock_is_held(self):
+        with (
+            patch.object(
+                self.capturer,
+                "capture",
+                return_value=CaptureResult(locked=True),
+            ),
+            patch("sherlock_collector.hook.subprocess.Popen") as popen,
+        ):
+            result = capture_and_spawn_drain(
+                self.capturer, [self.rollout], ["sherlock-collector", "drain"]
+            )
+
+        self.assertTrue(result.locked)
+        popen.assert_not_called()
+
+    def test_hook_does_not_spawn_a_drain_for_an_empty_healthy_queue(self):
+        self.rollout.write_bytes(b'{"type":"already-captured"}\n')
+        self.capturer.capture([self.rollout])
+        for path in self.spool.list_pending():
+            path.unlink()
+
+        with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+            result = capture_and_spawn_drain(
+                self.capturer, [self.rollout], ["sherlock-collector", "drain"]
+            )
+
+        self.assertEqual(result.enqueued, 0)
+        popen.assert_not_called()
 
     def test_append_does_not_advance_generation(self):
         first_source = b'{"type":"first"}\n'
@@ -701,10 +939,14 @@ class RolloutCaptureTests(unittest.TestCase):
         enqueue = self.spool.enqueue
         calls = 0
 
-        def crash_after_enqueue(manifest, stored):
+        def crash_after_enqueue(manifest, stored, *, workload_class=None):
             nonlocal calls
             calls += 1
-            path = enqueue(manifest, stored)
+            path = enqueue(
+                manifest,
+                stored,
+                workload_class=workload_class,
+            )
             if calls == 3:
                 raise OSError("simulated crash after durable enqueue")
             return path
@@ -725,6 +967,53 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(len(self.spool.list_pending()), expected_count)
         state = json.loads((state_root / "rollout-state.json").read_text())
         self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
+
+    def test_fragment_staging_rejects_mutation_before_any_spool_visibility(self):
+        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        self.rollout.write_bytes(source)
+        state_root = self.root / "fragment-mutation-state"
+        rollout = self.rollout
+
+        class MutatingCapturer(RolloutCapturer):
+            def _native_record_fragment_plan(self, handle, start, stable_end):
+                plan = super()._native_record_fragment_plan(
+                    handle,
+                    start,
+                    stable_end,
+                )
+                with rollout.open("r+b") as writer:
+                    writer.seek(5 * 1024 * 1024)
+                    original = writer.read(1)
+                    writer.seek(-1, os.SEEK_CUR)
+                    writer.write(b"y" if original != b"y" else b"z")
+                return plan
+
+        with self.assertRaisesRegex(OSError, "changed while staging"):
+            MutatingCapturer(
+                state_root,
+                self.spool,
+                chunk_bytes=128,
+            ).capture([self.rollout])
+
+        self.assertEqual(self.spool.list_pending(), [])
+        self.assertFalse((state_root / "rollout-state.json").exists())
+
+        result = RolloutCapturer(
+            state_root,
+            self.spool,
+            chunk_bytes=128,
+        ).capture([self.rollout])
+        expected_count = (len(source) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
+        self.assertEqual(result.enqueued, expected_count)
+        items = sorted(
+            (self.spool.load(path) for path in self.spool.list_pending()),
+            key=lambda item: item.manifest.start_offset,
+        )
+        reconstructed = b"".join(
+            validate_stored_payload(item.manifest, item.stored_payload)
+            for item in items
+        )
+        self.assertEqual(reconstructed, self.rollout.read_bytes())
 
     def test_fragment_manifest_rejects_noncanonical_count(self):
         source = b"x" * (MAX_SOURCE_BYTES + 1)
@@ -762,7 +1051,7 @@ class RolloutCaptureTests(unittest.TestCase):
             max_record_bytes=MAX_SOURCE_BYTES,
         )
 
-        with self.assertRaisesRegex(ContractError, "native rollout record exceeds"):
+        with self.assertRaisesRegex(ContractError, "native source record exceeds"):
             capturer.capture([self.rollout])
 
         self.assertEqual(self.spool.list_pending(), [])

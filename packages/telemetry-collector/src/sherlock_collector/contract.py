@@ -25,6 +25,10 @@ MAX_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_STORED_BYTES = 17 * 1024 * 1024
 FRAGMENT_BYTES = 4 * 1024 * 1024
 MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024
+SOURCE_KINDS = {
+    "codex": frozenset({"rollout"}),
+    "claude_code": frozenset({"transcript", "hook"}),
+}
 
 
 class ContractError(ValueError):
@@ -150,6 +154,7 @@ class RecordLocator:
 @dataclass(frozen=True)
 class BatchManifest:
     contract_version: str
+    source_provider: str
     source_kind: str
     source_stream_key: str
     generation_key: str
@@ -164,9 +169,11 @@ class BatchManifest:
     record_count: int
     records: tuple[RecordLocator, ...]
     observed_native_session_id: str | None = None
+    observed_parent_native_session_id: str | None = None
     first_occurred_at: str | None = None
     last_occurred_at: str | None = None
     codex_version: str | None = None
+    source_version: str | None = None
     collector_version: str | None = None
 
     @property
@@ -202,6 +209,9 @@ class BatchManifest:
             contract_version=_nonempty(
                 value.get("contract_version"), "contract_version"
             ),
+            source_provider=_nonempty(
+                value.get("source_provider", "codex"), "source_provider"
+            ),
             source_kind=_nonempty(value.get("source_kind"), "source_kind"),
             source_stream_key=_nonempty(
                 value.get("source_stream_key"), "source_stream_key"
@@ -224,9 +234,13 @@ class BatchManifest:
             record_count=_integer(value.get("record_count"), "record_count", minimum=1),
             records=tuple(RecordLocator.from_dict(record) for record in raw_records),
             observed_native_session_id=value.get("observed_native_session_id"),
+            observed_parent_native_session_id=value.get(
+                "observed_parent_native_session_id"
+            ),
             first_occurred_at=value.get("first_occurred_at"),
             last_occurred_at=value.get("last_occurred_at"),
             codex_version=value.get("codex_version"),
+            source_version=value.get("source_version", value.get("codex_version")),
             collector_version=value.get("collector_version"),
         )
         manifest.validate()
@@ -235,10 +249,10 @@ class BatchManifest:
     def validate(self) -> None:
         if self.contract_version != CONTRACT_VERSION:
             raise ContractError("unsupported contract_version")
-        if self.source_kind != "rollout":
-            raise ContractError(
-                "the first collector slice accepts rollout batches only"
-            )
+        if self.source_provider not in SOURCE_KINDS:
+            raise ContractError("source_provider is unsupported")
+        if self.source_kind not in SOURCE_KINDS[self.source_provider]:
+            raise ContractError("source_kind does not match source_provider")
         if self.storage_encoding != "gzip":
             raise ContractError("the stable rollout encoding must be gzip")
         if self.end_offset <= self.start_offset:
@@ -277,7 +291,13 @@ class BatchManifest:
             "observed_native_session_id",
             IDENTITY_HINT_BYTES,
         )
+        _bounded_text(
+            self.observed_parent_native_session_id,
+            "observed_parent_native_session_id",
+            IDENTITY_HINT_BYTES,
+        )
         _bounded_text(self.codex_version, "codex_version", VERSION_HINT_BYTES)
+        _bounded_text(self.source_version, "source_version", VERSION_HINT_BYTES)
         _bounded_text(self.collector_version, "collector_version", VERSION_HINT_BYTES)
         for record in self.records:
             _bounded_text(record.native_type, "record.native_type", NATIVE_LABEL_BYTES)
@@ -406,15 +426,19 @@ def _record_locator(
     )
 
 
-def build_rollout_batch(
+def build_source_batch(
     source_bytes: bytes,
     *,
     source_stream_key: str,
     generation_key: str,
     generation_seq: int,
     start_offset: int,
+    source_provider: str,
+    source_kind: str,
     observed_native_session_id: str | None = None,
+    observed_parent_native_session_id: str | None = None,
     codex_version: str | None = None,
+    source_version: str | None = None,
     collector_version: str | None = None,
     native_record_fragment: Mapping[str, Any] | None = None,
 ) -> tuple[BatchManifest, bytes]:
@@ -480,7 +504,8 @@ def build_rollout_batch(
     ]
     manifest = BatchManifest(
         contract_version=CONTRACT_VERSION,
-        source_kind="rollout",
+        source_provider=source_provider,
+        source_kind=source_kind,
         source_stream_key=_nonempty(source_stream_key, "source_stream_key"),
         generation_key=_nonempty(generation_key, "generation_key"),
         generation_seq=_integer(generation_seq, "generation_seq"),
@@ -494,13 +519,43 @@ def build_rollout_batch(
         record_count=len(records),
         records=tuple(records),
         observed_native_session_id=observed_native_session_id,
+        observed_parent_native_session_id=observed_parent_native_session_id,
         first_occurred_at=min(occurred)[1] if occurred else None,
         last_occurred_at=max(occurred)[1] if occurred else None,
         codex_version=codex_version,
+        source_version=source_version,
         collector_version=collector_version,
     )
     manifest.validate()
     return manifest, stored
+
+
+def build_rollout_batch(
+    source_bytes: bytes,
+    *,
+    source_stream_key: str,
+    generation_key: str,
+    generation_seq: int,
+    start_offset: int,
+    observed_native_session_id: str | None = None,
+    codex_version: str | None = None,
+    collector_version: str | None = None,
+    native_record_fragment: Mapping[str, Any] | None = None,
+) -> tuple[BatchManifest, bytes]:
+    return build_source_batch(
+        source_bytes,
+        source_stream_key=source_stream_key,
+        generation_key=generation_key,
+        generation_seq=generation_seq,
+        start_offset=start_offset,
+        source_provider="codex",
+        source_kind="rollout",
+        observed_native_session_id=observed_native_session_id,
+        codex_version=codex_version,
+        source_version=codex_version,
+        collector_version=collector_version,
+        native_record_fragment=native_record_fragment,
+    )
 
 
 RECEIPT_FIELDS = {

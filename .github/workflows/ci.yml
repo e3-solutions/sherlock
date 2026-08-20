@@ -118,14 +118,14 @@ jobs:
           deno test --allow-env --allow-net
           workers/telemetry-processor/queue_integration_test.ts
 
-      - name: Run oversized rollout end-to-end test
+      - name: Run oversized provider end-to-end tests
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
         run: |
           eval "$(supabase status -o env)"
           SHERLOCK_TEST_SUPABASE_URL="$API_URL" \
           SHERLOCK_TEST_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY" \
-          deno test --allow-env --allow-net --allow-read --allow-write --allow-run=python3 \
+          deno test --allow-env --allow-net --allow-read --allow-write --allow-run=python3,node \
             workers/telemetry-processor/oversized_rollout_e2e_test.ts
 
       - name: Stop isolated Supabase database

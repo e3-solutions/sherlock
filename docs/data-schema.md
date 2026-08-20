@@ -1,9 +1,9 @@
 # Sherlock v0 Data Architecture
 
-Status: the Supabase database foundation, rollout collector drain, asynchronous
-Codex normalizer worker, targeted versioned activity reducer, and workspace-
-scoped dashboard Flame read API are implemented. The durable snapshot resolver
-and version activation are not.
+Status: the Supabase database foundation, provider-aware JSONL collector drain,
+asynchronous Codex and Claude Code normalizers, targeted versioned activity
+reducer, and workspace-scoped dashboard Flame read API are implemented. The
+durable snapshot resolver and version activation are not.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
 views separate from source data. Seven source/product tables remain across two
@@ -37,15 +37,16 @@ Keeping one exact definition prevents the architecture notes from drifting.
   50 MiB.
 - Four no-login database roles separate ingest, normalization, reduction, and
   reads.
-- Fifty-eight database assertions cover the core schema, grants, bucket, and
+- Ninety-one database assertions cover the core schema, grants, bucket, and
   representative integrity failures.
-- The rollout collector and ingest function implement the versioned immutable
+- The collector and ingest function implement the versioned immutable
   batch and committed-receipt contract described below.
 - The ingest request durably enqueues work and returns its existing receipt
   without waiting for normalization.
-- Railway projects every native record with the immutable
-  `sherlock.codex-rollout.v1` normalizer, then reduces only affected sessions
-  into append-only `sherlock.activity.v1` span revisions.
+- Railway dispatches every native record to the immutable provider-specific
+  `sherlock.codex-rollout.v1` or `sherlock.claude-code-transcript.v1`
+  normalizer, then reduces only affected sessions into append-only
+  `sherlock.activity.v1` span revisions.
 - PostgreSQL automatically indexes bounded message excerpts as normalized
   event rows are inserted.
 
@@ -79,7 +80,7 @@ database columns.
 | --- | --- | --- |
 | `telemetry.workspaces` | Team and tenant boundary | Provisioned administratively |
 | `telemetry.people` | Stable human attribution inside a workspace | Server resolves normalized email and refreshes declared profile fields |
-| `telemetry.sessions` | Current cache for one native Codex execution stream | Normalizer may insert and update |
+| `telemetry.sessions` | Current cache for one provider-native execution stream | Normalizer may insert and update |
 | `telemetry.ingest_batches` | Receipt for one committed source byte range and Storage object | Ingest may insert only |
 | `telemetry.native_records` | Exact locator and parse status for each native record | Ingest may insert only |
 | `telemetry.events` | Versioned semantic projections of native records | Normalizer may insert only |
@@ -129,9 +130,10 @@ application error; it must not rewrite `sessions.person_id`.
 ### Ingest batches and native records are source facts
 
 An ingest batch identifies a non-empty half-open byte range `[start, end)`, its
-source and stored hashes, the Storage path, encoding, generation, record count,
-and server-resolved person attribution. Its `person_id` is fixed at commit time
-and is never inferred again from mutable identity configuration.
+explicit source provider and kind, source and stored hashes, Storage path,
+encoding, generation, record count, and server-resolved person attribution.
+Its `person_id` is fixed at commit time and is never inferred again from
+mutable identity configuration.
 
 Native records locate every source record, including unknown or malformed
 ones. They remain separate from events because one native record may produce
@@ -191,7 +193,7 @@ additionally declared read-only, and any downstream prompt feedback remains an
 ephemeral agent response rather than a database fact. Principal-scoped
 authorization is outside the v1 evidence contract.
 
-## Implemented rollout drain contract
+## Implemented JSONL drain contract
 
 `sherlock.rollout-batch.v1` and `sherlock.committed-receipt.v1` implement these
 application rules without changing the seven-table schema:
@@ -348,8 +350,8 @@ actually enforces it.
 - SHA-256 values are lowercase hexadecimal.
 - Required identity text is non-empty.
 - JSON is bounded and cannot replace typed fields used by core queries.
-- Codex is the only provider in v0. Generalize after a second provider provides
-  real requirements.
+- Provider identity and source kind are immutable batch facts. Provider-specific
+  interpretations use separate normalizer and role versions.
 - Use keyset pagination for ordered fact reads.
 - Do not partition until measured scale or retention work justifies it.
 
@@ -360,7 +362,7 @@ actually enforces it.
 - stored Flame frames, daily aggregates, builds, or snapshots;
 - editable project and repository catalogs;
 - incidents, alerts, transcript search, embeddings, and recommendations;
-- multi-provider normalization, warehouse export, and partitioning.
+- warehouse export and partitioning.
 - durable product snapshot cursors and generalized job orchestration;
 - native wall/monotonic-duration precedence, hook tails, and presence streams
   until normalized events actually provide that evidence.

@@ -37,6 +37,7 @@ export interface BatchNormalizer {
 
 export interface NormalizationResult {
   session_ids: string[];
+  normalizer_version: string;
 }
 
 export class IngestService {

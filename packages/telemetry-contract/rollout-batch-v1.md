@@ -1,12 +1,15 @@
 # Rollout batch v1
 
 `sherlock.rollout-batch.v1` is the collector-to-ingest manifest for one
-immutable gzip-encoded rollout byte range. The request contains declared
-collector identity, one manifest, and `stored_payload_base64`; workspace,
-person, collector key, object path, and batch ID are deliberately absent
-because the authorized server resolves them.
+immutable gzip-encoded JSONL source byte range. Codex emits
+`source_provider=codex` with `source_kind=rollout`; Claude Code emits
+`source_provider=claude_code` with `source_kind=transcript`. The request
+contains declared collector identity, one manifest, and
+`stored_payload_base64`; workspace, person, collector key, object path, and
+batch ID are deliberately absent because the authorized server resolves them.
 
-The manifest contains source stream and generation identity, half-open byte
+The manifest contains explicit provider/kind identity, source stream and
+generation identity, half-open byte
 bounds, source and stored sizes/SHA-256 values, optional native-session and
 version hints, and an ordered `records` array. Record indexes are contiguous;
 record source offsets are unique, ordered, non-overlapping, and contained by
@@ -28,4 +31,5 @@ The only successful acknowledgement is a JSON object with
 It contains exactly the fields listed in `docs/data-schema.md`. The collector
 checks every manifest-derived field, validates all server IDs, recomputes the
 canonical object path from authenticated receipt attribution, and only then
-deletes the local artifact.
+deletes the local artifact. `source_version` is provider-neutral;
+`codex_version` remains for compatibility with already deployed Codex clients.

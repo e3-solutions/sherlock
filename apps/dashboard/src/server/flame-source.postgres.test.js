@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   BUCKET_MS,
+  CLAUDE_NORMALIZER_VERSION,
   DirectFlameSource,
   NORMALIZER_VERSION,
 } from "./flame-source.js";
@@ -108,6 +109,271 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       const payload = await source.fetchDay({ now: FIXED_NOW });
 
       expect(payload.people.map(({ id }) => id)).toEqual([e3Id, unmatchedId]);
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
+  it("shows Claude primary and subagent transcript evidence throughout the Flame API", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const primarySessionId = crypto.randomUUID();
+    const workerSessionId = crypto.randomUUID();
+    const primaryBatchId = crypto.randomUUID();
+    const workerBatchId = crypto.randomUUID();
+    const collectorKey = `claude-${workspaceId}`;
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let source;
+    const now = new Date();
+    const bucketStartDate = new Date(
+      Math.floor(now.getTime() / BUCKET_MS) * BUCKET_MS - BUCKET_MS,
+    );
+    const at = (milliseconds) =>
+      new Date(bucketStartDate.getTime() + milliseconds).toISOString();
+
+    const eventFixtures = [{
+      batchId: primaryBatchId,
+      sessionId: primarySessionId,
+      recordIndex: 0,
+      at: at(500),
+      nativeType: "user",
+      subtype: "user_message",
+      actorRole: "primary",
+      messageRole: "user",
+      messageOrigin: "system",
+      excerpt: "Injected system context",
+    }, {
+      batchId: primaryBatchId,
+      sessionId: primarySessionId,
+      recordIndex: 1,
+      at: at(1_000),
+      nativeType: "user",
+      subtype: "user_message",
+      actorRole: "primary",
+      messageRole: "user",
+      messageOrigin: "human",
+      excerpt: "Review the ingestion path",
+    }, {
+      batchId: primaryBatchId,
+      sessionId: primarySessionId,
+      recordIndex: 2,
+      at: at(2_000),
+      nativeType: "assistant",
+      subtype: "message",
+      actorRole: "primary",
+      messageRole: "assistant",
+      messageOrigin: "worker",
+      excerpt: "I will inspect it.",
+    }, {
+      batchId: primaryBatchId,
+      sessionId: primarySessionId,
+      recordIndex: 3,
+      at: at(3_000),
+      nativeType: "assistant",
+      subtype: "tool_use",
+      actorRole: "primary",
+      eventKind: "tool_call",
+      toolCallId: "claude-tool-1",
+    }, {
+      batchId: workerBatchId,
+      sessionId: workerSessionId,
+      recordIndex: 0,
+      at: at(4_000),
+      nativeType: "user",
+      subtype: "user_message",
+      actorRole: "worker",
+      messageRole: "user",
+      messageOrigin: "parent_agent",
+      excerpt: "Check the dashboard query",
+    }, {
+      batchId: workerBatchId,
+      sessionId: workerSessionId,
+      recordIndex: 1,
+      at: at(5_000),
+      nativeType: "assistant",
+      subtype: "message",
+      actorRole: "worker",
+      messageRole: "assistant",
+      messageOrigin: "worker",
+      excerpt: "The query needs both providers.",
+    }];
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Claude dashboard fixture')`,
+        [workspaceId, `claude-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (
+           id, workspace_id, identity_key, display_name
+         ) values ($1, $2, $3, 'Claude User')`,
+        [personId, workspaceId, `claude-person-${personId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           parent_session_id, parent_native_session_id, actor_role,
+           role_version, started_at
+         ) values
+           ($1, $3, $4, $5, 'claude-primary', null, null, 'primary',
+            'sherlock.claude-code-role.v1', $6),
+           ($2, $3, $4, $5, 'claude-worker', $1, 'claude-primary', 'worker',
+            'sherlock.claude-code-role.v1', $6)`,
+        [
+          primarySessionId,
+          workerSessionId,
+          workspaceId,
+          personId,
+          collectorKey,
+          bucketStartDate.toISOString(),
+        ],
+      );
+      for (const [batchId, stream, nativeSessionId, parentId, recordCount] of [[
+        primaryBatchId,
+        "primary-stream",
+        "claude-primary",
+        null,
+        4,
+      ], [
+        workerBatchId,
+        "worker-stream",
+        "claude-worker",
+        "claude-primary",
+        2,
+      ]]) {
+        await sql.unsafe(
+          `insert into telemetry.ingest_batches (
+             id, workspace_id, person_id, collector_key,
+             observed_native_session_id, observed_parent_native_session_id,
+             source_provider, source_kind, source_stream_key, generation_key,
+             generation_seq, start_offset, end_offset, source_byte_count,
+             source_sha256, storage_path, storage_encoding, stored_byte_count,
+             stored_sha256, record_count, contract_version
+           ) values (
+             $1, $2, $3, $4, $5, $6, 'claude_code', 'transcript', $7,
+             'fixture-generation', 0, 0, $8, $8, repeat('a', 64), $9,
+             'identity', $8, repeat('b', 64), $10, 'sherlock.rollout-batch.v1'
+           )`,
+          [
+            batchId,
+            workspaceId,
+            personId,
+            collectorKey,
+            nativeSessionId,
+            parentId,
+            stream,
+            recordCount * 100,
+            `fixture/${batchId}`,
+            recordCount,
+          ],
+        );
+      }
+      for (const fixture of eventFixtures) {
+        const [record] = await sql.unsafe(
+          `insert into telemetry.native_records (
+             workspace_id, batch_id, record_index, source_start_offset,
+             source_end_offset, record_sha256, native_type, parse_status
+           ) values (
+             $1, $2, $3, $4, $5, repeat('c', 64),
+             $6,
+             'ok'
+           ) returning id`,
+          [
+            workspaceId,
+            fixture.batchId,
+            fixture.recordIndex,
+            fixture.recordIndex * 100,
+            fixture.recordIndex * 100 + 100,
+            fixture.nativeType,
+          ],
+        );
+        const content = fixture.excerpt ?? null;
+        await sql.unsafe(
+          `insert into telemetry.events (
+             workspace_id, session_id, source_record_id, normalizer_version,
+             projection_index, canonical_scope_key, logical_event_key,
+             source_priority, event_kind, event_subtype, actor_role,
+             occurred_at, observed_at, server_received_at, native_item_id,
+             tool_call_id, message_role, message_origin, content_sha256,
+             content_byte_size, content_excerpt
+           ) values (
+             $1, $2, $3, $4, 0, $5, $6, 100, $7, $8, $9,
+             $10, $10, $10, $11, $12, $13, $14,
+             case when $15::text is null then null else repeat('d', 64) end,
+             case when $15::text is null then null else octet_length($15::text) end,
+             $15
+           )`,
+          [
+            workspaceId,
+            fixture.sessionId,
+            record.id,
+            CLAUDE_NORMALIZER_VERSION,
+            `session:${fixture.sessionId}`,
+            `claude:${fixture.subtype}:${fixture.sessionId}:${fixture.recordIndex}`,
+            fixture.eventKind ?? "message",
+            fixture.subtype,
+            fixture.actorRole,
+            fixture.at,
+            crypto.randomUUID(),
+            fixture.toolCallId ?? null,
+            fixture.messageRole ?? null,
+            fixture.messageOrigin ?? null,
+            content,
+          ],
+        );
+      }
+
+      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      const payload = await source.fetchDay({ now });
+      const person = payload.people[0];
+      const bucketStart = bucketStartDate.toISOString();
+      const payloadStart = new Date(payload.start).getTime();
+      const bucket = person.buckets[
+        Math.floor((bucketStartDate.getTime() - payloadStart) / BUCKET_MS)
+      ];
+
+      expect(person.total).toEqual([1, 1, 0]);
+      expect(bucket).toEqual([1, 1, 0, 1]);
+
+      const interval = await source.fetchInterval({
+        personId,
+        start: bucketStart,
+        snapshot: payload.snapshot,
+      });
+      expect(interval.work).toEqual([
+        expect.objectContaining({
+          sessionId: primarySessionId,
+          role: "agent",
+          eventCount: 4,
+          summary: "Review the ingestion path",
+        }),
+        expect.objectContaining({
+          sessionId: workerSessionId,
+          role: "subagent",
+          eventCount: 2,
+          summary: "Check the dashboard query",
+        }),
+      ]);
+
+      const detail = await source.fetchWork({
+        personId,
+        start: bucketStart,
+        sessionId: primarySessionId,
+        role: "agent",
+        snapshot: payload.snapshot,
+        limit: "10",
+      });
+      expect(detail.eventCount).toBe(4);
+      expect(detail.items.map(({ role, content }) => [role, content])).toEqual([
+        ["user", "Review the ingestion path"],
+        ["assistant", "I will inspect it."],
+      ]);
     } finally {
       if (source) await source.close();
       try {

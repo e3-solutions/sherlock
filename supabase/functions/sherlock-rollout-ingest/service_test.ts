@@ -60,6 +60,7 @@ async function fixture(): Promise<{
     },
     manifest: {
       contract_version: CONTRACT_VERSION,
+      source_provider: "codex",
       source_kind: "rollout",
       source_stream_key: "stream-test",
       generation_key: "generation-test",
@@ -83,9 +84,11 @@ async function fixture(): Promise<{
         parse_status: "ok",
       }],
       observed_native_session_id: null,
+      observed_parent_native_session_id: null,
       first_occurred_at: null,
       last_occurred_at: null,
       codex_version: null,
+      source_version: null,
       collector_version: "test",
     },
     stored,
@@ -529,4 +532,70 @@ Deno.test("advisory lock identity is PostgreSQL-safe and tuple-distinct", async 
 
   assert(!identity.includes("\u0000"), "PostgreSQL text cannot contain NUL");
   assert(first !== second, "tuple boundaries must remain unambiguous");
+});
+
+Deno.test("ingest parses Claude transcripts without relabeling them as rollouts", async () => {
+  const { manifest, stored } = await fixture();
+  const value = parseEnvelope({
+    collector: COLLECTOR,
+    manifest: {
+      ...manifest,
+      source_provider: "claude_code",
+      source_kind: "transcript",
+      observed_native_session_id: "claude-session",
+      observed_parent_native_session_id: null,
+      codex_version: null,
+      source_version: "2.0.59",
+    },
+    stored_payload_base64: btoa(String.fromCharCode(...stored)),
+  });
+
+  assert(value.manifest.source_provider === "claude_code");
+  assert(value.manifest.source_kind === "transcript");
+  assert(value.manifest.source_version === "2.0.59");
+  assert(
+    storagePath({
+      workspace_id: "00000000-0000-4000-8000-000000000001",
+      person_id: "00000000-0000-4000-8000-000000000002",
+      collector_key: "collector-test",
+    }, value.manifest).includes("/transcript/"),
+  );
+});
+
+Deno.test("ingest accepts Claude hook evidence but rejects Codex hook batches", async () => {
+  const { manifest, stored } = await fixture();
+  const hookManifest = {
+    ...manifest,
+    source_provider: "claude_code",
+    source_kind: "hook",
+    observed_native_session_id: "claude-session",
+    observed_parent_native_session_id: null,
+    codex_version: null,
+    source_version: "2.0.59",
+  };
+  const value = parseEnvelope({
+    collector: COLLECTOR,
+    manifest: hookManifest,
+    stored_payload_base64: btoa(String.fromCharCode(...stored)),
+  });
+  assert(value.manifest.source_kind === "hook");
+  assert(
+    storagePath({
+      workspace_id: "00000000-0000-4000-8000-000000000001",
+      person_id: "00000000-0000-4000-8000-000000000002",
+      collector_key: "collector-test",
+    }, value.manifest).includes("/hook/"),
+  );
+
+  try {
+    parseEnvelope({
+      collector: COLLECTOR,
+      manifest: { ...hookManifest, source_provider: "codex" },
+      stored_payload_base64: btoa(String.fromCharCode(...stored)),
+    });
+    assert(false, "Codex hook batches must remain unsupported");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "unsupported_contract");
+  }
 });

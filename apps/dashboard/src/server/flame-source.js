@@ -3,6 +3,11 @@ import postgres from "postgres";
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
+export const NORMALIZER_VERSIONS = Object.freeze([
+  NORMALIZER_VERSION,
+  CLAUDE_NORMALIZER_VERSION,
+]);
 export const DATABASE_ROLE = "sherlock_reader";
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const WORK_CURSOR_VERSION = "v1";
@@ -72,7 +77,7 @@ activity_candidates as materialized (
     ${joins}
     cross join p
    where e.workspace_id = p.workspace_id
-     and e.normalizer_version = p.normalizer_version
+     and e.normalizer_version = any(p.normalizer_versions)
      and not e.is_replay
      and e.actor_role <> 'automation'
      and e.event_kind in (
@@ -160,7 +165,7 @@ prompt_candidates as materialized (
       on pe.workspace_id = s.workspace_id and pe.id = s.person_id
     cross join p
    where e.workspace_id = p.workspace_id
-     and e.normalizer_version = p.normalizer_version
+     and e.normalizer_version = any(p.normalizer_versions)
      and e.event_kind = 'message'
      and e.message_origin = 'human' and e.message_role = 'user'
      and e.content_sha256 is not null and e.content_byte_size > 0
@@ -336,7 +341,7 @@ function flameSql() {
   return `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version,
+         $3::timestamptz end_at, $4::text[] normalizer_versions,
          $5::timestamptz read_at
 ), roster as materialized (
   select pe.id person_id,
@@ -420,7 +425,7 @@ relevant_activity_sessions as materialized (
     join telemetry.sessions s
       on s.workspace_id = e.workspace_id and s.id = e.session_id
    where e.workspace_id = $1::uuid
-     and e.normalizer_version = $4::text
+     and e.normalizer_version = any($4::text[])
      and s.person_id = $7::uuid
      and not e.is_replay
      and e.actor_role <> 'automation'
@@ -467,6 +472,25 @@ relevant_activity_sessions as materialized (
 // matching also needs each direct match's alternative partners, so enrichment keeps two
 // hops of the largest pairing tolerance around the selected frame. This preserves degree
 // semantics without materializing a person's full day of native source metadata.
+const DETAIL_EVENT_COLUMNS = `,
+         e.id, e.event_kind, e.event_subtype,
+         e.actor_role stored_actor_role,
+         e.canonical_scope_key, e.logical_event_key, e.turn_id,
+         e.message_role, e.message_origin,
+         e.native_item_id source_native_item_id,
+         e.content_sha256,
+         nr.batch_id source_batch_id, nr.record_index source_record_index,
+         nr.source_start_offset, nr.source_end_offset,
+         nr.native_type source_native_type,
+         nr.native_payload_type source_native_payload_type,
+         ib.collector_key source_collector_key,
+         ib.source_kind, ib.source_stream_key,
+         ib.generation_key, ib.generation_seq,
+         ib.start_offset source_batch_start_offset,
+         ib.end_offset source_batch_end_offset,
+         ib.record_count source_batch_record_count,
+         e.content_byte_size, e.content_excerpt`;
+
 function detailActivityCte(candidatePredicate = "") {
   return `
 activity_candidates as materialized (
@@ -491,7 +515,7 @@ activity_candidates as materialized (
       on s.workspace_id = e.workspace_id and s.id = e.session_id
     cross join p
    where e.workspace_id = p.workspace_id
-     and e.normalizer_version = p.normalizer_version
+     and e.normalizer_version = any(p.normalizer_versions)
      and not e.is_replay
      and e.actor_role <> 'automation'
      ${candidatePredicate}
@@ -531,21 +555,8 @@ activity_candidates as materialized (
      and observed_at >= p.bucket_start - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
      and observed_at < p.bucket_end + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
 ), activity_events as materialized (
-  select ids.person_id, ids.session_id, ids.actor_role, ids.observed_at,
-         e.id, e.event_kind, e.event_subtype,
-         e.actor_role stored_actor_role,
-         e.canonical_scope_key, e.logical_event_key, e.turn_id,
-         e.message_role,
-         e.native_item_id source_native_item_id,
-         e.content_sha256,
-         nr.batch_id source_batch_id, nr.record_index source_record_index,
-         nr.source_start_offset, nr.source_end_offset,
-         nr.native_type source_native_type,
-         nr.native_payload_type source_native_payload_type,
-         ib.collector_key source_collector_key,
-         ib.source_kind, ib.source_stream_key,
-         ib.generation_key, ib.generation_seq,
-         e.content_byte_size, e.content_excerpt
+  select ids.person_id, ids.session_id, ids.actor_role,
+         ids.observed_at${DETAIL_EVENT_COLUMNS}
     from activity_event_ids ids
     join telemetry.events e on e.id = ids.id
     join telemetry.native_records nr
@@ -564,6 +575,11 @@ conversation_sources as materialized (
      and logical_event_key is null
      and turn_id is null
      and (
+       message_role = 'assistant'
+       or message_role = 'user'
+       and message_origin in ('human', 'parent_agent')
+     )
+     and (
        event_kind = 'agent_message'
        and event_subtype = 'agent_message'
        and message_role = 'assistant'
@@ -574,6 +590,12 @@ conversation_sources as materialized (
        and message_role in ('assistant', 'user')
        and source_native_type in ('event_msg', 'response_item')
        and source_native_payload_type in ('message', 'user_message')
+       or event_kind = 'message'
+       and event_subtype in ('message', 'user_message')
+       and message_role in ('assistant', 'user')
+       and source_kind = 'transcript'
+       and source_native_type in ('assistant', 'user')
+       and source_native_payload_type is null
      )
 ), cross_format_pair_candidates as materialized (
   select legacy.id legacy_id, structured.id structured_id,
@@ -683,7 +705,7 @@ conversation_sources as materialized (
 export const INTERVAL_WORK_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version,
+         $3::timestamptz end_at, $4::text[] normalizer_versions,
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end
@@ -703,7 +725,9 @@ with p as materialized (
          count(*)::bigint event_count,
          (array_agg(content_excerpt order by observed_at, id) filter (
            where event_subtype = 'user_message'
-             and message_role = 'user' and content_excerpt is not null
+             and message_role = 'user'
+             and message_origin in ('human', 'parent_agent')
+             and content_excerpt is not null
          ))[1] summary
     from bucket_events
    group by session_id, semantic_role
@@ -718,7 +742,7 @@ select session_id::text session_id, semantic_role, first_at, last_at,
 export const INTERVAL_PROMPTS_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version,
+         $3::timestamptz end_at, $4::text[] normalizer_versions,
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end
@@ -741,7 +765,7 @@ select prompt_identity, session_id::text session_id, observed_at,
 export const WORK_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text normalizer_version,
+         $3::timestamptz end_at, $4::text[] normalizer_versions,
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end, $10::uuid session_id,
@@ -765,6 +789,7 @@ with p as materialized (
          (array_agg(bucket_events.content_excerpt order by bucket_events.observed_at, bucket_events.id) filter (
            where bucket_events.event_subtype = 'user_message'
              and bucket_events.message_role = 'user'
+             and bucket_events.message_origin in ('human', 'parent_agent')
              and bucket_events.content_excerpt is not null
          ))[1] summary
     from bucket_events cross join p
@@ -776,7 +801,11 @@ with p as materialized (
    from bucket_events cross join p
    where bucket_events.semantic_role = p.semantic_role
      and bucket_events.event_kind in ('message', 'agent_message')
-     and bucket_events.message_role in ('user', 'assistant')
+     and (
+       bucket_events.message_role = 'assistant'
+       or bucket_events.message_role = 'user'
+       and bucket_events.message_origin in ('human', 'parent_agent')
+     )
      and (
        (extract(epoch from bucket_events.observed_at) * 1000000)::bigint,
        bucket_events.id
@@ -1201,7 +1230,7 @@ export class DirectFlameSource {
         this.workspaceId,
         start.toISOString(),
         end.toISOString(),
-        NORMALIZER_VERSION,
+        tx.array(NORMALIZER_VERSIONS),
         read.toISOString(),
       ], signal);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
@@ -1224,7 +1253,7 @@ export class DirectFlameSource {
         this.workspaceId,
         bounds.snapshotStart.toISOString(),
         bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
+        tx.array(NORMALIZER_VERSIONS),
         snapshotReceipt.read.toISOString(),
         snapshotReceipt.snapshot,
         personId,
@@ -1240,7 +1269,7 @@ export class DirectFlameSource {
         this.workspaceId,
         bounds.snapshotStart.toISOString(),
         bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
+        tx.array(NORMALIZER_VERSIONS),
         snapshotReceipt.read.toISOString(),
         snapshotReceipt.snapshot,
         personId,
@@ -1289,6 +1318,27 @@ export class DirectFlameSource {
           throw new FlameSourceError("flame_work_cursor_invalid");
         }
       }
+      const workLimit = INTERVAL_WORK_LIMIT + 1;
+      const workRows = await runQuery(tx, INTERVAL_WORK_SQL, [
+        this.workspaceId,
+        bounds.snapshotStart.toISOString(),
+        bounds.snapshotEnd.toISOString(),
+        tx.array(NORMALIZER_VERSIONS),
+        snapshotReceipt.read.toISOString(),
+        snapshotReceipt.snapshot,
+        personId,
+        startAt.toISOString(),
+        bounds.bucketEnd.toISOString(),
+        workLimit,
+      ], signal);
+      if (workRows.length === workLimit) {
+        throw new FlameSourceError("flame_work_result_too_large");
+      }
+      const headerRow = workRows.find((row) =>
+        String(row.session_id) === sessionId && String(row.semantic_role) === role
+      );
+      if (!headerRow) throw new FlameSourceError("flame_work_request_not_found");
+      const header = workFromRow(headerRow);
       const cursorAtMicroseconds = decodedCursor?.atMicroseconds ??
         bucketStartMicroseconds.toString();
       const cursorId = decodedCursor?.id ?? "0";
@@ -1296,7 +1346,7 @@ export class DirectFlameSource {
         this.workspaceId,
         bounds.snapshotStart.toISOString(),
         bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
+        tx.array(NORMALIZER_VERSIONS),
         snapshotReceipt.read.toISOString(),
         snapshotReceipt.snapshot,
         personId,
@@ -1309,7 +1359,6 @@ export class DirectFlameSource {
         pageSize + 1,
       ], signal);
       if (resultRows.length === 0) throw new FlameSourceError("flame_work_request_not_found");
-      const header = workFromRow(resultRows[0]);
       const itemRows = resultRows.filter((row) => row.id !== null && row.id !== undefined);
       const hasMore = itemRows.length > pageSize;
       const pageRows = hasMore ? itemRows.slice(0, pageSize) : itemRows;
@@ -1350,7 +1399,7 @@ export class DirectFlameSource {
         this.workspaceId,
         bounds.snapshotStart.toISOString(),
         bounds.snapshotEnd.toISOString(),
-        NORMALIZER_VERSION,
+        tx.array(NORMALIZER_VERSIONS),
         snapshotReceipt.read.toISOString(),
         snapshotReceipt.snapshot,
         personId,

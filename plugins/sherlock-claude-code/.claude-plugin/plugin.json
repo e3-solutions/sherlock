@@ -1,0 +1,17 @@
+{
+  "name": "sherlock-claude-code",
+  "version": "0.1.0",
+  "description": "Capture Claude Code transcript telemetry durably without blocking hooks.",
+  "author": {
+    "name": "E3 Solutions",
+    "url": "https://github.com/e3-solutions"
+  },
+  "homepage": "https://github.com/e3-solutions/sherlock",
+  "repository": "https://github.com/e3-solutions/sherlock",
+  "license": "UNLICENSED",
+  "keywords": [
+    "telemetry",
+    "claude-code",
+    "transcript"
+  ]
+}

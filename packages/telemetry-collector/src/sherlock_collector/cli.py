@@ -9,11 +9,18 @@ from pathlib import Path
 
 from .config import (
     ConfigurationError,
+    default_claude_home,
     default_codex_home,
     default_state_root,
     load_config,
 )
 from .drain import Drain
+from .discovery import (
+    CLAUDE_BACKFILL_MAX_BYTES,
+    CLAUDE_BACKFILL_MAX_FILES,
+    DEFAULT_LOOKBACK_SECONDS,
+    discover_claude_transcripts,
+)
 from .hook import capture_and_spawn_drain, run_hook
 from .http import HttpTransport
 from .rollout import RolloutCapturer
@@ -23,32 +30,52 @@ from .spool import DurableSpool
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="sherlock-collector")
     result.add_argument("--codex-home", type=Path)
+    result.add_argument("--claude-home", type=Path)
+    result.add_argument(
+        "--provider", choices=("codex", "claude_code"), default="codex"
+    )
     result.add_argument("--state-root", type=Path)
     result.add_argument("--config", type=Path)
     commands = result.add_subparsers(dest="command", required=True)
     capture = commands.add_parser("capture")
     capture.add_argument("rollout", nargs="+", type=Path)
+    backfill = commands.add_parser("backfill")
+    backfill.add_argument(
+        "--lookback-seconds",
+        type=int,
+        default=DEFAULT_LOOKBACK_SECONDS,
+    )
     hook = commands.add_parser("hook")
     hook.add_argument("event_name")
     commands.add_parser("drain")
+    commands.add_parser("health")
     return result
 
 
-def _payload_from_stdin() -> dict[str, object]:
+def _payload_from_stdin() -> tuple[dict[str, object], bytes]:
+    source = getattr(sys.stdin, "buffer", sys.stdin)
     try:
-        value = json.load(sys.stdin)
+        raw = source.read()
+    except (OSError, UnicodeError):
+        return {}, b""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    try:
+        value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
+        return {}, raw
+    return (value if isinstance(value, dict) else {}), raw
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    codex_home = Path(
-        args.codex_home or default_codex_home()
+    source_home = Path(
+        (args.claude_home or default_claude_home())
+        if args.provider == "claude_code"
+        else (args.codex_home or default_codex_home())
     ).expanduser().resolve()
     state_root = Path(
-        args.state_root or default_state_root(codex_home)
+        args.state_root or default_state_root(source_home)
     ).expanduser().resolve()
     spool = DurableSpool(state_root / "queue")
     source_root = str(Path(__file__).resolve().parents[1])
@@ -61,19 +88,107 @@ def main(argv: list[str] | None = None) -> int:
                 if os.environ.get("PYTHONPATH")
                 else ""
             ),
-            "CODEX_HOME": str(codex_home),
+            (
+                "CLAUDE_CONFIG_DIR"
+                if args.provider == "claude_code"
+                else "CODEX_HOME"
+            ): str(source_home),
         }
     )
+    if args.command == "backfill":
+        if args.provider != "claude_code" or args.lookback_seconds < 1:
+            print("backfill requires claude_code and a positive lookback", file=sys.stderr)
+            return 2
+        discovery = discover_claude_transcripts(
+            source_home,
+            lookback_seconds=args.lookback_seconds,
+        )
+        outcome = capture_and_spawn_drain(
+            RolloutCapturer(
+                state_root,
+                spool,
+                source_provider="claude_code",
+                source_kind="transcript",
+                state_name="claude-transcript",
+                capture_unterminated_tail=False,
+                allowed_root=(
+                    source_home / "projects"
+                    if not (source_home / "projects").is_symlink()
+                    and (source_home / "projects").is_dir()
+                    else None
+                ),
+            ),
+            discovery.paths,
+            [
+                sys.executable,
+                "-m",
+                "sherlock_collector.cli",
+                "--claude-home",
+                str(source_home),
+                "--provider",
+                "claude_code",
+                "--state-root",
+                str(state_root),
+                *(["--config", str(args.config)] if args.config else []),
+                "drain",
+            ],
+            native_session_ids=discovery.native_session_ids,
+            parent_native_session_ids=discovery.parent_native_session_ids,
+            source_snapshots=discovery.source_snapshots,
+            drain_environment=environment,
+            best_effort=True,
+            max_files=CLAUDE_BACKFILL_MAX_FILES,
+            max_sync_bytes=CLAUDE_BACKFILL_MAX_BYTES,
+            backlog_workload_class="backfill",
+        )
+        partial = bool(
+            discovery.errors
+            or discovery.invalid_count
+            or discovery.omitted_count
+            or outcome.errors
+            or outcome.locked
+            or outcome.deferred_files
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "partial" if partial else "complete",
+                    "lookback_seconds": args.lookback_seconds,
+                    "discovered": len(discovery.paths),
+                    "selected_bytes": discovery.selected_bytes,
+                    "invalid": discovery.invalid_count,
+                    "omitted": discovery.omitted_count,
+                    "discovery_errors": len(discovery.errors),
+                    **asdict(outcome),
+                },
+                sort_keys=True,
+            )
+        )
+        return 75 if outcome.locked else 0
     if args.command == "capture":
         outcome = capture_and_spawn_drain(
-            RolloutCapturer(state_root, spool),
+            RolloutCapturer(
+                state_root,
+                spool,
+                source_provider=args.provider,
+                source_kind=(
+                    "transcript" if args.provider == "claude_code" else "rollout"
+                ),
+                state_name=(
+                    "claude-transcript" if args.provider == "claude_code" else "rollout"
+                ),
+                capture_unterminated_tail=args.provider != "claude_code",
+            ),
             args.rollout,
             [
                 sys.executable,
                 "-m",
                 "sherlock_collector.cli",
-                "--codex-home",
-                str(codex_home),
+                *(["--claude-home", str(source_home)]
+                    if args.provider == "claude_code"
+                    else ["--codex-home", str(source_home)]),
+                "--provider",
+                args.provider,
                 "--state-root",
                 str(state_root),
                 *(["--config", str(args.config)] if args.config else []),
@@ -84,17 +199,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(outcome), sort_keys=True))
         return 0 if not outcome.locked else 75
     if args.command == "hook":
+        payload, raw_payload = _payload_from_stdin()
         outcome = run_hook(
             args.event_name,
-            _payload_from_stdin(),
-            codex_home=codex_home,
+            payload,
+            raw_payload=raw_payload,
+            codex_home=source_home if args.provider == "codex" else None,
+            claude_home=source_home if args.provider == "claude_code" else None,
             state_root=state_root,
+            provider=args.provider,
             drain_command=[
                 sys.executable,
                 "-m",
                 "sherlock_collector.cli",
-                "--codex-home",
-                str(codex_home),
+                *(["--claude-home", str(source_home)]
+                    if args.provider == "claude_code"
+                    else ["--codex-home", str(source_home)]),
+                "--provider",
+                args.provider,
                 "--state-root",
                 str(state_root),
                 *(["--config", str(args.config)] if args.config else []),
@@ -105,10 +227,34 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(outcome), sort_keys=True))
         return 0
     try:
-        configuration = load_config(args.config, codex_home=codex_home)
+        configuration = load_config(args.config, codex_home=source_home)
     except ConfigurationError as error:
         print(f"sherlock collector is not configured: {error}", file=sys.stderr)
         return 78
+    if args.command == "health":
+        pending_batches = len(spool.list_pending())
+        processing_batches = len(list(spool.processing.glob("*.json")))
+        dead_letter_batches = len(list(spool.dead_letter.glob("*.json")))
+        status = (
+            "degraded"
+            if dead_letter_batches
+            else "recovering" if processing_batches else "ok"
+        )
+        print(
+            json.dumps(
+                {
+                    "status": status,
+                    "provider": args.provider,
+                    "source_home": str(source_home),
+                    "state_root": str(state_root),
+                    "pending_batches": pending_batches,
+                    "processing_batches": processing_batches,
+                    "dead_letter_batches": dead_letter_batches,
+                },
+                sort_keys=True,
+            )
+        )
+        return 1 if dead_letter_batches else 0
     outcome = Drain(
         spool,
         HttpTransport(

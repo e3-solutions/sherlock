@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(88);
+select plan(96);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -21,6 +21,28 @@ select has_column('telemetry', 'people', 'github_id', 'people records GitHub ide
 select has_column(
   'telemetry', 'ingest_batches', 'processing_class_hint',
   'transport workload class is an auditable ingest fact'
+);
+select has_column(
+  'telemetry', 'ingest_batches', 'source_provider',
+  'ingest batches preserve the native provider identity'
+);
+select has_column(
+  'telemetry', 'ingest_batches', 'source_version',
+  'ingest batches preserve a provider-neutral source version'
+);
+select has_column(
+  'telemetry', 'ingest_batches', 'observed_parent_native_session_id',
+  'ingest batches preserve hook-observed parent identity'
+);
+select ok(
+  exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'telemetry.ingest_batches'::regclass
+      and conname = 'ingest_batches_provider_kind_check'
+      and contype = 'c'
+  ),
+  'source provider and source kind cannot be conflated'
 );
 select has_column(
   'telemetry', 'events', 'message_search',
@@ -252,7 +274,31 @@ select ok(
 );
 select ok(
   not has_table_privilege('sherlock_processor', 'telemetry.ingest_batches', 'select'),
-  'queue role cannot read immutable raw facts'
+  'queue role has no table-wide access to immutable raw facts'
+);
+select ok(
+  has_schema_privilege('sherlock_processor', 'telemetry', 'usage'),
+  'queue role can resolve the immutable batch identity relation'
+);
+select ok(
+  has_column_privilege(
+    'sherlock_processor', 'telemetry.ingest_batches', 'id', 'select'
+  ) and has_column_privilege(
+    'sherlock_processor', 'telemetry.ingest_batches', 'start_offset', 'select'
+  ),
+  'queue role can read only batch identity and ordering columns'
+);
+select ok(
+  not has_column_privilege(
+    'sherlock_processor', 'telemetry.ingest_batches', 'source_sha256', 'select'
+  ),
+  'queue role cannot read immutable source fingerprints'
+);
+select ok(
+  not has_column_privilege(
+    'sherlock_processor', 'telemetry.ingest_batches', 'storage_path', 'select'
+  ),
+  'queue role cannot read raw object locations'
 );
 select ok(
   not has_table_privilege('sherlock_processor', 'telemetry.ingest_batches', 'update'),
@@ -640,6 +686,19 @@ begin
     has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'insert') and
     not has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'delete') and
     not has_table_privilege('sherlock_processor', 'telemetry.ingest_batches', 'select') and
+    has_schema_privilege('sherlock_processor', 'telemetry', 'usage') and
+    has_column_privilege(
+      'sherlock_processor', 'telemetry.ingest_batches', 'id', 'select'
+    ) and
+    has_column_privilege(
+      'sherlock_processor', 'telemetry.ingest_batches', 'start_offset', 'select'
+    ) and
+    not has_column_privilege(
+      'sherlock_processor', 'telemetry.ingest_batches', 'source_sha256', 'select'
+    ) and
+    not has_column_privilege(
+      'sherlock_processor', 'telemetry.ingest_batches', 'storage_path', 'select'
+    ) and
     not exists (
       select 1 from cron.job
       where jobname = 'sherlock-activity-reducer-every-minute' and active
@@ -653,7 +712,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 86,
+  'assertion_count', 90,
   'tables', 8,
   'private_bucket', 'telemetry-raw'
 ) as verification;

@@ -19,9 +19,12 @@ objects.
 - `telemetry.people` is the roster, so real people with zero activity remain
   visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
   excluded; display names are never used as the filter.
-- Canonically selected `sherlock.codex-rollout.v1` event presence is grouped into
-  144 ten-minute UTC buckets. Distinct Sherlock execution sessions are counted
-  per effective role and bucket; they are not native thread or duration counts.
+- Canonically selected `sherlock.codex-rollout.v1` and
+  `sherlock.claude-code-transcript.v1` event presence is grouped into 144
+  ten-minute UTC buckets. Canonical winner selection remains scoped by
+  normalizer version, so evidence from different provider projections is never
+  collapsed together. Distinct Sherlock execution sessions are counted per
+  effective role and bucket; they are not native thread or duration counts.
   Metadata-only lifecycle records are not activity evidence.
 - The person rail's 24-hour active time uses the same canonical, non-replay,
   non-automation observed-session evidence and effective role mapping as the
@@ -67,6 +70,14 @@ objects.
   distinct. Response-item-only runtime
   context, plus worker and guardian parent messages, is not presented as human
   prompt input.
+- Claude Code transcript `user` and `assistant` native records are exposed
+  through the same provider-neutral normalized `user_message` and `message`
+  semantics used by aggregate prompt counts, interval summaries, and paginated
+  conversation detail. Their immutable native record type and transcript source
+  kind remain available for evidence selection; the dashboard does not rewrite
+  those source facts into Codex rollout types. Claude `isMeta` user records keep
+  their system origin and are excluded from human/parent prompt summaries and
+  conversation detail.
 - Some rollouts store one native turn in complementary `event_msg` and
   `response_item` formats. The dashboard bridges them only when immutable source
   evidence agrees: same session and effective role, full content hash,
