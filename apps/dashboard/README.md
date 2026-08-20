@@ -2,8 +2,8 @@
 
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
-uses SHERLOCK_WORKSPACE_ID and one small connection pool whose transactions are
-repeatable-read, read-only, and pinned to `sherlock_reader`.
+uses SHERLOCK_WORKSPACE_ID and two small, traffic-isolated connection pools whose
+transactions are repeatable-read, read-only, and pinned to `sherlock_reader`.
 
 The browser and MCP clients never receive database credentials. The page and
 aggregate API are public; the MCP endpoint requires a separate bearer token.
@@ -164,6 +164,34 @@ An entry stops being serveable after 24 hours, before its lazy-detail snapshot
 expires; health then reports `timeline_expired` until a refresh succeeds.
 Cross-restart outage survival would require a separate durable publication and
 immutable publication-time session facts.
+
+## Frame-evidence admission and cache
+
+Lazy frame evidence has a dedicated two-connection process pool, separate from
+the two-connection core pool used by aggregate refresh, readiness, paginated
+work detail, and MCP. The per-replica database-connection ceiling is therefore
+four. At most two interval transactions may run at once. Additional interval
+requests wait in a bounded, cancellation-aware FIFO queue; overload remains the
+existing database-unavailable API response. This isolates connection admission,
+not database CPU or I/O. The legacy combined endpoint holds one permit for its
+original single transaction and still runs work before prompts.
+
+Exact successful work, prompt, and combined responses have separate
+process-local singleflights and a small LRU keyed by workspace, code contract,
+kind, opaque snapshot, person, and canonical bucket start. Entries live for at
+most three minutes and never beyond snapshot expiry. The LRU holds at most 128
+entries, 16 MiB total, and 512 KiB per entry. Errors, cancellations, overflow,
+and oversized responses are not cached; combined responses are never assembled
+from split results. Prompt excerpts can therefore remain in process memory for
+this short bounded interval, but are not logged or persisted and disappear on
+restart. An unreferenced timer evicts expired payloads even when they are never
+requested again.
+
+Successful interval responses include safe `Server-Timing` measurements for
+cache state, evidence-gate wait, source load, and total time. Structured logs
+contain only the evidence kind, cache state, durations, and response byte count;
+they never contain person IDs, snapshot tokens, query parameters, or excerpts.
+HTTP responses remain `Cache-Control: no-store`.
 
 ## Environment
 

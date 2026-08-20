@@ -27,6 +27,10 @@ import {
   getGlobalPeak,
   getPersonActivityStatus,
 } from "./flame-data.js";
+import {
+  createFrameEvidenceCache,
+  frameEvidenceCacheKey,
+} from "./frame-evidence-cache.js";
 
 const LANE_HEIGHT = 82;
 const MIN_PROMPT_STEM_LENGTH = 4;
@@ -961,7 +965,8 @@ export default function FlameGraph({
   const intervalEvidenceKeyRef = useRef(null);
   const intervalRequestRef = useRef(null);
   const intervalRetryTargetRef = useRef("both");
-  const splitEvidenceDataRef = useRef(null);
+  const intervalEvidenceStateRef = useRef(null);
+  const cachedIntervalEvidenceRef = useRef(new WeakSet());
   const splitEvidenceSupportedRef = useRef(null);
   const workRequestRef = useRef(null);
   const [selection, setSelection] = useState(null);
@@ -975,6 +980,7 @@ export default function FlameGraph({
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], nextCursor: null,
   });
+  const intervalEvidenceCache = useMemo(createFrameEvidenceCache, [data.snapshot]);
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
   const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
   const promptPeak = data.people.reduce(
@@ -1003,7 +1009,7 @@ export default function FlameGraph({
     ? `${selectedPerson.id}:${selectedPoint.startMs}`
     : null;
   const selectionEvidenceKey = selectedPerson && selectedPoint
-    ? `${data.snapshot}:${selectedPerson.id}:${selectedPoint.startMs}`
+    ? frameEvidenceCacheKey(data.snapshot, selectedPerson.id, selectedPoint.startMs)
     : null;
   const visibleIntervalEvidence = intervalEvidence.key === selectionEvidenceKey
     ? intervalEvidence
@@ -1012,6 +1018,34 @@ export default function FlameGraph({
         workState: selectedPoint?.activity === 0 ? "ready" : "loading",
         promptState: selectedPoint?.prompts === 0 ? "ready" : "loading",
       };
+
+  useLayoutEffect(() => () => intervalEvidenceCache.clear(), [intervalEvidenceCache]);
+
+  useLayoutEffect(() => {
+    splitEvidenceSupportedRef.current = data.intervalEvidenceSplit === true ? null : false;
+  }, [data]);
+
+  useLayoutEffect(() => {
+    intervalEvidenceStateRef.current = intervalEvidence;
+  }, [intervalEvidence]);
+
+  useEffect(() => {
+    if (intervalEvidence.key !== selectionEvidenceKey ||
+        intervalEvidence.workState !== "ready" ||
+        intervalEvidence.promptState !== "ready" ||
+        intervalEvidence.workIncomplete ||
+        (selectedPoint?.activity === 0 && selectedPoint?.prompts === 0)) return;
+    if (!cachedIntervalEvidenceRef.current.has(intervalEvidence) &&
+        intervalEvidenceCache.set(selectionEvidenceKey, intervalEvidence)) {
+      cachedIntervalEvidenceRef.current.add(intervalEvidence);
+    }
+  }, [
+    intervalEvidence,
+    intervalEvidenceCache,
+    selectedPoint?.activity,
+    selectedPoint?.prompts,
+    selectionEvidenceKey,
+  ]);
 
   const beginCloseDetail = useCallback(() => {
     if (!selection || detailClosingRef.current) return;
@@ -1062,18 +1096,27 @@ export default function FlameGraph({
       return undefined;
     }
 
-    const controller = new AbortController();
-    const evidenceKey = `${data.snapshot}:${selectedPerson.id}:${selectedPoint.startMs}`;
-    if (splitEvidenceDataRef.current !== data) {
-      splitEvidenceDataRef.current = data;
-      splitEvidenceSupportedRef.current = data.intervalEvidenceSplit === true ? null : false;
-    }
+    const evidenceKey = frameEvidenceCacheKey(
+      data.snapshot,
+      selectedPerson.id,
+      selectedPoint.startMs,
+    );
     const retryTarget = intervalEvidenceKeyRef.current === evidenceKey
       ? intervalRetryTargetRef.current
       : "both";
     intervalEvidenceKeyRef.current = evidenceKey;
     intervalRetryTargetRef.current = "both";
     intervalRequestRef.current?.abort();
+    const currentEvidence = intervalEvidenceStateRef.current;
+    if (retryTarget === "both" && currentEvidence?.key === evidenceKey &&
+        currentEvidence.workState === "ready" && currentEvidence.promptState === "ready" &&
+        !currentEvidence.workIncomplete &&
+        currentEvidence.work.length === selectedPoint.activity &&
+        currentEvidence.prompts.length === selectedPoint.prompts) {
+      intervalRequestRef.current = null;
+      return undefined;
+    }
+    const controller = new AbortController();
     intervalRequestRef.current = controller;
     if (retryTarget === "both") {
       setIntervalEvidence({
@@ -1307,18 +1350,30 @@ export default function FlameGraph({
   ]);
 
   const selectInterval = (person, point) => {
+    const evidenceKey = frameEvidenceCacheKey(data.snapshot, person.id, point.startMs);
+    const sameSelection = selectionEvidenceKey === evidenceKey;
+    const cached = intervalEvidenceCache.get(evidenceKey);
     detailClosingRef.current = false;
     intervalRetryTargetRef.current = "both";
-    intervalRequestRef.current?.abort();
+    if (!sameSelection) intervalRequestRef.current?.abort();
     setDetailClosing(false);
     setShowAdditionalWork(false);
     setDrawerView({ screen: "overview" });
-    setIntervalEvidence({
-      ...emptyIntervalEvidence(`${data.snapshot}:${person.id}:${point.startMs}`),
-      workState: point.activity === 0 ? "ready" : "loading",
-      promptState: point.prompts === 0 ? "ready" : "loading",
-    });
-    setSelection({ personId: person.id, startMs: point.startMs });
+    if (cached) {
+      setIntervalEvidence(cached);
+    } else if (!sameSelection) {
+      setIntervalEvidence({
+        ...emptyIntervalEvidence(evidenceKey),
+        workState: point.activity === 0 ? "ready" : "loading",
+        promptState: point.prompts === 0 ? "ready" : "loading",
+      });
+    } else if (intervalRequestRef.current?.signal.aborted &&
+        intervalEvidence.key === evidenceKey &&
+        (intervalEvidence.workState === "loading" ||
+          intervalEvidence.promptState === "loading")) {
+      setIntervalRevision((revision) => revision + 1);
+    }
+    if (!sameSelection) setSelection({ personId: person.id, startMs: point.startMs });
   };
 
   const deactivateTooltip = useCallback((personId) => {

@@ -9,6 +9,7 @@ import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
 import { FlameDayCache } from "./src/server/flame-cache.js";
+import { FrameEvidenceCoordinator } from "./src/server/frame-evidence-coordinator.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -23,6 +24,15 @@ const validWorkspaceId =
 const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople <= 1000;
 const source = databaseUrl && validWorkspaceId && validMaxPeople
   ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
+  : null;
+const evidenceSource = source
+  ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople, maxConnections: 2 })
+  : null;
+const frameEvidence = source
+  ? new FrameEvidenceCoordinator({
+      workspaceId,
+      log: (event) => console.log(JSON.stringify(event)),
+    })
   : null;
 
 let databaseVerified = false;
@@ -179,18 +189,26 @@ const server = createServer(async (request, response) => {
       return;
     }
     const signal = requestAbortSignal(request, response);
+    const personId = url.searchParams.get("personId") ?? "";
+    const start = url.searchParams.get("start") ?? "";
+    const snapshot = url.searchParams.get("snapshot") ?? "";
     try {
-      sendJson(response, 200, await source.fetchInterval({
-        personId: url.searchParams.get("personId") ?? "",
-        start: url.searchParams.get("start") ?? "",
-        snapshot: url.searchParams.get("snapshot") ?? "",
+      const result = await frameEvidence.read({
+        kind: "combined",
+        personId,
+        start,
+        snapshot,
         signal,
-      }));
+        load: ({ signal: sharedSignal }) => evidenceSource.fetchInterval({
+          personId, start, snapshot, signal: sharedSignal,
+        }),
+      });
+      sendJson(response, 200, result.payload, { "Server-Timing": result.serverTiming });
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      if (code !== "flame_request_aborted") {
+      if (code !== "flame_request_aborted" || !signal.aborted) {
         sendJson(response, apiStatus(code, "flame_interval"), { error: code });
       }
     }
@@ -204,21 +222,30 @@ const server = createServer(async (request, response) => {
       return;
     }
     const signal = requestAbortSignal(request, response);
-    const fetchEvidence = url.pathname.endsWith("/work")
-      ? source.fetchIntervalWork.bind(source)
-      : source.fetchIntervalPrompts.bind(source);
+    const kind = url.pathname.endsWith("/work") ? "work" : "prompts";
+    const personId = url.searchParams.get("personId") ?? "";
+    const start = url.searchParams.get("start") ?? "";
+    const snapshot = url.searchParams.get("snapshot") ?? "";
+    const fetchEvidence = kind === "work"
+      ? evidenceSource.fetchIntervalWork.bind(evidenceSource)
+      : evidenceSource.fetchIntervalPrompts.bind(evidenceSource);
     try {
-      sendJson(response, 200, await fetchEvidence({
-        personId: url.searchParams.get("personId") ?? "",
-        start: url.searchParams.get("start") ?? "",
-        snapshot: url.searchParams.get("snapshot") ?? "",
+      const result = await frameEvidence.read({
+        kind,
+        personId,
+        start,
+        snapshot,
         signal,
-      }));
+        load: ({ signal: sharedSignal }) => fetchEvidence({
+          personId, start, snapshot, signal: sharedSignal,
+        }),
+      });
+      sendJson(response, 200, result.payload, { "Server-Timing": result.serverTiming });
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      if (code !== "flame_request_aborted") {
+      if (code !== "flame_request_aborted" || !signal.aborted) {
         sendJson(response, apiStatus(code, "flame_interval"), { error: code });
       }
     }
@@ -279,9 +306,9 @@ server.listen(PORT, "0.0.0.0", () => {
 async function shutdown(signal) {
   console.log(JSON.stringify({ event: "dashboard_shutdown", signal }));
   const drained = new Promise((resolve) => server.close(resolve));
-  await cache?.close();
+  await Promise.all([cache?.close(), frameEvidence?.close()]);
   await drained;
-  await Promise.all([mcpProtocol?.close(), source?.close()]);
+  await Promise.all([mcpProtocol?.close(), evidenceSource?.close(), source?.close()]);
 }
 
 process.once("SIGINT", () => shutdown("SIGINT"));

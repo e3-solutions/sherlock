@@ -606,8 +606,10 @@ describe("Sherlock Flame payload", () => {
     });
 
     expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[1][1][3]).toEqual(NORMALIZER_VERSIONS);
     expect(unsafe.mock.calls[1][1].at(-1)).toBe(201);
     expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[2][1][3]).toEqual(NORMALIZER_VERSIONS);
     expect(unsafe.mock.calls[2][1].at(-1)).toBe(201);
     expect(interval).toMatchObject({
       personId,
@@ -639,7 +641,10 @@ describe("Sherlock Flame payload", () => {
       const unsafe = vi.fn()
         .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
         .mockResolvedValueOnce(rows);
-      source.transaction = (callback) => callback({ unsafe });
+      source.transaction = (callback) => callback({
+        unsafe,
+        array: (values) => values,
+      });
       return { source, unsafe };
     };
 
@@ -669,6 +674,10 @@ describe("Sherlock Flame payload", () => {
     });
     expect(work.unsafe).toHaveBeenCalledTimes(2);
     expect(work.unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(work.unsafe.mock.calls[1][1][3]).toEqual([
+      NORMALIZER_VERSION,
+      CLAUDE_NORMALIZER_VERSION,
+    ]);
     expect(work.unsafe.mock.calls[1][1].at(-1)).toBe(201);
 
     const prompts = createSource([{
@@ -695,6 +704,7 @@ describe("Sherlock Flame payload", () => {
     });
     expect(prompts.unsafe).toHaveBeenCalledTimes(2);
     expect(prompts.unsafe.mock.calls[1][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(prompts.unsafe.mock.calls[1][1][3]).toEqual(NORMALIZER_VERSIONS);
     expect(prompts.unsafe.mock.calls[1][1].at(-1)).toBe(201);
   });
 
@@ -710,7 +720,10 @@ describe("Sherlock Flame payload", () => {
       const unsafe = vi.fn()
         .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
         .mockResolvedValueOnce(Array.from({ length: 201 }, () => ({})));
-      source.transaction = (callback) => callback({ unsafe });
+      source.transaction = (callback) => callback({
+        unsafe,
+        array: (values) => values,
+      });
       await expect(source[method]({
         personId,
         start: START.toISOString(),

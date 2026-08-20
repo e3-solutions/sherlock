@@ -1092,7 +1092,7 @@ async function fetchIntervalPartRows({
     workspaceId,
     bounds.snapshotStart.toISOString(),
     bounds.snapshotEnd.toISOString(),
-    tx.array?.(NORMALIZER_VERSIONS) ?? NORMALIZER_VERSIONS,
+    tx.array(NORMALIZER_VERSIONS),
     snapshotReceipt.read.toISOString(),
     snapshotReceipt.snapshot,
     personId,
@@ -1187,12 +1187,12 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
 }
 
 export class DirectFlameSource {
-  constructor({ databaseUrl, workspaceId, maxPeople = 500 }) {
+  constructor({ databaseUrl, workspaceId, maxPeople = 500, maxConnections = 2 }) {
     this.workspaceId = workspaceId;
     this.maxPeople = maxPeople;
     this.sql = postgres(databaseUrl, {
       prepare: false,
-      max: 2,
+      max: maxConnections,
       idle_timeout: 20,
       connect_timeout: 10,
     });

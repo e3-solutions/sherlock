@@ -341,11 +341,13 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect(person.total).toEqual([1, 1, 0]);
       expect(bucket).toEqual([1, 1, 0, 1]);
 
-      const interval = await source.fetchInterval({
+      const intervalRequest = {
         personId,
         start: bucketStart,
         snapshot: payload.snapshot,
-      });
+        now,
+      };
+      const interval = await source.fetchInterval(intervalRequest);
       expect(interval.work).toEqual([
         expect.objectContaining({
           sessionId: primarySessionId,
@@ -360,6 +362,27 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           summary: "Check the dashboard query",
         }),
       ]);
+      expect(interval.prompts).toEqual([
+        expect.objectContaining({
+          sessionId: primarySessionId,
+          content: "Review the ingestion path",
+        }),
+      ]);
+
+      const splitWork = await source.fetchIntervalWork(intervalRequest);
+      const splitPrompts = await source.fetchIntervalPrompts(intervalRequest);
+      expect(splitWork).toEqual({
+        personId,
+        start: bucketStart,
+        snapshot: payload.snapshot,
+        work: interval.work,
+      });
+      expect(splitPrompts).toEqual({
+        personId,
+        start: bucketStart,
+        snapshot: payload.snapshot,
+        prompts: interval.prompts,
+      });
 
       const detail = await source.fetchWork({
         personId,
