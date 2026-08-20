@@ -3,10 +3,15 @@
 import postgres from "npm:postgres@3.4.7";
 import {
   FRAME_NORMALIZER_VERSIONS,
+  FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
+  FRAME_WINDOW_HOURS,
 } from "../packages/frame-evidence/constants.js";
 import { ACTIVITY_VERSION } from "../supabase/functions/sherlock-activity-reducer/reducer.ts";
-import { PostgresFrameEvidenceProjector } from "../workers/telemetry-processor/frame-projector.ts";
+import {
+  nativeItemTimestampSql,
+  PostgresFrameEvidenceProjector,
+} from "../workers/telemetry-processor/frame-projector.ts";
 
 interface Options {
   workspaceId: string;
@@ -18,13 +23,27 @@ interface Options {
 interface ActivationOptions {
   workspaceId: string;
   activate: boolean;
+  windowStart?: Date;
 }
 
+const RELEVANT_EVENT_WINDOW_SQL = `(
+  coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+    >= $4::timestamptz - make_interval(secs => $5)
+  or ${nativeItemTimestampSql("e.native_item_id")}
+    >= $4::timestamptz - make_interval(secs => $5)
+)`;
+
 export const FRAME_ACTIVATION_PROOF_SQL = `
-with current_source as (
+with relevant_sessions as (
+  select distinct e.session_id
+    from telemetry.events e
+   where e.workspace_id = $1 and e.normalizer_version = any($2::text[])
+     and not e.is_replay and ${RELEVANT_EVENT_WINDOW_SQL}
+), current_source as (
   select s.id session_id, s.updated_at session_updated_at,
          max(e.id) through_event_id, count(*)::bigint source_event_count
     from telemetry.sessions s
+    join relevant_sessions relevant on relevant.session_id = s.id
     join telemetry.events e
       on e.workspace_id = s.workspace_id and e.session_id = s.id
    where s.workspace_id = $1 and e.normalizer_version = any($2::text[])
@@ -66,6 +85,9 @@ export async function proveAndActivateFrameProjection(
   sql: ReturnType<typeof postgres>,
   options: ActivationOptions,
 ): Promise<void> {
+  const windowStart = options.windowStart ?? new Date(
+    Date.now() - FRAME_WINDOW_HOURS * 60 * 60 * 1_000,
+  );
   await sql.begin("isolation level repeatable read", async (tx) => {
     const blockingJobs = await tx.unsafe(FRAME_BLOCKING_JOBS_SQL, [
       options.workspaceId,
@@ -81,6 +103,8 @@ export async function proveAndActivateFrameProjection(
       options.workspaceId,
       tx.array([...FRAME_NORMALIZER_VERSIONS]),
       FRAME_VERSION,
+      windowStart.toISOString(),
+      FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
     ]);
     if (missing.length > 0) {
       throw new Error(
@@ -111,6 +135,10 @@ if (import.meta.main) {
   const projector = PostgresFrameEvidenceProjector.connect(databaseUrl);
   let after = options.afterSessionId;
   let projected = 0;
+  const coveredThrough = new Date();
+  const coveredFrom = new Date(
+    coveredThrough.getTime() - FRAME_WINDOW_HOURS * 60 * 60 * 1_000,
+  );
   try {
     while (true) {
       const sessions = await sql.unsafe(
@@ -120,6 +148,12 @@ if (import.meta.main) {
            join telemetry.events e
              on e.workspace_id = s.workspace_id and e.session_id = s.id
             and e.normalizer_version = any($2::text[]) and not e.is_replay
+            and (
+              coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+                >= $6::timestamptz - make_interval(secs => $7)
+              or ${nativeItemTimestampSql("e.native_item_id")}
+                >= $6::timestamptz - make_interval(secs => $7)
+            )
            left join processing.telemetry_jobs j
              on j.workspace_id = s.workspace_id and j.session_id = s.id
             and j.job_kind = 'reduce'
@@ -135,6 +169,8 @@ if (import.meta.main) {
           after,
           options.sessionBatchSize,
           ACTIVITY_VERSION,
+          coveredFrom.toISOString(),
+          FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
         ],
       );
       for (const session of sessions) {
@@ -142,6 +178,7 @@ if (import.meta.main) {
           workspaceId: options.workspaceId,
           sessionId: String(session.session_id),
           requestGeneration: BigInt(String(session.request_generation)),
+          now: coveredThrough,
         });
         projected += 1;
       }
@@ -158,6 +195,7 @@ if (import.meta.main) {
     await proveAndActivateFrameProjection(sql, {
       workspaceId: options.workspaceId,
       activate: options.activate,
+      windowStart: coveredFrom,
     });
     console.log(JSON.stringify({
       event: options.activate

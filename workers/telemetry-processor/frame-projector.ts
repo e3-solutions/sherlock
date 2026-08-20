@@ -31,7 +31,7 @@ export function frameTimestampForWrite(
   return sql`${value}::text::timestamptz`;
 }
 
-function nativeItemTimestamp(column: string): string {
+export function nativeItemTimestampSql(column: string): string {
   return `case
     when ${column} ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
     then to_timestamp((
@@ -129,7 +129,7 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
        ) source_observed_at,
        to_char(coalesce(
-         ${nativeItemTimestamp("e.native_item_id")},
+         ${nativeItemTimestampSql("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
        ) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
          activity_observed_at,
@@ -168,11 +168,11 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
          'task_started', 'task_complete', 'turn_started', 'turn_complete'
        ))
        and coalesce(
-         ${nativeItemTimestamp("e.native_item_id")},
+         ${nativeItemTimestampSql("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
        ) >= $5::timestamptz - make_interval(secs => $7)
        and coalesce(
-         ${nativeItemTimestamp("e.native_item_id")},
+         ${nativeItemTimestampSql("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
        ) < $6::timestamptz + make_interval(secs => $7)
      ) or (
@@ -185,9 +185,9 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
            >= $5::timestamptz - interval '2 seconds'
          and coalesce(e.occurred_at, e.observed_at, e.server_received_at)
            < $6::timestamptz + interval '2 seconds'
-         or ${nativeItemTimestamp("e.native_item_id")}
+         or ${nativeItemTimestampSql("e.native_item_id")}
            >= $5::timestamptz - interval '2 seconds'
-         and ${nativeItemTimestamp("e.native_item_id")}
+         and ${nativeItemTimestampSql("e.native_item_id")}
            < $6::timestamptz + interval '2 seconds'
        )
      )

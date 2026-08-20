@@ -49,6 +49,7 @@ Deno.test({
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
     const sessionId = crypto.randomUUID();
+    const oldSessionId = crypto.randomUUID();
     const parentSessionId = crypto.randomUUID();
     const batchId = crypto.randomUUID();
     const unrelatedWorkspaceId = crypto.randomUUID();
@@ -350,10 +351,40 @@ Deno.test({
         [workspaceId, batchId],
       );
       assert(completedNormalize.length === 1);
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         ) values ($1,$2,$3,'frame-collector',$4,'primary','test.role.v1',$5)`,
+        [
+          oldSessionId,
+          workspaceId,
+          personId,
+          `native-${oldSessionId}`,
+          "2026-08-18T18:00:00Z",
+        ],
+      );
+      await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, source_priority, event_kind, event_subtype,
+           actor_role, occurred_at, observed_at, server_received_at
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v1',0,100,'lifecycle',
+           'turn_complete','primary',$4,$4,$4)`,
+        [workspaceId, oldSessionId, nativeRows[0], "2026-08-18T18:01:00Z"],
+      );
       await proveAndActivateFrameProjection(sql, {
         workspaceId,
         activate: false,
+        windowStart: new Date("2026-08-19T18:00:00Z"),
       });
+      const oldReceipts = await sql.unsafe(
+        `select count(*)::int count
+           from analytics.frame_projection_receipts
+          where workspace_id = $1 and session_id = $2`,
+        [workspaceId, oldSessionId],
+      );
+      assert(oldReceipts[0].count === 0, "old-only sessions need no receipt");
 
       await sql.unsafe(
         `insert into telemetry.sessions (
