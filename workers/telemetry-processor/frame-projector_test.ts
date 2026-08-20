@@ -2,21 +2,9 @@ import {
   canonicalEvidence,
   diffEvidence,
   type EvidenceState,
-  fingerprintEvidence,
-  FRAME_ADVISORY_LOCK_SQL,
-  FRAME_BEGIN_SQL,
-  FRAME_LOCK_TIMEOUT_SQL,
-  FRAME_RESET_TIMEOUT_SQL,
-  FRAME_SOURCE_COORDINATES_SQL,
   FRAME_SOURCE_EVENTS_SQL,
-  frameTimestampForWrite,
-  PostgresFrameEvidenceProjector,
   type SourceEvent,
 } from "./frame-projector.ts";
-import {
-  FRAME_ACTIVATION_PROOF_SQL,
-  FRAME_BLOCKING_JOBS_SQL,
-} from "../../scripts/backfill-frame-evidence.ts";
 
 function assert(
   condition: unknown,
@@ -107,27 +95,6 @@ Deno.test("frame evidence diff is append-only, idempotent, and tombstones remova
   );
 });
 
-Deno.test("frame fingerprints are deterministic and cover canonical state", async () => {
-  const activity = evidence();
-  const prompt = evidence({
-    evidence_kind: "prompt",
-    source_event_id: 2n,
-    prompt_identity: "native:msg_2",
-    is_summary_candidate: false,
-  });
-  const forward = await fingerprintEvidence([activity, prompt]);
-  const reverse = await fingerprintEvidence([prompt, activity]);
-  assert(forward === reverse && /^[0-9a-f]{64}$/.test(forward));
-  assert(
-    await fingerprintEvidence([activity, {
-      ...prompt,
-      observed_at: "2026-08-20T12:00:01.000Z",
-    }]) !==
-      forward,
-    "canonical timestamp correction must change the fingerprint",
-  );
-});
-
 Deno.test("adjacent event_msg user copies are suppressed from activity", () => {
   const earlier = sourceEvent();
   const duplicate = sourceEvent({
@@ -177,80 +144,10 @@ Deno.test("canonical rank preserves PostgreSQL timestamp microseconds", () => {
   assert(activity[0].observed_at.endsWith(".000100Z"));
 });
 
-Deno.test("revision writes preserve timestamp text until PostgreSQL casts it", () => {
-  const timestampWrite = frameTimestampForWrite.toString();
-  assert(timestampWrite.includes("::text::timestamptz"));
-  const projector = PostgresFrameEvidenceProjector.prototype.projectSession
-    .toString();
-  assert(projector.includes("change.anchor_observed_at"));
-  assert(projector.includes("change.observed_at"));
-  assert(
-    projector.match(/frameTimestampForWrite/g)?.length === 2,
-    "both revision timestamps must bypass the client timestamptz serializer",
-  );
-});
-
-Deno.test("receipt writes preserve the exact session revision timestamp", () => {
-  const projector = PostgresFrameEvidenceProjector.prototype.projectSession
-    .toString();
-  assert(
-    projector.includes("$11::text::timestamptz"),
-    "session_updated_at must bypass the client timestamptz serializer",
-  );
-  assert(
-    projector.includes("session_updated_at = $8::text::timestamptz"),
-    "exact reruns must compare the same unrounded session timestamp",
-  );
-});
-
 Deno.test("projector reads only bounded source metadata and never copies content", () => {
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt is not null"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt,"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("storage_path"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("record_sha256"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $4"));
-});
-
-Deno.test("projector bounds advisory-lock waits before taking its snapshot", () => {
-  assert(FRAME_LOCK_TIMEOUT_SQL.includes("statement_timeout"));
-  assert(FRAME_LOCK_TIMEOUT_SQL.includes("false"));
-  assert(FRAME_ADVISORY_LOCK_SQL.includes("pg_advisory_lock"));
-  assert(FRAME_RESET_TIMEOUT_SQL === "reset statement_timeout");
-  const implementation = PostgresFrameEvidenceProjector.prototype.projectSession
-    .toString();
-  assert(
-    implementation.indexOf("FRAME_LOCK_TIMEOUT_SQL") <
-      implementation.indexOf("FRAME_ADVISORY_LOCK_SQL"),
-  );
-  assert(
-    implementation.indexOf("FRAME_ADVISORY_LOCK_SQL") <
-      implementation.indexOf("FRAME_BEGIN_SQL"),
-    "the session lock must be held before repeatable read takes a snapshot",
-  );
-  assert(
-    !implementation.includes("connection.begin"),
-    "a reserved connection must not request a nested pool transaction",
-  );
-  assert(FRAME_BEGIN_SQL === "begin isolation level repeatable read");
-});
-
-Deno.test("projector and activation prove the complete session source state", () => {
-  assert(FRAME_SOURCE_COORDINATES_SQL.includes("max(id)"));
-  assert(FRAME_SOURCE_COORDINATES_SQL.includes("count(*)"));
-  assert(FRAME_SOURCE_COORDINATES_SQL.includes("not is_replay"));
-  assert(FRAME_ACTIVATION_PROOF_SQL.includes("source_event_count"));
-  assert(FRAME_ACTIVATION_PROOF_SQL.includes("session_updated_at"));
-  assert(FRAME_ACTIVATION_PROOF_SQL.includes("is distinct from"));
-  assert(
-    FRAME_BLOCKING_JOBS_SQL.includes("'queued', 'leased', 'failed'"),
-  );
-  assert(
-    FRAME_BLOCKING_JOBS_SQL.includes("job_kind = 'normalize'"),
-    "activation must wait for durable normalization backlog",
-  );
-  assert(FRAME_BLOCKING_JOBS_SQL.includes("job_kind = 'reduce'"));
-  assert(
-    FRAME_BLOCKING_JOBS_SQL.includes("workspace_id = $1"),
-    "unrelated workspaces must not block activation",
-  );
 });

@@ -357,16 +357,13 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       const relations = collectPlanRelations(plan);
       const indexes = collectPlanIndexes(plan);
       expect(relations.has("frame_evidence_revisions")).toBe(true);
-      expect(relations.has("frame_projection_receipts")).toBe(true);
+      expect(relations.has("frame_projection_receipts")).toBe(false);
       expect(relations.has("events")).toBe(true);
       expect(relations.has("sessions")).toBe(false);
       expect(relations.has("native_records")).toBe(false);
       expect(relations.has("ingest_batches")).toBe(false);
       expect([...indexes].some((name) =>
         name.startsWith("frame_evidence_revisions_")
-      )).toBe(true);
-      expect([...indexes].some((name) =>
-        name.startsWith("frame_projection_receipts_")
       )).toBe(true);
       expect([...indexes].some((name) => name.startsWith("events_"))).toBe(true);
 

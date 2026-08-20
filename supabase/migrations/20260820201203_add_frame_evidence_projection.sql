@@ -21,7 +21,6 @@ create table analytics.frame_projection_receipts (
   request_generation bigint not null,
   session_updated_at timestamptz not null,
   created_at timestamptz not null default now(),
-  constraint frame_projection_receipts_workspace_id_id_key unique (workspace_id, id),
   constraint frame_projection_receipts_scope_key unique (workspace_id, id, session_id, person_id, frame_version),
   constraint frame_projection_receipts_session_person_fkey foreign key (workspace_id, session_id, person_id)
     references telemetry.sessions (workspace_id, id, person_id),
@@ -80,19 +79,16 @@ create table analytics.frame_evidence_revisions (
 );
 
 create table analytics.frame_projection_activations (
-  id bigint generated always as identity primary key,
   workspace_id uuid not null references telemetry.workspaces (id),
   frame_version text not null,
   activated_at timestamptz not null default now(),
-  constraint frame_projection_activations_version_key unique (workspace_id, frame_version),
+  constraint frame_projection_activations_pkey primary key (workspace_id, frame_version),
   constraint frame_projection_activations_frame_version_nonempty check (btrim(frame_version) <> '')
 );
 
 create index frame_projection_receipts_latest_idx
   on analytics.frame_projection_receipts (workspace_id, session_id, frame_version, id desc)
   include (person_id, covered_from, covered_through, through_event_id, source_event_count, source_state_sha256, request_generation, session_updated_at);
-create index frame_projection_receipts_generation_idx
-  on analytics.frame_projection_receipts (workspace_id, frame_version, request_generation, session_id, id desc);
 create index frame_evidence_revisions_reader_idx
   on analytics.frame_evidence_revisions (workspace_id, frame_version, person_id, observed_at, evidence_kind, source_event_id, id desc)
   include (receipt_id, session_id, anchor_observed_at, actor_role, event_kind, event_subtype, message_role, message_origin, is_summary_candidate, is_tombstone);
@@ -108,7 +104,7 @@ create index frame_evidence_revisions_diff_idx
 
 revoke all on analytics.frame_projection_receipts, analytics.frame_evidence_revisions, analytics.frame_projection_activations
   from public, anon, authenticated, sherlock_ingest, sherlock_normalizer, sherlock_reducer, sherlock_processor, sherlock_reader, sherlock_frame_projector;
-revoke all on sequence analytics.frame_projection_receipts_id_seq, analytics.frame_evidence_revisions_id_seq, analytics.frame_projection_activations_id_seq
+revoke all on sequence analytics.frame_projection_receipts_id_seq, analytics.frame_evidence_revisions_id_seq
   from public, anon, authenticated, sherlock_ingest, sherlock_normalizer, sherlock_reducer, sherlock_processor, sherlock_reader, sherlock_frame_projector;
 revoke all on schema telemetry, analytics from sherlock_frame_projector;
 revoke all on all tables in schema telemetry from sherlock_frame_projector;
@@ -127,7 +123,6 @@ grant select (
   generation_key, generation_seq
 ) on telemetry.ingest_batches to sherlock_frame_projector;
 grant select, insert on analytics.frame_projection_receipts, analytics.frame_evidence_revisions to sherlock_frame_projector;
-grant select on analytics.frame_projection_activations to sherlock_frame_projector;
 grant usage, select on sequence analytics.frame_projection_receipts_id_seq, analytics.frame_evidence_revisions_id_seq to sherlock_frame_projector;
 grant select on analytics.frame_projection_receipts, analytics.frame_evidence_revisions, analytics.frame_projection_activations to sherlock_reader;
 grant sherlock_frame_projector to postgres, sherlock_worker_login;

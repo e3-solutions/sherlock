@@ -31,10 +31,19 @@ export function frameTimestampForWrite(
   return sql`${value}::text::timestamptz`;
 }
 
+function nativeItemTimestamp(column: string): string {
+  return `case
+    when ${column} ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    then to_timestamp((
+      ('x' || replace(substring(${column} from '[0-9a-f]{8}-[0-9a-f]{4}'), '-', ''))::bit(48)::bigint
+    ) / 1000.0)
+    else null
+  end`;
+}
+
 export interface FrameProjectionOptions {
   workspaceId: string;
   sessionId: string;
-  throughEventId: bigint;
   requestGeneration: bigint;
   statementTimeoutMs?: number;
   now?: Date;
@@ -120,16 +129,7 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
        ) source_observed_at,
        to_char(coalesce(
-         case
-           when e.native_item_id ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-           then to_timestamp((
-             ('x' || replace(
-               substring(e.native_item_id from '[0-9a-f]{8}-[0-9a-f]{4}'),
-               '-', ''
-             ))::bit(48)::bigint
-           ) / 1000.0)
-           else null
-         end,
+         ${nativeItemTimestamp("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
        ) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
          activity_observed_at,
@@ -168,29 +168,11 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
          'task_started', 'task_complete', 'turn_started', 'turn_complete'
        ))
        and coalesce(
-         case
-           when e.native_item_id ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-           then to_timestamp((
-             ('x' || replace(
-               substring(e.native_item_id from '[0-9a-f]{8}-[0-9a-f]{4}'),
-               '-', ''
-             ))::bit(48)::bigint
-           ) / 1000.0)
-           else null
-         end,
+         ${nativeItemTimestamp("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
        ) >= $5::timestamptz - make_interval(secs => $7)
        and coalesce(
-         case
-           when e.native_item_id ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-           then to_timestamp((
-             ('x' || replace(
-               substring(e.native_item_id from '[0-9a-f]{8}-[0-9a-f]{4}'),
-               '-', ''
-             ))::bit(48)::bigint
-           ) / 1000.0)
-           else null
-         end,
+         ${nativeItemTimestamp("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
        ) < $6::timestamptz + make_interval(secs => $7)
      ) or (
@@ -203,26 +185,10 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
            >= $5::timestamptz - interval '2 seconds'
          and coalesce(e.occurred_at, e.observed_at, e.server_received_at)
            < $6::timestamptz + interval '2 seconds'
-         or case
-           when e.native_item_id ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-           then to_timestamp((
-             ('x' || replace(
-               substring(e.native_item_id from '[0-9a-f]{8}-[0-9a-f]{4}'),
-               '-', ''
-             ))::bit(48)::bigint
-           ) / 1000.0)
-           else null
-         end >= $5::timestamptz - interval '2 seconds'
-         and case
-           when e.native_item_id ~ '^[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-           then to_timestamp((
-             ('x' || replace(
-               substring(e.native_item_id from '[0-9a-f]{8}-[0-9a-f]{4}'),
-               '-', ''
-             ))::bit(48)::bigint
-           ) / 1000.0)
-           else null
-         end < $6::timestamptz + interval '2 seconds'
+         or ${nativeItemTimestamp("e.native_item_id")}
+           >= $5::timestamptz - interval '2 seconds'
+         and ${nativeItemTimestamp("e.native_item_id")}
+           < $6::timestamptz + interval '2 seconds'
        )
      )
    )
@@ -989,32 +955,6 @@ export function diffEvidence(
     }
   }
   return changes.sort(compareEvidence);
-}
-
-export async function fingerprintEvidence(
-  states: readonly EvidenceState[],
-): Promise<string> {
-  const canonical = [...states].sort(compareEvidence).map((state) => [
-    state.evidence_kind,
-    state.source_event_id.toString(),
-    state.anchor_observed_at,
-    state.observed_at,
-    state.actor_role,
-    state.event_kind,
-    state.event_subtype,
-    state.message_role,
-    state.message_origin,
-    state.prompt_identity,
-    state.is_summary_candidate,
-    state.is_tombstone,
-  ]);
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(JSON.stringify(canonical)),
-  );
-  return [...new Uint8Array(digest)].map((byte) =>
-    byte.toString(16).padStart(2, "0")
-  ).join("");
 }
 
 async function fingerprintSourceState(

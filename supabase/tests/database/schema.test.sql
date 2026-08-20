@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(119);
+select plan(120);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -27,6 +27,21 @@ select has_table(
 select has_table(
   'analytics', 'frame_projection_activations',
   'frame projection activation is explicit'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+    where conrelid = 'analytics.frame_projection_activations'::regclass
+      and contype = 'p'
+      and pg_get_constraintdef(oid) =
+        'PRIMARY KEY (workspace_id, frame_version)'
+  ) and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'analytics'
+      and table_name = 'frame_projection_activations'
+      and column_name = 'id'
+  ),
+  'frame activation uses only its exact workspace and version identity'
 );
 select has_table('processing', 'telemetry_jobs', 'durable telemetry queue exists');
 select has_column(
@@ -368,8 +383,11 @@ select ok(
   not has_table_privilege(
     'sherlock_frame_projector',
     'analytics.frame_projection_activations', 'insert'
+  ) and not has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_projection_activations', 'select'
   ),
-  'worker cannot self-activate a projection version'
+  'worker cannot inspect or activate a projection version'
 );
 select ok(
   has_table_privilege(
@@ -853,22 +871,15 @@ begin
     to_regclass('telemetry.native_records') is not null and
     to_regclass('telemetry.events') is not null and
     to_regclass('analytics.activity_spans') is not null and
-    to_regclass('analytics.frame_projection_receipts') is not null and
-    to_regclass('analytics.frame_evidence_revisions') is not null and
-    to_regclass('analytics.frame_projection_activations') is not null and
     to_regclass('processing.telemetry_jobs') is not null and
-    (select count(*) = 6 from pg_roles where rolname in (
+    (select count(*) = 5 from pg_roles where rolname in (
       'sherlock_ingest', 'sherlock_normalizer', 'sherlock_reducer',
-      'sherlock_reader', 'sherlock_processor', 'sherlock_frame_projector'
+      'sherlock_reader', 'sherlock_processor'
     )) and
     pg_has_role('postgres', 'sherlock_ingest', 'member') and
     pg_has_role('postgres', 'sherlock_normalizer', 'member') and
     pg_has_role('postgres', 'sherlock_reducer', 'member') and
     pg_has_role('postgres', 'sherlock_processor', 'member') and
-    pg_has_role('postgres', 'sherlock_frame_projector', 'member') and
-    pg_has_role(
-      'sherlock_worker_login', 'sherlock_frame_projector', 'member'
-    ) and
     exists (
       select 1 from storage.buckets
       where id = 'telemetry-raw' and public = false
@@ -902,71 +913,6 @@ begin
     not has_table_privilege('sherlock_reducer', 'analytics.activity_spans', 'delete') and
     not has_table_privilege('sherlock_reducer', 'telemetry.events', 'insert') and
     not has_table_privilege('sherlock_reducer', 'telemetry.sessions', 'update') and
-    has_table_privilege(
-      'sherlock_frame_projector', 'telemetry.sessions', 'select'
-    ) and
-    has_table_privilege(
-      'sherlock_frame_projector', 'telemetry.events', 'select'
-    ) and
-    has_column_privilege(
-      'sherlock_frame_projector', 'telemetry.native_records',
-      'record_index', 'select'
-    ) and
-    has_column_privilege(
-      'sherlock_frame_projector', 'telemetry.ingest_batches',
-      'source_stream_key', 'select'
-    ) and
-    not has_column_privilege(
-      'sherlock_frame_projector', 'telemetry.native_records',
-      'record_sha256', 'select'
-    ) and
-    not has_column_privilege(
-      'sherlock_frame_projector', 'telemetry.ingest_batches',
-      'storage_path', 'select'
-    ) and
-    has_table_privilege(
-      'sherlock_frame_projector',
-      'analytics.frame_projection_receipts', 'insert'
-    ) and
-    has_table_privilege(
-      'sherlock_frame_projector',
-      'analytics.frame_evidence_revisions', 'insert'
-    ) and
-    not has_table_privilege(
-      'sherlock_frame_projector',
-      'analytics.frame_projection_receipts', 'update'
-    ) and
-    not has_table_privilege(
-      'sherlock_frame_projector',
-      'analytics.frame_projection_receipts', 'delete'
-    ) and
-    not has_table_privilege(
-      'sherlock_frame_projector',
-      'analytics.frame_evidence_revisions', 'update'
-    ) and
-    not has_table_privilege(
-      'sherlock_frame_projector',
-      'analytics.frame_evidence_revisions', 'delete'
-    ) and
-    not has_table_privilege(
-      'sherlock_frame_projector',
-      'analytics.frame_projection_activations', 'insert'
-    ) and
-    has_table_privilege(
-      'sherlock_reader', 'analytics.frame_projection_receipts', 'select'
-    ) and
-    has_table_privilege(
-      'sherlock_reader', 'analytics.frame_evidence_revisions', 'select'
-    ) and
-    has_table_privilege(
-      'sherlock_reader', 'analytics.frame_projection_activations', 'select'
-    ) and
-    not has_table_privilege(
-      'anon', 'analytics.frame_evidence_revisions', 'select'
-    ) and
-    not has_table_privilege(
-      'authenticated', 'analytics.frame_evidence_revisions', 'select'
-    ) and
     not has_table_privilege('sherlock_reader', 'telemetry.events', 'insert') and
     not has_table_privilege('sherlock_reader', 'telemetry.ingest_batches', 'insert') and
     not has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'update') and
@@ -1006,7 +952,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 119,
+  'assertion_count', 120,
   'tables', 11,
   'private_bucket', 'telemetry-raw'
 ) as verification;

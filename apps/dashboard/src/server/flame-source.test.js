@@ -386,7 +386,15 @@ describe("Sherlock Flame payload", () => {
     ]);
   });
 
-  it("emits v2 only when its exact frame projection is activated", async () => {
+  it.each([
+    [true, PROJECTION_FLAME_SQL, "v2"],
+    [false, FLAME_SQL, "v1"],
+    [null, FLAME_SQL, "v1"],
+  ])("routes an exact-version activation value of %s", async (
+    frameProjectionActive,
+    expectedSql,
+    expectedTokenVersion,
+  ) => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     source.maxPeople = 5;
@@ -395,11 +403,14 @@ describe("Sherlock Flame payload", () => {
       .mockResolvedValueOnce([{
         now: READ,
         snapshot: PG_SNAPSHOT,
-        frame_projection_active: true,
+        frame_projection_active: frameProjectionActive,
       }])
       .mockResolvedValueOnce(roster)
       .mockResolvedValueOnce(rowsFor("ada"));
-    source.transaction = (callback) => callback({ unsafe });
+    source.transaction = (callback) => callback({
+      unsafe,
+      array: (values) => values,
+    });
 
     const payload = await source.fetchDay();
 
@@ -407,44 +418,42 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).toContain("activation.frame_version = $2");
     expect(unsafe.mock.calls[0][0]).not.toContain("order by activation");
     expect(unsafe.mock.calls[0][1]).toEqual([source.workspaceId, FRAME_VERSION]);
-    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_FLAME_SQL);
-    expect(unsafe.mock.calls[2][1]).toEqual([
-      source.workspaceId,
-      START.toISOString(),
-      "2026-08-17T12:00:00.000Z",
-      FRAME_VERSION,
-      READ.toISOString(),
-    ]);
-    expect(decodeSnapshotToken(payload.snapshot)).toEqual({
+    expect(unsafe.mock.calls[2][0]).toBe(expectedSql);
+    const expectedSnapshot = {
       snapshot: PG_SNAPSHOT,
       read: READ,
-      frameVersion: FRAME_VERSION,
-    });
+    };
+    if (frameProjectionActive) {
+      expectedSnapshot.frameVersion = FRAME_VERSION;
+      expect(unsafe.mock.calls[2][1]).toEqual([
+        source.workspaceId,
+        START.toISOString(),
+        "2026-08-17T12:00:00.000Z",
+        FRAME_VERSION,
+        READ.toISOString(),
+      ]);
+    }
+    expect(payload.snapshot).toMatch(new RegExp(`^${expectedTokenVersion}\\.`));
+    expect(decodeSnapshotToken(payload.snapshot)).toEqual(expectedSnapshot);
   });
 
-  it("keeps a missing exact-version activation on the v1 raw path", async () => {
-    for (const frameProjectionActive of [false, null]) {
-      const source = Object.create(DirectFlameSource.prototype);
-      source.workspaceId = "11111111-1111-4111-8111-111111111111";
-      source.maxPeople = 5;
-      const unsafe = vi.fn()
-        .mockResolvedValueOnce([{
-          now: READ,
-          snapshot: PG_SNAPSHOT,
-          frame_projection_active: frameProjectionActive,
-        }])
-        .mockResolvedValueOnce([{ person_id: "ada", display_name: "Ada" }])
-        .mockResolvedValueOnce(rowsFor("ada"));
-      source.transaction = (callback) => callback({
-        unsafe,
-        array: (values) => values,
-      });
+  it("can disable projection lookup before the additive migration is present", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.maxPeople = 5;
+    source.projectionEnabled = false;
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: READ, snapshot: PG_SNAPSHOT, frame_projection_active: false }])
+      .mockResolvedValueOnce([{ person_id: "ada", display_name: "Ada" }])
+      .mockResolvedValueOnce(rowsFor("ada"));
+    source.transaction = (callback) => callback({ unsafe, array: (values) => values });
 
-      const payload = await source.fetchDay();
+    const payload = await source.fetchDay();
 
-      expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
-      expect(payload.snapshot).toMatch(/^v1\./);
-    }
+    expect(unsafe.mock.calls[0][0]).not.toContain("analytics.frame_projection_activations");
+    expect(unsafe.mock.calls[0][1]).toBeUndefined();
+    expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
+    expect(payload.snapshot).toMatch(/^v1\./);
   });
 
   it("selects the 30-second transaction timeout only for the cached timeline", async () => {
@@ -662,9 +671,9 @@ describe("Sherlock Flame payload", () => {
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
   });
 
-  it("keeps projection reads indexed and limits source text joins", () => {
+  it("keeps projection reads bounded, snapshot-visible, and semantically exact", () => {
     expect(PROJECTION_FLAME_SQL).toContain("analytics.frame_evidence_revisions");
-    expect(PROJECTION_FLAME_SQL).toContain("analytics.frame_projection_receipts");
+    expect(PROJECTION_FLAME_SQL).not.toContain("analytics.frame_projection_receipts");
     expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.events");
     expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.sessions");
     for (const query of [
@@ -683,8 +692,8 @@ describe("Sherlock Flame payload", () => {
       expect(query).toContain(
         `or revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`,
       );
-      expect(query).toContain("pg_visible_in_snapshot(receipt.xmin::text::xid8");
       expect(query).toContain("pg_visible_in_snapshot(revision.xmin::text::xid8");
+      expect(query).not.toContain("frame_projection_receipts");
       expect(query).not.toContain("telemetry.sessions");
       expect(query).not.toContain("telemetry.native_records");
       expect(query).not.toContain("telemetry.ingest_batches");
@@ -698,9 +707,6 @@ describe("Sherlock Flame payload", () => {
     expect(PROJECTION_WORK_DETAIL_SQL.indexOf("limit $11")).toBeLessThan(
       PROJECTION_WORK_DETAIL_SQL.indexOf("left join telemetry.events source"),
     );
-  });
-
-  it("preserves partial-bucket activity and exact person-wide prompt ranking", () => {
     expect(PROJECTION_FLAME_SQL).toContain(
       "and observed_at >= p.start_at and observed_at < p.read_at",
     );
@@ -807,68 +813,6 @@ describe("Sherlock Flame payload", () => {
         truncated: false,
       }],
     });
-  });
-
-  it("routes v2 interval evidence only through the pinned projection", async () => {
-    const source = Object.create(DirectFlameSource.prototype);
-    source.workspaceId = "11111111-1111-4111-8111-111111111111";
-    const personId = "22222222-2222-4222-8222-222222222222";
-    const sessionId = "33333333-3333-4333-8333-333333333333";
-    const unsafe = vi.fn()
-      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-      .mockResolvedValueOnce([{
-        session_id: sessionId,
-        semantic_role: "agent",
-        first_at: START,
-        last_at: new Date(START.getTime() + 1000),
-        event_count: 1,
-        summary: "Projected work",
-      }])
-      .mockResolvedValueOnce([{
-        prompt_identity: "native:projected",
-        session_id: sessionId,
-        observed_at: new Date(START.getTime() + 500),
-        content_byte_size: 9,
-        content_excerpt: "Projected",
-        eligible_prompt_count: 1,
-      }]);
-    source.transaction = (callback) => callback({ unsafe });
-    const snapshot = encodeProjectionSnapshotToken({
-      snapshot: PG_SNAPSHOT,
-      read: READ,
-      frameVersion: FRAME_VERSION,
-    });
-
-    const interval = await source.fetchInterval({
-      personId,
-      start: START.toISOString(),
-      snapshot,
-    });
-
-    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
-    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_INTERVAL_PROMPTS_SQL);
-    expect(unsafe.mock.calls[1][1]).toEqual([
-      source.workspaceId,
-      FRAME_VERSION,
-      PG_SNAPSHOT,
-      personId,
-      START.toISOString(),
-      new Date(START.getTime() + BUCKET_MS).toISOString(),
-      INTERVAL_WORK_LIMIT + 1,
-    ]);
-    expect(unsafe.mock.calls[2][1]).toEqual([
-      source.workspaceId,
-      FRAME_VERSION,
-      PG_SNAPSHOT,
-      personId,
-      START.toISOString(),
-      new Date(START.getTime() + 24 * 60 * 60 * 1000).toISOString(),
-      START.toISOString(),
-      new Date(START.getTime() + BUCKET_MS).toISOString(),
-      INTERVAL_PROMPT_LIMIT + 1,
-    ]);
-    expect(interval.work[0].summary).toBe("Projected work");
-    expect(interval.prompts[0].content).toBe("Projected");
   });
 
   it("never silently falls a failing v2 interval back to raw SQL", async () => {
@@ -1039,56 +983,6 @@ describe("Sherlock Flame payload", () => {
     expect(detail).toMatchObject({
       workId: `${sessionId}:agent`,
       eventCount: 2,
-    });
-  });
-
-  it("pages v2 work using projected IDs before bounded excerpt lookup", async () => {
-    const source = Object.create(DirectFlameSource.prototype);
-    source.workspaceId = "11111111-1111-4111-8111-111111111111";
-    const personId = "22222222-2222-4222-8222-222222222222";
-    const sessionId = "33333333-3333-4333-8333-333333333333";
-    const header = {
-      session_id: sessionId,
-      semantic_role: "agent",
-      first_at: START,
-      last_at: new Date(START.getTime() + 2000),
-      event_count: 2,
-      summary: "Projected summary",
-    };
-    const unsafe = vi.fn()
-      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-      .mockResolvedValueOnce([header])
-      .mockResolvedValueOnce([{
-        ...header,
-        id: "52",
-        observed_at: new Date(START.getTime() + 1000),
-        observed_at_microseconds: String(BigInt(START.getTime() + 1000) * 1000n),
-        message_role: "assistant",
-        content_byte_size: 15,
-        content_excerpt: "Projected item",
-      }]);
-    source.transaction = (callback) => callback({ unsafe });
-    const snapshot = encodeProjectionSnapshotToken({
-      snapshot: PG_SNAPSHOT,
-      read: READ,
-      frameVersion: FRAME_VERSION,
-    });
-
-    const detail = await source.fetchWork({
-      personId,
-      start: START.toISOString(),
-      sessionId,
-      role: "agent",
-      snapshot,
-    });
-
-    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
-    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_WORK_DETAIL_SQL);
-    expect(unsafe.mock.calls[2][1].at(-1)).toBe(DEFAULT_WORK_DETAIL_LIMIT + 1);
-    expect(detail).toMatchObject({
-      workId: `${sessionId}:agent`,
-      eventCount: 2,
-      items: [{ id: "52", content: "Projected item" }],
     });
   });
 

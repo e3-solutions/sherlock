@@ -175,7 +175,8 @@ immutable publication-time session facts.
 SUPABASE_DB_URL and SHERLOCK_WORKSPACE_ID are required. SUPABASE_DB_URL reuses
 the existing Sherlock worker login contract, which can assume
 sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
-exceed 1000.
+exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
+the additive frame-projection migration or when stopping new v2 token minting.
 
 ## Bonaparte MCP
 

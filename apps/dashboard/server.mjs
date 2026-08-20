@@ -17,12 +17,13 @@ const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
 const databaseUrl = process.env.SUPABASE_DB_URL ?? "";
 const mcpToken = process.env.SHERLOCK_MCP_TOKEN ?? "";
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
+const projectionEnabled = process.env.SHERLOCK_FRAME_PROJECTION_ENABLED !== "false";
 const validWorkspaceId =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
     .test(workspaceId);
 const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople <= 1000;
 const source = databaseUrl && validWorkspaceId && validMaxPeople
-  ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
+  ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople, projectionEnabled })
   : null;
 
 let databaseVerified = false;

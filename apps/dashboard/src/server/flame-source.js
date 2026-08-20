@@ -835,8 +835,7 @@ function projectedEvidenceCte({
   activityThroughReadAt = false,
 } = {}) {
   const visibility = snapshotVisible
-    ? `and pg_visible_in_snapshot(receipt.xmin::text::xid8, p.snapshot)
-     and pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)`
+    ? "and pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)"
     : "";
   const activityEnd = activityThroughReadAt ? "p.read_at" : "p.end_at";
   return `
@@ -844,15 +843,9 @@ ranked_frame_revisions as materialized (
   select revision.*,
          row_number() over (
            partition by revision.evidence_kind, revision.source_event_id
-           order by receipt.id desc, revision.id desc
+           order by revision.id desc
          ) latest_rank
     from analytics.frame_evidence_revisions revision
-    join analytics.frame_projection_receipts receipt
-      on receipt.id = revision.receipt_id
-     and receipt.workspace_id = revision.workspace_id
-     and receipt.session_id = revision.session_id
-     and receipt.person_id = revision.person_id
-     and receipt.frame_version = revision.frame_version
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
@@ -1457,9 +1450,10 @@ export function buildFlamePayload({
 }
 
 export class DirectFlameSource {
-  constructor({ databaseUrl, workspaceId, maxPeople = 500 }) {
+  constructor({ databaseUrl, workspaceId, maxPeople = 500, projectionEnabled = true }) {
     this.workspaceId = workspaceId;
     this.maxPeople = maxPeople;
+    this.projectionEnabled = projectionEnabled;
     this.sql = postgres(databaseUrl, {
       prepare: false,
       max: 2,
@@ -1523,16 +1517,21 @@ export class DirectFlameSource {
 
   async fetchDay({ now, signal } = {}) {
     return await this.transaction(async (tx) => {
+      const projectionEnabled = this.projectionEnabled !== false;
       const receipt = (await runQuery(tx,
-        `select transaction_timestamp() as now,
+        projectionEnabled
+          ? `select transaction_timestamp() as now,
                 pg_current_snapshot()::text as snapshot,
                 exists (
                   select 1
                     from analytics.frame_projection_activations activation
                    where activation.workspace_id = $1
                      and activation.frame_version = $2
-                ) frame_projection_active`,
-        [this.workspaceId, FRAME_VERSION],
+                ) frame_projection_active`
+          : `select transaction_timestamp() as now,
+                    pg_current_snapshot()::text as snapshot,
+                    false as frame_projection_active`,
+        projectionEnabled ? [this.workspaceId, FRAME_VERSION] : undefined,
         signal,
       ))[0];
       const read = now ? asDate(now) : asDate(receipt.now);

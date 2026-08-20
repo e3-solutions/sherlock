@@ -278,14 +278,12 @@ Deno.test({
         projector.projectSession({
           workspaceId,
           sessionId,
-          throughEventId: highEventId,
           requestGeneration: 1n,
           now,
         }),
         projector.projectSession({
           workspaceId,
           sessionId,
-          throughEventId: highEventId,
           requestGeneration: 1n,
           now,
         }),
@@ -388,7 +386,6 @@ Deno.test({
       const parentCorrection = await projector.projectSession({
         workspaceId,
         sessionId,
-        throughEventId: highEventId,
         requestGeneration: 2n,
         now,
       });
@@ -440,7 +437,6 @@ Deno.test({
       const corrected = await projector.projectSession({
         workspaceId,
         sessionId,
-        throughEventId: highEventId,
         requestGeneration: 3n,
         now,
       });

@@ -114,7 +114,7 @@ if (import.meta.main) {
   try {
     while (true) {
       const sessions = await sql.unsafe(
-        `select s.id::text session_id, max(e.id)::text through_event_id,
+        `select s.id::text session_id,
                 coalesce(max(j.request_generation), 1)::text request_generation
            from telemetry.sessions s
            join telemetry.events e
@@ -141,7 +141,6 @@ if (import.meta.main) {
         await projector.projectSession({
           workspaceId: options.workspaceId,
           sessionId: String(session.session_id),
-          throughEventId: BigInt(String(session.through_event_id)),
           requestGeneration: BigInt(String(session.request_generation)),
         });
         projected += 1;

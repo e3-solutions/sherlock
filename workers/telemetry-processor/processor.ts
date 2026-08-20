@@ -152,7 +152,6 @@ export class TelemetryProcessor {
     const projected = await this.frameProjector.projectSession({
       workspaceId: job.workspace_id,
       sessionId: job.session_id,
-      throughEventId: job.target_event_id,
       requestGeneration: job.request_generation,
       statementTimeoutMs: remainingMilliseconds,
     });

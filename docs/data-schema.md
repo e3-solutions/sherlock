@@ -224,7 +224,7 @@ rollback without v2 support must reject them rather than change their source.
 | `sherlock_ingest` | Read workspace, person, batch, and native-record metadata; insert batches and native records |
 | `sherlock_normalizer` | Read telemetry; insert/update session caches; insert events |
 | `sherlock_reducer` | Read sessions and normalized events; select/insert activity spans |
-| `sherlock_frame_projector` | Read sessions/events and only the native/batch columns needed for canonical representation pairing; select/insert frame receipts and revisions; read activations |
+| `sherlock_frame_projector` | Read sessions/events and only the native/batch columns needed for canonical representation pairing; select/insert frame receipts and revisions |
 | `sherlock_reader` | Read telemetry and analytics; no writes |
 
 The ingest role cannot write events or spans. The normalizer cannot write spans.
