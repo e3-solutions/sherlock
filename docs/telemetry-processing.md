@@ -147,11 +147,24 @@ disables automatic activity reduction; this is a degraded emergency mode, not
 a steady state. Do not stop Railway with backlog present, delete queue/raw rows,
 or re-enable the full-workspace Cron as a permanent design.
 
-## Open PR coordination
+## Oversized rollout records
 
-This design supersedes PR #12. Its two already-hosted migration files and
-same-cutoff reducer correction are retained, but its Edge wrapper and
-full-workspace Cron must not merge. PR #9 must rebase after this change and add
-the `backfill` header to its historical transport. Its proposed fragment
-metadata also requires a matching worker reconstruction change before PR #9 is
-mergeable; this PR intentionally preserves the current v1 batch body.
+Deploy the ingest function and Railway worker before collectors that can emit
+fragments. A rollout JSONL record over 16 MiB and up to 100 MiB is transported
+as deterministic 4 MiB v1 fragments using the fragment columns already present
+on `telemetry.native_records`. Each fragment remains an immutable, independently
+verifiable raw fact. The normalizer emits a bounded `unknown/native_fragment`
+coverage event instead of parsing a partial JSON document, so the oversized
+record itself does not create product activity while later records in the same
+stream continue normally. The complete raw record remains reconstructable from
+its ordered fragments and full-record hash.
+
+The collector's synchronous byte budget may be exceeded by one logical record:
+all fragments of that record are published durably before its cursor advances.
+This keeps crash replay stateless and idempotent at the cost of one bounded
+100 MiB worst-case capture.
+
+Rolling collectors back stops new fragments. Rolling the server back first can
+reject already-spooled fragments; collectors retain that head and block only
+its stream rather than discarding raw telemetry, so server-first deployment and
+collector-first rollback are required.

@@ -8,14 +8,34 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .contract import ContractError, MAX_RECORDS, MAX_SOURCE_BYTES, build_rollout_batch
+from .contract import (
+    FRAGMENT_BYTES,
+    MAX_LOGICAL_RECORD_BYTES,
+    MAX_RECORDS,
+    MAX_SOURCE_BYTES,
+    ContractError,
+    build_rollout_batch,
+)
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
 DEFAULT_MAX_FILES = 64
 DEFAULT_MAX_SYNC_BYTES = 64 * 1024 * 1024
-DEFAULT_MAX_OBJECT_BYTES = 5 * 1024 * 1024
+DEFAULT_MAX_OBJECT_BYTES = MAX_SOURCE_BYTES
 PREFIX_BYTES = 4096
+SCAN_BYTES = 1024 * 1024
+
+
+class _OversizedNativeRecord(ContractError):
+    pass
+
+
+@dataclass(frozen=True)
+class NativeRecordFragmentPlan:
+    start_offset: int
+    end_offset: int
+    sha256: str
+    fragment_count: int
 
 
 @dataclass
@@ -67,11 +87,15 @@ class RolloutCapturer:
         *,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        max_record_bytes: int = MAX_LOGICAL_RECORD_BYTES,
         collector_version: str = "0.1.0",
     ):
-        if not 0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES:
+        if not (
+            0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES
+            and MAX_SOURCE_BYTES <= max_record_bytes <= MAX_LOGICAL_RECORD_BYTES
+        ):
             raise ValueError(
-                "chunk_bytes and max_object_bytes must be positive and within v1 limits"
+                "capture byte limits are invalid or exceed the rollout contract"
             )
         self.state_root = Path(state_root)
         self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -82,6 +106,7 @@ class RolloutCapturer:
         self.spool = spool
         self.chunk_bytes = chunk_bytes
         self.max_object_bytes = max_object_bytes
+        self.max_record_bytes = max_record_bytes
         self.collector_version = collector_version
 
     def capture(
@@ -101,17 +126,14 @@ class RolloutCapturer:
                 return CaptureResult(locked=True)
             states, candidate_cursor = self._load_state()
             enqueued = captured = errors = 0
-            all_paths = list(
-                dict.fromkeys(str(Path(item).resolve()) for item in paths)
-            )
+            all_paths = list(dict.fromkeys(str(Path(item).resolve()) for item in paths))
             priority_count = min(max(0, priority_count), len(all_paths), max_files)
             priority_paths = all_paths[:priority_count]
             backlog_paths = sorted(all_paths[priority_count:])
             if backlog_paths:
                 candidate_cursor %= len(backlog_paths)
                 rotated = (
-                    backlog_paths[candidate_cursor:]
-                    + backlog_paths[:candidate_cursor]
+                    backlog_paths[candidate_cursor:] + backlog_paths[:candidate_cursor]
                 )
                 selected_paths = priority_paths + rotated[: max_files - priority_count]
             else:
@@ -203,12 +225,46 @@ class RolloutCapturer:
             enqueued = captured = 0
             while state.offset < stable_end and captured < byte_budget:
                 remaining_budget = byte_budget - captured
-                source = self._read_chunk(
-                    handle,
-                    state.offset,
-                    stable_end,
-                    min(self.chunk_bytes, remaining_budget),
-                )
+                try:
+                    source = self._read_chunk(
+                        handle,
+                        state.offset,
+                        stable_end,
+                        min(self.chunk_bytes, remaining_budget),
+                    )
+                except _OversizedNativeRecord:
+                    # max_sync_bytes is a batch-selection budget. One logical
+                    # record may exceed it because every deterministic fragment
+                    # must be durable before the logical cursor can advance.
+                    plan = self._native_record_fragment_plan(
+                        handle,
+                        state.offset,
+                        stable_end,
+                    )
+                    if plan.end_offset - plan.start_offset <= MAX_SOURCE_BYTES:
+                        raise ContractError(
+                            f"native rollout record exceeds {self.max_object_bytes} bytes"
+                        )
+                    fragment_enqueued, fragment_captured = self._enqueue_fragments(
+                        handle,
+                        key,
+                        state,
+                        plan,
+                        native_session_ids.get(str(path)),
+                    )
+                    after = os.fstat(handle.fileno())
+                    if (
+                        after.st_dev != details.st_dev
+                        or after.st_ino != details.st_ino
+                        or after.st_size < stable_end
+                    ):
+                        raise OSError("native rollout file changed while fragmenting")
+                    state.offset = plan.end_offset
+                    states[key] = state
+                    self._save_state(states, candidate_cursor)
+                    enqueued += fragment_enqueued
+                    captured += fragment_captured
+                    continue
                 if not source:
                     break
                 manifest, stored = build_rollout_batch(
@@ -228,6 +284,79 @@ class RolloutCapturer:
                 captured += len(source)
             states[key] = state
             return enqueued, captured
+
+    def _native_record_fragment_plan(
+        self,
+        handle,
+        start: int,
+        stable_end: int,
+    ) -> NativeRecordFragmentPlan:
+        handle.seek(start)
+        digest = hashlib.sha256()
+        end = start
+        while end < stable_end:
+            chunk = handle.read(min(SCAN_BYTES, stable_end - end))
+            if not chunk:
+                break
+            newline = chunk.find(b"\n")
+            selected = chunk if newline < 0 else chunk[: newline + 1]
+            digest.update(selected)
+            end += len(selected)
+            if end - start > self.max_record_bytes:
+                raise ContractError(
+                    f"native rollout record exceeds {self.max_record_bytes} bytes"
+                )
+            if newline >= 0:
+                break
+        length = end - start
+        if length <= self.max_object_bytes:
+            raise ContractError("could not locate an oversized native rollout record")
+        return NativeRecordFragmentPlan(
+            start_offset=start,
+            end_offset=end,
+            sha256=digest.hexdigest(),
+            fragment_count=(length + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES,
+        )
+
+    def _enqueue_fragments(
+        self,
+        handle,
+        source_stream_key: str,
+        state: StreamState,
+        plan: NativeRecordFragmentPlan,
+        observed_native_session_id: str | None,
+    ) -> tuple[int, int]:
+        captured = 0
+        digest = hashlib.sha256()
+        for fragment_index in range(plan.fragment_count):
+            start = plan.start_offset + fragment_index * FRAGMENT_BYTES
+            end = min(start + FRAGMENT_BYTES, plan.end_offset)
+            handle.seek(start)
+            source = handle.read(end - start)
+            if len(source) != end - start:
+                raise OSError("native rollout record changed while fragmenting")
+            digest.update(source)
+            manifest, stored = build_rollout_batch(
+                source,
+                source_stream_key=source_stream_key,
+                generation_key=state.generation_key,
+                generation_seq=state.generation_seq,
+                start_offset=start,
+                observed_native_session_id=observed_native_session_id,
+                collector_version=self.collector_version,
+                native_record_fragment={
+                    "native_record_start_offset": plan.start_offset,
+                    "native_record_end_offset": plan.end_offset,
+                    "native_record_sha256": plan.sha256,
+                    "fragment_index": fragment_index,
+                    "fragment_count": plan.fragment_count,
+                },
+            )
+            self.spool.enqueue(manifest, stored)
+            captured += len(source)
+        if digest.hexdigest() != plan.sha256:
+            raise OSError("native rollout record changed while fragmenting")
+        return plan.fragment_count, captured
 
     @staticmethod
     def _same_generation(
@@ -262,7 +391,7 @@ class RolloutCapturer:
         complete = candidate + overflow
         newline = complete.find(b"\n", len(candidate))
         if newline < 0 and remaining > overflow_limit:
-            raise ContractError(
+            raise _OversizedNativeRecord(
                 f"native rollout record exceeds {self.max_object_bytes} bytes"
             )
         return self._limit_records(complete if newline < 0 else complete[: newline + 1])

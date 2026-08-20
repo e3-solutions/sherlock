@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -12,9 +13,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sherlock_collector.contract import (
+    FRAGMENT_BYTES,
+    MAX_SOURCE_BYTES,
+    BatchManifest,
     ContractError,
     RECEIPT_VERSION,
     build_rollout_batch,
+    validate_stored_payload,
 )
 from sherlock_collector.config import CollectorIdentity
 from sherlock_collector.drain import (
@@ -214,22 +219,34 @@ class CollectorDrainTests(unittest.TestCase):
         queued = self.spool.load(self.spool.list_pending()[0])
         self.assertEqual(queued.metadata["last_upload_error"], "try later")
 
-    def test_permanent_failure_is_quarantined(self):
-        self.enqueue()
+    def test_permanent_failure_is_retained_and_blocks_only_its_stream(self):
+        first, _ = self.enqueue("stream-a")
+        self.enqueue("stream-a", first.end_offset)
+        self.enqueue("stream-b")
 
         class Permanent:
-            def upload(self, _item):
-                raise PermanentUploadError("bad payload")
+            def __init__(self):
+                self.calls = []
 
-        result = Drain(self.spool, Permanent()).run()
+            def upload(inner_self, item):
+                inner_self.calls.append(
+                    (item.manifest.source_stream_key, item.manifest.start_offset)
+                )
+                if item.manifest.source_stream_key == "stream-a":
+                    raise PermanentUploadError("unsupported contract")
+                return receipt(item.manifest)
 
-        self.assertEqual(result.dead_lettered, 1)
-        self.assertEqual(self.spool.list_pending(), [])
-        dead = list(self.spool.dead_letter.glob("*.json"))
-        self.assertEqual(len(dead), 1)
+        transport = Permanent()
+        result = Drain(self.spool, transport).run()
+
+        self.assertEqual(result.requeued, 1)
+        self.assertEqual(result.uploaded, 1)
+        self.assertEqual(result.dead_lettered, 0)
+        self.assertEqual(len(self.spool.list_pending()), 2)
+        self.assertEqual(list(self.spool.dead_letter.glob("*.json")), [])
         self.assertEqual(
-            self.spool.load(dead[0]).metadata["dead_letter"]["reason"],
-            "bad payload",
+            sorted(transport.calls),
+            [("stream-a", 0), ("stream-b", 0)],
         )
 
     def test_success_removes_stale_matching_dead_letter(self):
@@ -552,9 +569,7 @@ class RolloutCaptureTests(unittest.TestCase):
 
         state_path = self.root / "catch-up-state" / "rollout-state.json"
         first_state = json.loads(state_path.read_text())
-        first_paths = {
-            value["path"] for value in first_state["streams"].values()
-        }
+        first_paths = {value["path"] for value in first_state["streams"].values()}
         self.assertEqual(first.enqueued, DEFAULT_MAX_FILES)
         self.assertGreater(first.captured_bytes, 1024 * 1024)
         self.assertEqual(len(first_paths), DEFAULT_MAX_FILES)
@@ -563,9 +578,7 @@ class RolloutCaptureTests(unittest.TestCase):
         second = capturer.capture([current, *backlog], priority_count=1)
 
         second_state = json.loads(state_path.read_text())
-        second_paths = {
-            value["path"] for value in second_state["streams"].values()
-        }
+        second_paths = {value["path"] for value in second_state["streams"].values()}
         self.assertEqual(second.enqueued, 2)
         self.assertEqual(
             second_paths,
@@ -637,22 +650,123 @@ class RolloutCaptureTests(unittest.TestCase):
         item = self.spool.load(self.spool.list_pending()[0])
         self.assertEqual(item.manifest.record_count, 1)
 
-    def test_oversized_native_record_is_rejected_without_checkpointing(self):
-        self.rollout.write_bytes(b"x" * 1025)
+    def test_oversized_native_record_is_fragmented_and_reconstructed_exactly(self):
+        source = b'{"type":"compacted","payload":"' + b"x" * MAX_SOURCE_BYTES + b'"}\n'
+        self.rollout.write_bytes(source)
         capturer = RolloutCapturer(
             self.root / "oversized-state",
             self.spool,
             chunk_bytes=128,
-            max_object_bytes=1024,
+        )
+
+        result = capturer.capture([self.rollout], max_sync_bytes=1024 * 1024)
+
+        expected_count = (len(source) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
+        self.assertEqual(result.enqueued, expected_count)
+        self.assertEqual(result.captured_bytes, len(source))
+        items = sorted(
+            (self.spool.load(path) for path in self.spool.list_pending()),
+            key=lambda item: item.manifest.start_offset,
+        )
+        reconstructed = b"".join(
+            validate_stored_payload(item.manifest, item.stored_payload)
+            for item in items
+        )
+        self.assertEqual(reconstructed, source)
+        for index, item in enumerate(items):
+            locator = item.manifest.records[0]
+            self.assertEqual(locator.parse_status, "fragment")
+            self.assertEqual(locator.native_type, None)
+            self.assertEqual(locator.occurred_at, None)
+            self.assertEqual(locator.native_record_start_offset, 0)
+            self.assertEqual(locator.native_record_end_offset, len(source))
+            self.assertEqual(
+                locator.native_record_sha256,
+                hashlib.sha256(source).hexdigest(),
+            )
+            self.assertEqual(locator.fragment_index, index)
+            self.assertEqual(locator.fragment_count, expected_count)
+            self.assertEqual(item.manifest.first_occurred_at, None)
+            self.assertEqual(item.manifest.last_occurred_at, None)
+        state = json.loads(
+            (self.root / "oversized-state" / "rollout-state.json").read_text()
+        )
+        self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
+
+    def test_fragment_spooling_replays_safely_before_logical_checkpoint(self):
+        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        self.rollout.write_bytes(source)
+        state_root = self.root / "fragment-replay-state"
+        capturer = RolloutCapturer(state_root, self.spool, chunk_bytes=128)
+        enqueue = self.spool.enqueue
+        calls = 0
+
+        def crash_after_enqueue(manifest, stored):
+            nonlocal calls
+            calls += 1
+            path = enqueue(manifest, stored)
+            if calls == 3:
+                raise OSError("simulated crash after durable enqueue")
+            return path
+
+        with (
+            patch.object(self.spool, "enqueue", side_effect=crash_after_enqueue),
+            self.assertRaisesRegex(OSError, "simulated crash"),
+        ):
+            capturer.capture([self.rollout])
+
+        self.assertEqual(len(self.spool.list_pending()), 3)
+        self.assertFalse((state_root / "rollout-state.json").exists())
+
+        result = capturer.capture([self.rollout])
+
+        expected_count = (len(source) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
+        self.assertEqual(result.enqueued, expected_count)
+        self.assertEqual(len(self.spool.list_pending()), expected_count)
+        state = json.loads((state_root / "rollout-state.json").read_text())
+        self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
+
+    def test_fragment_manifest_rejects_noncanonical_count(self):
+        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        self.rollout.write_bytes(source)
+        RolloutCapturer(
+            self.root / "fragment-contract-state",
+            self.spool,
+            chunk_bytes=128,
+        ).capture([self.rollout])
+        item = self.spool.load(self.spool.list_pending()[0])
+        value = json.loads(json.dumps(item.manifest.to_dict()))
+        value["records"][0]["fragment_count"] += 1
+
+        with self.assertRaisesRegex(ContractError, "not canonical"):
+            BatchManifest.from_dict(value)
+
+        value = json.loads(json.dumps(item.manifest.to_dict()))
+        value["end_offset"] += 1
+        value["source_byte_count"] += 1
+        with self.assertRaisesRegex(ContractError, "cover its complete batch"):
+            BatchManifest.from_dict(value)
+
+        value = json.loads(json.dumps(item.manifest.to_dict()))
+        value["first_occurred_at"] = "2026-08-19T00:00:00Z"
+        value["last_occurred_at"] = "2026-08-19T00:00:00Z"
+        with self.assertRaisesRegex(ContractError, "parsed metadata"):
+            BatchManifest.from_dict(value)
+
+    def test_native_record_hard_cap_rejects_without_checkpointing(self):
+        self.rollout.write_bytes(b"x" * (MAX_SOURCE_BYTES + 1))
+        state_root = self.root / "hard-cap-state"
+        capturer = RolloutCapturer(
+            state_root,
+            self.spool,
+            max_record_bytes=MAX_SOURCE_BYTES,
         )
 
         with self.assertRaisesRegex(ContractError, "native rollout record exceeds"):
             capturer.capture([self.rollout])
 
         self.assertEqual(self.spool.list_pending(), [])
-        self.assertFalse(
-            (self.root / "oversized-state" / "rollout-state.json").exists()
-        )
+        self.assertFalse((state_root / "rollout-state.json").exists())
 
 
 if __name__ == "__main__":
