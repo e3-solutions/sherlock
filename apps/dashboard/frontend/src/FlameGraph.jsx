@@ -34,6 +34,14 @@ const TOOLTIP_GAP = 10;
 const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;
 const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
 
+export const PERSON_RANK_OPTIONS = [
+  { value: "roster", label: "Name" },
+  { value: "active-time", label: "Active time" },
+  { value: "peak-sessions", label: "Peak sessions" },
+  { value: "prompts", label: "Prompts" },
+  { value: "subagents", label: "Subagents" },
+];
+
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
   minute: "2-digit",
@@ -49,6 +57,30 @@ function formatSessionCount(value) {
 
 function formatPromptCount(value) {
   return `${value} ${value === 1 ? "prompt" : "prompts"}`;
+}
+
+function personRankValue(person, rankBy) {
+  if (rankBy === "active-time") return person.activeSeconds;
+  if (rankBy === "peak-sessions") {
+    return person.buckets.reduce(
+      (peak, bucket) => Math.max(peak, bucket.activity),
+      0,
+    );
+  }
+  if (rankBy === "prompts") {
+    return person.buckets.reduce((total, bucket) => total + bucket.prompts, 0);
+  }
+  if (rankBy === "subagents") return person.total[1];
+  return 0;
+}
+
+/** Returns a ranked view without mutating the API's roster ordering. */
+export function rankPeople(people, rankBy) {
+  if (rankBy === "roster") return people;
+  return people
+    .map((person, index) => ({ person, index, value: personRankValue(person, rankBy) }))
+    .sort((left, right) => right.value - left.value || left.index - right.index)
+    .map(({ person }) => person);
 }
 
 async function apiFailure(response, fallback) {
@@ -853,7 +885,14 @@ function useSharedChartWidth(scrollportRef, requestedWidth) {
   return Math.max(1, measuredWidth);
 }
 
-export default function FlameGraph({ data, chartWidth, stale = false, onRefresh, timelineMeta }) {
+export default function FlameGraph({
+  data,
+  chartWidth,
+  stale = false,
+  onRefresh,
+  rankBy = "roster",
+  timelineMeta,
+}) {
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
@@ -885,6 +924,10 @@ export default function FlameGraph({ data, chartWidth, stale = false, onRefresh,
   const windowLabel = formatWindowDuration(windowMinutes);
   const ticks = data.axisTicks ?? createTimeAxisTicks(data.startMs, bucketCount);
   const endMs = data.startMs + bucketCount * BUCKET_MS;
+  const rankedPeople = useMemo(
+    () => rankPeople(data.people, rankBy),
+    [data.people, rankBy],
+  );
   const selectedPerson = selection
     ? data.people.find(({ id }) => id === selection.personId)
     : null;
@@ -1170,7 +1213,7 @@ export default function FlameGraph({ data, chartWidth, stale = false, onRefresh,
         aria-label={`People activity timelines, ${data.people.length} people`}
         tabIndex={0}
       >
-        {data.people.map((person) => (
+        {rankedPeople.map((person) => (
           <PersonLane
             key={person.id}
             person={person}

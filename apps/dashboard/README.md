@@ -113,7 +113,10 @@ objects.
   timeline refresh can correctly include newly normalized evidence.
 - Initial page load makes one `GET /api/flame` request and renders the complete
   144-bucket timeline as a single view. The graph never shrinks to a different
-  preview window while the full aggregate is loading.
+  preview window while the full aggregate is loading. People can be ranked in
+  the browser by active time, peak observed sessions in one bucket, canonical
+  prompt count, or distinct subagent sessions. Ranking creates a product view
+  over the adapted payload; it does not mutate the roster or source telemetry.
 
 ## Initial-load cache
 

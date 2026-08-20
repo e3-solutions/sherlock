@@ -203,12 +203,64 @@ input { font: inherit; }
 }
 
 .flame-legends {
-  display: flex;
+  display: grid;
   width: 100%;
   min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
   gap: 24px;
+}
+
+.flame-rank-selector {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.flame-rank-selector > span {
+  flex: 0 0 auto;
+  color: var(--flame-muted);
+  font-size: 9px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.flame-rank-selector > div {
+  display: flex;
+  min-width: 0;
+  border: 1px solid var(--flame-rule);
+}
+
+.flame-rank-selector button {
+  min-height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--flame-rule);
+  background: transparent;
+  color: var(--flame-muted);
+  cursor: pointer;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.flame-rank-selector button:last-child { border-right: 0; }
+
+.flame-rank-selector button:hover { color: var(--flame-ink); }
+
+.flame-rank-selector button[aria-pressed="true"] {
+  background: var(--flame-ink);
+  color: var(--flame-page);
+}
+
+.flame-rank-selector button:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 1px solid var(--flame-selected);
+  outline-offset: 2px;
 }
 
 .flame-legend {
@@ -1026,6 +1078,8 @@ input { font: inherit; }
     border-top: 1px solid var(--flame-rule);
   }
   .flame-legends { gap: 6px; }
+  .flame-rank-selector { gap: 5px; }
+  .flame-rank-selector button { padding: 0 5px; font-size: 8px; }
   .flame-legend { gap: 10px; }
   .flame-legend li { gap: 4px; }
   .flame-legend,
@@ -1044,9 +1098,23 @@ input { font: inherit; }
   .flame-person-rail h2 { font-size: 14px; }
 
   .flame-legends {
+    display: flex;
     flex-wrap: wrap;
     gap: 8px 16px;
   }
+  .flame-rank-selector {
+    width: 100%;
+    order: 3;
+  }
+  .flame-rank-selector > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+  .flame-rank-selector > div { width: 100%; }
+  .flame-rank-selector button { flex: 1 1 0; padding: 0 3px; }
   .flame-legend {
     gap: 8px;
   }
