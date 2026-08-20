@@ -5,11 +5,19 @@ import hashlib
 import json
 import os
 import stat as stat_module
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping
 
-from .contract import ContractError, MAX_RECORDS, MAX_SOURCE_BYTES, build_source_batch
+from .contract import (
+    FRAGMENT_BYTES,
+    MAX_LOGICAL_RECORD_BYTES,
+    MAX_RECORDS,
+    MAX_SOURCE_BYTES,
+    ContractError,
+    build_source_batch,
+)
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
@@ -30,6 +38,7 @@ class NativeRecordFragmentPlan:
     end_offset: int
     sha256: str
     fragment_count: int
+    terminated: bool
 
 
 @dataclass
@@ -355,13 +364,51 @@ class RolloutCapturer:
             enqueued = captured = 0
             while state.offset < stable_end and captured < byte_budget:
                 remaining_budget = byte_budget - captured
-                source = self._read_chunk(
-                    handle,
-                    state.offset,
-                    stable_end,
-                    min(self.chunk_bytes, remaining_budget),
-                    remaining_budget,
-                )
+                try:
+                    source = self._read_chunk(
+                        handle,
+                        state.offset,
+                        stable_end,
+                        min(self.chunk_bytes, remaining_budget),
+                        remaining_budget,
+                    )
+                except _OversizedNativeRecord:
+                    # max_sync_bytes selects ordinary batches. One logical native
+                    # record may exceed it because every deterministic fragment
+                    # must be durable before the logical cursor can advance.
+                    plan = self._native_record_fragment_plan(
+                        handle,
+                        state.offset,
+                        stable_end,
+                    )
+                    if not plan.terminated and not self.capture_unterminated_tail:
+                        break
+                    if plan.end_offset - plan.start_offset <= MAX_SOURCE_BYTES:
+                        raise ContractError(
+                            f"native source record exceeds {self.max_object_bytes} bytes"
+                        )
+                    fragment_enqueued, fragment_captured = self._enqueue_fragments(
+                        handle,
+                        key,
+                        state,
+                        plan,
+                        native_session_ids.get(str(path)),
+                        parent_native_session_ids.get(str(path)),
+                        workload_class,
+                    )
+                    after = os.fstat(handle.fileno())
+                    if (
+                        after.st_dev != details.st_dev
+                        or after.st_ino != details.st_ino
+                        or after.st_size < stable_end
+                    ):
+                        raise OSError("native source file changed while fragmenting")
+                    state.offset = plan.end_offset
+                    states[key] = state
+                    self._save_state(states, candidate_cursor)
+                    enqueued += fragment_enqueued
+                    captured += fragment_captured
+                    continue
                 if not source:
                     break
                 manifest, stored = build_source_batch(
@@ -396,6 +443,107 @@ class RolloutCapturer:
                 captured += len(source)
             states[key] = state
             return enqueued, captured
+
+    def _native_record_fragment_plan(
+        self,
+        handle,
+        start: int,
+        stable_end: int,
+    ) -> NativeRecordFragmentPlan:
+        handle.seek(start)
+        digest = hashlib.sha256()
+        end = start
+        terminated = False
+        while end < stable_end:
+            chunk = handle.read(min(SCAN_BYTES, stable_end - end))
+            if not chunk:
+                break
+            newline = chunk.find(b"\n")
+            selected = chunk if newline < 0 else chunk[: newline + 1]
+            digest.update(selected)
+            end += len(selected)
+            if end - start > self.max_record_bytes:
+                raise ContractError(
+                    f"native source record exceeds {self.max_record_bytes} bytes"
+                )
+            if newline >= 0:
+                terminated = True
+                break
+        length = end - start
+        if length <= self.max_object_bytes:
+            raise ContractError("could not locate an oversized native source record")
+        return NativeRecordFragmentPlan(
+            start_offset=start,
+            end_offset=end,
+            sha256=digest.hexdigest(),
+            fragment_count=(length + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES,
+            terminated=terminated,
+        )
+
+    def _enqueue_fragments(
+        self,
+        handle,
+        source_stream_key: str,
+        state: StreamState,
+        plan: NativeRecordFragmentPlan,
+        observed_native_session_id: str | None,
+        observed_parent_native_session_id: str | None,
+        workload_class: str | None,
+    ) -> tuple[int, int]:
+        record_bytes = plan.end_offset - plan.start_offset
+        with tempfile.TemporaryFile(mode="w+b", dir=self.state_root) as staged:
+            handle.seek(plan.start_offset)
+            digest = hashlib.sha256()
+            remaining = record_bytes
+            while remaining:
+                source = handle.read(min(SCAN_BYTES, remaining))
+                if not source:
+                    raise OSError("native source record changed while staging")
+                digest.update(source)
+                staged.write(source)
+                remaining -= len(source)
+            if digest.hexdigest() != plan.sha256:
+                raise OSError("native source record changed while staging")
+
+            captured = 0
+            for fragment_index in range(plan.fragment_count):
+                relative_start = fragment_index * FRAGMENT_BYTES
+                start = plan.start_offset + relative_start
+                end = min(start + FRAGMENT_BYTES, plan.end_offset)
+                staged.seek(relative_start)
+                source = staged.read(end - start)
+                if len(source) != end - start:
+                    raise OSError("staged native source record is incomplete")
+                manifest, stored = build_source_batch(
+                    source,
+                    source_stream_key=source_stream_key,
+                    generation_key=state.generation_key,
+                    generation_seq=state.generation_seq,
+                    start_offset=start,
+                    source_provider=self.source_provider,
+                    source_kind=self.source_kind,
+                    observed_native_session_id=observed_native_session_id,
+                    observed_parent_native_session_id=observed_parent_native_session_id,
+                    source_version=self.source_version,
+                    codex_version=(
+                        self.source_version if self.source_provider == "codex" else None
+                    ),
+                    collector_version=self.collector_version,
+                    native_record_fragment={
+                        "native_record_start_offset": plan.start_offset,
+                        "native_record_end_offset": plan.end_offset,
+                        "native_record_sha256": plan.sha256,
+                        "fragment_index": fragment_index,
+                        "fragment_count": plan.fragment_count,
+                    },
+                )
+                self.spool.enqueue(
+                    manifest,
+                    stored,
+                    workload_class=workload_class,
+                )
+                captured += len(source)
+        return plan.fragment_count, captured
 
     def _canonical_path(self, value: Path | str) -> Path:
         path = Path(value).expanduser()
@@ -473,17 +621,20 @@ class RolloutCapturer:
             return self._limit_records(candidate[: newline + 1])
         # One native record exceeds the normal chunk size. Keep it whole rather than
         # splitting or truncating source evidence.
-        overflow_limit = min(self.max_object_bytes, remaining, byte_budget)
+        overflow_limit = min(self.max_object_bytes, remaining)
         overflow = handle.read(overflow_limit - len(candidate))
         complete = candidate + overflow
         newline = complete.find(b"\n", len(candidate))
         if newline < 0 and remaining > overflow_limit:
-            if byte_budget < min(self.max_object_bytes, remaining):
-                return b""
-            raise ContractError(
-                f"native rollout record exceeds {self.max_object_bytes} bytes"
+            raise _OversizedNativeRecord(
+                f"native source record exceeds {self.max_object_bytes} bytes"
             )
-        return self._limit_records(complete if newline < 0 else complete[: newline + 1])
+        selected = complete if newline < 0 else complete[: newline + 1]
+        if len(selected) > byte_budget:
+            return b""
+        if newline < 0 and not self.capture_unterminated_tail:
+            return b""
+        return self._limit_records(selected)
 
     @staticmethod
     def _deferred_snapshots(

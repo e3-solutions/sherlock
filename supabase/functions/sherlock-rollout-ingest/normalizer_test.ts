@@ -310,6 +310,65 @@ Deno.test("normalizer never parses a native record fragment", async () => {
   assert(projection.events[0].content_excerpt === null);
 });
 
+Deno.test("Claude fragments cannot poison provider-specific session facts", async () => {
+  const { manifest, source } = await fixture([{
+    sessionId: "fabricated-session",
+    agentId: "fabricated-agent",
+    isSidechain: true,
+    customTitle: "fabricated title",
+    gitBranch: "fabricated-branch",
+    cwd: "/fabricated",
+    type: "assistant",
+    message: {
+      role: "assistant",
+      model: "fabricated-model",
+      content: [{ type: "text", text: "fabricated message" }],
+    },
+  }]);
+  manifest.source_provider = "claude_code";
+  manifest.source_kind = "transcript";
+  manifest.source_version = "2.0.59";
+  manifest.codex_version = null;
+  manifest.observed_native_session_id = "observed-session";
+  manifest.records[0] = {
+    ...manifest.records[0],
+    native_type: null,
+    native_payload_type: null,
+    occurred_at: null,
+    parse_status: "fragment",
+    native_record_start_offset: 0,
+    native_record_end_offset: source.byteLength * 2,
+    native_record_sha256: "f".repeat(64),
+    fragment_index: 0,
+    fragment_count: 2,
+  };
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(projection.session?.native_session_id === "observed-session");
+  assert(
+    projection.session?.actor_role === "primary",
+    `unexpected fragment actor role: ${projection.session?.actor_role}`,
+  );
+  assert(projection.session?.title === null);
+  assert(projection.session?.branch === null);
+  assert(projection.session?.cwd === null);
+  assert(projection.session?.model === null);
+  assert(projection.events.length === 1);
+  const fragment = projection.events[0];
+  assert(fragment.event_kind === "unknown");
+  assert(fragment.error_code === "native_fragment");
+  assert(fragment.native_item_id === null);
+  assert(fragment.parent_native_item_id === null);
+  assert(fragment.event_subtype === null);
+  assert(fragment.message_role === null);
+  assert(fragment.model === null);
+  assert(fragment.branch === null);
+  assert(fragment.cwd === null);
+  assert(fragment.attributes === null);
+  assert(fragment.content_excerpt === null);
+});
+
 Deno.test("usage without a native session keeps a deterministic stream scope", async () => {
   const { manifest, source } = await fixture([{
     timestamp: "2026-08-15T00:00:00Z",

@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from sherlock_collector import discovery as discovery_module
 from sherlock_collector.claude_hook import write_observation
+from sherlock_collector.contract import FRAGMENT_BYTES, MAX_SOURCE_BYTES
 from sherlock_collector.discovery import (
     CLAUDE_BACKFILL_MAX_BYTES,
     CLAUDE_BACKFILL_MAX_FILES,
@@ -1121,6 +1122,168 @@ class ClaudePluginTests(unittest.TestCase):
                 for item in items
             )
             self.assertEqual(reconstructed, source)
+
+    def test_oversized_claude_subagent_defers_then_fragments_provider_neutrally(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            primary_id = "11111111-1111-4111-8111-111111111111"
+            agent_id = "worker-oversized"
+            transcript = (
+                claude_home
+                / "projects"
+                / "repo"
+                / primary_id
+                / "subagents"
+                / f"agent-{agent_id}.jsonl"
+            )
+            transcript.parent.mkdir(parents=True)
+            prefix = (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": primary_id,
+                        "agentId": agent_id,
+                        "isSidechain": True,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                        },
+                    },
+                    separators=(",", ":"),
+                )[:-3]
+                + '"'
+            ).encode()
+            suffix = b'"}}'
+            target_without_newline = MAX_SOURCE_BYTES + 37
+            oversized_partial = (
+                prefix
+                + b"x" * (target_without_newline - len(prefix) - len(suffix))
+                + suffix
+            )
+            self.assertEqual(len(oversized_partial), target_without_newline)
+            transcript.write_bytes(oversized_partial)
+            state_root = root / "state"
+            spool = DurableSpool(state_root / "queue")
+            capturer = RolloutCapturer(
+                state_root,
+                spool,
+                source_provider="claude_code",
+                source_kind="transcript",
+                state_name="claude-transcript",
+                capture_unterminated_tail=False,
+                allowed_root=claude_home / "projects",
+            )
+
+            partial_discovery = discover_claude_transcripts(
+                claude_home,
+                lookback_seconds=24 * 60 * 60,
+            )
+            partial = capturer.capture(
+                partial_discovery.paths,
+                native_session_ids=partial_discovery.native_session_ids,
+                parent_native_session_ids=(
+                    partial_discovery.parent_native_session_ids
+                ),
+                source_snapshots=partial_discovery.source_snapshots,
+                max_sync_bytes=1024 * 1024,
+                backlog_workload_class="backfill",
+            )
+            self.assertEqual(partial.enqueued, 0)
+            self.assertEqual(partial.captured_bytes, 0)
+            self.assertEqual(partial.deferred_bytes, len(oversized_partial))
+
+            later = (
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": primary_id,
+                        "agentId": agent_id,
+                        "isSidechain": True,
+                        "message": {"role": "user", "content": "later"},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+            with transcript.open("ab") as handle:
+                handle.write(b"\n" + later)
+            complete_discovery = discover_claude_transcripts(
+                claude_home,
+                lookback_seconds=24 * 60 * 60,
+            )
+            fragmented = capturer.capture(
+                complete_discovery.paths,
+                native_session_ids=complete_discovery.native_session_ids,
+                parent_native_session_ids=(
+                    complete_discovery.parent_native_session_ids
+                ),
+                source_snapshots=complete_discovery.source_snapshots,
+                max_sync_bytes=1024 * 1024,
+                backlog_workload_class="backfill",
+            )
+            oversized = oversized_partial + b"\n"
+            expected_fragments = (
+                len(oversized) + FRAGMENT_BYTES - 1
+            ) // FRAGMENT_BYTES
+            self.assertEqual(fragmented.enqueued, expected_fragments)
+            self.assertEqual(fragmented.captured_bytes, len(oversized))
+            self.assertEqual(fragmented.deferred_bytes, len(later))
+
+            fragment_items = [
+                json.loads(path.read_text())
+                for path in (state_root / "queue" / "pending").glob("*.json")
+            ]
+            fragment_items.sort(key=lambda item: item["manifest"]["start_offset"])
+            self.assertEqual(len(fragment_items), expected_fragments)
+            for index, item in enumerate(fragment_items):
+                manifest = item["manifest"]
+                locator = manifest["records"][0]
+                self.assertEqual(manifest["source_provider"], "claude_code")
+                self.assertEqual(manifest["source_kind"], "transcript")
+                self.assertEqual(manifest["observed_native_session_id"], agent_id)
+                self.assertEqual(
+                    manifest["observed_parent_native_session_id"],
+                    primary_id,
+                )
+                self.assertEqual(locator["parse_status"], "fragment")
+                self.assertEqual(locator["fragment_index"], index)
+                self.assertEqual(locator["fragment_count"], expected_fragments)
+                self.assertEqual(item["metadata"]["workload_class"], "backfill")
+            reconstructed = b"".join(
+                gzip.decompress(
+                    base64.b64decode(item["stored_payload_base64"], validate=True)
+                )
+                for item in fragment_items
+            )
+            self.assertEqual(reconstructed, oversized)
+
+            resumed = capturer.capture(
+                complete_discovery.paths,
+                native_session_ids=complete_discovery.native_session_ids,
+                parent_native_session_ids=(
+                    complete_discovery.parent_native_session_ids
+                ),
+                source_snapshots=complete_discovery.source_snapshots,
+                backlog_workload_class="backfill",
+            )
+            self.assertEqual(resumed.enqueued, 1)
+            self.assertEqual(resumed.captured_bytes, len(later))
+            self.assertEqual(resumed.deferred_bytes, 0)
+            all_items = [
+                json.loads(path.read_text())
+                for path in (state_root / "queue" / "pending").glob("*.json")
+            ]
+            ordinary = next(
+                item
+                for item in all_items
+                if item["manifest"]["records"][0]["parse_status"] != "fragment"
+            )
+            self.assertEqual(ordinary["manifest"]["source_provider"], "claude_code")
+            self.assertEqual(
+                ordinary["manifest"]["observed_parent_native_session_id"],
+                primary_id,
+            )
 
     def test_claude_backfill_does_not_stop_at_live_hook_file_limit(self):
         with TemporaryDirectory() as temporary:

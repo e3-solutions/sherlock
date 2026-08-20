@@ -32,13 +32,16 @@ and never reads beyond that boundary. It queues only complete JSONL records
 through the same immutable checkpoint and spool used by live hooks, then starts
 one detached drain. A rerun does not duplicate captured byte ranges.
 
-One pass is bounded to 4,096 files and 512 MiB. The durable cursor advances
-across every eligible transcript rather than repeatedly selecting only the
-newest files. JSON status reports `deferred_files` and `deferred_bytes` when a
-pass reaches a bound or observes an incomplete trailing record; a partial
-result prints a warning, and later `SessionStart` hooks resume the same
-checkpointed catch-up. Once Claude finishes the trailing record, Sherlock
-queues that exact remaining byte range once.
+One pass uses a 4,096-file and 512-MiB normal-batch selection budget. A single
+logical record already selected at that boundary may exceed the remaining
+budget, up to the 100-MiB logical-record cap, because its deterministic
+fragments must become durable before its checkpoint advances. The durable
+cursor advances across every eligible transcript rather than repeatedly
+selecting only the newest files. JSON status reports `deferred_files` and
+`deferred_bytes` when a pass reaches a bound or observes an incomplete trailing
+record; a partial result prints a warning, and later `SessionStart` hooks resume
+the same checkpointed catch-up. Once Claude finishes the trailing record,
+Sherlock queues that exact remaining byte range once.
 Historical transcripts do not fabricate `Stop` or `SubagentStop` evidence that
 Sherlock never observed, so pre-install turns can remain provisionally open.
 

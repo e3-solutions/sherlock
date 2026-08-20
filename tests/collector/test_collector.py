@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import threading
@@ -20,6 +21,7 @@ from sherlock_collector.contract import (
     RECEIPT_VERSION,
     build_rollout_batch,
     build_source_batch,
+    validate_stored_payload,
 )
 from sherlock_collector.config import CollectorIdentity
 from sherlock_collector.drain import (
@@ -937,10 +939,14 @@ class RolloutCaptureTests(unittest.TestCase):
         enqueue = self.spool.enqueue
         calls = 0
 
-        def crash_after_enqueue(manifest, stored):
+        def crash_after_enqueue(manifest, stored, *, workload_class=None):
             nonlocal calls
             calls += 1
-            path = enqueue(manifest, stored)
+            path = enqueue(
+                manifest,
+                stored,
+                workload_class=workload_class,
+            )
             if calls == 3:
                 raise OSError("simulated crash after durable enqueue")
             return path
@@ -961,6 +967,53 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(len(self.spool.list_pending()), expected_count)
         state = json.loads((state_root / "rollout-state.json").read_text())
         self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
+
+    def test_fragment_staging_rejects_mutation_before_any_spool_visibility(self):
+        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        self.rollout.write_bytes(source)
+        state_root = self.root / "fragment-mutation-state"
+        rollout = self.rollout
+
+        class MutatingCapturer(RolloutCapturer):
+            def _native_record_fragment_plan(self, handle, start, stable_end):
+                plan = super()._native_record_fragment_plan(
+                    handle,
+                    start,
+                    stable_end,
+                )
+                with rollout.open("r+b") as writer:
+                    writer.seek(5 * 1024 * 1024)
+                    original = writer.read(1)
+                    writer.seek(-1, os.SEEK_CUR)
+                    writer.write(b"y" if original != b"y" else b"z")
+                return plan
+
+        with self.assertRaisesRegex(OSError, "changed while staging"):
+            MutatingCapturer(
+                state_root,
+                self.spool,
+                chunk_bytes=128,
+            ).capture([self.rollout])
+
+        self.assertEqual(self.spool.list_pending(), [])
+        self.assertFalse((state_root / "rollout-state.json").exists())
+
+        result = RolloutCapturer(
+            state_root,
+            self.spool,
+            chunk_bytes=128,
+        ).capture([self.rollout])
+        expected_count = (len(source) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
+        self.assertEqual(result.enqueued, expected_count)
+        items = sorted(
+            (self.spool.load(path) for path in self.spool.list_pending()),
+            key=lambda item: item.manifest.start_offset,
+        )
+        reconstructed = b"".join(
+            validate_stored_payload(item.manifest, item.stored_payload)
+            for item in items
+        )
+        self.assertEqual(reconstructed, self.rollout.read_bytes())
 
     def test_fragment_manifest_rejects_noncanonical_count(self):
         source = b"x" * (MAX_SOURCE_BYTES + 1)
@@ -998,7 +1051,7 @@ class RolloutCaptureTests(unittest.TestCase):
             max_record_bytes=MAX_SOURCE_BYTES,
         )
 
-        with self.assertRaisesRegex(ContractError, "native rollout record exceeds"):
+        with self.assertRaisesRegex(ContractError, "native source record exceeds"):
             capturer.capture([self.rollout])
 
         self.assertEqual(self.spool.list_pending(), [])

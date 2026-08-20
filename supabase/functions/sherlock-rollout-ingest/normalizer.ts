@@ -455,7 +455,11 @@ async function projectClaudeBatch(
 ): Promise<BatchProjection> {
   const records = manifest.records.map((locator) => ({
     locator,
-    envelope: parseEnvelope(recordBytes(manifest, source, locator)),
+    // A transport fragment is opaque source evidence, never a partial Claude
+    // envelope. Provider-native interpretation starts only after reassembly.
+    envelope: locator.parse_status === "fragment"
+      ? null
+      : parseEnvelope(recordBytes(manifest, source, locator)),
   }));
   const envelopes = records.flatMap((record) =>
     record.envelope ? [record.envelope] : []

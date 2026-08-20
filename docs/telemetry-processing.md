@@ -154,22 +154,28 @@ disables automatic activity reduction; this is a degraded emergency mode, not
 a steady state. Do not stop Railway with backlog present, delete queue/raw rows,
 or re-enable the full-workspace Cron as a permanent design.
 
-## Oversized rollout records
+## Oversized native records
 
 Deploy the ingest function and Railway worker before collectors that can emit
-fragments. A rollout JSONL record over 16 MiB and up to 100 MiB is transported
-as deterministic 4 MiB v1 fragments using the fragment columns already present
-on `telemetry.native_records`. Each fragment remains an immutable, independently
-verifiable raw fact. The normalizer emits a bounded `unknown/native_fragment`
-coverage event instead of parsing a partial JSON document, so the oversized
-record itself does not create product activity while later records in the same
-stream continue normally. The complete raw record remains reconstructable from
-its ordered fragments and full-record hash.
+fragments. A Codex rollout or Claude transcript JSONL record over 16 MiB and up
+to 100 MiB is transported as deterministic 4 MiB v1 fragments using the
+fragment columns already present on `telemetry.native_records`. Each fragment
+remains an immutable, independently verifiable raw fact. The normalizer emits a
+bounded `unknown/native_fragment` coverage event instead of parsing a partial
+JSON document, so the oversized record itself does not create product activity
+while later records in the same stream continue normally. The complete raw
+record remains reconstructable from its ordered fragments and full-record hash.
 
 The collector's synchronous byte budget may be exceeded by one logical record:
 all fragments of that record are published durably before its cursor advances.
 This keeps crash replay stateless and idempotent at the cost of one bounded
 100 MiB worst-case capture.
+
+Official collectors upload each stream in generation and source-offset order.
+The worker additionally blocks a committed later range while an earlier
+committed range is queued or leased, but it cannot infer a predecessor that has
+not reached ingest. Direct producers must therefore preserve the same per-stream
+upload order; concurrency remains available across independent streams.
 
 Rolling collectors back stops new fragments. Rolling the server back first can
 reject already-spooled fragments; collectors retain that head and block only

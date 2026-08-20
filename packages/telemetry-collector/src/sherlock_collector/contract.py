@@ -21,8 +21,10 @@ NATIVE_LABEL_BYTES = 256
 IDENTITY_HINT_BYTES = 512
 VERSION_HINT_BYTES = 128
 MAX_RECORDS = 20_000
-MAX_SOURCE_BYTES = 5 * 1024 * 1024
-MAX_STORED_BYTES = 6 * 1024 * 1024
+MAX_SOURCE_BYTES = 16 * 1024 * 1024
+MAX_STORED_BYTES = 17 * 1024 * 1024
+FRAGMENT_BYTES = 4 * 1024 * 1024
+MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024
 SOURCE_KINDS = {
     "codex": frozenset({"rollout"}),
     "claude_code": frozenset({"transcript", "hook"}),
@@ -538,6 +540,7 @@ def build_rollout_batch(
     observed_native_session_id: str | None = None,
     codex_version: str | None = None,
     collector_version: str | None = None,
+    native_record_fragment: Mapping[str, Any] | None = None,
 ) -> tuple[BatchManifest, bytes]:
     return build_source_batch(
         source_bytes,
@@ -551,6 +554,7 @@ def build_rollout_batch(
         codex_version=codex_version,
         source_version=codex_version,
         collector_version=collector_version,
+        native_record_fragment=native_record_fragment,
     )
 
 
