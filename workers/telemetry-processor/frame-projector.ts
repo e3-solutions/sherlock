@@ -12,6 +12,7 @@ const UNKEYED_PROMPT_MATCH_MS = 2_000;
 const ADJACENT_PROMPT_MATCH_MS = 100;
 const ASSISTANT_REPRESENTATION_MATCH_MS = 3_000;
 const DEFAULT_FRAME_LOCK_TIMEOUT_MS = 60_000;
+const REVISION_INSERT_BATCH_SIZE = 3_000;
 
 export const FRAME_LOCK_TIMEOUT_SQL =
   "select set_config('statement_timeout', $1, false)";
@@ -39,6 +40,18 @@ export function nativeItemTimestampSql(column: string): string {
     ) / 1000.0)
     else null
   end`;
+}
+
+export function revisionInsertBatches<T>(values: readonly T[]): T[][] {
+  const batches: T[][] = [];
+  for (
+    let index = 0;
+    index < values.length;
+    index += REVISION_INSERT_BATCH_SIZE
+  ) {
+    batches.push(values.slice(index, index + REVISION_INSERT_BATCH_SIZE));
+  }
+  return batches;
 }
 
 export interface FrameProjectionOptions {
@@ -445,9 +458,11 @@ export class PostgresFrameEvidenceProjector {
             }));
             // postgres.js supports Query fragments in its runtime values
             // builder, but its object-helper type excludes those fragments.
-            await tx`insert into analytics.frame_evidence_revisions ${
-              tx(inserts as never, ...REVISION_COLUMNS)
-            }`;
+            for (const batch of revisionInsertBatches(inserts)) {
+              await tx`insert into analytics.frame_evidence_revisions ${
+                tx(batch as never, ...REVISION_COLUMNS)
+              }`;
+            }
           }
           return {
             candidate_count: desired.length,
