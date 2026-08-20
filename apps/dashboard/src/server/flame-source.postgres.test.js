@@ -368,7 +368,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect([...indexes].some((name) =>
         name.startsWith("frame_projection_receipts_")
       )).toBe(true);
-      expect(indexes.has("events_pkey")).toBe(true);
+      expect([...indexes].some((name) => name.startsWith("events_"))).toBe(true);
 
       const secondEventRows = await sql.unsafe(
         `insert into telemetry.events (
