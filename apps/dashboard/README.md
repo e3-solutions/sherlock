@@ -125,6 +125,18 @@ objects.
   work evidence are pinned to the aggregate's immutable MVCC visibility token. This is a
   read-consistency boundary, not a durable pipeline publication cutoff: a later
   timeline refresh can correctly include newly normalized evidence.
+- Snapshot tokens remain source-explicit during the frame-projection rollout.
+  Legacy `v1` tokens always use the canonical raw-event queries. Once an owner
+  activates the exact immutable `frame-evidence-v1` version for the workspace,
+  a projection-backed timeline emits `v2` tokens containing that version and
+  every lazy evidence read stays on the matching append-only projection. A v2
+  failure is surfaced; it never silently falls back to a different evidence
+  universe. Existing v1 tokens remain usable through their normal expiry.
+- Projection-backed timeline reads touch only the indexed analytics receipts
+  and evidence revisions. Interval summaries, prompt excerpts, and conversation
+  pages select bounded source event IDs first and then use primary-key joins to
+  immutable `telemetry.events` for stored excerpts. They do not rescan sessions,
+  native-record locators, or ingest batches on the click path.
 - Initial page load makes one `GET /api/flame` request and renders the complete
   144-bucket timeline as a single view. The graph never shrinks to a different
   preview window while the full aggregate is loading. People can be ranked in
@@ -168,7 +180,8 @@ filters every roster, detail, and MCP evidence read for that one-workspace
 service. SUPABASE_DB_URL reuses
 the existing Sherlock worker login contract, which can assume
 sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
-exceed 1000.
+exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
+the additive frame-projection migration or when stopping new v2 token minting.
 
 ## Bonaparte MCP
 

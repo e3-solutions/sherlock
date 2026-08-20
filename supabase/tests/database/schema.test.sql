@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(96);
+select plan(120);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -16,7 +16,42 @@ select has_table('telemetry', 'ingest_batches', 'ingest_batches table exists');
 select has_table('telemetry', 'native_records', 'native_records table exists');
 select has_table('telemetry', 'events', 'events table exists');
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
+select has_table(
+  'analytics', 'frame_projection_receipts',
+  'frame projection receipts are auditable'
+);
+select has_table(
+  'analytics', 'frame_evidence_revisions',
+  'frame evidence revisions are append-only'
+);
+select has_table(
+  'analytics', 'frame_projection_activations',
+  'frame projection activation is explicit'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+    where conrelid = 'analytics.frame_projection_activations'::regclass
+      and contype = 'p'
+      and pg_get_constraintdef(oid) =
+        'PRIMARY KEY (workspace_id, frame_version)'
+  ) and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'analytics'
+      and table_name = 'frame_projection_activations'
+      and column_name = 'id'
+  ),
+  'frame activation uses only its exact workspace and version identity'
+);
 select has_table('processing', 'telemetry_jobs', 'durable telemetry queue exists');
+select has_column(
+  'analytics', 'frame_projection_receipts', 'request_generation',
+  'projection receipts preserve queue generation'
+);
+select has_column(
+  'analytics', 'frame_projection_receipts', 'session_updated_at',
+  'projection receipts preserve the consumed session-cache revision'
+);
 select has_column('telemetry', 'people', 'github_id', 'people records GitHub identity');
 select has_column(
   'telemetry', 'ingest_batches', 'processing_class_hint',
@@ -90,6 +125,10 @@ select ok(
   'queue processor role exists'
 );
 select ok(
+  exists (select 1 from pg_roles where rolname = 'sherlock_frame_projector'),
+  'frame projector role exists'
+);
+select ok(
   exists (
     select 1 from pg_roles
     where rolname = 'sherlock_worker_login' and rolcanlogin and not rolinherit
@@ -123,6 +162,10 @@ select ok(
 select ok(
   pg_has_role('sherlock_worker_login', 'sherlock_reducer', 'member'),
   'Railway login can assume the reducer role for activity revisions'
+);
+select ok(
+  pg_has_role('sherlock_worker_login', 'sherlock_frame_projector', 'member'),
+  'Railway login can assume the frame projector role'
 );
 select ok(
   pg_has_role('sherlock_worker_login', 'sherlock_reader', 'member'),
@@ -249,6 +292,122 @@ select ok(
   'reducer cannot update session caches'
 );
 select ok(
+  has_table_privilege('sherlock_frame_projector', 'telemetry.sessions', 'select') and
+  has_table_privilege('sherlock_frame_projector', 'telemetry.events', 'select'),
+  'frame projector can read normalized session evidence'
+);
+select ok(
+  has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'workspace_id', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'batch_id', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'record_index', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'source_start_offset', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'source_end_offset', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'native_type', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'native_payload_type', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'collector_key', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'source_kind', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'source_stream_key', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'generation_key', 'select'
+  ) and has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'generation_seq', 'select'
+  ),
+  'frame projector can read only canonical representation-pairing metadata'
+);
+select ok(
+  not has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records',
+    'record_sha256', 'select'
+  ) and not has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'source_sha256', 'select'
+  ) and not has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'storage_path', 'select'
+  ) and not has_table_privilege(
+    'sherlock_frame_projector', 'telemetry.native_records', 'update'
+  ) and not has_table_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches', 'update'
+  ),
+  'frame projector cannot read source fingerprints or object locations'
+);
+select ok(
+  has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_projection_receipts', 'insert'
+  ) and has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_evidence_revisions', 'insert'
+  ),
+  'frame projector can append receipts and evidence'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_projection_receipts', 'update'
+  ) and not has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_projection_receipts', 'delete'
+  ) and not has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_evidence_revisions', 'update'
+  ) and not has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_evidence_revisions', 'delete'
+  ),
+  'frame projection facts cannot be updated or deleted'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_projection_activations', 'insert'
+  ) and not has_table_privilege(
+    'sherlock_frame_projector',
+    'analytics.frame_projection_activations', 'select'
+  ),
+  'worker cannot inspect or activate a projection version'
+);
+select ok(
+  has_table_privilege(
+    'sherlock_reader', 'analytics.frame_projection_receipts', 'select'
+  ) and has_table_privilege(
+    'sherlock_reader', 'analytics.frame_evidence_revisions', 'select'
+  ) and has_table_privilege(
+    'sherlock_reader', 'analytics.frame_projection_activations', 'select'
+  ),
+  'reader can inspect activated frame projections'
+);
+select ok(
+  not has_table_privilege(
+    'anon', 'analytics.frame_evidence_revisions', 'select'
+  ) and not has_table_privilege(
+    'authenticated', 'analytics.frame_evidence_revisions', 'select'
+  ),
+  'frame evidence remains outside the Data API'
+);
+select ok(
   not has_table_privilege('sherlock_reader', 'telemetry.events', 'insert'),
   'reader cannot insert events'
 );
@@ -364,6 +523,87 @@ select ok(
       and pg_get_expr(i.indpred, i.indrelid) like '%(NOT is_replay)%'
   ),
   'dashboard timeline reads use the canonical timestamp window index'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'analytics'
+      and indexname = 'frame_evidence_revisions_reader_idx'
+      and indexdef like
+        '%workspace_id, frame_version, person_id, observed_at, evidence_kind, source_event_id, id DESC%'
+  ),
+  'frame reads have an indexed person and time revision path'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'analytics'
+      and indexname = 'frame_evidence_revisions_window_idx'
+      and indexdef like
+        '%workspace_id, frame_version, anchor_observed_at, evidence_kind, source_event_id, id DESC%'
+      and indexdef like
+        '%INCLUDE (receipt_id, person_id, session_id, observed_at, actor_role,%'
+      and indexdef like '%prompt_identity, is_summary_candidate, is_tombstone)%'
+  ),
+  'workspace timelines have an indexed anchor-time revision window'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'analytics'
+      and indexname = 'frame_evidence_revisions_diff_idx'
+      and indexdef like
+        '%workspace_id, session_id, frame_version, anchor_observed_at, evidence_kind, source_event_id, id DESC%'
+      and indexdef like
+        '%INCLUDE (receipt_id, person_id, observed_at, actor_role,%'
+      and indexdef like '%prompt_identity, is_summary_candidate, is_tombstone)%'
+  ),
+  'projector diffs have an indexed session and rolling-window path'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'analytics'
+      and indexname = 'frame_projection_receipts_latest_idx'
+      and indexdef like
+        '%workspace_id, session_id, frame_version, id DESC%'
+  ),
+  'latest session projection receipts are indexed'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+    where conrelid = 'analytics.frame_evidence_revisions'::regclass
+      and conname = 'frame_evidence_revisions_receipt_fkey' and contype = 'f'
+  ),
+  'evidence revisions cite an exact tenant-scoped receipt'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+    where conrelid = 'analytics.frame_evidence_revisions'::regclass
+      and conname = 'frame_evidence_revisions_source_event_fkey'
+      and contype = 'f'
+  ),
+  'evidence revisions retain source-event provenance'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+    where conrelid = 'analytics.frame_evidence_revisions'::regclass
+      and conname = 'frame_evidence_revisions_prompt_identity_shape_check'
+      and contype = 'c'
+  ),
+  'prompt identity exists only on prompt evidence'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+    where conrelid = 'analytics.frame_evidence_revisions'::regclass
+      and conname = 'frame_evidence_revisions_summary_candidate_check'
+      and contype = 'c'
+  ),
+  'summary eligibility is explicit and structurally bounded'
 );
 
 select ok(
@@ -712,8 +952,8 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 90,
-  'tables', 8,
+  'assertion_count', 120,
+  'tables', 11,
   'private_bucket', 'telemetry-raw'
 ) as verification;
 
