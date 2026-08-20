@@ -9,6 +9,8 @@ export const NORMALIZER_VERSIONS = Object.freeze([
   CLAUDE_NORMALIZER_VERSION,
 ]);
 export const DATABASE_ROLE = "sherlock_reader";
+const DEFAULT_STATEMENT_TIMEOUT_MS = 20_000;
+const TIMELINE_STATEMENT_TIMEOUT_MS = 30_000;
 const SNAPSHOT_TOKEN_VERSION = "v1";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
@@ -1166,11 +1168,19 @@ export class DirectFlameSource {
     await this.sql.end({ timeout: 5 });
   }
 
-  async transaction(callback, { signal } = {}) {
+  async transaction(callback, {
+    signal,
+    statementTimeoutMs = DEFAULT_STATEMENT_TIMEOUT_MS,
+  } = {}) {
     try {
       return await this.sql.begin(async (tx) => {
         await runQuery(tx, "set transaction isolation level repeatable read, read only", undefined, signal);
-        await runQuery(tx, "select set_config('statement_timeout', '20000', true)", undefined, signal);
+        await runQuery(
+          tx,
+          "select set_config('statement_timeout', $1, true)",
+          [String(statementTimeoutMs)],
+          signal,
+        );
         await runQuery(tx, `set local role ${DATABASE_ROLE}`, undefined, signal);
         return await callback(tx);
       });
@@ -1234,7 +1244,7 @@ export class DirectFlameSource {
         read.toISOString(),
       ], signal);
       return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
-    }, { signal });
+    }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
   }
 
   async fetchInterval({ personId, start, snapshot, signal, now }) {

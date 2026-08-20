@@ -125,16 +125,31 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.activity_spans");
   });
 
-  it("pins every source transaction to the read-only database role", async () => {
+  it("configures default source transactions before pinning the read-only role", async () => {
     const unsafe = vi.fn().mockResolvedValue([]);
     const source = Object.create(DirectFlameSource.prototype);
     source.sql = { begin: (callback) => callback({ unsafe }) };
 
     await source.transaction(async () => "ok");
 
-    expect(unsafe.mock.calls.map(([sql]) => sql)).toContain(
-      "set local role sherlock_reader",
-    );
+    expect(unsafe.mock.calls).toEqual([
+      ["set transaction isolation level repeatable read, read only"],
+      ["select set_config('statement_timeout', $1, true)", ["20000"]],
+      ["set local role sherlock_reader"],
+    ]);
+  });
+
+  it("allows a source transaction to select a 30-second statement timeout", async () => {
+    const unsafe = vi.fn().mockResolvedValue([]);
+    const source = Object.create(DirectFlameSource.prototype);
+    source.sql = { begin: (callback) => callback({ unsafe }) };
+
+    await source.transaction(async () => "ok", { statementTimeoutMs: 30_000 });
+
+    expect(unsafe.mock.calls[1]).toEqual([
+      "select set_config('statement_timeout', $1, true)",
+      ["30000"],
+    ]);
   });
 
   it("rejects incomplete result grids", () => {
@@ -336,6 +351,20 @@ describe("Sherlock Flame payload", () => {
       NORMALIZER_VERSIONS,
       READ.toISOString(),
     ]);
+  });
+
+  it("selects the 30-second transaction timeout only for the cached timeline", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    const signal = new AbortController().signal;
+    source.transaction = vi.fn().mockResolvedValue("timeline");
+
+    await expect(source.fetchDay({ signal })).resolves.toBe("timeline");
+
+    expect(source.transaction).toHaveBeenCalledOnce();
+    expect(source.transaction).toHaveBeenCalledWith(
+      expect.any(Function),
+      { signal, statementTimeoutMs: 30_000 },
+    );
   });
 
   it("uses stable prompt identifiers before a mutually unique source-stream bridge", () => {
