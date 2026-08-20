@@ -4,6 +4,7 @@ import {
   type EvidenceState,
   fingerprintEvidence,
   FRAME_ADVISORY_LOCK_SQL,
+  FRAME_BEGIN_SQL,
   FRAME_LOCK_TIMEOUT_SQL,
   FRAME_RESET_TIMEOUT_SQL,
   FRAME_SOURCE_COORDINATES_SQL,
@@ -196,9 +197,14 @@ Deno.test("projector bounds advisory-lock waits before taking its snapshot", () 
   );
   assert(
     implementation.indexOf("FRAME_ADVISORY_LOCK_SQL") <
-      implementation.indexOf("connection.begin"),
+      implementation.indexOf("FRAME_BEGIN_SQL"),
     "the session lock must be held before repeatable read takes a snapshot",
   );
+  assert(
+    !implementation.includes("connection.begin"),
+    "a reserved connection must not request a nested pool transaction",
+  );
+  assert(FRAME_BEGIN_SQL === "begin isolation level repeatable read");
 });
 
 Deno.test("projector and activation prove the complete session source state", () => {

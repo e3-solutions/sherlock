@@ -20,6 +20,9 @@ export const FRAME_ADVISORY_LOCK_SQL =
 export const FRAME_ADVISORY_UNLOCK_SQL =
   "select pg_advisory_unlock(hashtextextended($1, 0))";
 export const FRAME_RESET_TIMEOUT_SQL = "reset statement_timeout";
+export const FRAME_BEGIN_SQL = "begin isolation level repeatable read";
+export const FRAME_COMMIT_SQL = "commit";
+export const FRAME_ROLLBACK_SQL = "rollback";
 
 export interface FrameProjectionOptions {
   workspaceId: string;
@@ -309,9 +312,11 @@ export class PostgresFrameEvidenceProjector {
       lockAcquired = true;
       await connection.unsafe(FRAME_RESET_TIMEOUT_SQL);
       sessionTimeoutSet = false;
-      return await connection.begin(
-        "isolation level repeatable read",
-        async (tx) => {
+      await connection.unsafe(FRAME_BEGIN_SQL);
+      let transactionOpen = true;
+      try {
+        const tx = connection;
+        const result = await (async () => {
           if (options.statementTimeoutMs !== undefined) {
             await tx.unsafe(
               "select set_config('statement_timeout', $1, true)",
@@ -458,8 +463,21 @@ export class PostgresFrameEvidenceProjector {
             ).length,
             receipt_id: receiptId,
           };
-        },
-      );
+        })();
+        await connection.unsafe(FRAME_COMMIT_SQL);
+        transactionOpen = false;
+        return result;
+      } catch (error) {
+        if (transactionOpen) {
+          try {
+            await connection.unsafe(FRAME_ROLLBACK_SQL);
+          } catch {
+            // Preserve the projection failure; the reserved connection is
+            // released below even when rollback cleanup also fails.
+          }
+        }
+        throw error;
+      }
     } finally {
       try {
         if (lockAcquired) {
