@@ -11,9 +11,10 @@ vi.mock("./flame-data.js", () => ({
 }));
 
 vi.mock("./FlameGraph.jsx", () => ({
-  default: ({ data, stale, onRefresh, timelineMeta }) => (
+  default: ({ data, rankBy, stale, onRefresh, timelineMeta }) => (
     <div
       data-testid="flame-graph"
+      data-rank-by={rankBy}
       data-stale={String(stale)}
       data-split={String(data.intervalEvidenceSplit)}
     >
@@ -22,6 +23,14 @@ vi.mock("./FlameGraph.jsx", () => ({
       <button type="button" onClick={onRefresh}>Refresh timeline</button>
     </div>
   ),
+  PERSON_RANK_OPTIONS: [
+    { value: "roster", label: "Name" },
+    { value: "active-time", label: "Active time" },
+    { value: "peak-sessions", label: "Peak sessions" },
+    { value: "prompts", label: "Prompts" },
+    { value: "subagents", label: "Subagents" },
+  ],
+  DEFAULT_PERSON_RANK: "active-time",
 }));
 
 import App, { expectedTimelineEnd, nextRefreshDelay, timelineFreshness } from "./App.jsx";
@@ -138,7 +147,7 @@ describe("App", () => {
     );
   });
 
-  it("orders recency before the role legend in one shared header row", () => {
+  it("places the ranking selector between recency and role legends", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     const { container } = render(<App />);
     const header = container.querySelector(".portal-header");
@@ -147,13 +156,19 @@ describe("App", () => {
     const statusLegend = within(legendRegion).getByRole("list", {
       name: "Activity recency legend",
     });
+    const rankSelector = within(legendRegion).getByRole("group", {
+      name: "Rank by",
+    });
 
     expect(header.querySelector(".portal-header__brand")).toHaveTextContent("Bonaparte");
     expect(header.querySelector(".portal-header__brand + .portal-header__legend"))
       .toBe(legendRegion);
     expect(statusLegend.parentElement).toHaveClass("flame-legends");
     expect(activityLegend.parentElement).toBe(statusLegend.parentElement);
-    expect(statusLegend.nextElementSibling).toBe(activityLegend);
+    expect(statusLegend.nextElementSibling).toBe(rankSelector);
+    expect(rankSelector.nextElementSibling).toBe(activityLegend);
+    expect(within(rankSelector).getByRole("button", { name: "Active time", pressed: true }))
+      .toBeInTheDocument();
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(activityLegend).getByText(label)).toBeInTheDocument();
     }
@@ -165,6 +180,21 @@ describe("App", () => {
     expect(within(statusLegend).getByLabelText(
       "Red: activity more than 30 minutes ago or no activity",
     )).toHaveTextContent(">30m / none");
+  });
+
+  it("updates the graph ranking from the inline selector", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response()));
+    render(<App />);
+    await settle();
+
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-rank-by", "active-time");
+    fireEvent.click(screen.getByRole("button", { name: "Peak sessions" }));
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute(
+      "data-rank-by",
+      "peak-sessions",
+    );
+    expect(screen.getByRole("button", { name: "Peak sessions", pressed: true }))
+      .toBeInTheDocument();
   });
 
   it("offers an immediate retry after the initial request fails", async () => {

@@ -15,7 +15,7 @@ def arguments() -> argparse.Namespace:
         description="Install Sherlock's collector runtime and owner-only local config."
     )
     parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--codex-home", type=Path)
+    parser.add_argument("--codex-home", "--collector-home", dest="collector_home", type=Path)
     parser.add_argument("--name", required=True)
     parser.add_argument("--github-id", "--github_id", dest="github_id", required=True)
     parser.add_argument("--email", required=True)
@@ -72,8 +72,8 @@ def install_runtime(source: Path, destination: Path) -> None:
 
 def main() -> int:
     args = arguments()
-    codex_home = Path(
-        args.codex_home
+    collector_home = Path(
+        args.collector_home
         or os.environ.get("CODEX_HOME")
         or (Path.home() / ".codex")
     ).expanduser().resolve()
@@ -92,7 +92,7 @@ def main() -> int:
         endpoint = validate_endpoint(args.endpoint)
     except ConfigurationError as error:
         raise SystemExit(f"invalid collector endpoint: {error}") from error
-    root = codex_home / "sherlock"
+    root = collector_home / "sherlock"
     config_path = root / "collector.json"
     installation_id = existing_installation_id(config_path) or str(uuid.uuid4())
     try:

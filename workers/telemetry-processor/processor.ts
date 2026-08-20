@@ -8,9 +8,7 @@ import {
   IngestError,
   receiptFromRow,
 } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
-import {
-  NORMALIZER_VERSION,
-} from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
+import { NORMALIZER_VERSION } from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
 import { PostgresBatchNormalizer } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import { validateStoredBatch } from "../../supabase/functions/sherlock-rollout-ingest/service.ts";
 import type { NormalizationJob, ReductionJob, WorkloadClass } from "./queue.ts";
@@ -98,12 +96,13 @@ export class TelemetryProcessor {
       const targetEventId = await this.resolveSessionCutoff(
         job.workspace_id,
         sessionId,
+        normalized.normalizer_version,
       );
       if (targetEventId > 0n) {
         targets.push({
           workspace_id: job.workspace_id,
           session_id: sessionId,
-          normalizer_version: NORMALIZER_VERSION,
+          normalizer_version: normalized.normalizer_version,
           activity_version: ACTIVITY_VERSION,
           target_event_id: targetEventId,
           workload_class: job.workload_class,
@@ -139,17 +138,18 @@ export class TelemetryProcessor {
     return await this.loader.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_normalizer");
       const batches = await tx.unsafe(
-        `select id, workspace_id, person_id, collector_key, source_kind,
+        `select id, workspace_id, person_id, collector_key, source_provider,
+                source_kind,
                 source_stream_key, generation_key, generation_seq,
                 start_offset, end_offset, source_byte_count, source_sha256,
                 storage_path, storage_encoding, stored_byte_count,
                 stored_sha256, record_count, contract_version,
-                observed_native_session_id,
+                observed_native_session_id, observed_parent_native_session_id,
                 to_char(first_occurred_at at time zone 'UTC',
                   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as first_occurred_at,
                 to_char(last_occurred_at at time zone 'UTC',
                   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as last_occurred_at,
-                codex_version, collector_version, committed_at
+                codex_version, source_version, collector_version, committed_at
            from telemetry.ingest_batches
           where workspace_id = $1 and id = $2`,
         [job.workspace_id, job.batch_id],
@@ -164,7 +164,9 @@ export class TelemetryProcessor {
       const row = batches[0] as Record<string, unknown>;
       if (
         row.contract_version !== CONTRACT_VERSION ||
-        row.source_kind !== "rollout" ||
+        !(["rollout", "transcript", "hook"] as unknown[]).includes(
+          row.source_kind,
+        ) ||
         row.storage_encoding !== "gzip"
       ) {
         throw new IngestError(
@@ -178,7 +180,9 @@ export class TelemetryProcessor {
                 record_sha256, native_type, native_payload_type,
                 to_char(occurred_at at time zone 'UTC',
                   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as occurred_at,
-                parse_status
+                parse_status, native_record_start_offset,
+                native_record_end_offset, native_record_sha256,
+                fragment_index, fragment_count
            from telemetry.native_records
           where workspace_id = $1 and batch_id = $2
           order by record_index`,
@@ -186,7 +190,10 @@ export class TelemetryProcessor {
       );
       const manifest: BatchManifest = {
         contract_version: CONTRACT_VERSION,
-        source_kind: row.source_kind,
+        source_provider: String(
+          row.source_provider,
+        ) as BatchManifest["source_provider"],
+        source_kind: String(row.source_kind) as BatchManifest["source_kind"],
         source_stream_key: String(row.source_stream_key),
         generation_key: String(row.generation_key),
         generation_seq: Number(row.generation_seq),
@@ -198,25 +205,17 @@ export class TelemetryProcessor {
         stored_byte_count: Number(row.stored_byte_count),
         stored_sha256: String(row.stored_sha256),
         record_count: Number(row.record_count),
-        records: records.map((record) => ({
-          record_index: Number(record.record_index),
-          source_start_offset: Number(record.source_start_offset),
-          source_end_offset: Number(record.source_end_offset),
-          record_sha256: String(record.record_sha256),
-          native_type: nullableString(record.native_type),
-          native_payload_type: nullableString(record.native_payload_type),
-          occurred_at: nullableString(record.occurred_at),
-          parse_status: String(record.parse_status) as
-            | "ok"
-            | "unknown"
-            | "malformed",
-        })),
+        records: records.map(recordLocatorFromRow),
         observed_native_session_id: nullableString(
           row.observed_native_session_id,
+        ),
+        observed_parent_native_session_id: nullableString(
+          row.observed_parent_native_session_id,
         ),
         first_occurred_at: nullableString(row.first_occurred_at),
         last_occurred_at: nullableString(row.last_occurred_at),
         codex_version: nullableString(row.codex_version),
+        source_version: nullableString(row.source_version),
         collector_version: nullableString(row.collector_version),
       };
       if (manifest.records.length !== manifest.record_count) {
@@ -233,6 +232,7 @@ export class TelemetryProcessor {
   private async resolveSessionCutoff(
     workspaceId: string,
     sessionId: string,
+    normalizerVersion: string,
   ): Promise<bigint> {
     return await this.loader.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_normalizer");
@@ -241,7 +241,7 @@ export class TelemetryProcessor {
            from telemetry.events
           where workspace_id = $1 and session_id = $2
             and normalizer_version = $3`,
-        [workspaceId, sessionId, NORMALIZER_VERSION],
+        [workspaceId, sessionId, normalizerVersion],
       );
       return BigInt(String(rows[0].cutoff));
     });
@@ -274,6 +274,30 @@ export async function reduceAffectedSessions(
     total.tombstone_count += reduced.tombstone_count;
   }
   return total;
+}
+
+export function recordLocatorFromRow(
+  record: Record<string, unknown>,
+): BatchManifest["records"][number] {
+  return {
+    record_index: Number(record.record_index),
+    source_start_offset: Number(record.source_start_offset),
+    source_end_offset: Number(record.source_end_offset),
+    record_sha256: String(record.record_sha256),
+    native_type: nullableString(record.native_type),
+    native_payload_type: nullableString(record.native_payload_type),
+    occurred_at: nullableString(record.occurred_at),
+    parse_status: String(
+      record.parse_status,
+    ) as BatchManifest["records"][number]["parse_status"],
+    native_record_start_offset: nullableNumber(
+      record.native_record_start_offset,
+    ),
+    native_record_end_offset: nullableNumber(record.native_record_end_offset),
+    native_record_sha256: nullableString(record.native_record_sha256),
+    fragment_index: nullableNumber(record.fragment_index),
+    fragment_count: nullableNumber(record.fragment_count),
+  };
 }
 
 export class SupabaseRawStorage {
@@ -347,4 +371,8 @@ export class SupabaseRawStorage {
 
 function nullableString(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
+}
+
+function nullableNumber(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
 }

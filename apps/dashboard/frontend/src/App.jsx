@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import bonaparteLogo from "./assets/bonaparte-logo.png";
-import FlameGraph from "./FlameGraph.jsx";
+import FlameGraph, {
+  DEFAULT_PERSON_RANK,
+  PERSON_RANK_OPTIONS,
+} from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_MS } from "./flame-data.js";
 
 const REFRESH_OFFSET_MS = 90 * 1000;
@@ -44,6 +47,7 @@ export default function App() {
   const [state, setState] = useState("loading");
   const [message, setMessage] = useState("");
   const [clock, setClock] = useState(() => Date.now());
+  const [rankBy, setRankBy] = useState(DEFAULT_PERSON_RANK);
   const lastGoodRef = useRef(null);
   const timerRef = useRef(null);
   const requestRef = useRef(null);
@@ -120,7 +124,7 @@ export default function App() {
   if (!data && state === "loading") {
     return (
       <>
-        <PortalHeader />
+        <PortalHeader rankBy={rankBy} onRankChange={setRankBy} />
         <div className="load-state" role="status">Loading timeline</div>
       </>
     );
@@ -129,7 +133,7 @@ export default function App() {
   if (!data) {
     return (
       <>
-        <PortalHeader />
+        <PortalHeader rankBy={rankBy} onRankChange={setRankBy} />
         <div className="load-state" role="alert">
           <span>Timeline unavailable</span>
           <button type="button" onClick={load}>Retry</button>
@@ -143,7 +147,7 @@ export default function App() {
 
   return (
     <>
-      <PortalHeader />
+      <PortalHeader rankBy={rankBy} onRankChange={setRankBy} />
       {refreshProblem && (
         <span className="visually-hidden" role="status">
           {state === "stale" ? "Timeline refresh failed." : "Timeline update delayed."}
@@ -151,6 +155,7 @@ export default function App() {
       )}
       <FlameGraph
         data={data}
+        rankBy={rankBy}
         stale={state === "stale" || state === "delayed"}
         onRefresh={() => load({ refresh: "force" })}
         timelineMeta={(
@@ -167,7 +172,7 @@ export default function App() {
   );
 }
 
-function PortalHeader() {
+function PortalHeader({ rankBy, onRankChange }) {
   return (
     <header className="portal-header">
       <div className="portal-header__brand">
@@ -180,13 +185,13 @@ function PortalHeader() {
         <h1>Bonaparte</h1>
       </div>
       <aside className="portal-header__legend" aria-label="Timeline legend">
-        <SemanticLegend />
+        <SemanticLegend rankBy={rankBy} onRankChange={onRankChange} />
       </aside>
     </header>
   );
 }
 
-function SemanticLegend() {
+function SemanticLegend({ rankBy, onRankChange }) {
   return (
     <div className="flame-legends">
       <ul className="flame-status-legend" aria-label="Activity recency legend">
@@ -203,6 +208,25 @@ function SemanticLegend() {
           &gt;30m / none
         </li>
       </ul>
+      <div
+        className="flame-rank-selector"
+        role="group"
+        aria-labelledby="flame-rank-selector-label"
+      >
+        <span id="flame-rank-selector-label">Rank by</span>
+        <div>
+          {PERSON_RANK_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              aria-pressed={rankBy === option.value}
+              onClick={() => onRankChange(option.value)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
       <ul className="flame-legend" aria-label="Activity legend">
         <li><i className="flame-key flame-key--agent" aria-hidden="true" />Agent</li>
         <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>

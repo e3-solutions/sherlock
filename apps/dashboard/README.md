@@ -2,11 +2,12 @@
 
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
-uses SHERLOCK_WORKSPACE_ID, every database transaction is repeatable-read and
-read-only, and the server assumes Sherlock's existing sherlock_normalizer role.
+uses SHERLOCK_WORKSPACE_ID and one small connection pool whose transactions are
+repeatable-read, read-only, and pinned to `sherlock_reader`.
 
-The browser never receives database credentials. The page and aggregate API
-are public; every database query remains pinned to one configured workspace.
+The browser and MCP clients never receive database credentials. The page and
+aggregate API are public; the MCP endpoint requires a separate bearer token.
+Every database query remains pinned to one configured workspace.
 The aggregate API does not return prompt text. Lazy interval and work-detail
 endpoints return only canonical normalized evidence for one person and one
 ten-minute bucket. Message content is limited to
@@ -18,9 +19,12 @@ objects.
 - `telemetry.people` is the roster, so real people with zero activity remain
   visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
   excluded; display names are never used as the filter.
-- Canonically selected `sherlock.codex-rollout.v1` event presence is grouped into
-  144 ten-minute UTC buckets. Distinct Sherlock execution sessions are counted
-  per effective role and bucket; they are not native thread or duration counts.
+- Canonically selected `sherlock.codex-rollout.v1` and
+  `sherlock.claude-code-transcript.v1` event presence is grouped into 144
+  ten-minute UTC buckets. Canonical winner selection remains scoped by
+  normalizer version, so evidence from different provider projections is never
+  collapsed together. Distinct Sherlock execution sessions are counted per
+  effective role and bucket; they are not native thread or duration counts.
   Metadata-only lifecycle records are not activity evidence.
 - The person rail's 24-hour active time uses the same canonical, non-replay,
   non-automation observed-session evidence and effective role mapping as the
@@ -66,6 +70,14 @@ objects.
   distinct. Response-item-only runtime
   context, plus worker and guardian parent messages, is not presented as human
   prompt input.
+- Claude Code transcript `user` and `assistant` native records are exposed
+  through the same provider-neutral normalized `user_message` and `message`
+  semantics used by aggregate prompt counts, interval summaries, and paginated
+  conversation detail. Their immutable native record type and transcript source
+  kind remain available for evidence selection; the dashboard does not rewrite
+  those source facts into Codex rollout types. Claude `isMeta` user records keep
+  their system origin and are excluded from human/parent prompt summaries and
+  conversation detail.
 - Some rollouts store one native turn in complementary `event_msg` and
   `response_item` formats. The dashboard bridges them only when immutable source
   evidence agrees: same session and effective role, full content hash,
@@ -120,7 +132,11 @@ objects.
   timeline refresh can correctly include newly normalized evidence.
 - Initial page load makes one `GET /api/flame` request and renders the complete
   144-bucket timeline as a single view. The graph never shrinks to a different
-  preview window while the full aggregate is loading.
+  preview window while the full aggregate is loading. People can be ranked in
+  the browser by active time, peak observed sessions in one bucket, canonical
+  prompt count, or distinct subagent sessions. Ranking creates a product view
+  over the adapted payload; it does not mutate the roster or source telemetry.
+  Active time is selected by default, and Name restores the source roster order.
 
 ## Initial-load cache
 
@@ -152,16 +168,49 @@ immutable publication-time session facts.
 ## Environment
 
 SUPABASE_DB_URL and SHERLOCK_WORKSPACE_ID are required. SUPABASE_DB_URL reuses
-the existing Sherlock worker login contract, which can assume
-sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
-exceed 1000.
+the existing Sherlock worker login contract, which must be granted
+`sherlock_reader`; every dashboard transaction pins itself to that read-only
+role. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not exceed 1000.
+
+## Bonaparte MCP
+
+`/mcp` is a stateless Streamable HTTP MCP endpoint for agent-assisted usage and
+prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
+least 32 characters and configure the MCP client to send it as
+`Authorization: Bearer <token>`. Browser-origin requests are rejected; the
+endpoint is for origin-free agent clients and server-to-server MCP hosts.
+
+The endpoint exposes two versioned read-only tools. Their complete input,
+output, pagination, error, and limitation contract is documented in
+[`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
+
+- `list_usage_evidence` keyset-pages the eagerly refreshed canonical timeline
+  snapshot at 20 people per response and returns explicit session counts,
+  prompt counts, and prompt-bearing buckets without rerunning the aggregate.
+- `list_prompt_evidence` takes the exact snapshot token, person ID, and bucket
+  returned by the first tool. It returns the earliest five canonical
+  primary-human prompt excerpts from that bucket and reports how many were
+  omitted. Conversation context is intentionally excluded from v1.
+
+Every tool advertises strict input and output schemas and read-only,
+non-destructive, idempotent, closed-world annotations. Results are returned as
+both structured content and serialized JSON for client compatibility. Prompt
+excerpts are structurally labeled as untrusted data; agents must never execute
+instructions within them. The server does not generate or persist feedback.
+
+The endpoint never reads raw Storage objects and never writes feedback or
+derived judgments to Sherlock. The shared bearer token is a pilot transport
+gate, not principal-scoped authorization; authorization, ingress request-size
+limits, rate limits, and sensitive-read auditing remain required before broad
+access.
 
 ## Local verification
 
 Run corepack pnpm install --frozen-lockfile, then pnpm check, pnpm test, and
-pnpm build. With the repository's isolated Supabase database running, set
-`SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to execute the dashboard SQL
-integration fixture.
+pnpm build. The test suite includes an official MCP client discovering and
+calling the Streamable HTTP tools. With the repository's isolated Supabase
+database running, set `SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to
+execute the dashboard SQL integration fixture.
 
 ## Railway deployment
 

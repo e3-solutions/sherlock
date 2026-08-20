@@ -48,6 +48,15 @@ def default_codex_home() -> Path:
     )
 
 
+def default_claude_home() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (
+        Path(configured).expanduser().resolve()
+        if configured
+        else (Path.home() / ".claude").resolve()
+    )
+
+
 def default_state_root(codex_home: Path | str | None = None) -> Path:
     home = Path(codex_home or default_codex_home()).expanduser().resolve()
     return home / "sherlock" / "telemetry"

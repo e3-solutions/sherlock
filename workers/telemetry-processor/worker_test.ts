@@ -4,7 +4,7 @@ import {
   loadConfig,
   retryDelaySeconds,
 } from "./main.ts";
-import { reduceAffectedSessions } from "./processor.ts";
+import { recordLocatorFromRow, reduceAffectedSessions } from "./processor.ts";
 
 function assert(
   condition: unknown,
@@ -73,6 +73,31 @@ Deno.test("retry backoff grows exponentially and caps", () => {
   assert(retryDelaySeconds(1, 5, 300) === 5);
   assert(retryDelaySeconds(4, 5, 300) === 40);
   assert(retryDelaySeconds(20, 5, 300) === 300);
+});
+
+Deno.test("worker reloads immutable native fragment metadata", () => {
+  const locator = recordLocatorFromRow({
+    record_index: "0",
+    source_start_offset: "4194304",
+    source_end_offset: "8388608",
+    record_sha256: "a".repeat(64),
+    native_type: null,
+    native_payload_type: null,
+    occurred_at: null,
+    parse_status: "fragment",
+    native_record_start_offset: "0",
+    native_record_end_offset: "20971521",
+    native_record_sha256: "b".repeat(64),
+    fragment_index: "1",
+    fragment_count: "6",
+  });
+
+  assert(locator.parse_status === "fragment");
+  assert(locator.native_record_start_offset === 0);
+  assert(locator.native_record_end_offset === 20 * 1024 * 1024 + 1);
+  assert(locator.native_record_sha256 === "b".repeat(64));
+  assert(locator.fragment_index === 1);
+  assert(locator.fragment_count === 6);
 });
 
 Deno.test("reduction targets only normalized sessions with no workspace scan", async () => {

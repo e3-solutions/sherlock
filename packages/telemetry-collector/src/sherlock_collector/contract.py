@@ -21,8 +21,14 @@ NATIVE_LABEL_BYTES = 256
 IDENTITY_HINT_BYTES = 512
 VERSION_HINT_BYTES = 128
 MAX_RECORDS = 20_000
-MAX_SOURCE_BYTES = 5 * 1024 * 1024
-MAX_STORED_BYTES = 6 * 1024 * 1024
+MAX_SOURCE_BYTES = 16 * 1024 * 1024
+MAX_STORED_BYTES = 17 * 1024 * 1024
+FRAGMENT_BYTES = 4 * 1024 * 1024
+MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024
+SOURCE_KINDS = {
+    "codex": frozenset({"rollout"}),
+    "claude_code": frozenset({"transcript", "hook"}),
+}
 
 
 class ContractError(ValueError):
@@ -74,11 +80,16 @@ class RecordLocator:
     native_payload_type: str | None
     occurred_at: str | None
     parse_status: str
+    native_record_start_offset: int | None = None
+    native_record_end_offset: int | None = None
+    native_record_sha256: str | None = None
+    fragment_index: int | None = None
+    fragment_count: int | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RecordLocator":
         parse_status = _nonempty(value.get("parse_status"), "record.parse_status")
-        if parse_status not in {"ok", "unknown", "malformed"}:
+        if parse_status not in {"ok", "unknown", "malformed", "fragment"}:
             raise ContractError("record.parse_status is unsupported")
         native_type = value.get("native_type")
         native_payload_type = value.get("native_payload_type")
@@ -98,12 +109,52 @@ class RecordLocator:
             native_payload_type=native_payload_type,
             occurred_at=occurred_at,
             parse_status=parse_status,
+            native_record_start_offset=(
+                _integer(
+                    value.get("native_record_start_offset"),
+                    "record.native_record_start_offset",
+                )
+                if value.get("native_record_start_offset") is not None
+                else None
+            ),
+            native_record_end_offset=(
+                _integer(
+                    value.get("native_record_end_offset"),
+                    "record.native_record_end_offset",
+                    minimum=1,
+                )
+                if value.get("native_record_end_offset") is not None
+                else None
+            ),
+            native_record_sha256=(
+                _hash(
+                    value.get("native_record_sha256"),
+                    "record.native_record_sha256",
+                )
+                if value.get("native_record_sha256") is not None
+                else None
+            ),
+            fragment_index=(
+                _integer(value.get("fragment_index"), "record.fragment_index")
+                if value.get("fragment_index") is not None
+                else None
+            ),
+            fragment_count=(
+                _integer(
+                    value.get("fragment_count"),
+                    "record.fragment_count",
+                    minimum=2,
+                )
+                if value.get("fragment_count") is not None
+                else None
+            ),
         )
 
 
 @dataclass(frozen=True)
 class BatchManifest:
     contract_version: str
+    source_provider: str
     source_kind: str
     source_stream_key: str
     generation_key: str
@@ -118,9 +169,11 @@ class BatchManifest:
     record_count: int
     records: tuple[RecordLocator, ...]
     observed_native_session_id: str | None = None
+    observed_parent_native_session_id: str | None = None
     first_occurred_at: str | None = None
     last_occurred_at: str | None = None
     codex_version: str | None = None
+    source_version: str | None = None
     collector_version: str | None = None
 
     @property
@@ -156,6 +209,9 @@ class BatchManifest:
             contract_version=_nonempty(
                 value.get("contract_version"), "contract_version"
             ),
+            source_provider=_nonempty(
+                value.get("source_provider", "codex"), "source_provider"
+            ),
             source_kind=_nonempty(value.get("source_kind"), "source_kind"),
             source_stream_key=_nonempty(
                 value.get("source_stream_key"), "source_stream_key"
@@ -178,9 +234,13 @@ class BatchManifest:
             record_count=_integer(value.get("record_count"), "record_count", minimum=1),
             records=tuple(RecordLocator.from_dict(record) for record in raw_records),
             observed_native_session_id=value.get("observed_native_session_id"),
+            observed_parent_native_session_id=value.get(
+                "observed_parent_native_session_id"
+            ),
             first_occurred_at=value.get("first_occurred_at"),
             last_occurred_at=value.get("last_occurred_at"),
             codex_version=value.get("codex_version"),
+            source_version=value.get("source_version", value.get("codex_version")),
             collector_version=value.get("collector_version"),
         )
         manifest.validate()
@@ -189,10 +249,10 @@ class BatchManifest:
     def validate(self) -> None:
         if self.contract_version != CONTRACT_VERSION:
             raise ContractError("unsupported contract_version")
-        if self.source_kind != "rollout":
-            raise ContractError(
-                "the first collector slice accepts rollout batches only"
-            )
+        if self.source_provider not in SOURCE_KINDS:
+            raise ContractError("source_provider is unsupported")
+        if self.source_kind not in SOURCE_KINDS[self.source_provider]:
+            raise ContractError("source_kind does not match source_provider")
         if self.storage_encoding != "gzip":
             raise ContractError("the stable rollout encoding must be gzip")
         if self.end_offset <= self.start_offset:
@@ -231,7 +291,13 @@ class BatchManifest:
             "observed_native_session_id",
             IDENTITY_HINT_BYTES,
         )
+        _bounded_text(
+            self.observed_parent_native_session_id,
+            "observed_parent_native_session_id",
+            IDENTITY_HINT_BYTES,
+        )
         _bounded_text(self.codex_version, "codex_version", VERSION_HINT_BYTES)
+        _bounded_text(self.source_version, "source_version", VERSION_HINT_BYTES)
         _bounded_text(self.collector_version, "collector_version", VERSION_HINT_BYTES)
         for record in self.records:
             _bounded_text(record.native_type, "record.native_type", NATIVE_LABEL_BYTES)
@@ -240,6 +306,63 @@ class BatchManifest:
                 "record.native_payload_type",
                 NATIVE_LABEL_BYTES,
             )
+            fragment_fields = (
+                record.native_record_start_offset,
+                record.native_record_end_offset,
+                record.native_record_sha256,
+                record.fragment_index,
+                record.fragment_count,
+            )
+            if record.parse_status != "fragment":
+                if any(value is not None for value in fragment_fields):
+                    raise ContractError(
+                        "non-fragment records cannot include fragment metadata"
+                    )
+                continue
+            if any(value is None for value in fragment_fields):
+                raise ContractError("fragment record metadata must be complete")
+            if (
+                self.record_count != 1
+                or record.source_start_offset != self.start_offset
+                or record.source_end_offset != self.end_offset
+            ):
+                raise ContractError("fragment locator must cover its complete batch")
+            if any(
+                value is not None
+                for value in (
+                    record.native_type,
+                    record.native_payload_type,
+                    record.occurred_at,
+                    self.first_occurred_at,
+                    self.last_occurred_at,
+                )
+            ):
+                raise ContractError("fragment records cannot include parsed metadata")
+            assert record.native_record_start_offset is not None
+            assert record.native_record_end_offset is not None
+            assert record.fragment_index is not None
+            assert record.fragment_count is not None
+            native_length = (
+                record.native_record_end_offset - record.native_record_start_offset
+            )
+            if not MAX_SOURCE_BYTES < native_length <= MAX_LOGICAL_RECORD_BYTES:
+                raise ContractError("fragmented native record has invalid size")
+            expected_count = (native_length + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
+            expected_start = (
+                record.native_record_start_offset
+                + record.fragment_index * FRAGMENT_BYTES
+            )
+            expected_end = min(
+                expected_start + FRAGMENT_BYTES,
+                record.native_record_end_offset,
+            )
+            if (
+                record.fragment_count != expected_count
+                or record.fragment_index >= expected_count
+                or record.source_start_offset != expected_start
+                or record.source_end_offset != expected_end
+            ):
+                raise ContractError("fragment range or count is not canonical")
 
 
 def _record_locator(
@@ -303,30 +426,71 @@ def _record_locator(
     )
 
 
-def build_rollout_batch(
+def build_source_batch(
     source_bytes: bytes,
     *,
     source_stream_key: str,
     generation_key: str,
     generation_seq: int,
     start_offset: int,
+    source_provider: str,
+    source_kind: str,
     observed_native_session_id: str | None = None,
+    observed_parent_native_session_id: str | None = None,
     codex_version: str | None = None,
+    source_version: str | None = None,
     collector_version: str | None = None,
+    native_record_fragment: Mapping[str, Any] | None = None,
 ) -> tuple[BatchManifest, bytes]:
     if not source_bytes:
         raise ContractError("source batch must not be empty")
     if len(source_bytes) > MAX_SOURCE_BYTES:
         raise ContractError("source batch exceeds rollout v1 limits")
-    parts = source_bytes.split(b"\n")
-    lines = [part + b"\n" for part in parts[:-1]]
-    if parts[-1]:
-        lines.append(parts[-1])
-    records: list[RecordLocator] = []
-    offset = start_offset
-    for index, line in enumerate(lines):
-        records.append(_record_locator(line, offset, index))
-        offset += len(line)
+    if native_record_fragment is None:
+        parts = source_bytes.split(b"\n")
+        lines = [part + b"\n" for part in parts[:-1]]
+        if parts[-1]:
+            lines.append(parts[-1])
+        records: list[RecordLocator] = []
+        offset = start_offset
+        for index, line in enumerate(lines):
+            records.append(_record_locator(line, offset, index))
+            offset += len(line)
+    else:
+        records = [
+            RecordLocator(
+                record_index=0,
+                source_start_offset=start_offset,
+                source_end_offset=start_offset + len(source_bytes),
+                record_sha256=sha256_hex(source_bytes),
+                native_type=None,
+                native_payload_type=None,
+                occurred_at=None,
+                parse_status="fragment",
+                native_record_start_offset=_integer(
+                    native_record_fragment.get("native_record_start_offset"),
+                    "native_record_start_offset",
+                ),
+                native_record_end_offset=_integer(
+                    native_record_fragment.get("native_record_end_offset"),
+                    "native_record_end_offset",
+                    minimum=1,
+                ),
+                native_record_sha256=_hash(
+                    native_record_fragment.get("native_record_sha256"),
+                    "native_record_sha256",
+                ),
+                fragment_index=_integer(
+                    native_record_fragment.get("fragment_index"),
+                    "fragment_index",
+                ),
+                fragment_count=_integer(
+                    native_record_fragment.get("fragment_count"),
+                    "fragment_count",
+                    minimum=2,
+                ),
+            )
+        ]
     if len(records) > MAX_RECORDS:
         raise ContractError(f"source batch exceeds {MAX_RECORDS} native records")
     stored = gzip.compress(source_bytes, compresslevel=6, mtime=0)
@@ -340,7 +504,8 @@ def build_rollout_batch(
     ]
     manifest = BatchManifest(
         contract_version=CONTRACT_VERSION,
-        source_kind="rollout",
+        source_provider=source_provider,
+        source_kind=source_kind,
         source_stream_key=_nonempty(source_stream_key, "source_stream_key"),
         generation_key=_nonempty(generation_key, "generation_key"),
         generation_seq=_integer(generation_seq, "generation_seq"),
@@ -354,13 +519,43 @@ def build_rollout_batch(
         record_count=len(records),
         records=tuple(records),
         observed_native_session_id=observed_native_session_id,
+        observed_parent_native_session_id=observed_parent_native_session_id,
         first_occurred_at=min(occurred)[1] if occurred else None,
         last_occurred_at=max(occurred)[1] if occurred else None,
         codex_version=codex_version,
+        source_version=source_version,
         collector_version=collector_version,
     )
     manifest.validate()
     return manifest, stored
+
+
+def build_rollout_batch(
+    source_bytes: bytes,
+    *,
+    source_stream_key: str,
+    generation_key: str,
+    generation_seq: int,
+    start_offset: int,
+    observed_native_session_id: str | None = None,
+    codex_version: str | None = None,
+    collector_version: str | None = None,
+    native_record_fragment: Mapping[str, Any] | None = None,
+) -> tuple[BatchManifest, bytes]:
+    return build_source_batch(
+        source_bytes,
+        source_stream_key=source_stream_key,
+        generation_key=generation_key,
+        generation_seq=generation_seq,
+        start_offset=start_offset,
+        source_provider="codex",
+        source_kind="rollout",
+        observed_native_session_id=observed_native_session_id,
+        codex_version=codex_version,
+        source_version=codex_version,
+        collector_version=collector_version,
+        native_record_fragment=native_record_fragment,
+    )
 
 
 RECEIPT_FIELDS = {

@@ -1,9 +1,11 @@
 export const CONTRACT_VERSION = "sherlock.rollout-batch.v1";
 export const RECEIPT_VERSION = "sherlock.committed-receipt.v1";
-export const MAX_STORED_BYTES = 6 * 1024 * 1024;
-export const MAX_SOURCE_BYTES = 5 * 1024 * 1024;
+export const MAX_STORED_BYTES = 17 * 1024 * 1024;
+export const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 export const MAX_RECORDS = 20_000;
-export const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
+export const MAX_REQUEST_BYTES = 24 * 1024 * 1024;
+export const FRAGMENT_SOURCE_BYTES = 4 * 1024 * 1024;
+export const MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024;
 export const NATIVE_LABEL_BYTES = 256;
 export const IDENTITY_HINT_BYTES = 512;
 export const VERSION_HINT_BYTES = 128;
@@ -24,12 +26,18 @@ export interface RecordLocator {
   native_type: string | null;
   native_payload_type: string | null;
   occurred_at: string | null;
-  parse_status: "ok" | "unknown" | "malformed";
+  parse_status: "ok" | "unknown" | "malformed" | "fragment";
+  native_record_start_offset?: number | null;
+  native_record_end_offset?: number | null;
+  native_record_sha256?: string | null;
+  fragment_index?: number | null;
+  fragment_count?: number | null;
 }
 
 export interface BatchManifest {
   contract_version: typeof CONTRACT_VERSION;
-  source_kind: "rollout";
+  source_provider: "codex" | "claude_code";
+  source_kind: "rollout" | "transcript" | "hook";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -43,9 +51,11 @@ export interface BatchManifest {
   record_count: number;
   records: RecordLocator[];
   observed_native_session_id: string | null;
+  observed_parent_native_session_id: string | null;
   first_occurred_at: string | null;
   last_occurred_at: string | null;
   codex_version: string | null;
+  source_version: string | null;
   collector_version: string | null;
 }
 
@@ -66,7 +76,7 @@ export interface CommittedReceipt extends Attribution {
   receipt_version: typeof RECEIPT_VERSION;
   status: "committed";
   batch_id: string;
-  source_kind: "rollout";
+  source_kind: "rollout" | "transcript" | "hook";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -331,7 +341,7 @@ function decodeBase64(value: unknown): Uint8Array {
   if (value.length > maximumEncodedLength) {
     throw new IngestError(
       "payload_too_large",
-      "stored payload exceeds 6 MiB",
+      "stored payload exceeds 17 MiB",
       413,
     );
   }
@@ -344,7 +354,7 @@ function decodeBase64(value: unknown): Uint8Array {
     if (bytes.byteLength > MAX_STORED_BYTES) {
       throw new IngestError(
         "payload_too_large",
-        "stored payload exceeds 6 MiB",
+        "stored payload exceeds 17 MiB",
         413,
       );
     }
@@ -362,7 +372,11 @@ function decodeBase64(value: unknown): Uint8Array {
 function parseRecord(value: unknown): RecordLocator {
   const input = object(value, "record");
   const parseStatus = text(input.parse_status, "record.parse_status");
-  if (!(["ok", "unknown", "malformed"] as string[]).includes(parseStatus)) {
+  if (
+    !(["ok", "unknown", "malformed", "fragment"] as string[]).includes(
+      parseStatus,
+    )
+  ) {
     throw new IngestError(
       "invalid_manifest",
       "record.parse_status is unsupported",
@@ -393,6 +407,28 @@ function parseRecord(value: unknown): RecordLocator {
     ),
     occurred_at: nullableTimestamp(input.occurred_at, "record.occurred_at"),
     parse_status: parseStatus as RecordLocator["parse_status"],
+    native_record_start_offset: input.native_record_start_offset == null
+      ? null
+      : integer(
+        input.native_record_start_offset,
+        "record.native_record_start_offset",
+      ),
+    native_record_end_offset: input.native_record_end_offset == null
+      ? null
+      : integer(
+        input.native_record_end_offset,
+        "record.native_record_end_offset",
+        1,
+      ),
+    native_record_sha256: input.native_record_sha256 == null
+      ? null
+      : hash(input.native_record_sha256, "record.native_record_sha256"),
+    fragment_index: input.fragment_index == null
+      ? null
+      : integer(input.fragment_index, "record.fragment_index"),
+    fragment_count: input.fragment_count == null
+      ? null
+      : integer(input.fragment_count, "record.fragment_count", 2),
   };
 }
 
@@ -411,12 +447,22 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
     );
   }
   const contractVersion = text(raw.contract_version, "contract_version");
+  const sourceProvider = raw.source_provider === undefined
+    ? "codex"
+    : text(raw.source_provider, "source_provider");
   const sourceKind = text(raw.source_kind, "source_kind");
   const storageEncoding = text(raw.storage_encoding, "storage_encoding");
-  if (contractVersion !== CONTRACT_VERSION || sourceKind !== "rollout") {
+  if (
+    contractVersion !== CONTRACT_VERSION ||
+    !(["codex", "claude_code"] as string[]).includes(sourceProvider) ||
+    !(["rollout", "transcript", "hook"] as string[]).includes(sourceKind) ||
+    (sourceProvider === "codex" && sourceKind !== "rollout") ||
+    (sourceProvider === "claude_code" &&
+      !(["transcript", "hook"] as string[]).includes(sourceKind))
+  ) {
     throw new IngestError(
       "unsupported_contract",
-      "only rollout batch v1 is accepted",
+      "source provider and kind are not supported by batch v1",
       400,
     );
   }
@@ -429,7 +475,8 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
   }
   const manifest: BatchManifest = {
     contract_version: CONTRACT_VERSION,
-    source_kind: "rollout",
+    source_provider: sourceProvider as BatchManifest["source_provider"],
+    source_kind: sourceKind as BatchManifest["source_kind"],
     source_stream_key: safeSegment(raw.source_stream_key, "source_stream_key"),
     generation_key: safeSegment(raw.generation_key, "generation_key"),
     generation_seq: integer(raw.generation_seq, "generation_seq"),
@@ -447,6 +494,11 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
       "observed_native_session_id",
       IDENTITY_HINT_BYTES,
     ),
+    observed_parent_native_session_id: boundedNullableText(
+      raw.observed_parent_native_session_id,
+      "observed_parent_native_session_id",
+      IDENTITY_HINT_BYTES,
+    ),
     first_occurred_at: nullableTimestamp(
       raw.first_occurred_at,
       "first_occurred_at",
@@ -458,6 +510,11 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
     codex_version: boundedNullableText(
       raw.codex_version,
       "codex_version",
+      VERSION_HINT_BYTES,
+    ),
+    source_version: boundedNullableText(
+      raw.source_version ?? raw.codex_version,
+      "source_version",
       VERSION_HINT_BYTES,
     ),
     collector_version: boundedNullableText(
@@ -476,7 +533,20 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
 
 export function validateManifest(manifest: BatchManifest): void {
   if (
+    (manifest.source_provider === "codex" &&
+      manifest.source_kind !== "rollout") ||
+    (manifest.source_provider === "claude_code" &&
+      !(["transcript", "hook"] as string[]).includes(manifest.source_kind))
+  ) {
+    throw new IngestError(
+      "unsupported_contract",
+      "source provider and kind do not match",
+      400,
+    );
+  }
+  if (
     manifest.source_byte_count > MAX_SOURCE_BYTES ||
+    manifest.stored_byte_count > MAX_STORED_BYTES ||
     manifest.record_count > MAX_RECORDS
   ) {
     throw new IngestError(
@@ -543,6 +613,93 @@ export function validateManifest(manifest: BatchManifest): void {
       );
     }
     previousEnd = record.source_end_offset;
+
+    const fragmentFields = [
+      record.native_record_start_offset,
+      record.native_record_end_offset,
+      record.native_record_sha256,
+      record.fragment_index,
+      record.fragment_count,
+    ];
+    if (record.parse_status !== "fragment") {
+      if (fragmentFields.some((value) => value != null)) {
+        throw new IngestError(
+          "invalid_manifest",
+          "non-fragment records cannot include fragment metadata",
+          400,
+        );
+      }
+      return;
+    }
+    if (fragmentFields.some((value) => value == null)) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragment record metadata must be complete",
+        400,
+      );
+    }
+    if (
+      record.native_type !== null ||
+      record.native_payload_type !== null ||
+      record.occurred_at !== null ||
+      manifest.first_occurred_at !== null ||
+      manifest.last_occurred_at !== null
+    ) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragment records cannot claim unparsed semantic metadata",
+        400,
+      );
+    }
+    if (
+      manifest.record_count !== 1 ||
+      record.source_start_offset !== manifest.start_offset ||
+      record.source_end_offset !== manifest.end_offset
+    ) {
+      throw new IngestError(
+        "invalid_manifest",
+        "a fragment batch must contain exactly its one fragment range",
+        400,
+      );
+    }
+
+    const logicalStart = record.native_record_start_offset as number;
+    const logicalEnd = record.native_record_end_offset as number;
+    const fragmentIndex = record.fragment_index as number;
+    const fragmentCount = record.fragment_count as number;
+    const logicalBytes = logicalEnd - logicalStart;
+    if (logicalBytes <= MAX_SOURCE_BYTES) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragmented native record must exceed the 16 MiB inline limit",
+        400,
+      );
+    }
+    if (logicalBytes > MAX_LOGICAL_RECORD_BYTES) {
+      throw new IngestError(
+        "payload_too_large",
+        "fragmented native record exceeds the 100 MiB logical limit",
+        413,
+      );
+    }
+    const expectedCount = Math.ceil(logicalBytes / FRAGMENT_SOURCE_BYTES);
+    const expectedStart = logicalStart + fragmentIndex * FRAGMENT_SOURCE_BYTES;
+    const expectedEnd = Math.min(
+      expectedStart + FRAGMENT_SOURCE_BYTES,
+      logicalEnd,
+    );
+    if (
+      fragmentCount !== expectedCount ||
+      fragmentIndex >= expectedCount ||
+      record.source_start_offset !== expectedStart ||
+      record.source_end_offset !== expectedEnd
+    ) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragment range, index, or count is not the deterministic 4 MiB partition",
+        400,
+      );
+    }
   });
 }
 
@@ -579,7 +736,7 @@ export function receiptFromRow(row: Record<string, unknown>): CommittedReceipt {
     workspace_id: String(row.workspace_id),
     person_id: String(row.person_id),
     collector_key: String(row.collector_key),
-    source_kind: "rollout",
+    source_kind: String(row.source_kind) as CommittedReceipt["source_kind"],
     source_stream_key: String(row.source_stream_key),
     generation_key: String(row.generation_key),
     generation_seq: Number(row.generation_seq),

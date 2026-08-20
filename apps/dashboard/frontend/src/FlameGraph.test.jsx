@@ -8,6 +8,7 @@ import FlameGraph, {
   getBucketCenterX,
   getBucketTooltipPlacement,
   formatActiveTime,
+  rankPeople,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
 
@@ -86,6 +87,40 @@ describe("formatActiveTime", () => {
     [86_400, "24h active"],
   ])("formats %i seconds as %s", (seconds, expected) => {
     expect(formatActiveTime(seconds)).toBe(expected);
+  });
+});
+
+describe("rankPeople", () => {
+  const bucket = (activity = 0, prompts = 0) => ({ activity, prompts });
+  const people = [
+    {
+      id: "alpha", activeSeconds: 1_200, total: [3, 1, 0],
+      buckets: [bucket(3, 2), bucket(1, 1)],
+    },
+    {
+      id: "beta", activeSeconds: 600, total: [1, 5, 0],
+      buckets: [bucket(6, 0), bucket(0, 8)],
+    },
+    {
+      id: "gamma", activeSeconds: 1_800, total: [2, 0, 0],
+      buckets: [bucket(2, 1), bucket(2, 0)],
+    },
+  ];
+
+  it.each([
+    ["active-time", ["gamma", "alpha", "beta"]],
+    ["peak-sessions", ["beta", "alpha", "gamma"]],
+    ["prompts", ["beta", "alpha", "gamma"]],
+    ["subagents", ["beta", "alpha", "gamma"]],
+  ])("ranks descending by %s", (rankBy, expected) => {
+    expect(rankPeople(people, rankBy).map(({ id }) => id)).toEqual(expected);
+  });
+
+  it("preserves API order for the roster option and for equal metrics", () => {
+    expect(rankPeople(people, "roster")).toBe(people);
+    expect(rankPeople([people[0], people[2]], "subagents").map(({ id }) => id))
+      .toEqual(["alpha", "gamma"]);
+    expect(people.map(({ id }) => id)).toEqual(["alpha", "beta", "gamma"]);
   });
 });
 
@@ -233,6 +268,50 @@ describe("FlameGraph", () => {
     expect(peopleScroll.querySelectorAll(".flame-person")).toHaveLength(2);
   });
 
+  it("lets people be ranked by each observed activity metric", () => {
+    const data = model();
+    const ada = data.people[0];
+    const zero = data.people[1];
+    const promptLeader = {
+      ...zero,
+      id: "prompt-leader",
+      name: "Prompt Leader",
+      buckets: zero.buckets.map((point, index) => (
+        index === 0 ? { ...point, prompts: 9 } : point
+      )),
+    };
+    const subagentLeader = {
+      ...zero,
+      id: "subagent-leader",
+      name: "Subagent Leader",
+      activeSeconds: 600,
+      total: [0, 7, 0],
+      buckets: zero.buckets.map((point, index) => (
+        index === 0 ? { ...point, subagent: 7, activity: 7 } : point
+      )),
+    };
+    data.people = [ada, promptLeader, subagentLeader, zero];
+
+    const view = render(<FlameGraph data={data} chartWidth={1008} />);
+    const { container } = view;
+    const names = () => [...container.querySelectorAll(".flame-person h2")]
+      .map((heading) => heading.textContent);
+
+    expect(names()).toEqual(["Ada Lovelace", "Subagent Leader", "Prompt Leader", "Zero Activity"]);
+
+    view.rerender(<FlameGraph data={data} chartWidth={1008} rankBy="prompts" />);
+    expect(names()[0]).toBe("Prompt Leader");
+
+    view.rerender(<FlameGraph data={data} chartWidth={1008} rankBy="subagents" />);
+    expect(names()[0]).toBe("Subagent Leader");
+
+    view.rerender(<FlameGraph data={data} chartWidth={1008} rankBy="peak-sessions" />);
+    expect(names()[0]).toBe("Subagent Leader");
+
+    view.rerender(<FlameGraph data={data} chartWidth={1008} rankBy="active-time" />);
+    expect(names()[0]).toBe("Ada Lovelace");
+  });
+
   it("sizes both fixed axis and rows from the scrollbar-adjusted people scrollport", async () => {
     const observations = [];
     const observe = vi.fn();
@@ -281,6 +360,8 @@ describe("FlameGraph", () => {
     });
 
     expect(active).toHaveClass("flame-person-status--active");
+    expect(active.parentElement).toHaveClass("flame-person-heading");
+    expect(active.previousElementSibling).toHaveTextContent("Ada Lovelace");
     expect(active).toHaveAttribute(
       "title",
       expect.stringContaining("last 10 minutes"),

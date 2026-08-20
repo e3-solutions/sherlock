@@ -1,0 +1,81 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py\" SessionStart || true'",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py\" UserPromptSubmit || true'",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py\" PostToolUse || true'",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py\" Stop || true'",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py\" SubagentStart || true'",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py\" SubagentStop || true'",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py\" SessionEnd || true'",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}

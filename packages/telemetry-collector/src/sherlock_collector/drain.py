@@ -122,8 +122,14 @@ class Drain:
             self.spool.requeue(claimed, item, error)
             return "requeued"
         except (PermanentUploadError, ContractError) as error:
-            self.spool.quarantine(claimed, item, error)
-            return "dead-lettered"
+            if item is None:
+                self.spool.quarantine(claimed, None, error)
+                return "dead-lettered"
+            # A readable local artifact remains the source of truth even when the
+            # server rejects it. Retain it and block later ranges in this stream so
+            # a rollout/version mismatch cannot silently create a source gap.
+            self.spool.requeue(claimed, item, error)
+            return "requeued"
         except Exception as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
