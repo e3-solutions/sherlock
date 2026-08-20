@@ -13,8 +13,18 @@ from .claude_hook import (
     write_observation,
 )
 from .config import default_claude_home, default_codex_home, default_state_root
-from .discovery import discover_claude_transcripts, discover_rollouts
-from .rollout import CaptureResult, RolloutCapturer
+from .discovery import (
+    DEFAULT_LOOKBACK_SECONDS,
+    discover_claude_transcripts,
+    discover_rollouts,
+)
+from .rollout import (
+    DEFAULT_MAX_FILES,
+    DEFAULT_MAX_SYNC_BYTES,
+    CaptureResult,
+    RolloutCapturer,
+    SourceSnapshot,
+)
 from .spool import DurableSpool
 
 
@@ -47,6 +57,8 @@ class HookResult:
     captured_bytes: int = 0
     discovery_errors: int = 0
     capture_errors: int = 0
+    deferred_files: int = 0
+    deferred_bytes: int = 0
     locked: bool = False
     skipped: str | None = None
 
@@ -94,6 +106,11 @@ def capture_and_spawn_drain(
     drain_environment: Mapping[str, str] | None = None,
     best_effort: bool = False,
     priority_count: int = 0,
+    max_files: int | None = None,
+    max_sync_bytes: int | None = None,
+    priority_workload_class: str | None = None,
+    backlog_workload_class: str | None = None,
+    source_snapshots: Mapping[str, SourceSnapshot] | None = None,
 ) -> CaptureResult:
     """Durably capture local bytes, then detach a drain without awaiting network."""
     outcome: CaptureResult | None = None
@@ -104,6 +121,15 @@ def capture_and_spawn_drain(
             parent_native_session_ids=parent_native_session_ids,
             best_effort=best_effort,
             priority_count=priority_count,
+            max_files=max_files if max_files is not None else DEFAULT_MAX_FILES,
+            max_sync_bytes=(
+                max_sync_bytes
+                if max_sync_bytes is not None
+                else DEFAULT_MAX_SYNC_BYTES
+            ),
+            priority_workload_class=priority_workload_class,
+            backlog_workload_class=backlog_workload_class,
+            source_snapshots=source_snapshots,
         )
     finally:
         # A concurrent capture winner already starts its own drain. Avoid a
@@ -147,7 +173,13 @@ def run_hook(
     ).expanduser().resolve()
     root = Path(state_root or default_state_root(home)).expanduser().resolve()
     discovery = (
-        discover_claude_transcripts(home, hook_payload=payload)
+        discover_claude_transcripts(
+            home,
+            hook_payload=payload,
+            lookback_seconds=(
+                DEFAULT_LOOKBACK_SECONDS if event_name == "SessionStart" else None
+            ),
+        )
         if provider == "claude_code"
         else discover_rollouts(home, hook_payload=payload)
     )
@@ -214,14 +246,27 @@ def run_hook(
                 "claude-transcript" if provider == "claude_code" else "rollout"
             ),
             capture_unterminated_tail=provider != "claude_code",
+            allowed_root=(
+                home / "projects"
+                if provider == "claude_code"
+                and not (home / "projects").is_symlink()
+                and (home / "projects").is_dir()
+                else None
+            ),
         ),
         discovery.paths,
         drain_command,
         native_session_ids=discovery.native_session_ids,
         parent_native_session_ids=discovery.parent_native_session_ids,
+        source_snapshots=discovery.source_snapshots,
         drain_environment=environment,
         best_effort=True,
         priority_count=discovery.priority_count,
+        backlog_workload_class=(
+            "backfill"
+            if provider == "claude_code" and event_name == "SessionStart"
+            else None
+        ),
     )
     if (
         outcome.locked
@@ -236,5 +281,7 @@ def run_hook(
         captured_bytes=outcome.captured_bytes + hook_outcome.captured_bytes,
         discovery_errors=len(discovery.errors),
         capture_errors=outcome.errors + hook_outcome.errors + hook_errors,
+        deferred_files=outcome.deferred_files + hook_outcome.deferred_files,
+        deferred_bytes=outcome.deferred_bytes + hook_outcome.deferred_bytes,
         locked=outcome.locked or hook_outcome.locked,
     )

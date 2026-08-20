@@ -85,6 +85,30 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
   --github-id "$GITHUB_ID" \
   --email "$EMAIL"
 
+RUNTIME_ROOT="$CLAUDE_CONFIG_DIR/sherlock/runtime"
+if [ -n "${PYTHONPATH:-}" ]; then
+  COLLECTOR_PYTHONPATH="$RUNTIME_ROOT:$PYTHONPATH"
+else
+  COLLECTOR_PYTHONPATH="$RUNTIME_ROOT"
+fi
+if BACKFILL_RESULT=$(PYTHONPATH="$COLLECTOR_PYTHONPATH" "$PYTHON_BIN" \
+  -m sherlock_collector.cli \
+  --provider claude_code \
+  --claude-home "$CLAUDE_CONFIG_DIR" \
+  --state-root "$CLAUDE_CONFIG_DIR/sherlock/telemetry" \
+  --config "$CLAUDE_CONFIG_DIR/sherlock/collector.json" \
+  backfill --lookback-seconds 86400); then
+  echo "Claude Code 24-hour backfill: $BACKFILL_RESULT"
+  case "$BACKFILL_RESULT" in
+    *'"status": "complete"'*) ;;
+    *)
+      echo "Warning: Claude Code backfill was partial; later SessionStart hooks will resume it." >&2
+      ;;
+  esac
+else
+  echo "Warning: Claude Code backfill could not start; plugin installation will continue and SessionStart will retry it." >&2
+fi
+
 "$CLAUDE_BIN" plugin validate "$REPO_ROOT/plugins/sherlock-claude-code"
 "$CLAUDE_BIN" plugin validate "$REPO_ROOT"
 # Refresh the local marketplace registration so reruns update an existing install.
@@ -92,4 +116,4 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
 "$CLAUDE_BIN" plugin marketplace add "$REPO_ROOT"
 "$CLAUDE_BIN" plugin install sherlock-claude-code@sherlock
 
-echo "Sherlock for Claude Code is installed. Start a new Claude Code session to load its hooks."
+echo "Sherlock for Claude Code is installed. Recent transcripts were queued for upload; start a new Claude Code session to load its hooks."

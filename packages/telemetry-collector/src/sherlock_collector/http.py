@@ -35,15 +35,19 @@ class HttpTransport:
             },
             separators=(",", ":"),
         ).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "sherlock-telemetry-collector/0.1.0",
+        }
+        workload_class = item.metadata.get("workload_class")
+        if workload_class in {"live", "backfill"}:
+            headers["X-Sherlock-Workload-Class"] = str(workload_class)
         request = urllib.request.Request(
             self.endpoint,
             data=body,
             method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "sherlock-telemetry-collector/0.1.0",
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(

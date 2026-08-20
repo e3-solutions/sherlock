@@ -140,6 +140,40 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(body["collector"]["github_id"], "test-user")
         self.assertEqual(value["status"], "committed")
 
+    def test_backfill_spool_fact_sets_workload_header(self):
+        manifest, stored = batch("stream-backfill-http")
+        item = SpoolItem(manifest, stored, {"workload_class": "backfill"})
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _limit):
+                return json.dumps(receipt(manifest)).encode()
+
+        with patch(
+            "sherlock_collector.http.urllib.request.urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            HttpTransport(
+                "https://example.test/ingest",
+                CollectorIdentity(
+                    name="Test User",
+                    github_id="test-user",
+                    email="test@example.com",
+                    installation_id="00000000-0000-4000-8000-000000000001",
+                ),
+            ).upload(item)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.get_header("X-sherlock-workload-class"),
+            "backfill",
+        )
+
     def test_claude_manifest_round_trip_keeps_provider_identity(self):
         source = b'{"type":"user","sessionId":"session-1"}\n'
         manifest, stored = build_source_batch(
@@ -244,7 +278,8 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(len(transport.items), 1)
 
     def test_transient_failure_is_requeued_once_per_drain(self):
-        self.enqueue()
+        manifest, stored = batch("stream-backfill-retry")
+        self.spool.enqueue(manifest, stored, workload_class="backfill")
 
         class Transient:
             calls = 0
@@ -260,6 +295,7 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(transport.calls, 1)
         queued = self.spool.load(self.spool.list_pending()[0])
         self.assertEqual(queued.metadata["last_upload_error"], "try later")
+        self.assertEqual(queued.metadata["workload_class"], "backfill")
 
     def test_permanent_failure_is_retained_and_blocks_only_its_stream(self):
         first, _ = self.enqueue("stream-a")
@@ -418,6 +454,134 @@ class RolloutCaptureTests(unittest.TestCase):
                 chunk_bytes=2048,
                 max_object_bytes=1024,
             )
+
+    def test_allowed_root_captures_nested_regular_file_by_descriptor(self):
+        projects = self.root / "projects"
+        transcript = projects / "project" / "session" / "subagents" / "agent.jsonl"
+        transcript.parent.mkdir(parents=True)
+        source = b'{"type":"assistant"}\n'
+        transcript.write_bytes(source)
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            chunk_bytes=128,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([transcript])
+
+        self.assertEqual(result.captured_bytes, len(source))
+        self.assertEqual(result.errors, 0)
+        item = self.spool.load(self.spool.list_pending()[0])
+        self.assertEqual(item.manifest.source_byte_count, len(source))
+        state = json.loads(
+            (self.root / "confined-state" / "rollout-state.json").read_text()
+        )
+        only = next(iter(state["streams"].values()))
+        self.assertEqual(
+            only["path"],
+            str(projects.resolve() / transcript.relative_to(projects)),
+        )
+
+    def test_allowed_root_rejects_lexically_external_path(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        outside = self.root / "outside.jsonl"
+        outside.write_bytes(b'{"type":"outside"}\n')
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside allowed_root"):
+            capturer.capture([outside], best_effort=True)
+        with self.assertRaisesRegex(ValueError, "outside allowed_root"):
+            capturer.capture([Path("..") / outside.name], best_effort=True)
+
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_does_not_follow_final_file_symlink(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        outside = self.root / "outside.jsonl"
+        outside.write_bytes(b'{"type":"outside"}\n')
+        linked = projects / "linked.jsonl"
+        linked.symlink_to(outside)
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([linked], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_does_not_follow_directory_symlink(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "session.jsonl").write_bytes(b'{"type":"outside"}\n')
+        (projects / "linked-project").symlink_to(outside, target_is_directory=True)
+        candidate = projects / "linked-project" / "session.jsonl"
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([candidate], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_rejects_fifo_without_blocking(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        candidate = projects / "session.jsonl"
+        os.mkfifo(candidate)
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+
+        result = capturer.capture([candidate], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+
+    def test_allowed_root_rejects_file_swapped_to_symlink_before_open(self):
+        projects = self.root / "projects"
+        projects.mkdir()
+        candidate = projects / "session.jsonl"
+        candidate.write_bytes(b'{"type":"inside"}\n')
+        outside = self.root / "outside.jsonl"
+        outside.write_bytes(b'{"type":"outside"}\n')
+        capturer = RolloutCapturer(
+            self.root / "confined-state",
+            self.spool,
+            allowed_root=projects,
+        )
+        original_open = capturer._open_source
+
+        def swap_before_open(path):
+            path.unlink()
+            path.symlink_to(outside)
+            return original_open(path)
+
+        with patch.object(capturer, "_open_source", side_effect=swap_before_open):
+            result = capturer.capture([candidate], best_effort=True)
+
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.captured_bytes, 0)
+        self.assertEqual(self.spool.list_pending(), [])
 
     def test_offsets_advance_only_after_durable_enqueue(self):
         source = b'{"type":"one"}\n{"type":"two"}\n'

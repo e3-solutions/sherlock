@@ -16,6 +16,47 @@ function assert(
   if (!condition) throw new Error(message);
 }
 
+async function insertQueueBatch(
+  sql: ReturnType<typeof postgres>,
+  input: {
+    id: string;
+    workspaceId: string;
+    personId: string;
+    sourceKind: "rollout" | "transcript" | "hook";
+    streamKey: string;
+    generationKey: string;
+    startOffset: number;
+  },
+): Promise<void> {
+  await sql.unsafe(
+    `insert into telemetry.ingest_batches (
+       id, workspace_id, person_id, collector_key, source_provider,
+       source_kind, source_stream_key, generation_key, generation_seq,
+       start_offset, end_offset, source_byte_count, source_sha256,
+       storage_path, storage_encoding, stored_byte_count, stored_sha256,
+       record_count, contract_version, first_occurred_at, last_occurred_at,
+       processing_class_hint
+     ) values (
+       $1, $2, $3, 'queue-collector', $4, $5, $6, $7, 0,
+       $8::bigint, $8::bigint + 1, 1, $9, $10, 'gzip', 1, $11, 1,
+       'sherlock.rollout-batch.v1', now(), now(), 'backfill'
+     )`,
+    [
+      input.id,
+      input.workspaceId,
+      input.personId,
+      input.sourceKind === "rollout" ? "codex" : "claude_code",
+      input.sourceKind,
+      input.streamKey,
+      input.generationKey,
+      input.startOffset,
+      "d".repeat(64),
+      `queue-tests/${input.id}.jsonl.gz`,
+      "e".repeat(64),
+    ],
+  );
+}
+
 Deno.test({
   name:
     "queue claims are durable, fenced, retryable, and terminally inspectable",
@@ -136,6 +177,150 @@ Deno.test({
       assert(state[0].status === "failed");
       assert(state[0].last_error_code === "transient");
       assert(state[0].completed_at !== null);
+
+      const orderedFirstId = crypto.randomUUID();
+      const orderedSecondId = crypto.randomUUID();
+      const independentId = crypto.randomUUID();
+      const hookId = crypto.randomUUID();
+      await insertQueueBatch(sql, {
+        id: orderedFirstId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "ordered-transcript",
+        generationKey: "ordered-generation",
+        startOffset: 0,
+      });
+      await insertQueueBatch(sql, {
+        id: orderedSecondId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "ordered-transcript",
+        generationKey: "ordered-generation",
+        startOffset: 1,
+      });
+      await insertQueueBatch(sql, {
+        id: independentId,
+        workspaceId,
+        personId,
+        sourceKind: "rollout",
+        streamKey: "independent-codex",
+        generationKey: "independent-generation",
+        startOffset: 0,
+      });
+      await insertQueueBatch(sql, {
+        id: hookId,
+        workspaceId,
+        personId,
+        sourceKind: "hook",
+        streamKey: "independent-hook",
+        generationKey: "hook-generation",
+        startOffset: 0,
+      });
+      await sql.unsafe(
+        `update processing.telemetry_jobs
+            set available_at = case batch_id
+              when $2 then now() - interval '4 minutes'
+              when $1 then now() - interval '3 minutes'
+              when $3 then now() - interval '2 minutes'
+              when $4 then now() - interval '1 minute'
+              else available_at
+            end
+          where workspace_id = $5 and batch_id = any($6::uuid[])`,
+        [
+          orderedFirstId,
+          orderedSecondId,
+          independentId,
+          hookId,
+          workspaceId,
+          [orderedFirstId, orderedSecondId, independentId, hookId],
+        ],
+      );
+
+      const orderedFirst = await queue.claim("backfill", "ordered-first", 60);
+      assert(
+        orderedFirst?.job_kind === "normalize" &&
+          orderedFirst.batch_id === orderedFirstId,
+        "a later transcript range must not become eligible before its predecessor",
+      );
+      const independent = await queue.claim("backfill", "independent", 60);
+      assert(
+        independent?.job_kind === "normalize" &&
+          independent.batch_id === independentId,
+        "another provider stream must remain concurrently eligible",
+      );
+      const hook = await queue.claim("backfill", "hook", 60);
+      assert(
+        hook?.job_kind === "normalize" && hook.batch_id === hookId,
+        "a separate hook stream must not wait for transcript normalization",
+      );
+      assert(
+        await queue.retry(
+          orderedFirst,
+          60,
+          "transient_predecessor",
+          "retry remains ordered",
+        ),
+      );
+      assert(
+        await queue.claim("backfill", "blocked-by-retry", 60) === null,
+        "a queued predecessor retry must continue to block later ranges",
+      );
+      await sql.unsafe(
+        `update processing.telemetry_jobs set available_at = now()
+          where workspace_id = $1 and batch_id = $2`,
+        [workspaceId, orderedFirstId],
+      );
+      const retriedFirst = await queue.claim("backfill", "retried-first", 60);
+      assert(
+        retriedFirst?.job_kind === "normalize" &&
+          retriedFirst.batch_id === orderedFirstId,
+      );
+      assert(await queue.complete(retriedFirst) === "succeeded");
+      const orderedSecond = await queue.claim("backfill", "ordered-second", 60);
+      assert(
+        orderedSecond?.job_kind === "normalize" &&
+          orderedSecond.batch_id === orderedSecondId,
+        "the next transcript range must become eligible after its predecessor",
+      );
+      const orderedThirdId = crypto.randomUUID();
+      await insertQueueBatch(sql, {
+        id: orderedThirdId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "ordered-transcript",
+        generationKey: "ordered-generation",
+        startOffset: 2,
+      });
+      assert(
+        await queue.fail(
+          orderedSecond,
+          "permanent_source_gap",
+          "the predecessor remains auditable",
+        ),
+      );
+      const orderedThird = await queue.claim("backfill", "ordered-third", 60);
+      assert(
+        orderedThird?.job_kind === "normalize" &&
+          orderedThird.batch_id === orderedThirdId,
+        "a terminally failed predecessor must not suppress later evidence",
+      );
+      const failedPredecessor = await sql.unsafe(
+        `select status, last_error_code
+           from processing.telemetry_jobs
+          where workspace_id = $1 and batch_id = $2`,
+        [workspaceId, orderedSecondId],
+      );
+      assert(
+        failedPredecessor[0].status === "failed" &&
+          failedPredecessor[0].last_error_code === "permanent_source_gap",
+        "the released ordering gap must remain explicit and auditable",
+      );
+      assert(await queue.complete(orderedThird) === "succeeded");
+      assert(await queue.complete(independent) === "succeeded");
+      assert(await queue.complete(hook) === "succeeded");
       const immutable = await sql.unsafe(
         `select source_sha256, count(*) over ()::int as count
            from telemetry.ingest_batches

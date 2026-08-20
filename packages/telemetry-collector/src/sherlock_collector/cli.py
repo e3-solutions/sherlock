@@ -15,6 +15,12 @@ from .config import (
     load_config,
 )
 from .drain import Drain
+from .discovery import (
+    CLAUDE_BACKFILL_MAX_BYTES,
+    CLAUDE_BACKFILL_MAX_FILES,
+    DEFAULT_LOOKBACK_SECONDS,
+    discover_claude_transcripts,
+)
 from .hook import capture_and_spawn_drain, run_hook
 from .http import HttpTransport
 from .rollout import RolloutCapturer
@@ -33,6 +39,12 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     capture = commands.add_parser("capture")
     capture.add_argument("rollout", nargs="+", type=Path)
+    backfill = commands.add_parser("backfill")
+    backfill.add_argument(
+        "--lookback-seconds",
+        type=int,
+        default=DEFAULT_LOOKBACK_SECONDS,
+    )
     hook = commands.add_parser("hook")
     hook.add_argument("event_name")
     commands.add_parser("drain")
@@ -83,6 +95,76 @@ def main(argv: list[str] | None = None) -> int:
             ): str(source_home),
         }
     )
+    if args.command == "backfill":
+        if args.provider != "claude_code" or args.lookback_seconds < 1:
+            print("backfill requires claude_code and a positive lookback", file=sys.stderr)
+            return 2
+        discovery = discover_claude_transcripts(
+            source_home,
+            lookback_seconds=args.lookback_seconds,
+        )
+        outcome = capture_and_spawn_drain(
+            RolloutCapturer(
+                state_root,
+                spool,
+                source_provider="claude_code",
+                source_kind="transcript",
+                state_name="claude-transcript",
+                capture_unterminated_tail=False,
+                allowed_root=(
+                    source_home / "projects"
+                    if not (source_home / "projects").is_symlink()
+                    and (source_home / "projects").is_dir()
+                    else None
+                ),
+            ),
+            discovery.paths,
+            [
+                sys.executable,
+                "-m",
+                "sherlock_collector.cli",
+                "--claude-home",
+                str(source_home),
+                "--provider",
+                "claude_code",
+                "--state-root",
+                str(state_root),
+                *(["--config", str(args.config)] if args.config else []),
+                "drain",
+            ],
+            native_session_ids=discovery.native_session_ids,
+            parent_native_session_ids=discovery.parent_native_session_ids,
+            source_snapshots=discovery.source_snapshots,
+            drain_environment=environment,
+            best_effort=True,
+            max_files=CLAUDE_BACKFILL_MAX_FILES,
+            max_sync_bytes=CLAUDE_BACKFILL_MAX_BYTES,
+            backlog_workload_class="backfill",
+        )
+        partial = bool(
+            discovery.errors
+            or discovery.invalid_count
+            or discovery.omitted_count
+            or outcome.errors
+            or outcome.locked
+            or outcome.deferred_files
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "partial" if partial else "complete",
+                    "lookback_seconds": args.lookback_seconds,
+                    "discovered": len(discovery.paths),
+                    "selected_bytes": discovery.selected_bytes,
+                    "invalid": discovery.invalid_count,
+                    "omitted": discovery.omitted_count,
+                    "discovery_errors": len(discovery.errors),
+                    **asdict(outcome),
+                },
+                sort_keys=True,
+            )
+        )
+        return 75 if outcome.locked else 0
     if args.command == "capture":
         outcome = capture_and_spawn_drain(
             RolloutCapturer(

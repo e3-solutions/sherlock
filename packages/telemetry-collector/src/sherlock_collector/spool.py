@@ -104,9 +104,20 @@ class DurableSpool:
     def lock_path(self) -> Path:
         return self.root / "drain.lock"
 
-    def enqueue(self, manifest: BatchManifest, stored_payload: bytes) -> Path:
+    def enqueue(
+        self,
+        manifest: BatchManifest,
+        stored_payload: bytes,
+        *,
+        workload_class: str | None = None,
+    ) -> Path:
         validate_stored_payload(manifest, stored_payload)
-        item = SpoolItem(manifest, stored_payload, {"enqueued_at": utc_now()})
+        if workload_class not in {None, "live", "backfill"}:
+            raise ContractError("spool workload_class is unsupported")
+        metadata = {"enqueued_at": utc_now()}
+        if workload_class is not None:
+            metadata["workload_class"] = workload_class
+        item = SpoolItem(manifest, stored_payload, metadata)
         destination = self.pending / f"{manifest.spool_key}.json"
         if destination.exists():
             existing = self.load(destination)

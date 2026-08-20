@@ -269,6 +269,8 @@ class TeamInstallerTests(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertIn("Claude Code 24-hour backfill", completed.stdout)
+            self.assertIn('"status": "complete"', completed.stdout)
             config = claude_home / "sherlock" / "collector.json"
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             configured = json.loads(config.read_text(encoding="utf-8"))
@@ -280,6 +282,14 @@ class TeamInstallerTests(unittest.TestCase):
                     / "runtime"
                     / "sherlock_collector"
                     / "cli.py"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    claude_home
+                    / "sherlock"
+                    / "telemetry"
+                    / "claude-transcript-state.json"
                 ).is_file()
             )
             calls = [json.loads(line)["argv"] for line in capture.read_text().splitlines()]

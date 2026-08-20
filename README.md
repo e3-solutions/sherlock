@@ -39,8 +39,14 @@ is not currently supported. From the same checkout, run:
 The installer validates the Claude plugin and marketplace, stores the runtime
 and owner-only config under `${CLAUDE_CONFIG_DIR:-~/.claude}/sherlock`, adds
 the local `sherlock` marketplace, and installs
-`sherlock-claude-code@sherlock`. Start a new Claude Code session so its hooks
-load. The existing Codex plugin remains separate under `plugins/sherlock/`.
+`sherlock-claude-code@sherlock`. It also queues newline-complete bytes from
+Claude primary and subagent transcripts modified during the preceding 24
+hours. Each pass uses a descriptor-verified point-in-time snapshot and reports
+any bounded or incomplete-record bytes as deferred. Reinstalling is
+idempotent, and later `SessionStart` hooks resume those byte ranges with a
+durable cursor before capturing the current session. Start a new Claude Code
+session so its hooks load. The existing Codex plugin remains separate under
+`plugins/sherlock/`.
 
 ## Verify
 

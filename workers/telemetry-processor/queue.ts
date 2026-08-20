@@ -59,18 +59,40 @@ export class PostgresJobQueue {
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
         `with candidate as (
-           select id
-             from processing.telemetry_jobs
-            where workload_class = $1
-              and attempt_count < attempt_limit
+           select j.id
+             from processing.telemetry_jobs j
+             left join telemetry.ingest_batches batch
+               on j.job_kind = 'normalize'
+              and batch.workspace_id = j.workspace_id
+              and batch.id = j.batch_id
+            where j.workload_class = $1
+              and j.attempt_count < j.attempt_limit
               and (
-                (status = 'queued' and available_at <= now()) or
-                (status = 'leased' and lease_expires_at <= now())
+                (j.status = 'queued' and j.available_at <= now()) or
+                (j.status = 'leased' and j.lease_expires_at <= now())
               )
-            order by case when status = 'queued' then available_at
-                          else lease_expires_at end,
-                     id
-            for update skip locked
+              and (
+                j.job_kind <> 'normalize' or not exists (
+                  select 1
+                    from telemetry.ingest_batches predecessor
+                    join processing.telemetry_jobs predecessor_job
+                      on predecessor_job.workspace_id = predecessor.workspace_id
+                     and predecessor_job.batch_id = predecessor.id
+                     and predecessor_job.job_kind = 'normalize'
+                   where predecessor.workspace_id = batch.workspace_id
+                     and predecessor.collector_key = batch.collector_key
+                     and predecessor.source_kind = batch.source_kind
+                     and predecessor.source_stream_key = batch.source_stream_key
+                     and predecessor.generation_seq = batch.generation_seq
+                     and predecessor.generation_key = batch.generation_key
+                     and predecessor.start_offset < batch.start_offset
+                     and predecessor_job.status in ('queued', 'leased')
+                )
+              )
+            order by case when j.status = 'queued' then j.available_at
+                          else j.lease_expires_at end,
+                     j.id
+            for update of j skip locked
             limit 1
          )
          update processing.telemetry_jobs j

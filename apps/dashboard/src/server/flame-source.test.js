@@ -9,7 +9,9 @@ import {
   FLAME_SQL,
   INTERVAL_PROMPTS_SQL,
   INTERVAL_WORK_SQL,
+  INTERVAL_WORK_LIMIT,
   MAX_WORK_DETAIL_LIMIT,
+  MCP_PROMPT_EVIDENCE_LIMIT,
   NORMALIZER_VERSION,
   NORMALIZER_VERSIONS,
   PEOPLE_SQL,
@@ -469,6 +471,9 @@ describe("Sherlock Flame payload", () => {
       expect(sql).toContain("e.actor_role <> 'unknown'");
       expect(sql).toContain("or pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)");
       expect(sql).toContain("pg_visible_in_snapshot(s.xmin::text::xid8, p.snapshot)");
+      expect(sql).toContain("ib.start_offset source_batch_start_offset");
+      expect(sql).toContain("ib.end_offset source_batch_end_offset");
+      expect(sql).toContain("ib.record_count source_batch_record_count");
       expect(sql).not.toContain("analytics.activity_spans");
     }
     expect(INTERVAL_WORK_SQL).toContain("group by session_id, semantic_role");
@@ -503,6 +508,19 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
   });
 
+  it("keeps Claude system meta messages out of user summaries and detail", () => {
+    for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
+      expect(sql).toContain("e.message_role, e.message_origin");
+      expect(sql).toContain("message_origin in ('human', 'parent_agent')");
+    }
+    expect(INTERVAL_WORK_SQL).toContain(
+      "and message_origin in ('human', 'parent_agent')",
+    );
+    expect(WORK_DETAIL_SQL).toContain(
+      "bucket_events.message_origin in ('human', 'parent_agent')",
+    );
+  });
+
   it("selects MCP prompt excerpts from the exact canonical prompt universe", () => {
     expect(INTERVAL_PROMPTS_SQL).toContain("prompt_candidates as materialized");
     expect(INTERVAL_PROMPTS_SQL).toContain("e.message_origin = 'human'");
@@ -519,19 +537,6 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_PROMPTS_SQL).not.toContain("activity_candidates as materialized");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("context_before");
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
-  });
-
-  it("keeps Claude system meta messages out of user summaries and detail", () => {
-    for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
-      expect(sql).toContain("e.message_role, e.message_origin");
-      expect(sql).toContain("message_origin in ('human', 'parent_agent')");
-    }
-    expect(INTERVAL_WORK_SQL).toContain(
-      "and message_origin in ('human', 'parent_agent')",
-    );
-    expect(WORK_DETAIL_SQL).toContain(
-      "bucket_events.message_origin in ('human', 'parent_agent')",
-    );
   });
 
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
@@ -675,7 +680,9 @@ describe("Sherlock Flame payload", () => {
         display_name: "Ada",
       }]))
       .mockImplementationOnce(() => pendingRows);
-    source.sql = { begin: (callback) => callback({ unsafe }) };
+    source.sql = {
+      begin: (callback) => callback({ unsafe, array: (values) => values }),
+    };
     const controller = new AbortController();
 
     const request = source.fetchDay({ signal: controller.signal });
@@ -731,6 +738,7 @@ describe("Sherlock Flame payload", () => {
     }];
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([header])
       .mockResolvedValueOnce(items);
     source.transaction = (callback) => callback({
       unsafe,
@@ -747,9 +755,11 @@ describe("Sherlock Flame payload", () => {
       limit: "1",
     });
 
-    expect(unsafe.mock.calls).toHaveLength(2);
-    expect(unsafe.mock.calls[1][0]).toBe(WORK_DETAIL_SQL);
-    expect(unsafe.mock.calls[1][1].at(-1)).toBe(2);
+    expect(unsafe.mock.calls).toHaveLength(3);
+    expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(INTERVAL_WORK_LIMIT + 1);
+    expect(unsafe.mock.calls[2][0]).toBe(WORK_DETAIL_SQL);
+    expect(unsafe.mock.calls[2][1].at(-1)).toBe(2);
     expect(detail.items).toEqual([expect.objectContaining({
       id: "41",
       role: "user",
@@ -807,7 +817,8 @@ describe("Sherlock Flame payload", () => {
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
       .mockResolvedValueOnce(rows);
-    source.transaction = (callback) => callback({ unsafe });
+    const array = vi.fn((values) => values);
+    source.transaction = (callback) => callback({ unsafe, array });
     const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 
     const result = await source.fetchPromptEvidence({
@@ -817,6 +828,8 @@ describe("Sherlock Flame payload", () => {
     });
 
     expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(array).toHaveBeenCalledWith(NORMALIZER_VERSIONS);
+    expect(unsafe.mock.calls[1][1][3]).toEqual(NORMALIZER_VERSIONS);
     expect(unsafe.mock.calls[1][1].at(-1)).toBe(5);
     expect(result.eligiblePromptCount).toBe(8);
     expect(result.prompts).toHaveLength(5);

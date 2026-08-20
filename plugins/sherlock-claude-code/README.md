@@ -23,6 +23,25 @@ From the Sherlock repository root:
 Set `CLAUDE_CONFIG_DIR`, `CLAUDE_BIN`, `PYTHON_BIN`, or
 `SHERLOCK_INGEST_URL` to override their documented defaults.
 
+Installation immediately scans Claude's known primary and subagent transcript
+layouts for regular JSONL files modified during the preceding 24 hours. It
+opens them by descriptor without following symlinks, validates their
+provider-native session identities, and records an inode, prefix digest, and
+point-in-time byte boundary before capture. Capture rejects a replaced source
+and never reads beyond that boundary. It queues only complete JSONL records
+through the same immutable checkpoint and spool used by live hooks, then starts
+one detached drain. A rerun does not duplicate captured byte ranges.
+
+One pass is bounded to 4,096 files and 512 MiB. The durable cursor advances
+across every eligible transcript rather than repeatedly selecting only the
+newest files. JSON status reports `deferred_files` and `deferred_bytes` when a
+pass reaches a bound or observes an incomplete trailing record; a partial
+result prints a warning, and later `SessionStart` hooks resume the same
+checkpointed catch-up. Once Claude finishes the trailing record, Sherlock
+queues that exact remaining byte range once.
+Historical transcripts do not fabricate `Stop` or `SubagentStop` evidence that
+Sherlock never observed, so pre-install turns can remain provisionally open.
+
 ## Verify
 
 ```sh
