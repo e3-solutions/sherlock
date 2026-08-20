@@ -156,7 +156,8 @@ Deno.test({
            source_priority, event_kind, event_subtype, actor_role,
            occurred_at, observed_at, server_received_at
          ) values ($1,$2,$3,'sherlock.codex-rollout.v1',1,'micro-scope',
-           'micro-logical',100,'reasoning','reasoning','unknown',$4,$4,$4)
+           'micro-logical',100,'reasoning','reasoning','unknown',
+           $4::text::timestamptz,$4::text::timestamptz,$4::text::timestamptz)
          returning id::text id`,
         [
           workspaceId,
@@ -173,7 +174,8 @@ Deno.test({
            source_priority, event_kind, event_subtype, actor_role,
            occurred_at, observed_at, server_received_at
          ) values ($1,$2,$3,'sherlock.codex-rollout.v1',2,'micro-scope',
-           'micro-logical',100,'reasoning','reasoning','unknown',$4,$4,$4)
+           'micro-logical',100,'reasoning','reasoning','unknown',
+           $4::text::timestamptz,$4::text::timestamptz,$4::text::timestamptz)
          returning id::text id`,
         [
           workspaceId,
