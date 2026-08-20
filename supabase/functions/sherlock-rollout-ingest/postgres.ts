@@ -92,11 +92,15 @@ export function assertExactRecords(
       native_type: record.native_type,
       native_payload_type: record.native_payload_type,
       parse_status: record.parse_status,
+      native_record_start_offset: record.native_record_start_offset ?? null,
+      native_record_end_offset: record.native_record_end_offset ?? null,
+      native_record_sha256: record.native_record_sha256 ?? null,
+      fragment_index: record.fragment_index ?? null,
+      fragment_count: record.fragment_count ?? null,
     };
     for (const [field, value] of Object.entries(expected)) {
-      const actual = typeof value === "number"
-        ? Number(row[field])
-        : row[field];
+      const rowValue = row[field] ?? null;
+      const actual = typeof value === "number" ? Number(rowValue) : rowValue;
       if (actual !== value) {
         throw new IngestError(
           "record_identity_conflict",
@@ -130,7 +134,8 @@ async function assertCommittedRecords(
     `select record_index, source_start_offset, source_end_offset, record_sha256,
             native_type, native_payload_type,
             to_char(occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as occurred_at,
-            parse_status
+            parse_status, native_record_start_offset, native_record_end_offset,
+            native_record_sha256, fragment_index, fragment_count
        from telemetry.native_records
       where workspace_id = $1 and batch_id = $2
       order by record_index`,
@@ -382,6 +387,11 @@ export class PostgresBatchRepository implements BatchRepository {
         native_payload_type: record.native_payload_type,
         occurred_at: record.occurred_at,
         parse_status: record.parse_status,
+        native_record_start_offset: record.native_record_start_offset ?? null,
+        native_record_end_offset: record.native_record_end_offset ?? null,
+        native_record_sha256: record.native_record_sha256 ?? null,
+        fragment_index: record.fragment_index ?? null,
+        fragment_count: record.fragment_count ?? null,
       }));
       for (let offset = 0; offset < records.length; offset += 1_000) {
         const locatorBatch = records.slice(offset, offset + 1_000);
@@ -398,6 +408,11 @@ export class PostgresBatchRepository implements BatchRepository {
             "native_payload_type",
             "occurred_at",
             "parse_status",
+            "native_record_start_offset",
+            "native_record_end_offset",
+            "native_record_sha256",
+            "fragment_index",
+            "fragment_count",
           )
         }`;
       }

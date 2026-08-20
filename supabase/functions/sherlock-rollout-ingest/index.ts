@@ -36,7 +36,7 @@ function ingestBackend(): {
   return backend;
 }
 
-async function handler(request: Request): Promise<Response> {
+export async function handler(request: Request): Promise<Response> {
   try {
     if (request.method !== "POST") {
       return Response.json({ error: { code: "method_not_allowed" } }, {
@@ -93,7 +93,7 @@ async function readJsonBounded(request: Request): Promise<unknown> {
   if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
     throw new IngestError(
       "payload_too_large",
-      "request body exceeds 12 MiB",
+      "request body exceeds 24 MiB",
       413,
     );
   }
@@ -111,7 +111,7 @@ async function readJsonBounded(request: Request): Promise<unknown> {
       await reader.cancel();
       throw new IngestError(
         "payload_too_large",
-        "request body exceeds 12 MiB",
+        "request body exceeds 24 MiB",
         413,
       );
     }

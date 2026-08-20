@@ -92,7 +92,11 @@ export async function projectBatch(
 ): Promise<BatchProjection> {
   const records = manifest.records.map((locator) => ({
     locator,
-    envelope: parseEnvelope(recordBytes(manifest, source, locator)),
+    // A transport fragment is deliberately not a JSON record. Preserve an
+    // observable bounded projection without parsing partial native content.
+    envelope: locator.parse_status === "fragment"
+      ? null
+      : parseEnvelope(recordBytes(manifest, source, locator)),
   }));
   const metaRecord = records.find((record) =>
     record.envelope?.type === "session_meta" &&

@@ -178,7 +178,9 @@ export class TelemetryProcessor {
                 record_sha256, native_type, native_payload_type,
                 to_char(occurred_at at time zone 'UTC',
                   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as occurred_at,
-                parse_status
+                parse_status, native_record_start_offset,
+                native_record_end_offset, native_record_sha256,
+                fragment_index, fragment_count
            from telemetry.native_records
           where workspace_id = $1 and batch_id = $2
           order by record_index`,
@@ -198,19 +200,7 @@ export class TelemetryProcessor {
         stored_byte_count: Number(row.stored_byte_count),
         stored_sha256: String(row.stored_sha256),
         record_count: Number(row.record_count),
-        records: records.map((record) => ({
-          record_index: Number(record.record_index),
-          source_start_offset: Number(record.source_start_offset),
-          source_end_offset: Number(record.source_end_offset),
-          record_sha256: String(record.record_sha256),
-          native_type: nullableString(record.native_type),
-          native_payload_type: nullableString(record.native_payload_type),
-          occurred_at: nullableString(record.occurred_at),
-          parse_status: String(record.parse_status) as
-            | "ok"
-            | "unknown"
-            | "malformed",
-        })),
+        records: records.map(recordLocatorFromRow),
         observed_native_session_id: nullableString(
           row.observed_native_session_id,
         ),
@@ -274,6 +264,30 @@ export async function reduceAffectedSessions(
     total.tombstone_count += reduced.tombstone_count;
   }
   return total;
+}
+
+export function recordLocatorFromRow(
+  record: Record<string, unknown>,
+): BatchManifest["records"][number] {
+  return {
+    record_index: Number(record.record_index),
+    source_start_offset: Number(record.source_start_offset),
+    source_end_offset: Number(record.source_end_offset),
+    record_sha256: String(record.record_sha256),
+    native_type: nullableString(record.native_type),
+    native_payload_type: nullableString(record.native_payload_type),
+    occurred_at: nullableString(record.occurred_at),
+    parse_status: String(
+      record.parse_status,
+    ) as BatchManifest["records"][number]["parse_status"],
+    native_record_start_offset: nullableNumber(
+      record.native_record_start_offset,
+    ),
+    native_record_end_offset: nullableNumber(record.native_record_end_offset),
+    native_record_sha256: nullableString(record.native_record_sha256),
+    fragment_index: nullableNumber(record.fragment_index),
+    fragment_count: nullableNumber(record.fragment_count),
+  };
 }
 
 export class SupabaseRawStorage {
@@ -347,4 +361,8 @@ export class SupabaseRawStorage {
 
 function nullableString(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
+}
+
+function nullableNumber(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
 }

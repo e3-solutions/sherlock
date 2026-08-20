@@ -237,6 +237,36 @@ Deno.test("normalizer emits observable unknown events for malformed records", as
   assert(projection.events[0].error_code === "native_malformed");
 });
 
+Deno.test("normalizer never parses a native record fragment", async () => {
+  const { manifest, source } = await fixture([{
+    timestamp: "2026-08-15T00:00:00Z",
+    type: "event_msg",
+    payload: {
+      type: "agent_message",
+      message: "this would become product activity if parsed",
+    },
+  }]);
+  manifest.records[0] = {
+    ...manifest.records[0],
+    native_type: null,
+    native_payload_type: null,
+    occurred_at: null,
+    parse_status: "fragment",
+    native_record_start_offset: 0,
+    native_record_end_offset: source.byteLength * 2,
+    native_record_sha256: "f".repeat(64),
+    fragment_index: 0,
+    fragment_count: 2,
+  };
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(projection.events.length === 1);
+  assert(projection.events[0].event_kind === "unknown");
+  assert(projection.events[0].error_code === "native_fragment");
+  assert(projection.events[0].content_excerpt === null);
+});
+
 Deno.test("usage without a native session keeps a deterministic stream scope", async () => {
   const { manifest, source } = await fixture([{
     timestamp: "2026-08-15T00:00:00Z",

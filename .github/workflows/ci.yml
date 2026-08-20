@@ -83,8 +83,10 @@ jobs:
           pnpm test
           pnpm build
 
-      - name: Start isolated Supabase database
-        run: supabase db start
+      - name: Start isolated Supabase database and Storage
+        run: >-
+          supabase start --exclude
+          realtime,imgproxy,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
 
       - name: Run database schema tests
         run: supabase test db --local supabase/tests/database/schema.test.sql
@@ -115,6 +117,16 @@ jobs:
         run: >-
           deno test --allow-env --allow-net
           workers/telemetry-processor/queue_integration_test.ts
+
+      - name: Run oversized rollout end-to-end test
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: |
+          eval "$(supabase status -o env)"
+          SHERLOCK_TEST_SUPABASE_URL="$API_URL" \
+          SHERLOCK_TEST_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY" \
+          deno test --allow-env --allow-net --allow-read --allow-write --allow-run=python3 \
+            workers/telemetry-processor/oversized_rollout_e2e_test.ts
 
       - name: Stop isolated Supabase database
         if: always()

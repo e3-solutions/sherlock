@@ -1,9 +1,11 @@
 export const CONTRACT_VERSION = "sherlock.rollout-batch.v1";
 export const RECEIPT_VERSION = "sherlock.committed-receipt.v1";
-export const MAX_STORED_BYTES = 6 * 1024 * 1024;
-export const MAX_SOURCE_BYTES = 5 * 1024 * 1024;
+export const MAX_STORED_BYTES = 17 * 1024 * 1024;
+export const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 export const MAX_RECORDS = 20_000;
-export const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
+export const MAX_REQUEST_BYTES = 24 * 1024 * 1024;
+export const FRAGMENT_SOURCE_BYTES = 4 * 1024 * 1024;
+export const MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024;
 export const NATIVE_LABEL_BYTES = 256;
 export const IDENTITY_HINT_BYTES = 512;
 export const VERSION_HINT_BYTES = 128;
@@ -24,7 +26,12 @@ export interface RecordLocator {
   native_type: string | null;
   native_payload_type: string | null;
   occurred_at: string | null;
-  parse_status: "ok" | "unknown" | "malformed";
+  parse_status: "ok" | "unknown" | "malformed" | "fragment";
+  native_record_start_offset?: number | null;
+  native_record_end_offset?: number | null;
+  native_record_sha256?: string | null;
+  fragment_index?: number | null;
+  fragment_count?: number | null;
 }
 
 export interface BatchManifest {
@@ -331,7 +338,7 @@ function decodeBase64(value: unknown): Uint8Array {
   if (value.length > maximumEncodedLength) {
     throw new IngestError(
       "payload_too_large",
-      "stored payload exceeds 6 MiB",
+      "stored payload exceeds 17 MiB",
       413,
     );
   }
@@ -344,7 +351,7 @@ function decodeBase64(value: unknown): Uint8Array {
     if (bytes.byteLength > MAX_STORED_BYTES) {
       throw new IngestError(
         "payload_too_large",
-        "stored payload exceeds 6 MiB",
+        "stored payload exceeds 17 MiB",
         413,
       );
     }
@@ -362,7 +369,11 @@ function decodeBase64(value: unknown): Uint8Array {
 function parseRecord(value: unknown): RecordLocator {
   const input = object(value, "record");
   const parseStatus = text(input.parse_status, "record.parse_status");
-  if (!(["ok", "unknown", "malformed"] as string[]).includes(parseStatus)) {
+  if (
+    !(["ok", "unknown", "malformed", "fragment"] as string[]).includes(
+      parseStatus,
+    )
+  ) {
     throw new IngestError(
       "invalid_manifest",
       "record.parse_status is unsupported",
@@ -393,6 +404,28 @@ function parseRecord(value: unknown): RecordLocator {
     ),
     occurred_at: nullableTimestamp(input.occurred_at, "record.occurred_at"),
     parse_status: parseStatus as RecordLocator["parse_status"],
+    native_record_start_offset: input.native_record_start_offset == null
+      ? null
+      : integer(
+        input.native_record_start_offset,
+        "record.native_record_start_offset",
+      ),
+    native_record_end_offset: input.native_record_end_offset == null
+      ? null
+      : integer(
+        input.native_record_end_offset,
+        "record.native_record_end_offset",
+        1,
+      ),
+    native_record_sha256: input.native_record_sha256 == null
+      ? null
+      : hash(input.native_record_sha256, "record.native_record_sha256"),
+    fragment_index: input.fragment_index == null
+      ? null
+      : integer(input.fragment_index, "record.fragment_index"),
+    fragment_count: input.fragment_count == null
+      ? null
+      : integer(input.fragment_count, "record.fragment_count", 2),
   };
 }
 
@@ -477,6 +510,7 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
 export function validateManifest(manifest: BatchManifest): void {
   if (
     manifest.source_byte_count > MAX_SOURCE_BYTES ||
+    manifest.stored_byte_count > MAX_STORED_BYTES ||
     manifest.record_count > MAX_RECORDS
   ) {
     throw new IngestError(
@@ -543,6 +577,93 @@ export function validateManifest(manifest: BatchManifest): void {
       );
     }
     previousEnd = record.source_end_offset;
+
+    const fragmentFields = [
+      record.native_record_start_offset,
+      record.native_record_end_offset,
+      record.native_record_sha256,
+      record.fragment_index,
+      record.fragment_count,
+    ];
+    if (record.parse_status !== "fragment") {
+      if (fragmentFields.some((value) => value != null)) {
+        throw new IngestError(
+          "invalid_manifest",
+          "non-fragment records cannot include fragment metadata",
+          400,
+        );
+      }
+      return;
+    }
+    if (fragmentFields.some((value) => value == null)) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragment record metadata must be complete",
+        400,
+      );
+    }
+    if (
+      record.native_type !== null ||
+      record.native_payload_type !== null ||
+      record.occurred_at !== null ||
+      manifest.first_occurred_at !== null ||
+      manifest.last_occurred_at !== null
+    ) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragment records cannot claim unparsed semantic metadata",
+        400,
+      );
+    }
+    if (
+      manifest.record_count !== 1 ||
+      record.source_start_offset !== manifest.start_offset ||
+      record.source_end_offset !== manifest.end_offset
+    ) {
+      throw new IngestError(
+        "invalid_manifest",
+        "a fragment batch must contain exactly its one fragment range",
+        400,
+      );
+    }
+
+    const logicalStart = record.native_record_start_offset as number;
+    const logicalEnd = record.native_record_end_offset as number;
+    const fragmentIndex = record.fragment_index as number;
+    const fragmentCount = record.fragment_count as number;
+    const logicalBytes = logicalEnd - logicalStart;
+    if (logicalBytes <= MAX_SOURCE_BYTES) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragmented native record must exceed the 16 MiB inline limit",
+        400,
+      );
+    }
+    if (logicalBytes > MAX_LOGICAL_RECORD_BYTES) {
+      throw new IngestError(
+        "payload_too_large",
+        "fragmented native record exceeds the 100 MiB logical limit",
+        413,
+      );
+    }
+    const expectedCount = Math.ceil(logicalBytes / FRAGMENT_SOURCE_BYTES);
+    const expectedStart = logicalStart + fragmentIndex * FRAGMENT_SOURCE_BYTES;
+    const expectedEnd = Math.min(
+      expectedStart + FRAGMENT_SOURCE_BYTES,
+      logicalEnd,
+    );
+    if (
+      fragmentCount !== expectedCount ||
+      fragmentIndex >= expectedCount ||
+      record.source_start_offset !== expectedStart ||
+      record.source_end_offset !== expectedEnd
+    ) {
+      throw new IngestError(
+        "invalid_manifest",
+        "fragment range, index, or count is not the deterministic 4 MiB partition",
+        400,
+      );
+    }
   });
 }
 

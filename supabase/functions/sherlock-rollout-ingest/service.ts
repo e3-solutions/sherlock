@@ -131,7 +131,7 @@ export async function decompressBounded(
         await reader.cancel();
         throw new IngestError(
           "payload_too_large",
-          "uncompressed source exceeds 5 MiB",
+          "uncompressed source exceeds 16 MiB",
           413,
         );
       }
