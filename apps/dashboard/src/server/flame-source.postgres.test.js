@@ -178,8 +178,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       );
       await sql.unsafe(
         `insert into telemetry.people (
-           id, workspace_id, identity_key, display_name
-         ) values ($1, $2, $3, 'Projected User')`,
+           id, workspace_id, identity_key, display_name, email
+         ) values ($1, $2, $3, 'Projected User', 'projected@e3group.ai')`,
         [personId, workspaceId, `projection-person-${personId}`],
       );
       await sql.unsafe(
@@ -311,7 +311,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         ],
       );
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const legacyDay = await source.fetchDay({ now: partialRead });
       const legacyInterval = await source.fetchInterval({
         personId,
