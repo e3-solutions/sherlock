@@ -12,7 +12,11 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-const source = new DirectFlameSource({ databaseUrl, workspaceId });
+const source = new DirectFlameSource({
+  databaseUrl,
+  workspaceId,
+  expectedEmailDomain: "e3group.ai",
+});
 try {
   const now = new Date(Date.now() + 60_000);
   const day = await source.fetchDay({ now });

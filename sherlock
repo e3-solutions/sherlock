@@ -5,6 +5,8 @@ set -eu
 REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SHERLOCK_HOME=${SHERLOCK_HOME:-"$HOME/.sherlock"}
+CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
+CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 NAME=""
 GITHUB_ID=""
 EMAIL=""
@@ -86,6 +88,13 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Python 3 is required." >&2
   exit 1
 fi
+
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/validate_install_email.py" \
+  --email "$EMAIL" \
+  --collector-home "$CODEX_HOME"
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/validate_install_email.py" \
+  --email "$EMAIL" \
+  --collector-home "$CLAUDE_CONFIG_DIR"
 
 # Resolve both agent CLIs before either provider installer changes local state.
 if [ -n "${CODEX_BIN:-}" ]; then
