@@ -537,6 +537,26 @@ Deno.test({
           lowerRevision[0].actor_role === "worker" &&
           !lowerRevision[0].is_tombstone,
       );
+      await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, source_priority, event_kind, event_subtype,
+           actor_role, occurred_at, observed_at, server_received_at
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v1',9,100,'lifecycle',
+           'turn_complete','worker',$4,$4,$4)`,
+        [workspaceId, sessionId, nativeRows[0], "2026-08-21T20:00:00Z"],
+      );
+      await assertRejects(
+        () =>
+          projector.projectSession({
+            workspaceId,
+            sessionId,
+            requestGeneration: 4n,
+            now,
+          }),
+        "future evidence must fail closed until its timestamp is corrected",
+        "future event",
+      );
     } finally {
       await projector.close();
       await cleanup(sql, workspaceId);

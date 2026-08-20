@@ -213,7 +213,13 @@ select distinct on (evidence_kind, source_event_id)
 `;
 
 export const FRAME_SOURCE_COORDINATES_SQL = `
-select max(id)::text through_event_id, count(*)::text source_event_count
+select max(id)::text through_event_id, count(*)::text source_event_count,
+       max(id) filter (where
+         coalesce(occurred_at, observed_at, server_received_at)
+           >= $4::timestamptz + make_interval(secs => $5)
+         or ${nativeItemTimestampSql("native_item_id")}
+           >= $4::timestamptz + make_interval(secs => $5)
+       )::text future_event_id
   from telemetry.events
  where workspace_id = $1 and session_id = $2
    and normalizer_version = any($3::text[])
@@ -318,7 +324,16 @@ export class PostgresFrameEvidenceProjector {
             options.workspaceId,
             options.sessionId,
             tx.array([...FRAME_NORMALIZER_VERSIONS]),
+            coveredThrough.toISOString(),
+            FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
           ]);
+          if (coordinates[0].future_event_id !== null) {
+            throw new Error(
+              `frame projection blocked by future event ${
+                coordinates[0].future_event_id
+              }`,
+            );
+          }
           const throughEventId = coordinates[0].through_event_id === null
             ? null
             : BigInt(String(coordinates[0].through_event_id));
