@@ -74,7 +74,7 @@ export async function proveAndActivateFrameProjection(
     ]);
     if (blockingJobs.length > 0) {
       throw new Error(
-        `frame activation blocked by ${blockingJobs.length} sampled unfinished or failed reduce jobs`,
+        `frame activation blocked by ${blockingJobs.length} sampled unfinished or failed normalization or reduction jobs`,
       );
     }
     const missing = await tx.unsafe(FRAME_ACTIVATION_PROOF_SQL, [

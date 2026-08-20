@@ -44,6 +44,9 @@ Deno.test({
     const sessionId = crypto.randomUUID();
     const parentSessionId = crypto.randomUUID();
     const batchId = crypto.randomUUID();
+    const unrelatedWorkspaceId = crypto.randomUUID();
+    const unrelatedPersonId = crypto.randomUUID();
+    const unrelatedBatchId = crypto.randomUUID();
     const now = new Date("2026-08-20T20:00:00.000Z");
     try {
       await sql.unsafe(
@@ -85,6 +88,42 @@ Deno.test({
           "a".repeat(64),
           `frame/${workspaceId}`,
           "b".repeat(64),
+        ],
+      );
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Unrelated frame projector test')`,
+        [
+          unrelatedWorkspaceId,
+          `unrelated-frame-projector-${unrelatedWorkspaceId}`,
+        ],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (id, workspace_id, identity_key)
+         values ($1, $2, $3)`,
+        [
+          unrelatedPersonId,
+          unrelatedWorkspaceId,
+          `unrelated-frame-person-${unrelatedPersonId}`,
+        ],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_kind,
+           source_stream_key, generation_key, generation_seq, start_offset,
+           end_offset, source_byte_count, source_sha256, storage_path,
+           storage_encoding, stored_byte_count, stored_sha256, record_count,
+           contract_version
+         ) values ($1,$2,$3,'unrelated-frame-collector','rollout',
+           'unrelated-frame-stream','unrelated-frame-generation',0,0,1,1,$4,
+           $5,'identity',1,$6,1,'test.contract.v1')`,
+        [
+          unrelatedBatchId,
+          unrelatedWorkspaceId,
+          unrelatedPersonId,
+          "e".repeat(64),
+          `unrelated-frame/${unrelatedWorkspaceId}`,
+          "f".repeat(64),
         ],
       );
       const nativeRows = [];
@@ -288,6 +327,23 @@ Deno.test({
           JSON.stringify(microsecondCanonical)
         }`,
       );
+      await assertRejects(
+        () =>
+          proveAndActivateFrameProjection(sql, {
+            workspaceId,
+            activate: false,
+          }),
+        "target-workspace normalization backlog must block activation",
+      );
+      const completedNormalize = await sql.unsafe(
+        `update processing.telemetry_jobs
+            set status = 'succeeded', completed_at = now(), updated_at = now()
+          where workspace_id = $1 and batch_id = $2
+            and job_kind = 'normalize'
+          returning id::text id`,
+        [workspaceId, batchId],
+      );
+      assert(completedNormalize.length === 1);
       await proveAndActivateFrameProjection(sql, {
         workspaceId,
         activate: false,
@@ -449,6 +505,7 @@ Deno.test({
     } finally {
       await projector.close();
       await cleanup(sql, workspaceId);
+      await cleanup(sql, unrelatedWorkspaceId);
       await sql.end();
     }
   },

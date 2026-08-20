@@ -235,4 +235,9 @@ Deno.test("projector and activation prove the complete session source state", ()
     FRAME_BLOCKING_JOBS_SQL.includes("job_kind = 'normalize'"),
     "activation must wait for durable normalization backlog",
   );
+  assert(FRAME_BLOCKING_JOBS_SQL.includes("job_kind = 'reduce'"));
+  assert(
+    FRAME_BLOCKING_JOBS_SQL.includes("workspace_id = $1"),
+    "unrelated workspaces must not block activation",
+  );
 });
