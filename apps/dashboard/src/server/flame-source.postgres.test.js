@@ -89,18 +89,23 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     const source = new DirectFlameSource({
       databaseUrl: DATABASE_URL,
       workspaceId: crypto.randomUUID(),
+      expectedEmailDomain: "e3group.ai",
     });
     try {
       await expect(source.readiness()).resolves.toEqual({
         status: "ok",
         mode: "sherlock_backend_aggregate",
       });
+      await expect(source.fetchDay({ now: FIXED_NOW })).resolves.toMatchObject({
+        latest: null,
+        people: [],
+      });
     } finally {
       await source.close();
     }
   }, 30_000);
 
-  it("shows the E3 identity instead of a matching Core Edge identity", async () => {
+  it("shows only the dashboard's expected email domain", async () => {
     const workspaceId = crypto.randomUUID();
     const coreEdgeId = crypto.randomUUID();
     const e3Id = crypto.randomUUID();
@@ -132,10 +137,14 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         ],
       );
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const payload = await source.fetchDay({ now: FIXED_NOW });
 
-      expect(payload.people.map(({ id }) => id)).toEqual([e3Id, unmatchedId]);
+      expect(payload.people.map(({ id }) => id)).toEqual([e3Id]);
     } finally {
       if (source) await source.close();
       try {
@@ -556,8 +565,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       );
       await sql.unsafe(
         `insert into telemetry.people (
-           id, workspace_id, identity_key, display_name
-         ) values ($1, $2, $3, 'Claude User')`,
+           id, workspace_id, identity_key, display_name, email
+         ) values ($1, $2, $3, 'Claude User', 'claude@e3group.ai')`,
         [personId, workspaceId, `claude-person-${personId}`],
       );
       await sql.unsafe(
@@ -674,7 +683,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const payload = await source.fetchDay({ now });
       const person = payload.people[0];
       const bucketStart = bucketStartDate.toISOString();
@@ -822,8 +835,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `flame-${workspaceId}`, "Flame boundary fixture"],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, $4)`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, $4, 'boundary@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`, "Boundary Person"],
       );
 
@@ -903,7 +916,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const payload = await source.fetchDay({ now: FIXED_NOW });
       const person = payload.people[0];
 
@@ -992,8 +1009,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `boundary-${workspaceId}`, "Representation boundary fixture"],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, 'Boundary Person')`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Boundary Person', 'boundary@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`],
       );
       await sql.unsafe(
@@ -1055,7 +1072,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const day = await source.fetchDay({ now: FIXED_NOW });
       expect(day.people[0].buckets[bucketIndex(frameStart)].slice(0, 3)).toEqual([1, 0, 0]);
 
@@ -1115,8 +1136,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `prompt-${workspaceId}`, "Prompt identity fixture"],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, 'Prompt Person')`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Prompt Person', 'prompt@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`],
       );
       await sql.unsafe(
@@ -1204,7 +1225,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const day = await source.fetchDay({ now: FIXED_NOW });
       const person = day.people[0];
       expect(person.buckets[bucketIndex(frameStart)][3]).toBe(3);
@@ -1277,8 +1302,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `mcp-${workspaceId}`],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, 'Prompt Person')`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Prompt Person', 'prompt@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`],
       );
       await sql.unsafe(
@@ -1349,7 +1374,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const aggregate = await source.fetchDay({ now: FIXED_NOW });
       const bucket = aggregate.people[0].buckets[bucketIndex(new Date(bucketStart))];
       const evidence = await source.fetchPromptEvidence({

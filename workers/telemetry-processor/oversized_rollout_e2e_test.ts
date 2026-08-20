@@ -274,11 +274,15 @@ async function runOversizedE2E(
     prefix: `sherlock-oversized-${provider}-e2e-`,
   });
   const workspaceId = crypto.randomUUID();
+  const sixtyfourWorkspaceId = workspaceId ===
+      "00000000-0000-4000-8000-000000000002"
+    ? "00000000-0000-4000-8000-000000000003"
+    : "00000000-0000-4000-8000-000000000002";
   const workspaceSlug = `oversized-e2e-${workspaceId}`;
   const collector = {
     name: provider === "claude_code" ? "Oversized Claude E2E" : "Oversized E2E",
     github_id: `oversized-${workspaceId.slice(0, 24)}`,
-    email: `oversized-${workspaceId}@example.com`,
+    email: `oversized-${workspaceId}@e3group.ai`,
     installation_id: crypto.randomUUID(),
   };
   const storagePaths: string[] = [];
@@ -288,7 +292,8 @@ async function runOversizedE2E(
       SUPABASE_DB_URL: databaseUrl!,
       SUPABASE_URL: supabaseUrl!,
       SUPABASE_SERVICE_ROLE_KEY: serviceRoleKey!,
-      SHERLOCK_WORKSPACE_ID: workspaceId,
+      SHERLOCK_E3_WORKSPACE_ID: workspaceId,
+      SHERLOCK_SIXTYFOUR_WORKSPACE_ID: sixtyfourWorkspaceId,
     })
   ) {
     previousEnvironment.set(name, Deno.env.get(name));
@@ -324,6 +329,10 @@ async function runOversizedE2E(
     const receiptByManifest = new Map<string, CommittedReceipt>();
     for (const envelope of [...envelopes].reverse()) {
       const receipt = await uploadEnvelope(envelope, collector);
+      assert(
+        receipt.workspace_id === workspaceId,
+        "ingest receipt was attributed to the wrong workspace",
+      );
       receiptByManifest.set(manifestIdentity(envelope.manifest), receipt);
       storagePaths.push(receipt.storage_path);
     }

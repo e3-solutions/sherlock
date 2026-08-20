@@ -37,6 +37,7 @@ class CollectorConfig:
 
 
 GITHUB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
+APPROVED_EMAIL_DOMAINS = frozenset({"e3group.ai", "sixtyfour.ai"})
 
 
 def default_codex_home() -> Path:
@@ -81,6 +82,64 @@ def validate_endpoint(value: object) -> str:
     if not parsed.netloc or parsed.username or parsed.password:
         raise ConfigurationError("the ingest endpoint is invalid")
     return value
+
+
+def validate_install_email(value: object) -> str:
+    normalized_email = _bounded(value, "email", 320).lower()
+    if (
+        normalized_email.count("@") != 1
+        or any(character.isspace() or ord(character) < 32 for character in normalized_email)
+    ):
+        raise ConfigurationError("email must be a valid address")
+    local, domain = normalized_email.split("@")
+    if not local or domain not in APPROVED_EMAIL_DOMAINS:
+        raise ConfigurationError(
+            "email must use the e3group.ai or sixtyfour.ai work domain"
+        )
+    return normalized_email
+
+
+def _require_clean_or_configured_collector_home(
+    collector_home: Path | str,
+) -> None:
+    queue_root = (
+        Path(collector_home).expanduser().resolve()
+        / "sherlock"
+        / "telemetry"
+        / "queue"
+    )
+    for directory_name in ("pending", "processing"):
+        if any((queue_root / directory_name).glob("*.json")):
+            raise ConfigurationError(
+                "pending collector telemetry exists without collector.json; "
+                "recover the config or use a separate clean collector home"
+            )
+
+
+def validate_install_email_for_home(
+    value: object,
+    collector_home: Path | str,
+) -> str:
+    normalized_email = validate_install_email(value)
+    config_path = (
+        Path(collector_home).expanduser().resolve() / "sherlock" / "collector.json"
+    )
+    existing = _read_owner_only(config_path)
+    if not existing:
+        _require_clean_or_configured_collector_home(collector_home)
+        return normalized_email
+    existing_email = existing.get("email")
+    try:
+        normalized_existing_email = validate_install_email(existing_email)
+    except ConfigurationError as error:
+        raise ConfigurationError(
+            "the existing collector email is invalid; use a separate clean collector home"
+        ) from error
+    if normalized_existing_email != normalized_email:
+        raise ConfigurationError(
+            "the collector email cannot be changed; use a separate clean collector home"
+        )
+    return normalized_email
 
 
 def _bounded(value: object, field: str, maximum_bytes: int) -> str:
@@ -163,9 +222,15 @@ def load_config(
     *,
     codex_home: Path | str | None = None,
 ) -> CollectorConfig:
-    file_values = _read_owner_only(
-        Path(path or default_config_path(codex_home)).expanduser().resolve()
-    )
+    config_path = Path(path or default_config_path(codex_home)).expanduser().resolve()
+    file_values = _read_owner_only(config_path)
+    if not config_path.exists():
+        source_home = (
+            Path(codex_home).expanduser().resolve()
+            if codex_home is not None
+            else config_path.parent.parent
+        )
+        _require_clean_or_configured_collector_home(source_home)
     endpoint = os.environ.get("SHERLOCK_INGEST_URL")
     if endpoint is None:
         endpoint = file_values.get("endpoint")
@@ -179,4 +244,19 @@ def load_config(
             "SHERLOCK_INSTALLATION_ID", file_values.get("installation_id")
         ),
     )
+    if config_path.exists():
+        installed_identity = validate_identity(
+            name=file_values.get("name"),
+            github_id=file_values.get("github_id"),
+            email=file_values.get("email"),
+            installation_id=file_values.get("installation_id"),
+        )
+        if identity.email != installed_identity.email:
+            raise ConfigurationError(
+                "SHERLOCK_EMAIL must match the installed collector email"
+            )
+        if identity.installation_id != installed_identity.installation_id:
+            raise ConfigurationError(
+                "SHERLOCK_INSTALLATION_ID must match the installed collector installation_id"
+            )
     return CollectorConfig(validate_endpoint(endpoint), identity)

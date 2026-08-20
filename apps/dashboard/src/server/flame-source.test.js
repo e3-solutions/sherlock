@@ -22,7 +22,7 @@ import {
   PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
   PROJECTION_WORK_DETAIL_SQL,
-  REPLACED_DASHBOARD_EMAIL_DOMAIN,
+  SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN,
   WORK_DETAIL_SQL,
   ASSISTANT_REPRESENTATION_MATCH_SECONDS,
   DirectFlameSource,
@@ -35,6 +35,7 @@ import {
   encodeWorkCursor,
   encodeProjectionSnapshotToken,
   encodeSnapshotToken,
+  validateDashboardEmailDomain,
 } from "./flame-source.js";
 
 const START = new Date("2026-08-16T12:00:00.000Z");
@@ -169,6 +170,34 @@ describe("Sherlock Flame payload", () => {
     })).toThrow(FlameSourceError);
   });
 
+  it("returns a valid empty payload for a new workspace", () => {
+    const payload = buildFlamePayload({
+      rows: [],
+      roster: [],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    });
+
+    expect(payload).toMatchObject({
+      start: START.toISOString(),
+      read: READ.toISOString(),
+      latest: null,
+      people: [],
+    });
+    expect(decodeSnapshotToken(payload.snapshot)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+    });
+    expect(() => buildFlamePayload({
+      rows: [{ person_id: "unexpected" }],
+      roster: [],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    })).toThrow(FlameSourceError);
+  });
+
   it("keeps observed-event buckets without querying inferred activity spans", () => {
     expect(FLAME_SQL).toContain("e.workspace_id = p.workspace_id");
     expect(FLAME_SQL).toContain("date_bin(interval '10 minutes', a.observed_at");
@@ -286,18 +315,34 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
   });
 
-  it("prefers the E3 dashboard identity over a matching Core Edge identity", () => {
+  it("requires one approved dashboard email domain", () => {
     expect(PREFERRED_DASHBOARD_EMAIL_DOMAIN).toBe("e3group.ai");
-    expect(REPLACED_DASHBOARD_EMAIL_DOMAIN).toBe("coreedgesolution.com");
-    for (const query of [PEOPLE_SQL, FLAME_SQL]) {
-      expect(query).toContain("from telemetry.people preferred");
-      expect(query).toContain("preferred.github_id = pe.github_id");
+    expect(SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN).toBe("sixtyfour.ai");
+    expect(validateDashboardEmailDomain("e3group.ai")).toBe("e3group.ai");
+    expect(validateDashboardEmailDomain("sixtyfour.ai")).toBe("sixtyfour.ai");
+    expect(() => validateDashboardEmailDomain("example.com")).toThrow(TypeError);
+    expect(() => validateDashboardEmailDomain("sub.e3group.ai")).toThrow(TypeError);
+  });
+
+  it("binds expected-domain visibility across roster, day, and detail SQL", () => {
+    expect(PEOPLE_SQL).toContain("split_part(pe.email, '@', 2) = $3");
+    expect(PEOPLE_SQL).toContain("split_part(pe.email, '@', 3) = ''");
+    for (const query of [FLAME_SQL, INTERVAL_WORK_SQL, INTERVAL_PROMPTS_SQL, WORK_DETAIL_SQL]) {
+      expect(query).toContain("expected_email_domain");
+      expect(query).toContain("split_part(pe.email, '@', 2) = p.expected_email_domain");
+      expect(query).toContain("split_part(pe.email, '@', 3) = ''");
+    }
+    for (const query of [
+      PROJECTION_FLAME_SQL,
+      PROJECTION_INTERVAL_WORK_SQL,
+      PROJECTION_INTERVAL_PROMPTS_SQL,
+      PROJECTION_WORK_DETAIL_SQL,
+    ]) {
+      expect(query).toContain("expected_email_domain");
       expect(query).toContain(
-        "split_part(pe.email, '@', 2) = 'coreedgesolution.com'",
+        "split_part(evidence_person.email, '@', 2) = p.expected_email_domain",
       );
-      expect(query).toContain(
-        "split_part(preferred.email, '@', 2) = 'e3group.ai'",
-      );
+      expect(query).toContain("split_part(evidence_person.email, '@', 3) = ''");
     }
   });
 
@@ -359,6 +404,7 @@ describe("Sherlock Flame payload", () => {
   it("captures the aggregate snapshot in the same transaction as its rows", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
     source.maxPeople = 5;
     const roster = [{ person_id: "ada", display_name: "Ada" }];
     const unsafe = vi.fn()
@@ -383,6 +429,7 @@ describe("Sherlock Flame payload", () => {
       "2026-08-17T12:00:00.000Z",
       NORMALIZER_VERSIONS,
       READ.toISOString(),
+      "e3group.ai",
     ]);
   });
 
@@ -397,6 +444,7 @@ describe("Sherlock Flame payload", () => {
   ) => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
     source.maxPeople = 5;
     const roster = [{ person_id: "ada", display_name: "Ada" }];
     const unsafe = vi.fn()
@@ -431,6 +479,7 @@ describe("Sherlock Flame payload", () => {
         "2026-08-17T12:00:00.000Z",
         FRAME_VERSION,
         READ.toISOString(),
+        "e3group.ai",
       ]);
     }
     expect(payload.snapshot).toMatch(new RegExp(`^${expectedTokenVersion}\\.`));
@@ -440,6 +489,7 @@ describe("Sherlock Flame payload", () => {
   it("can disable projection lookup before the additive migration is present", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
     source.maxPeople = 5;
     source.projectionEnabled = false;
     const unsafe = vi.fn()
@@ -624,20 +674,20 @@ describe("Sherlock Flame payload", () => {
       ") >= date_trunc('milliseconds', s.started_at)",
     );
     expect(INTERVAL_WORK_SQL).toContain("select distinct e.session_id");
-    expect(INTERVAL_WORK_SQL).toContain("limit $10");
+    expect(INTERVAL_WORK_SQL).toContain("limit $11");
     expect(WORK_DETAIL_SQL).toContain("and e.session_id = p.session_id");
     expect(ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS).toBe(6);
     expect(WORK_DETAIL_SQL).toContain("p.bucket_start - interval '6 seconds'");
     expect(WORK_DETAIL_SQL).toContain("from header left join selected on true");
     expect(WORK_DETAIL_SQL).toContain(") > (p.cursor_at_microseconds, p.cursor_id)");
     expect(WORK_DETAIL_SQL).toContain("order by selected.observed_at nulls first");
-    expect(WORK_DETAIL_SQL).toContain("limit $14");
+    expect(WORK_DETAIL_SQL).toContain("limit $15");
     expect(INTERVAL_PROMPTS_SQL).toContain("e.message_origin = 'human'");
     expect(INTERVAL_PROMPTS_SQL).toContain("e.message_role = 'user'");
     expect(INTERVAL_PROMPTS_SQL).toContain("e.actor_role = 'primary'");
     expect(INTERVAL_PROMPTS_SQL).toContain("and s.person_id = p.person_id");
     expect(INTERVAL_PROMPTS_SQL).toContain("pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)");
-    expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
+    expect(INTERVAL_PROMPTS_SQL).toContain("limit $11");
   });
 
   it("keeps Claude system meta messages out of user summaries and detail", () => {
@@ -665,7 +715,7 @@ describe("Sherlock Flame payload", () => {
     );
     expect(INTERVAL_PROMPTS_SQL).toContain("and s.person_id = p.person_id");
     expect(INTERVAL_PROMPTS_SQL).toContain("count(*) over ()::bigint");
-    expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
+    expect(INTERVAL_PROMPTS_SQL).toContain("limit $11");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("activity_candidates as materialized");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("context_before");
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
@@ -698,13 +748,13 @@ describe("Sherlock Flame payload", () => {
       expect(query).not.toContain("telemetry.native_records");
       expect(query).not.toContain("telemetry.ingest_batches");
     }
-    expect(PROJECTION_INTERVAL_WORK_SQL.indexOf("limit $7")).toBeLessThan(
+    expect(PROJECTION_INTERVAL_WORK_SQL.indexOf("limit $8")).toBeLessThan(
       PROJECTION_INTERVAL_WORK_SQL.indexOf("join telemetry.events summary"),
     );
-    expect(PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("limit $9")).toBeLessThan(
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("limit $10")).toBeLessThan(
       PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("join telemetry.events source"),
     );
-    expect(PROJECTION_WORK_DETAIL_SQL.indexOf("limit $11")).toBeLessThan(
+    expect(PROJECTION_WORK_DETAIL_SQL.indexOf("limit $12")).toBeLessThan(
       PROJECTION_WORK_DETAIL_SQL.indexOf("left join telemetry.events source"),
     );
     expect(PROJECTION_FLAME_SQL).toContain(

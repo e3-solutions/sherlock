@@ -85,6 +85,7 @@ def main() -> int:
     from sherlock_collector.config import (
         ConfigurationError,
         validate_endpoint,
+        validate_install_email_for_home,
         validate_identity,
     )
 
@@ -96,6 +97,7 @@ def main() -> int:
     config_path = root / "collector.json"
     installation_id = existing_installation_id(config_path) or str(uuid.uuid4())
     try:
+        validate_install_email_for_home(args.email, collector_home)
         identity = validate_identity(
             name=args.name,
             github_id=args.github_id,

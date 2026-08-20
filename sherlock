@@ -1,0 +1,163 @@
+#!/bin/sh
+
+set -eu
+
+REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
+PYTHON_BIN=${PYTHON_BIN:-python3}
+SHERLOCK_HOME=${SHERLOCK_HOME:-"$HOME/.sherlock"}
+CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
+CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
+NAME=""
+GITHUB_ID=""
+EMAIL=""
+
+usage() {
+  cat <<'EOF'
+Usage: ./sherlock install --name NAME --github LOGIN --email EMAIL
+
+Installs Sherlock for both Codex and Claude Code with the same team identity.
+Both agent CLIs must already be installed.
+
+Aliases:
+  --github-id LOGIN     Same as --github
+
+Environment overrides:
+  CODEX_BIN             Codex executable to use
+  CODEX_HOME            Codex state directory (default: ~/.codex)
+  CLAUDE_BIN            Claude executable to use
+  CLAUDE_CONFIG_DIR     Claude state directory (default: ~/.claude)
+  SHERLOCK_HOME         Durable client marketplace (default: ~/.sherlock)
+  PYTHON_BIN            Python 3 executable (default: python3)
+  SHERLOCK_INGEST_URL   Collector endpoint
+EOF
+}
+
+if [ "$#" -eq 0 ]; then
+  usage >&2
+  exit 2
+fi
+
+case "$1" in
+  install)
+    shift
+    ;;
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --name)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      NAME=$2
+      shift 2
+      ;;
+    --github|--github-id|--github_id)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      GITHUB_ID=$2
+      shift 2
+      ;;
+    --email)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      EMAIL=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$NAME" ] || [ -z "$GITHUB_ID" ] || [ -z "$EMAIL" ]; then
+  usage >&2
+  exit 2
+fi
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python 3 is required." >&2
+  exit 1
+fi
+
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/validate_install_email.py" \
+  --email "$EMAIL" \
+  --collector-home "$CODEX_HOME"
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/validate_install_email.py" \
+  --email "$EMAIL" \
+  --collector-home "$CLAUDE_CONFIG_DIR"
+
+# Resolve both agent CLIs before either provider installer changes local state.
+if [ -n "${CODEX_BIN:-}" ]; then
+  RESOLVED_CODEX_BIN=$CODEX_BIN
+  if [ ! -x "$RESOLVED_CODEX_BIN" ]; then
+    echo "CODEX_BIN is not executable: $RESOLVED_CODEX_BIN" >&2
+    exit 1
+  fi
+else
+  RESOLVED_CODEX_BIN=""
+  if command -v codex >/dev/null 2>&1; then
+    CANDIDATE=$(command -v codex)
+    if "$CANDIDATE" --version >/dev/null 2>&1; then
+      RESOLVED_CODEX_BIN=$CANDIDATE
+    fi
+  fi
+  if [ -z "$RESOLVED_CODEX_BIN" ] && [ -x /Applications/ChatGPT.app/Contents/Resources/codex ]; then
+    RESOLVED_CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex
+  fi
+  if [ -z "$RESOLVED_CODEX_BIN" ]; then
+    echo "Codex CLI was not found. Install or open the Codex desktop app first." >&2
+    exit 1
+  fi
+fi
+
+if [ -n "${CLAUDE_BIN:-}" ]; then
+  RESOLVED_CLAUDE_BIN=$CLAUDE_BIN
+  if [ ! -x "$RESOLVED_CLAUDE_BIN" ]; then
+    echo "CLAUDE_BIN is not executable: $RESOLVED_CLAUDE_BIN" >&2
+    exit 1
+  fi
+else
+  RESOLVED_CLAUDE_BIN=$(command -v claude || true)
+  if [ -z "$RESOLVED_CLAUDE_BIN" ]; then
+    echo "Claude Code CLI was not found." >&2
+    exit 1
+  fi
+fi
+
+if ! "$RESOLVED_CODEX_BIN" --version >/dev/null 2>&1; then
+  echo "Codex CLI is not usable: $RESOLVED_CODEX_BIN" >&2
+  exit 1
+fi
+if ! "$RESOLVED_CLAUDE_BIN" --version >/dev/null 2>&1; then
+  echo "Claude Code CLI is not usable: $RESOLVED_CLAUDE_BIN" >&2
+  exit 1
+fi
+
+MARKETPLACE_ROOT="$SHERLOCK_HOME/marketplace"
+"$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/stage_marketplace.py" \
+  --repo-root "$REPO_ROOT" \
+  --destination "$MARKETPLACE_ROOT"
+
+SHERLOCK_MARKETPLACE_ROOT=$MARKETPLACE_ROOT \
+  CODEX_BIN=$RESOLVED_CODEX_BIN "$REPO_ROOT/install.sh" \
+  --name "$NAME" \
+  --github-id "$GITHUB_ID" \
+  --email "$EMAIL"
+
+SHERLOCK_MARKETPLACE_ROOT=$MARKETPLACE_ROOT \
+  CLAUDE_BIN=$RESOLVED_CLAUDE_BIN "$REPO_ROOT/install-claude.sh" \
+  --name "$NAME" \
+  --github-id "$GITHUB_ID" \
+  --email "$EMAIL"
+
+echo "Sherlock is installed for Codex and Claude Code. Start new sessions in both agents to load their hooks."
