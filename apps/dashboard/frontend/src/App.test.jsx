@@ -25,6 +25,7 @@ vi.mock("./FlameGraph.jsx", () => ({
     { value: "prompts", label: "Prompts" },
     { value: "subagents", label: "Subagents" },
   ],
+  DEFAULT_PERSON_RANK: "active-time",
 }));
 
 import App, { expectedTimelineEnd, nextRefreshDelay, timelineFreshness } from "./App.jsx";
@@ -150,7 +151,7 @@ describe("App", () => {
     expect(activityLegend.parentElement).toBe(statusLegend.parentElement);
     expect(statusLegend.nextElementSibling).toBe(rankSelector);
     expect(rankSelector.nextElementSibling).toBe(activityLegend);
-    expect(within(rankSelector).getByRole("button", { name: "Name", pressed: true }))
+    expect(within(rankSelector).getByRole("button", { name: "Active time", pressed: true }))
       .toBeInTheDocument();
     for (const label of ["Agent", "Subagent", "Unclassified", "Prompts"]) {
       expect(within(activityLegend).getByText(label)).toBeInTheDocument();
@@ -170,7 +171,7 @@ describe("App", () => {
     render(<App />);
     await settle();
 
-    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-rank-by", "roster");
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-rank-by", "active-time");
     fireEvent.click(screen.getByRole("button", { name: "Peak sessions" }));
     expect(screen.getByTestId("flame-graph")).toHaveAttribute(
       "data-rank-by",

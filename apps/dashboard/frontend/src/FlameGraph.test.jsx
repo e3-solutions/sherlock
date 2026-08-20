@@ -107,7 +107,7 @@ describe("rankPeople", () => {
     expect(rankPeople(people, rankBy).map(({ id }) => id)).toEqual(expected);
   });
 
-  it("preserves API order for the default and for equal metrics", () => {
+  it("preserves API order for the roster option and for equal metrics", () => {
     expect(rankPeople(people, "roster")).toBe(people);
     expect(rankPeople([people[0], people[2]], "subagents").map(({ id }) => id))
       .toEqual(["alpha", "gamma"]);
@@ -288,7 +288,7 @@ describe("FlameGraph", () => {
     const names = () => [...container.querySelectorAll(".flame-person h2")]
       .map((heading) => heading.textContent);
 
-    expect(names()).toEqual(["Ada Lovelace", "Prompt Leader", "Subagent Leader", "Zero Activity"]);
+    expect(names()).toEqual(["Ada Lovelace", "Subagent Leader", "Prompt Leader", "Zero Activity"]);
 
     view.rerender(<FlameGraph data={data} chartWidth={1008} rankBy="prompts" />);
     expect(names()[0]).toBe("Prompt Leader");

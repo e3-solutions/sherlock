@@ -42,6 +42,8 @@ export const PERSON_RANK_OPTIONS = [
   { value: "subagents", label: "Subagents" },
 ];
 
+export const DEFAULT_PERSON_RANK = "active-time";
+
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
   minute: "2-digit",
@@ -892,7 +894,7 @@ export default function FlameGraph({
   chartWidth,
   stale = false,
   onRefresh,
-  rankBy = "roster",
+  rankBy = DEFAULT_PERSON_RANK,
   timelineMeta,
 }) {
   const peopleScrollRef = useRef(null);
