@@ -2,11 +2,12 @@
 
 Status: the Supabase database foundation, provider-aware JSONL collector drain,
 asynchronous Codex and Claude Code normalizers, targeted versioned activity
-reducer, and workspace-scoped dashboard Flame read API are implemented. The
-durable snapshot resolver and version activation are not.
+reducer, append-only indexed frame-evidence projection, and workspace-scoped
+dashboard Flame read API are implemented. Durable cross-version snapshot
+resolution remains future work; frame projection activation is explicit.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
-views separate from source data. Seven source/product tables remain across two
+views separate from source data. Ten source/product tables remain across two
 private schemas, with one private operational queue table in `processing` and
 one private Storage bucket.
 
@@ -35,9 +36,9 @@ Keeping one exact definition prevents the architecture notes from drifting.
   tables and sequences.
 - The private `telemetry-raw` bucket accepts gzip and binary objects up to
   50 MiB.
-- Four no-login database roles separate ingest, normalization, reduction, and
-  reads.
-- Ninety-one database assertions cover the core schema, grants, bucket, and
+- Five no-login database roles separate ingest, normalization, reduction,
+  frame projection, and reads.
+- Database assertions cover the core schema, grants, bucket, and
   representative integrity failures.
 - The collector and ingest function implement the versioned immutable
   batch and committed-receipt contract described below.
@@ -47,6 +48,9 @@ Keeping one exact definition prevents the architecture notes from drifting.
   `sherlock.codex-rollout.v1` or `sherlock.claude-code-transcript.v1`
   normalizer, then reduces only affected sessions into append-only
   `sherlock.activity.v1` span revisions.
+- Railway also projects payload-free activity and prompt selections with one
+  bounded, fingerprinted session receipt per run. An owner-written activation
+  fact gates dashboard cutover after the initial backfill.
 - PostgreSQL automatically indexes bounded message excerpts as normalized
   event rows are inserted.
 
@@ -65,7 +69,10 @@ flowchart LR
     N --> Q["processing.telemetry_jobs"]
     Q --> E["Railway → telemetry.events"]
     E --> A["analytics.activity_spans"]
-    E --> F["Dashboard Flame read API"]
+    E --> P["Railway frame projector"]
+    P --> R["analytics.frame_projection_receipts"]
+    P --> F["analytics.frame_evidence_revisions"]
+    F --> D["Dashboard Flame read API"]
     N --> T["Future transcript reader"]
 ```
 
@@ -85,6 +92,9 @@ database columns.
 | `telemetry.native_records` | Exact locator and parse status for each native record | Ingest may insert only |
 | `telemetry.events` | Versioned semantic projections of native records | Normalizer may insert only |
 | `analytics.activity_spans` | Versioned, rebuildable activity intervals | Reducer may insert only |
+| `analytics.frame_projection_receipts` | Bounded, fingerprinted proof of one session source state consumed by a frame version | Frame projector may insert only |
+| `analytics.frame_evidence_revisions` | Payload-free activity and prompt selection revisions tied to source events and receipts | Frame projector may insert only |
+| `analytics.frame_projection_activations` | Explicit post-backfill cutover facts by workspace and version | Owner inserts once; application roles read only |
 | `processing.telemetry_jobs` | Mutable leases, retries, workload class, and terminal outcomes | Ingest trigger inserts; Railway transitions with fencing |
 
 Append-only behavior is enforced for application roles through grants. A
@@ -171,8 +181,41 @@ queries so those queries do not depend on mutable session caches. They are
 still derived data: selected events plus an immutable `activity_version` must
 be sufficient to rebuild them.
 
-Flame frames and daily aggregates are not database facts and are not stored in
-v0. A read response may be cached by immutable snapshot and query parameters.
+Flame bucket aggregates remain response-time values, but their canonical
+evidence selection is precomputed. Each projection receipt records the maximum
+event ID and exact count of all committed, non-replay events from the accepted
+frame normalizer versions in that session. It also records the observed
+session `updated_at`, queue generation, and half-open time coverage. The source
+state SHA-256 fingerprints the bounded evidence and effective session state
+actually selected by that run. Evidence revisions retain exact
+tenant, session, person, receipt, source-event, effective-role, display-time,
+summary-eligibility, and prompt-identity facts without copying excerpts or raw
+payloads.
+
+`frame-evidence-v1` deliberately chooses one semantic winner across the
+projector's bounded session window, rather than changing that winner at each
+dashboard window boundary. This stabilizes duplicate identity over time; a
+malformed duplicate group split exactly across the legacy 24-hour boundary can
+therefore differ from the old window-local query and requires a new frame
+version if that policy changes.
+
+Corrections append tombstones or replacement revisions; application roles
+cannot update or delete history. Reads select the latest revision visible in
+the publication's PostgreSQL snapshot before grouping it into buckets. The
+stable selection identity is evidence kind plus source event within one
+workspace, session, and immutable frame version. A parent repair must requeue
+every repaired child even at the same event cutoff because the stored actor
+role is the effective display role. Owner-written activation is allowed only
+after a repeatable-read proof matches every relevant session's current maximum
+event ID, event count, and `updated_at` to its latest receipt. The count catches
+late lower-ID commits; `updated_at` catches parent and start-state repairs.
+The unique workspace/version activation is a permanent capability fact queried
+by existence, not a latest-state trail or a mutable feature flag. Rollback stops
+minting new projection-backed tokens without deleting that fact or projection
+history. Existing v1 tokens continue using their raw read path through their
+bounded lifetime; already-issued v2 tokens remain on the projection path until
+their normal 25-hour expiry when that reader remains deployed, and a dashboard
+rollback without v2 support must reject them rather than change their source.
 
 ## Database roles
 
@@ -181,12 +224,16 @@ v0. A read response may be cached by immutable snapshot and query parameters.
 | `sherlock_ingest` | Read workspace, person, batch, and native-record metadata; insert batches and native records |
 | `sherlock_normalizer` | Read telemetry; insert/update session caches; insert events |
 | `sherlock_reducer` | Read sessions and normalized events; select/insert activity spans |
+| `sherlock_frame_projector` | Read sessions/events and only the native/batch columns needed for canonical representation pairing; select/insert frame receipts and revisions; read activations |
 | `sherlock_reader` | Read telemetry and analytics; no writes |
 
 The ingest role cannot write events or spans. The normalizer cannot write spans.
 The reducer cannot read raw receipts or native locators, change session caches
-or events, or update/delete spans. The reader cannot write any fact. These
-grants separate collection, interpretation, reduction, and product reads.
+or events, or update/delete spans. The frame projector can read only bounded
+record adjacency, native type, collector, stream, and generation metadata; it
+cannot read source fingerprints or object locations, update/delete projection
+history, or activate itself. The reader cannot write any fact. These grants
+separate collection, interpretation, reduction, projection, and product reads.
 The `sherlock_worker_login` role has `NOINHERIT` and may explicitly assume the
 reader for the bearer-gated Bonaparte MCP pilot. MCP transactions are
 additionally declared read-only, and any downstream prompt feedback remains an
@@ -196,7 +243,7 @@ authorization is outside the v1 evidence contract.
 ## Implemented JSONL drain contract
 
 `sherlock.rollout-batch.v1` and `sherlock.committed-receipt.v1` implement these
-application rules without changing the seven-table schema:
+application rules without changing the immutable source-table contract:
 
 1. Scope the public endpoint to its server-configured `workspace_id`. Normalize
    the declared email, resolve one `person_id` per workspace/email, and derive a

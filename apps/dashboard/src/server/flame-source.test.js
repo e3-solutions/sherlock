@@ -6,8 +6,10 @@ import {
   BUCKET_MS,
   CLAUDE_NORMALIZER_VERSION,
   DEFAULT_WORK_DETAIL_LIMIT,
+  FRAME_VERSION,
   FLAME_SQL,
   INTERVAL_PROMPTS_SQL,
+  INTERVAL_PROMPT_LIMIT,
   INTERVAL_WORK_SQL,
   INTERVAL_WORK_LIMIT,
   MAX_WORK_DETAIL_LIMIT,
@@ -16,6 +18,10 @@ import {
   NORMALIZER_VERSIONS,
   PEOPLE_SQL,
   PREFERRED_DASHBOARD_EMAIL_DOMAIN,
+  PROJECTION_FLAME_SQL,
+  PROJECTION_INTERVAL_PROMPTS_SQL,
+  PROJECTION_INTERVAL_WORK_SQL,
+  PROJECTION_WORK_DETAIL_SQL,
   REPLACED_DASHBOARD_EMAIL_DOMAIN,
   WORK_DETAIL_SQL,
   ASSISTANT_REPRESENTATION_MATCH_SECONDS,
@@ -27,6 +33,7 @@ import {
   decodeWorkCursor,
   decodeSnapshotToken,
   encodeWorkCursor,
+  encodeProjectionSnapshotToken,
   encodeSnapshotToken,
 } from "./flame-source.js";
 
@@ -314,9 +321,35 @@ describe("Sherlock Flame payload", () => {
     expect(decodeSnapshotToken(token)).toEqual({ snapshot: PG_SNAPSHOT, read: READ });
   });
 
+  it("pins projection snapshots to the exact immutable frame version", () => {
+    const token = encodeProjectionSnapshotToken({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: FRAME_VERSION,
+    });
+
+    expect(token).toMatch(/^v2\.[A-Za-z0-9_-]+$/);
+    expect(decodeSnapshotToken(token)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: FRAME_VERSION,
+    });
+    expect(() => encodeProjectionSnapshotToken({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: "frame-evidence-v2",
+    })).toThrow(FlameSourceError);
+    const unsupported = Buffer.from(JSON.stringify([
+      PG_SNAPSHOT,
+      READ.toISOString(),
+      "frame-evidence-v2",
+    ])).toString("base64url");
+    expect(() => decodeSnapshotToken(`v2.${unsupported}`)).toThrow(FlameSourceError);
+  });
+
   it.each([
     "",
-    "v2.Zm9v",
+    "v3.Zm9v",
     "v1.not+base64url",
     "v1.WyIxOjI6MyIsIjIwMjYtMDgtMTdUMTI6MDA6MDEuMDAwWiJd",
   ])("rejects invalid prompt snapshot token %s", (token) => {
@@ -351,6 +384,67 @@ describe("Sherlock Flame payload", () => {
       NORMALIZER_VERSIONS,
       READ.toISOString(),
     ]);
+  });
+
+  it("emits v2 only when its exact frame projection is activated", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.maxPeople = 5;
+    const roster = [{ person_id: "ada", display_name: "Ada" }];
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{
+        now: READ,
+        snapshot: PG_SNAPSHOT,
+        frame_projection_active: true,
+      }])
+      .mockResolvedValueOnce(roster)
+      .mockResolvedValueOnce(rowsFor("ada"));
+    source.transaction = (callback) => callback({ unsafe });
+
+    const payload = await source.fetchDay();
+
+    expect(unsafe.mock.calls[0][0]).toContain("exists (");
+    expect(unsafe.mock.calls[0][0]).toContain("activation.frame_version = $2");
+    expect(unsafe.mock.calls[0][0]).not.toContain("order by activation");
+    expect(unsafe.mock.calls[0][1]).toEqual([source.workspaceId, FRAME_VERSION]);
+    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_FLAME_SQL);
+    expect(unsafe.mock.calls[2][1]).toEqual([
+      source.workspaceId,
+      START.toISOString(),
+      "2026-08-17T12:00:00.000Z",
+      FRAME_VERSION,
+      READ.toISOString(),
+    ]);
+    expect(decodeSnapshotToken(payload.snapshot)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: FRAME_VERSION,
+    });
+  });
+
+  it("keeps a missing exact-version activation on the v1 raw path", async () => {
+    for (const frameProjectionActive of [false, null]) {
+      const source = Object.create(DirectFlameSource.prototype);
+      source.workspaceId = "11111111-1111-4111-8111-111111111111";
+      source.maxPeople = 5;
+      const unsafe = vi.fn()
+        .mockResolvedValueOnce([{
+          now: READ,
+          snapshot: PG_SNAPSHOT,
+          frame_projection_active: frameProjectionActive,
+        }])
+        .mockResolvedValueOnce([{ person_id: "ada", display_name: "Ada" }])
+        .mockResolvedValueOnce(rowsFor("ada"));
+      source.transaction = (callback) => callback({
+        unsafe,
+        array: (values) => values,
+      });
+
+      const payload = await source.fetchDay();
+
+      expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
+      expect(payload.snapshot).toMatch(/^v1\./);
+    }
   });
 
   it("selects the 30-second transaction timeout only for the cached timeline", async () => {
@@ -568,6 +662,63 @@ describe("Sherlock Flame payload", () => {
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
   });
 
+  it("keeps projection reads indexed and limits source text joins", () => {
+    expect(PROJECTION_FLAME_SQL).toContain("analytics.frame_evidence_revisions");
+    expect(PROJECTION_FLAME_SQL).toContain("analytics.frame_projection_receipts");
+    expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.events");
+    expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.sessions");
+    for (const query of [
+      PROJECTION_INTERVAL_WORK_SQL,
+      PROJECTION_INTERVAL_PROMPTS_SQL,
+      PROJECTION_WORK_DETAIL_SQL,
+    ]) {
+      expect(query).toContain("revision.evidence_kind = 'activity'");
+      expect(query).toContain(
+        `revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`,
+      );
+      expect(query).toContain("revision.evidence_kind = 'prompt'");
+      expect(query).toContain(
+        `revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`,
+      );
+      expect(query).toContain(
+        `or revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`,
+      );
+      expect(query).toContain("pg_visible_in_snapshot(receipt.xmin::text::xid8");
+      expect(query).toContain("pg_visible_in_snapshot(revision.xmin::text::xid8");
+      expect(query).not.toContain("telemetry.sessions");
+      expect(query).not.toContain("telemetry.native_records");
+      expect(query).not.toContain("telemetry.ingest_batches");
+    }
+    expect(PROJECTION_INTERVAL_WORK_SQL.indexOf("limit $7")).toBeLessThan(
+      PROJECTION_INTERVAL_WORK_SQL.indexOf("join telemetry.events summary"),
+    );
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("limit $9")).toBeLessThan(
+      PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("join telemetry.events source"),
+    );
+    expect(PROJECTION_WORK_DETAIL_SQL.indexOf("limit $11")).toBeLessThan(
+      PROJECTION_WORK_DETAIL_SQL.indexOf("left join telemetry.events source"),
+    );
+  });
+
+  it("preserves partial-bucket activity and exact person-wide prompt ranking", () => {
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "and observed_at >= p.start_at and observed_at < p.read_at",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "where evidence.observed_at < p.end_at",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "and evidence.observed_at < p.end_at",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "latest_frame_evidence.anchor_observed_at,",
+    );
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL).toContain(
+      "latest_frame_evidence.anchor_observed_at,",
+    );
+    expect(PROJECTION_INTERVAL_WORK_SQL).not.toContain("p.read_at");
+  });
+
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
     expect(ASSISTANT_REPRESENTATION_MATCH_SECONDS).toBe(3);
     for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
@@ -656,6 +807,91 @@ describe("Sherlock Flame payload", () => {
         truncated: false,
       }],
     });
+  });
+
+  it("routes v2 interval evidence only through the pinned projection", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([{
+        session_id: sessionId,
+        semantic_role: "agent",
+        first_at: START,
+        last_at: new Date(START.getTime() + 1000),
+        event_count: 1,
+        summary: "Projected work",
+      }])
+      .mockResolvedValueOnce([{
+        prompt_identity: "native:projected",
+        session_id: sessionId,
+        observed_at: new Date(START.getTime() + 500),
+        content_byte_size: 9,
+        content_excerpt: "Projected",
+        eligible_prompt_count: 1,
+      }]);
+    source.transaction = (callback) => callback({ unsafe });
+    const snapshot = encodeProjectionSnapshotToken({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: FRAME_VERSION,
+    });
+
+    const interval = await source.fetchInterval({
+      personId,
+      start: START.toISOString(),
+      snapshot,
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[1][1]).toEqual([
+      source.workspaceId,
+      FRAME_VERSION,
+      PG_SNAPSHOT,
+      personId,
+      START.toISOString(),
+      new Date(START.getTime() + BUCKET_MS).toISOString(),
+      INTERVAL_WORK_LIMIT + 1,
+    ]);
+    expect(unsafe.mock.calls[2][1]).toEqual([
+      source.workspaceId,
+      FRAME_VERSION,
+      PG_SNAPSHOT,
+      personId,
+      START.toISOString(),
+      new Date(START.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      START.toISOString(),
+      new Date(START.getTime() + BUCKET_MS).toISOString(),
+      INTERVAL_PROMPT_LIMIT + 1,
+    ]);
+    expect(interval.work[0].summary).toBe("Projected work");
+    expect(interval.prompts[0].content).toBe("Projected");
+  });
+
+  it("never silently falls a failing v2 interval back to raw SQL", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const failure = new Error("projection unavailable");
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockRejectedValueOnce(failure);
+    source.transaction = (callback) => callback({ unsafe });
+
+    await expect(source.fetchInterval({
+      personId,
+      start: START.toISOString(),
+      snapshot: encodeProjectionSnapshotToken({
+        snapshot: PG_SNAPSHOT,
+        read: READ,
+        frameVersion: FRAME_VERSION,
+      }),
+    })).rejects.toBe(failure);
+    expect(unsafe).toHaveBeenCalledTimes(2);
+    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
   });
 
   it("distinguishes an expired snapshot from an invalid frame range", async () => {
@@ -806,6 +1042,56 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
+  it("pages v2 work using projected IDs before bounded excerpt lookup", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const header = {
+      session_id: sessionId,
+      semantic_role: "agent",
+      first_at: START,
+      last_at: new Date(START.getTime() + 2000),
+      event_count: 2,
+      summary: "Projected summary",
+    };
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([header])
+      .mockResolvedValueOnce([{
+        ...header,
+        id: "52",
+        observed_at: new Date(START.getTime() + 1000),
+        observed_at_microseconds: String(BigInt(START.getTime() + 1000) * 1000n),
+        message_role: "assistant",
+        content_byte_size: 15,
+        content_excerpt: "Projected item",
+      }]);
+    source.transaction = (callback) => callback({ unsafe });
+    const snapshot = encodeProjectionSnapshotToken({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: FRAME_VERSION,
+    });
+
+    const detail = await source.fetchWork({
+      personId,
+      start: START.toISOString(),
+      sessionId,
+      role: "agent",
+      snapshot,
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_WORK_DETAIL_SQL);
+    expect(unsafe.mock.calls[2][1].at(-1)).toBe(DEFAULT_WORK_DETAIL_LIMIT + 1);
+    expect(detail).toMatchObject({
+      workId: `${sessionId}:agent`,
+      eventCount: 2,
+      items: [{ id: "52", content: "Projected item" }],
+    });
+  });
+
   it("round-trips work cursors and enforces page bounds", async () => {
     const cursor = encodeWorkCursor({ atMicroseconds: "1786881600123456", id: "99" });
     expect(decodeWorkCursor(cursor)).toEqual({
@@ -865,6 +1151,37 @@ describe("Sherlock Flame payload", () => {
     expect(result.prompts[0]).toEqual({
       excerpt: "Short",
       excerptTruncated: true,
+    });
+  });
+
+  it("serves a v2 MCP sample from projected prompt identities", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([{
+        content_byte_size: 9,
+        content_excerpt: "Projected",
+        eligible_prompt_count: 1,
+      }]);
+    source.transaction = (callback) => callback({ unsafe });
+
+    const result = await source.fetchPromptEvidence({
+      personId,
+      start: START.toISOString(),
+      snapshot: encodeProjectionSnapshotToken({
+        snapshot: PG_SNAPSHOT,
+        read: READ,
+        frameVersion: FRAME_VERSION,
+      }),
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(MCP_PROMPT_EVIDENCE_LIMIT);
+    expect(result).toMatchObject({
+      eligiblePromptCount: 1,
+      prompts: [{ excerpt: "Projected", excerptTruncated: false }],
     });
   });
 

@@ -63,6 +63,8 @@ jobs:
           deno check supabase/functions/sherlock-rollout-ingest/index.ts
           deno check workers/telemetry-processor/main.ts
           deno check scripts/reduce-activity.ts
+          deno check scripts/backfill-frame-evidence.ts
+          deno check workers/telemetry-processor/frame-projector.ts
 
       - name: Run collector tests
         env:
@@ -117,6 +119,13 @@ jobs:
         run: >-
           deno test --allow-env --allow-net
           workers/telemetry-processor/queue_integration_test.ts
+
+      - name: Run frame projector database integration test
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: >-
+          deno test --allow-env --allow-net
+          workers/telemetry-processor/frame-projector_postgres_test.ts
 
       - name: Run oversized provider end-to-end tests
         env:

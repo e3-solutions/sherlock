@@ -2,6 +2,10 @@ import postgres from "postgres";
 
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
+// Keep this immutable reader contract aligned with the worker's frame version.
+// The dashboard Docker build context is apps/dashboard, so it cannot import the
+// repository-level worker module at runtime.
+export const FRAME_VERSION = "frame-evidence-v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 export const NORMALIZER_VERSIONS = Object.freeze([
@@ -11,7 +15,8 @@ export const NORMALIZER_VERSIONS = Object.freeze([
 export const DATABASE_ROLE = "sherlock_reader";
 const DEFAULT_STATEMENT_TIMEOUT_MS = 20_000;
 const TIMELINE_STATEMENT_TIMEOUT_MS = 30_000;
-const SNAPSHOT_TOKEN_VERSION = "v1";
+const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
+const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -824,6 +829,273 @@ select header.session_id::text session_id, header.semantic_role,
  order by selected.observed_at nulls first, selected.id nulls first
 `;
 
+function projectedEvidenceCte({
+  snapshotVisible = false,
+  personScoped = false,
+  activityThroughReadAt = false,
+} = {}) {
+  const visibility = snapshotVisible
+    ? `and pg_visible_in_snapshot(receipt.xmin::text::xid8, p.snapshot)
+     and pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)`
+    : "";
+  const activityEnd = activityThroughReadAt ? "p.read_at" : "p.end_at";
+  return `
+ranked_frame_revisions as materialized (
+  select revision.*,
+         row_number() over (
+           partition by revision.evidence_kind, revision.source_event_id
+           order by receipt.id desc, revision.id desc
+         ) latest_rank
+    from analytics.frame_evidence_revisions revision
+    join analytics.frame_projection_receipts receipt
+      on receipt.id = revision.receipt_id
+     and receipt.workspace_id = revision.workspace_id
+     and receipt.session_id = revision.session_id
+     and receipt.person_id = revision.person_id
+     and receipt.frame_version = revision.frame_version
+    cross join p
+   where revision.workspace_id = p.workspace_id
+     and revision.frame_version = p.frame_version
+     ${personScoped ? "and revision.person_id = p.person_id" : ""}
+     and (
+       revision.evidence_kind = 'activity'
+       and revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+       and revision.observed_at < ${activityEnd} + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+       or revision.evidence_kind = 'prompt'
+       and (
+         revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+         and revision.anchor_observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+         or revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+         and revision.observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       )
+     )
+     ${visibility}
+), latest_frame_evidence as materialized (
+  select *
+    from ranked_frame_revisions
+   where latest_rank = 1 and not is_tombstone
+), projected_activity as materialized (
+  select latest_frame_evidence.*
+   from latest_frame_evidence cross join p
+   where evidence_kind = 'activity'
+     and observed_at >= p.start_at and observed_at < ${activityEnd}
+), projected_prompt_candidates as materialized (
+  select latest_frame_evidence.*,
+         row_number() over (
+           partition by latest_frame_evidence.person_id,
+                        latest_frame_evidence.prompt_identity
+           order by latest_frame_evidence.observed_at,
+                    latest_frame_evidence.anchor_observed_at,
+                    latest_frame_evidence.source_event_id
+         ) prompt_rank
+    from latest_frame_evidence cross join p
+   where evidence_kind = 'prompt'
+     and prompt_identity is not null
+     and observed_at >= p.start_at and observed_at < p.end_at
+), projected_prompts as materialized (
+  select * from projected_prompt_candidates where prompt_rank = 1
+)`;
+}
+
+export const PROJECTION_FLAME_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::timestamptz start_at,
+         $3::timestamptz end_at, $4::text frame_version,
+         $5::timestamptz read_at, null::uuid person_id,
+         null::pg_snapshot snapshot
+), roster as materialized (
+  select pe.id person_id,
+         coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) display_name
+    from telemetry.people pe cross join p
+   where pe.workspace_id = p.workspace_id
+     and pe.github_id is distinct from 'sherlock-smoke'
+     ${dashboardPersonVisibility("pe")}
+), buckets as materialized (
+  select generate_series(p.start_at, p.end_at - interval '10 minutes',
+                         interval '10 minutes') bucket_start
+    from p
+), ${projectedEvidenceCte({ activityThroughReadAt: true })}, bucket_activity as materialized (
+  select evidence.person_id,
+         date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
+         count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
+         count(distinct evidence.session_id) filter (where evidence.actor_role in ('worker', 'guardian'))::bigint subagent,
+         count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other
+    from projected_activity evidence cross join p
+   where evidence.observed_at < p.end_at
+   group by evidence.person_id, bucket_start
+), day_activity as materialized (
+  select r.person_id,
+         count(distinct evidence.session_id) filter (
+           where evidence.actor_role = 'primary' and evidence.observed_at < p.end_at
+         )::bigint day_agent,
+         count(distinct evidence.session_id) filter (
+           where evidence.actor_role in ('worker', 'guardian')
+             and evidence.observed_at < p.end_at
+         )::bigint day_subagent,
+         count(distinct evidence.session_id) filter (
+           where evidence.actor_role = 'unknown' and evidence.observed_at < p.end_at
+         )::bigint day_other
+    from roster r left join projected_activity evidence using (person_id)
+    cross join p
+   group by r.person_id
+), recent_activity as materialized (
+  select r.person_id, max(evidence.observed_at) latest_activity
+    from roster r left join projected_activity evidence using (person_id)
+   group by r.person_id
+), prompt_counts as materialized (
+  select prompts.person_id,
+         date_bin(interval '10 minutes', prompts.observed_at, p.start_at) bucket_start,
+         count(*)::bigint prompts
+    from projected_prompts prompts cross join p
+   group by prompts.person_id, bucket_start
+), latest_observation as materialized (
+  select greatest(
+           (select max(observed_at) from projected_activity),
+           (select max(observed_at) from projected_prompts)
+         ) latest
+)
+select r.person_id::text person_id, r.display_name, b.bucket_start,
+       coalesce(ba.agent, 0)::bigint agent,
+       coalesce(ba.subagent, 0)::bigint subagent,
+       coalesce(ba.other, 0)::bigint other,
+       coalesce(pc.prompts, 0)::bigint prompts,
+       d.day_agent, d.day_subagent, d.day_other, l.latest,
+       ra.latest_activity
+  from roster r cross join buckets b
+  join day_activity d using (person_id)
+  join recent_activity ra using (person_id)
+  cross join latest_observation l
+  left join bucket_activity ba
+    on ba.person_id = r.person_id and ba.bucket_start = b.bucket_start
+  left join prompt_counts pc
+    on pc.person_id = r.person_id and pc.bucket_start = b.bucket_start
+ order by lower(r.display_name), r.person_id, b.bucket_start
+`;
+
+export const PROJECTION_INTERVAL_WORK_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::text frame_version,
+         $3::pg_snapshot snapshot, $4::uuid person_id,
+         $5::timestamptz start_at, $6::timestamptz end_at
+), ${projectedEvidenceCte({
+  snapshotVisible: true,
+  personScoped: true,
+})}, bucket_events as materialized (
+  select evidence.*,
+         case when actor_role = 'primary' then 'agent'
+              when actor_role in ('worker', 'guardian') then 'subagent'
+              else 'unclassified' end semantic_role
+    from projected_activity evidence
+), grouped as materialized (
+  select session_id, semantic_role,
+         min(observed_at) first_at, max(observed_at) last_at,
+         count(*)::bigint event_count,
+         (array_agg(source_event_id order by observed_at, source_event_id)
+           filter (where is_summary_candidate))[1] summary_event_id
+    from bucket_events
+   group by session_id, semantic_role
+   order by first_at, session_id, semantic_role
+   limit $7
+)
+select grouped.session_id::text session_id, grouped.semantic_role,
+       grouped.first_at, grouped.last_at, grouped.event_count,
+       summary.content_excerpt summary
+  from grouped
+  left join telemetry.events summary
+    on summary.workspace_id = $1 and summary.id = grouped.summary_event_id
+ order by grouped.first_at, grouped.session_id, grouped.semantic_role
+`;
+
+export const PROJECTION_INTERVAL_PROMPTS_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::text frame_version,
+         $3::pg_snapshot snapshot, $4::uuid person_id,
+         $5::timestamptz start_at, $6::timestamptz end_at,
+         $7::timestamptz bucket_start, $8::timestamptz bucket_end
+), ${projectedEvidenceCte({
+  snapshotVisible: true,
+  personScoped: true,
+})}, selected as materialized (
+  select projected_prompts.*,
+         count(*) over ()::bigint eligible_prompt_count
+    from projected_prompts cross join p
+   where projected_prompts.observed_at >= p.bucket_start
+     and projected_prompts.observed_at < p.bucket_end
+   order by observed_at, prompt_identity
+   limit $9
+)
+select selected.prompt_identity, selected.session_id::text session_id,
+       selected.observed_at, source.content_byte_size, source.content_excerpt,
+       selected.eligible_prompt_count
+  from selected
+  join telemetry.events source
+    on source.workspace_id = $1 and source.id = selected.source_event_id
+ order by selected.observed_at, selected.prompt_identity
+`;
+
+export const PROJECTION_WORK_DETAIL_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::text frame_version,
+         $3::pg_snapshot snapshot, $4::uuid person_id,
+         $5::timestamptz start_at, $6::timestamptz end_at,
+         $7::uuid session_id, $8::text semantic_role,
+         $9::bigint cursor_at_microseconds, $10::bigint cursor_id
+), ${projectedEvidenceCte({
+  snapshotVisible: true,
+  personScoped: true,
+})}, bucket_events as materialized (
+  select evidence.*,
+         case when actor_role = 'primary' then 'agent'
+              when actor_role in ('worker', 'guardian') then 'subagent'
+              else 'unclassified' end semantic_role
+    from projected_activity evidence
+), header as materialized (
+  select bucket_events.session_id, bucket_events.semantic_role,
+         min(bucket_events.observed_at) first_at,
+         max(bucket_events.observed_at) last_at,
+         count(*)::bigint event_count,
+         (array_agg(bucket_events.source_event_id order by bucket_events.observed_at,
+                    bucket_events.source_event_id)
+           filter (where bucket_events.is_summary_candidate))[1] summary_event_id
+    from bucket_events cross join p
+   where bucket_events.session_id = p.session_id
+     and bucket_events.semantic_role = p.semantic_role
+   group by bucket_events.session_id, bucket_events.semantic_role
+), selected as materialized (
+  select bucket_events.*,
+         (extract(epoch from bucket_events.observed_at) * 1000000)::bigint
+           observed_at_microseconds
+    from bucket_events cross join p
+   where bucket_events.session_id = p.session_id
+     and bucket_events.semantic_role = p.semantic_role
+     and bucket_events.event_kind in ('message', 'agent_message')
+     and (
+       bucket_events.message_role = 'assistant'
+       or bucket_events.message_role = 'user'
+          and bucket_events.message_origin in ('human', 'parent_agent')
+     )
+     and (
+       (extract(epoch from bucket_events.observed_at) * 1000000)::bigint,
+       bucket_events.source_event_id
+     ) > (p.cursor_at_microseconds, p.cursor_id)
+   order by bucket_events.observed_at, bucket_events.source_event_id
+   limit $11
+)
+select header.session_id::text session_id, header.semantic_role,
+       header.first_at, header.last_at, header.event_count,
+       summary.content_excerpt summary,
+       selected.source_event_id::text id, selected.observed_at,
+       selected.observed_at_microseconds, selected.message_role,
+       source.content_byte_size, source.content_excerpt
+  from header
+  left join telemetry.events summary
+    on summary.workspace_id = $1 and summary.id = header.summary_event_id
+  left join selected on true
+  left join telemetry.events source
+    on source.workspace_id = $1 and source.id = selected.source_event_id
+ order by selected.observed_at nulls first, selected.source_event_id nulls first
+`;
+
 export class FlameSourceError extends Error {
   constructor(code, options) {
     super(code, options);
@@ -866,15 +1138,34 @@ function parsePgSnapshot(value) {
   return value;
 }
 
-export function encodeSnapshotToken({ snapshot, read }) {
-  const readAt = asDate(read).toISOString();
-  const pgSnapshot = parsePgSnapshot(snapshot);
-  const body = Buffer.from(JSON.stringify([pgSnapshot, readAt]), "utf8").toString("base64url");
-  const token = `${SNAPSHOT_TOKEN_VERSION}.${body}`;
+function encodeVersionedSnapshotToken(version, values) {
+  const body = Buffer.from(JSON.stringify(values), "utf8").toString("base64url");
+  const token = `${version}.${body}`;
   if (token.length > MAX_SNAPSHOT_TOKEN_LENGTH) {
     throw new FlameSourceError("flame_snapshot_too_large");
   }
   return token;
+}
+
+export function encodeSnapshotToken({ snapshot, read }) {
+  const readAt = asDate(read).toISOString();
+  const pgSnapshot = parsePgSnapshot(snapshot);
+  return encodeVersionedSnapshotToken(
+    LEGACY_SNAPSHOT_TOKEN_VERSION,
+    [pgSnapshot, readAt],
+  );
+}
+
+export function encodeProjectionSnapshotToken({ snapshot, read, frameVersion }) {
+  if (frameVersion !== FRAME_VERSION) {
+    throw new FlameSourceError("flame_snapshot_invalid");
+  }
+  const readAt = asDate(read).toISOString();
+  const pgSnapshot = parsePgSnapshot(snapshot);
+  return encodeVersionedSnapshotToken(
+    PROJECTION_SNAPSHOT_TOKEN_VERSION,
+    [pgSnapshot, readAt, frameVersion],
+  );
 }
 
 export function decodeSnapshotToken(token) {
@@ -882,7 +1173,8 @@ export function decodeSnapshotToken(token) {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
   const [version, body, extra] = token.split(".");
-  if (version !== SNAPSHOT_TOKEN_VERSION || !body || extra !== undefined ||
+  if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version) ||
+      !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
@@ -892,11 +1184,19 @@ export function decodeSnapshotToken(token) {
       throw new Error("noncanonical_token");
     }
     const value = JSON.parse(decoded);
-    if (!Array.isArray(value) || value.length !== 2) throw new Error("invalid_payload");
-    const [snapshot, rawRead] = value;
+    const expectedLength = version === LEGACY_SNAPSHOT_TOKEN_VERSION ? 2 : 3;
+    if (!Array.isArray(value) || value.length !== expectedLength) {
+      throw new Error("invalid_payload");
+    }
+    const [snapshot, rawRead, frameVersion] = value;
     const read = asDate(rawRead);
     if (read.toISOString() !== rawRead) throw new Error("noncanonical_read");
-    return { snapshot: parsePgSnapshot(snapshot), read };
+    const receipt = { snapshot: parsePgSnapshot(snapshot), read };
+    if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
+      if (frameVersion !== FRAME_VERSION) throw new Error("unsupported_frame_version");
+      receipt.frameVersion = frameVersion;
+    }
+    return receipt;
   } catch {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
@@ -1083,7 +1383,9 @@ function promptEvidenceFromRow(row) {
   };
 }
 
-export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
+export function buildFlamePayload({
+  rows, roster, start, read, snapshot, frameVersion = null,
+}) {
   if (roster.length === 0) throw new FlameSourceError("flame_database_roster_empty");
   if (rows.length !== roster.length * BUCKET_COUNT) {
     throw new FlameSourceError("flame_database_result_incomplete");
@@ -1141,7 +1443,9 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
   return {
     start: asDate(start).toISOString(),
     read: asDate(read).toISOString(),
-    snapshot: encodeSnapshotToken({ snapshot, read }),
+    snapshot: frameVersion === null
+      ? encodeSnapshotToken({ snapshot, read })
+      : encodeProjectionSnapshotToken({ snapshot, read, frameVersion }),
     latest: latest?.toISOString() ?? null,
     coverage: {
       evidence: "observed_events",
@@ -1220,8 +1524,15 @@ export class DirectFlameSource {
   async fetchDay({ now, signal } = {}) {
     return await this.transaction(async (tx) => {
       const receipt = (await runQuery(tx,
-        "select transaction_timestamp() as now, pg_current_snapshot()::text as snapshot",
-        undefined,
+        `select transaction_timestamp() as now,
+                pg_current_snapshot()::text as snapshot,
+                exists (
+                  select 1
+                    from analytics.frame_projection_activations activation
+                   where activation.workspace_id = $1
+                     and activation.frame_version = $2
+                ) frame_projection_active`,
+        [this.workspaceId, FRAME_VERSION],
         signal,
       ))[0];
       const read = now ? asDate(now) : asDate(receipt.now);
@@ -1236,14 +1547,32 @@ export class DirectFlameSource {
       if (roster.length > this.maxPeople) {
         throw new FlameSourceError("flame_database_roster_too_large");
       }
-      const rows = await runQuery(tx, FLAME_SQL, [
-        this.workspaceId,
-        start.toISOString(),
-        end.toISOString(),
-        tx.array(NORMALIZER_VERSIONS),
-        read.toISOString(),
-      ], signal);
-      return buildFlamePayload({ rows, roster, start, read, snapshot: receipt.snapshot });
+      const frameVersion = receipt.frame_projection_active === true
+        ? FRAME_VERSION
+        : null;
+      const rows = frameVersion === null
+        ? await runQuery(tx, FLAME_SQL, [
+          this.workspaceId,
+          start.toISOString(),
+          end.toISOString(),
+          tx.array(NORMALIZER_VERSIONS),
+          read.toISOString(),
+        ], signal)
+        : await runQuery(tx, PROJECTION_FLAME_SQL, [
+          this.workspaceId,
+          start.toISOString(),
+          end.toISOString(),
+          frameVersion,
+          read.toISOString(),
+        ], signal);
+      return buildFlamePayload({
+        rows,
+        roster,
+        start,
+        read,
+        snapshot: receipt.snapshot,
+        frameVersion,
+      });
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
   }
 
@@ -1258,35 +1587,58 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
+      const projected = snapshotReceipt.frameVersion === FRAME_VERSION;
       const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const work = await runQuery(tx, INTERVAL_WORK_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        tx.array(NORMALIZER_VERSIONS),
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        workLimit,
-      ], signal);
+      const work = projected
+        ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
+          this.workspaceId,
+          snapshotReceipt.frameVersion,
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          workLimit,
+        ], signal)
+        : await runQuery(tx, INTERVAL_WORK_SQL, [
+          this.workspaceId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
+          tx.array(NORMALIZER_VERSIONS),
+          snapshotReceipt.read.toISOString(),
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          workLimit,
+        ], signal);
       if (work.length === workLimit) {
         throw new FlameSourceError("flame_interval_work_result_too_large");
       }
       const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
-      const prompts = await runQuery(tx, INTERVAL_PROMPTS_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        tx.array(NORMALIZER_VERSIONS),
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        promptLimit,
-      ], signal);
+      const prompts = projected
+        ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
+          this.workspaceId,
+          snapshotReceipt.frameVersion,
+          snapshotReceipt.snapshot,
+          personId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          promptLimit,
+        ], signal)
+        : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+          this.workspaceId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
+          tx.array(NORMALIZER_VERSIONS),
+          snapshotReceipt.read.toISOString(),
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          promptLimit,
+        ], signal);
       if (prompts.length === promptLimit) {
         throw new FlameSourceError("flame_interval_prompt_result_too_large");
       }
@@ -1319,6 +1671,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
+      const projected = snapshotReceipt.frameVersion === FRAME_VERSION;
       const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
       const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
       if (decodedCursor) {
@@ -1329,18 +1682,28 @@ export class DirectFlameSource {
         }
       }
       const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const workRows = await runQuery(tx, INTERVAL_WORK_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        tx.array(NORMALIZER_VERSIONS),
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        workLimit,
-      ], signal);
+      const workRows = projected
+        ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
+          this.workspaceId,
+          snapshotReceipt.frameVersion,
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          workLimit,
+        ], signal)
+        : await runQuery(tx, INTERVAL_WORK_SQL, [
+          this.workspaceId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
+          tx.array(NORMALIZER_VERSIONS),
+          snapshotReceipt.read.toISOString(),
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          workLimit,
+        ], signal);
       if (workRows.length === workLimit) {
         throw new FlameSourceError("flame_work_result_too_large");
       }
@@ -1352,22 +1715,36 @@ export class DirectFlameSource {
       const cursorAtMicroseconds = decodedCursor?.atMicroseconds ??
         bucketStartMicroseconds.toString();
       const cursorId = decodedCursor?.id ?? "0";
-      const resultRows = await runQuery(tx, WORK_DETAIL_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        tx.array(NORMALIZER_VERSIONS),
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        sessionId,
-        role,
-        cursorAtMicroseconds,
-        cursorId,
-        pageSize + 1,
-      ], signal);
+      const resultRows = projected
+        ? await runQuery(tx, PROJECTION_WORK_DETAIL_SQL, [
+          this.workspaceId,
+          snapshotReceipt.frameVersion,
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          sessionId,
+          role,
+          cursorAtMicroseconds,
+          cursorId,
+          pageSize + 1,
+        ], signal)
+        : await runQuery(tx, WORK_DETAIL_SQL, [
+          this.workspaceId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
+          tx.array(NORMALIZER_VERSIONS),
+          snapshotReceipt.read.toISOString(),
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          sessionId,
+          role,
+          cursorAtMicroseconds,
+          cursorId,
+          pageSize + 1,
+        ], signal);
       if (resultRows.length === 0) throw new FlameSourceError("flame_work_request_not_found");
       const itemRows = resultRows.filter((row) => row.id !== null && row.id !== undefined);
       const hasMore = itemRows.length > pageSize;
@@ -1405,18 +1782,31 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const rows = await runQuery(tx, INTERVAL_PROMPTS_SQL, [
-        this.workspaceId,
-        bounds.snapshotStart.toISOString(),
-        bounds.snapshotEnd.toISOString(),
-        tx.array(NORMALIZER_VERSIONS),
-        snapshotReceipt.read.toISOString(),
-        snapshotReceipt.snapshot,
-        personId,
-        startAt.toISOString(),
-        bounds.bucketEnd.toISOString(),
-        MCP_PROMPT_EVIDENCE_LIMIT,
-      ], signal);
+      const projected = snapshotReceipt.frameVersion === FRAME_VERSION;
+      const rows = projected
+        ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
+          this.workspaceId,
+          snapshotReceipt.frameVersion,
+          snapshotReceipt.snapshot,
+          personId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          MCP_PROMPT_EVIDENCE_LIMIT,
+        ], signal)
+        : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+          this.workspaceId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
+          tx.array(NORMALIZER_VERSIONS),
+          snapshotReceipt.read.toISOString(),
+          snapshotReceipt.snapshot,
+          personId,
+          startAt.toISOString(),
+          bounds.bucketEnd.toISOString(),
+          MCP_PROMPT_EVIDENCE_LIMIT,
+        ], signal);
       const eligiblePromptCount = rows.length === 0
         ? 0
         : count(rows[0].eligible_prompt_count);

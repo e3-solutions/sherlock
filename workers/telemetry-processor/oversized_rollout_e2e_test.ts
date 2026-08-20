@@ -1,4 +1,5 @@
 import postgres from "npm:postgres@3.4.7";
+import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
 import { handler as ingestHandler } from "../../supabase/functions/sherlock-rollout-ingest/index.ts";
 import {
   type BatchManifest,
@@ -126,10 +127,19 @@ async function assertClaudeDashboard(
   }
   const receipt = JSON.parse(
     new TextDecoder().decode(output.stdout),
-  ) as { roles: string[]; promptCount: number; detailCount: number };
+  ) as {
+    roles: string[];
+    promptCount: number;
+    detailCount: number;
+    snapshotVersion: string;
+  };
   assert(receipt.roles.join(",") === "agent,subagent");
   assert(receipt.promptCount >= 1);
   assert(receipt.detailCount >= 2);
+  assert(
+    receipt.snapshotVersion === "v2",
+    "dashboard did not use frame projection",
+  );
 }
 
 async function loadSpool(path: string): Promise<SpoolEnvelope[]> {
@@ -584,6 +594,10 @@ async function runOversizedE2E(
     assert(Number(spans[0].count) >= 1, "later activity was not reduced");
     if (provider === "claude_code") {
       assert(Number(spans[0].tools) >= 1, "later Claude tool was not reduced");
+      await proveAndActivateFrameProjection(sql, {
+        workspaceId,
+        activate: true,
+      });
       await sql.unsafe("grant sherlock_reader to postgres");
       await assertClaudeDashboard(databaseUrl!, workspaceId);
     }
@@ -604,7 +618,23 @@ async function runOversizedE2E(
       [workspaceId],
     ).catch(() => undefined);
     await sql.unsafe(
+      "delete from analytics.frame_projection_activations where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
+      "delete from analytics.frame_evidence_revisions where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
+      "delete from analytics.frame_projection_receipts where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
       "delete from telemetry.events where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
+      "delete from telemetry.native_records where workspace_id = $1",
       [workspaceId],
     ).catch(() => undefined);
     await sql.unsafe(

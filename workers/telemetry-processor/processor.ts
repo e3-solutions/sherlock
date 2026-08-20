@@ -11,9 +11,18 @@ import {
 import { NORMALIZER_VERSION } from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
 import { PostgresBatchNormalizer } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import { validateStoredBatch } from "../../supabase/functions/sherlock-rollout-ingest/service.ts";
+import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";
 import type { NormalizationJob, ReductionJob, WorkloadClass } from "./queue.ts";
 
 type Sql = ReturnType<typeof postgres>;
+
+export const AFFECTED_SESSIONS_SQL = `
+select id::text as id
+  from telemetry.sessions
+ where workspace_id = $1
+   and (id = any($2::uuid[]) or parent_session_id = any($2::uuid[]))
+ order by id
+`;
 
 export interface ProcessingResult {
   session_count: number;
@@ -57,6 +66,7 @@ export class TelemetryProcessor {
   private readonly loader: Sql;
   private readonly normalizer: PostgresBatchNormalizer;
   private readonly reducer: PostgresActivityReducer;
+  private readonly frameProjector: PostgresFrameEvidenceProjector;
 
   constructor(
     databaseUrl: string,
@@ -69,6 +79,7 @@ export class TelemetryProcessor {
     });
     this.normalizer = PostgresBatchNormalizer.connect(databaseUrl);
     this.reducer = PostgresActivityReducer.connect(databaseUrl);
+    this.frameProjector = PostgresFrameEvidenceProjector.connect(databaseUrl);
   }
 
   async close(): Promise<void> {
@@ -76,6 +87,7 @@ export class TelemetryProcessor {
       this.loader.end(),
       this.normalizer.close(),
       this.reducer.close(),
+      this.frameProjector.close(),
     ]);
   }
 
@@ -91,8 +103,12 @@ export class TelemetryProcessor {
       batch.manifest,
       source,
     );
+    const affectedSessionIds = await this.resolveAffectedSessionIds(
+      job.workspace_id,
+      normalized.session_ids,
+    );
     const targets: ReductionTarget[] = [];
-    for (const sessionId of normalized.session_ids) {
+    for (const sessionId of affectedSessionIds) {
       const targetEventId = await this.resolveSessionCutoff(
         job.workspace_id,
         sessionId,
@@ -116,6 +132,7 @@ export class TelemetryProcessor {
     job: ReductionJob,
     maximumDurationMs: number,
   ): Promise<ProcessingResult> {
+    const deadlineAtMs = performance.now() + maximumDurationMs;
     const reduced = await this.reducer.reduceSession({
       workspaceId: job.workspace_id,
       sessionId: job.session_id,
@@ -124,13 +141,26 @@ export class TelemetryProcessor {
       throughEventId: job.target_event_id,
       eventPageSize: 1_000,
       statementTimeoutMs: maximumDurationMs,
-      deadlineAtMs: performance.now() + maximumDurationMs,
+      deadlineAtMs,
+    });
+    const remainingMilliseconds = Math.floor(deadlineAtMs - performance.now());
+    if (remainingMilliseconds <= 0) {
+      throw new Error(
+        "frame projection deadline exhausted after activity reduction",
+      );
+    }
+    const projected = await this.frameProjector.projectSession({
+      workspaceId: job.workspace_id,
+      sessionId: job.session_id,
+      throughEventId: job.target_event_id,
+      requestGeneration: job.request_generation,
+      statementTimeoutMs: remainingMilliseconds,
     });
     return {
       session_count: 1,
-      candidate_count: reduced.candidate_count,
-      inserted_count: reduced.inserted_count,
-      tombstone_count: reduced.tombstone_count,
+      candidate_count: reduced.candidate_count + projected.candidate_count,
+      inserted_count: reduced.inserted_count + projected.inserted_count,
+      tombstone_count: reduced.tombstone_count + projected.tombstone_count,
     };
   }
 
@@ -244,6 +274,21 @@ export class TelemetryProcessor {
         [workspaceId, sessionId, normalizerVersion],
       );
       return BigInt(String(rows[0].cutoff));
+    });
+  }
+
+  private async resolveAffectedSessionIds(
+    workspaceId: string,
+    normalizedSessionIds: readonly string[],
+  ): Promise<string[]> {
+    if (normalizedSessionIds.length === 0) return [];
+    return await this.loader.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_normalizer");
+      const rows = await tx.unsafe(
+        AFFECTED_SESSIONS_SQL,
+        [workspaceId, normalizedSessionIds],
+      );
+      return rows.map((row) => String(row.id));
     });
   }
 }
