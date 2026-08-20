@@ -3,6 +3,7 @@
 set -eu
 
 REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
+MARKETPLACE_ROOT=${SHERLOCK_MARKETPLACE_ROOT:-$REPO_ROOT}
 DEFAULT_ENDPOINT="https://psmuyotyyojrkojycyzz.supabase.co/functions/v1/sherlock-rollout-ingest"
 CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
@@ -109,11 +110,11 @@ else
   echo "Warning: Claude Code backfill could not start; plugin installation will continue and SessionStart will retry it." >&2
 fi
 
-"$CLAUDE_BIN" plugin validate "$REPO_ROOT/plugins/sherlock-claude-code"
-"$CLAUDE_BIN" plugin validate "$REPO_ROOT"
+"$CLAUDE_BIN" plugin validate "$MARKETPLACE_ROOT/plugins/sherlock-claude-code"
+"$CLAUDE_BIN" plugin validate "$MARKETPLACE_ROOT"
 # Refresh the local marketplace registration so reruns update an existing install.
 "$CLAUDE_BIN" plugin marketplace remove sherlock >/dev/null 2>&1 || true
-"$CLAUDE_BIN" plugin marketplace add "$REPO_ROOT"
+"$CLAUDE_BIN" plugin marketplace add "$MARKETPLACE_ROOT"
 "$CLAUDE_BIN" plugin install sherlock-claude-code@sherlock
 
 echo "Sherlock for Claude Code is installed. Recent transcripts were queued for upload; start a new Claude Code session to load its hooks."

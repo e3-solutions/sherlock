@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "install.sh"
 CLAUDE_INSTALLER = ROOT / "install-claude.sh"
+UNIFIED_INSTALLER = ROOT / "sherlock"
 
 
 FAKE_CODEX = r'''#!/usr/bin/env python3
@@ -145,6 +146,190 @@ raise SystemExit(2)
 
 
 class TeamInstallerTests(unittest.TestCase):
+    def test_unified_command_installs_codex_and_claude_with_same_identity(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            claude_home = root / "claude"
+            sherlock_home = root / "sherlock-home"
+            fake_codex = root / "fake-codex"
+            fake_claude = root / "fake-claude"
+            capture = root / "calls.jsonl"
+            fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
+            fake_codex.chmod(0o755)
+            fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CODEX_BIN": str(fake_codex),
+                    "CODEX_HOME": str(codex_home),
+                    "CLAUDE_BIN": str(fake_claude),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "SHERLOCK_HOME": str(sherlock_home),
+                    "PYTHON_BIN": sys.executable,
+                    "SHERLOCK_FAKE_CAPTURE": str(capture),
+                    "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(UNIFIED_INSTALLER),
+                    "install",
+                    "--name",
+                    "Unified User",
+                    "--github",
+                    "unified-user",
+                    "--email",
+                    "UNIFIED@example.com",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn(
+                "Sherlock is installed for Codex and Claude Code",
+                completed.stdout,
+            )
+            for config in (
+                codex_home / "sherlock" / "collector.json",
+                claude_home / "sherlock" / "collector.json",
+            ):
+                configured = json.loads(config.read_text(encoding="utf-8"))
+                self.assertEqual(configured["name"], "Unified User")
+                self.assertEqual(configured["github_id"], "unified-user")
+                self.assertEqual(configured["email"], "unified@example.com")
+
+            calls = [json.loads(line) for line in capture.read_text().splitlines()]
+            marketplace_root = sherlock_home / "marketplace"
+            self.assertEqual(
+                {path.name for path in marketplace_root.iterdir()},
+                {".agents", ".claude-plugin", "plugins"},
+            )
+            self.assertTrue(
+                (marketplace_root / "plugins" / "sherlock" / "hooks").is_dir()
+            )
+            self.assertTrue(
+                (
+                    marketplace_root
+                    / "plugins"
+                    / "sherlock-claude-code"
+                    / "hooks"
+                ).is_dir()
+            )
+            marketplace_adds = [
+                call["argv"]
+                for call in calls
+                if call.get("argv", [])[:3] == ["plugin", "marketplace", "add"]
+            ]
+            self.assertEqual(len(marketplace_adds), 2)
+            self.assertTrue(
+                all(
+                    Path(arguments[3]).resolve() == marketplace_root.resolve()
+                    for arguments in marketplace_adds
+                )
+            )
+            self.assertTrue(
+                any(call.get("argv", [])[:2] == ["plugin", "add"] for call in calls)
+            )
+            self.assertTrue(
+                any(
+                    call.get("argv", [])[:2] == ["plugin", "install"]
+                    for call in calls
+                )
+            )
+
+    def test_unified_command_preflights_both_agents_before_installing(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            fake_codex = root / "fake-codex"
+            fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
+            fake_codex.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CODEX_BIN": str(fake_codex),
+                    "CODEX_HOME": str(codex_home),
+                    "CLAUDE_BIN": str(root / "missing-claude"),
+                    "PYTHON_BIN": sys.executable,
+                    "SHERLOCK_FAKE_CAPTURE": str(root / "calls.jsonl"),
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(UNIFIED_INSTALLER),
+                    "install",
+                    "--name",
+                    "Unified User",
+                    "--github-id",
+                    "unified-user",
+                    "--email",
+                    "unified@example.com",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("CLAUDE_BIN is not executable", completed.stderr)
+            self.assertFalse((codex_home / "sherlock").exists())
+
+    def test_unified_command_rejects_unusable_agent_before_installing(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            fake_codex = root / "fake-codex"
+            fake_claude = root / "not-claude"
+            fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
+            fake_codex.chmod(0o755)
+            fake_claude.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CODEX_BIN": str(fake_codex),
+                    "CODEX_HOME": str(codex_home),
+                    "CLAUDE_BIN": str(fake_claude),
+                    "PYTHON_BIN": sys.executable,
+                    "SHERLOCK_FAKE_CAPTURE": str(root / "calls.jsonl"),
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(UNIFIED_INSTALLER),
+                    "install",
+                    "--name",
+                    "Unified User",
+                    "--github",
+                    "unified-user",
+                    "--email",
+                    "unified@example.com",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("Claude Code CLI is not usable", completed.stderr)
+            self.assertFalse((codex_home / "sherlock").exists())
+
     def test_one_command_installs_and_trusts_only_sherlock_hooks(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
