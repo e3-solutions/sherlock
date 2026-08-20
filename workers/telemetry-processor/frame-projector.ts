@@ -421,7 +421,7 @@ export class PostgresFrameEvidenceProjector {
            workspace_id, session_id, person_id, frame_version,
            covered_from, covered_through, through_event_id, source_event_count,
            source_state_sha256, request_generation, session_updated_at
-         ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::timestamptz)
          returning id::text id`,
             [
               options.workspaceId,

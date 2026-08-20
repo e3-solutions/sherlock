@@ -190,6 +190,15 @@ Deno.test("revision writes preserve timestamp text until PostgreSQL casts it", (
   );
 });
 
+Deno.test("receipt writes preserve the exact session revision timestamp", () => {
+  const projector = PostgresFrameEvidenceProjector.prototype.projectSession
+    .toString();
+  assert(
+    projector.includes("$11::text::timestamptz"),
+    "session_updated_at must bypass the client timestamptz serializer",
+  );
+});
+
 Deno.test("projector reads only bounded source metadata and never copies content", () => {
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt is not null"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt,"));
