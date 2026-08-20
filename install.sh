@@ -3,6 +3,7 @@
 set -eu
 
 REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
+MARKETPLACE_ROOT=${SHERLOCK_MARKETPLACE_ROOT:-$REPO_ROOT}
 DEFAULT_ENDPOINT="https://psmuyotyyojrkojycyzz.supabase.co/functions/v1/sherlock-rollout-ingest"
 CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
@@ -96,12 +97,12 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
 
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install_marketplace.py" \
   --codex-bin "$CODEX_BIN" \
-  --repo-root "$REPO_ROOT"
+  --repo-root "$MARKETPLACE_ROOT"
 "$CODEX_BIN" plugin add sherlock@sherlock --json >/dev/null
 
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/trust_hooks.py" \
   --codex-bin "$CODEX_BIN" \
   --codex-home "$CODEX_HOME" \
-  --cwd "$REPO_ROOT"
+  --cwd "$MARKETPLACE_ROOT"
 
 echo "Sherlock is installed. Start a new Codex task to load its hooks."
