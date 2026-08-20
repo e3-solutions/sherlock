@@ -118,6 +118,7 @@ objects.
   the browser by active time, peak observed sessions in one bucket, canonical
   prompt count, or distinct subagent sessions. Ranking creates a product view
   over the adapted payload; it does not mutate the roster or source telemetry.
+  Active time is selected by default, and Name restores the source roster order.
 
 ## Initial-load cache
 

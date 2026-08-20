@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import bonaparteLogo from "./assets/bonaparte-logo.png";
-import FlameGraph, { PERSON_RANK_OPTIONS } from "./FlameGraph.jsx";
+import FlameGraph, {
+  DEFAULT_PERSON_RANK,
+  PERSON_RANK_OPTIONS,
+} from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_MS } from "./flame-data.js";
 
 const REFRESH_OFFSET_MS = 90 * 1000;
@@ -44,7 +47,7 @@ export default function App() {
   const [state, setState] = useState("loading");
   const [message, setMessage] = useState("");
   const [clock, setClock] = useState(() => Date.now());
-  const [rankBy, setRankBy] = useState("roster");
+  const [rankBy, setRankBy] = useState(DEFAULT_PERSON_RANK);
   const lastGoodRef = useRef(null);
   const timerRef = useRef(null);
   const requestRef = useRef(null);
