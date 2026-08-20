@@ -52,7 +52,15 @@ if sys.argv[1:] != ["app-server", "--stdio"]:
 
 codex_home = Path(os.environ["CODEX_HOME"])
 hook_file = codex_home / "plugins" / "cache" / "sherlock" / "sherlock" / "v1" / "hooks" / "hooks.json"
-events = ("post_tool_use", "session_start", "user_prompt_submit", "stop")
+events = (
+    "post_compact",
+    "post_tool_use",
+    "session_start",
+    "stop",
+    "subagent_start",
+    "subagent_stop",
+    "user_prompt_submit",
+)
 list_count = 0
 for line in sys.stdin:
     message = json.loads(line)
@@ -195,7 +203,7 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertEqual(configured["github_id"], "test-user")
             self.assertEqual(configured["email"], "test@example.com")
             self.assertNotIn("token", configured)
-            self.assertIn("Trusted 4 Sherlock hooks", completed.stdout)
+            self.assertIn("Trusted 7 Sherlock hooks", completed.stdout)
             calls = [json.loads(line) for line in capture.read_text().splitlines()]
             self.assertEqual(
                 calls[0]["argv"][:4],
@@ -210,7 +218,7 @@ class TeamInstallerTests(unittest.TestCase):
                 ["plugin", "add", "sherlock@sherlock"],
             )
             edits = calls[3]["batchWrite"]["edits"]
-            self.assertEqual(len(edits), 4)
+            self.assertEqual(len(edits), 7)
             self.assertTrue(
                 all(
                     edit["keyPath"].startswith(
