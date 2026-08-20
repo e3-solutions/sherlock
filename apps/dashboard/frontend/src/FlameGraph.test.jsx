@@ -860,23 +860,6 @@ describe("FlameGraph", () => {
       .toBeInTheDocument();
   });
 
-  it("evicts the least recently used frame after three complete entries", async () => {
-    const data = modelWithCacheableFrames(4);
-    const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    prepareTimeline(wrapper);
-
-    for (let index = 0; index < 4; index += 1) {
-      selectBucket(wrapper, index);
-      await waitFor(() => expect(fetch).toHaveBeenCalledTimes((index + 1) * 2));
-      await waitFor(() => expect(screen.queryByText("Loading frame evidence…"))
-        .not.toBeInTheDocument());
-    }
-
-    selectBucket(wrapper, 0);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(10));
-  });
-
   it("does not cache a frame with an evidence error", async () => {
     const data = modelWithCacheableFrames(2);
     const firstStart = new Date(data.people[0].buckets[0].startMs).toISOString();
@@ -899,12 +882,12 @@ describe("FlameGraph", () => {
 
     selectBucket(wrapper, 0);
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Work evidence is temporarily unavailable",
+      "Frame evidence is temporarily unavailable",
     );
     selectBucket(wrapper, 0);
     expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "Work evidence is temporarily unavailable",
+      "Frame evidence is temporarily unavailable",
     );
     expect(fetch).toHaveBeenCalledTimes(2);
 
@@ -915,7 +898,7 @@ describe("FlameGraph", () => {
     selectBucket(wrapper, 0);
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(6));
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Work evidence is temporarily unavailable",
+      "Frame evidence is temporarily unavailable",
     );
   });
 
@@ -1090,71 +1073,17 @@ describe("FlameGraph", () => {
       .toBe(true);
   });
 
-  it("keeps successful work visible when prompt evidence fails", async () => {
+  it("settles split failures atomically and retries the complete frame", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    const refreshedWork = deferred();
+    const firstWork = deferred();
+    let workAttempts = 0;
     let promptAttempts = 0;
     vi.mocked(fetch).mockImplementation((url, options) => {
       const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work" &&
-          request.searchParams.get("snapshot") === "v1.refreshed-snapshot") {
-        return refreshedWork.promise.then(() => defaultFetch(url, options));
+      if (request.pathname === "/api/flame/interval/work" && workAttempts++ === 0) {
+        return firstWork.promise.then(() => defaultFetch(url, options));
       }
       if (request.pathname === "/api/flame/interval/prompts" && promptAttempts++ === 0) {
-        return Promise.resolve({
-          ok: false,
-          status: 503,
-          json: () => Promise.resolve({ error: "flame_database_unavailable" }),
-        });
-      }
-      return defaultFetch(url, options);
-    });
-    const { container, rerender } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
-
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-
-    expect(await screen.findByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Prompt evidence is temporarily unavailable",
-    );
-    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(fetch).mock.calls.slice(1).every(([url]) =>
-      new URL(url, "http://dashboard.test").pathname === "/api/flame/interval/prompts"))
-      .toBe(true);
-
-    const refreshed = model();
-    refreshed.snapshot = "v1.refreshed-snapshot";
-    rerender(<FlameGraph data={refreshed} chartWidth={1008} />);
-
-    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
-    expect(new URL(vi.mocked(fetch).mock.calls[3][0], "http://dashboard.test").pathname)
-      .toBe("/api/flame/interval/work");
-    expect(new URL(vi.mocked(fetch).mock.calls[4][0], "http://dashboard.test").pathname)
-      .toBe("/api/flame/interval/prompts");
-    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
-
-    refreshedWork.resolve();
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-  });
-
-  it("still loads prompts after an ordinary work failure", async () => {
-    const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    vi.mocked(fetch).mockImplementation((url, options) => {
-      const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work") {
         return Promise.resolve({
           ok: false,
           status: 503,
@@ -1171,12 +1100,30 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    await act(() => Promise.resolve());
+    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /First exact prompt/ }))
+      .not.toBeInTheDocument();
 
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Work evidence is temporarily unavailable",
+    firstWork.resolve();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Frame evidence is temporarily unavailable",
     );
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: /First exact prompt/ }))
+      .not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
+    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(vi.mocked(fetch).mock.calls.slice(2).map(([url]) =>
+      new URL(url, "http://dashboard.test").pathname)).toEqual([
+      "/api/flame/interval/work",
+      "/api/flame/interval/prompts",
+    ]);
   });
 
   it("skips zero-count evidence requests without creating an N+1 path", async () => {
@@ -1206,6 +1153,21 @@ describe("FlameGraph", () => {
     fireEvent.click(wrappers[1], { clientX: 3, clientY: 34 });
     await act(() => Promise.resolve());
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens a zero-evidence frame ready without a loading paint or request", () => {
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const wrapper = container.querySelectorAll(".flame-person .recharts-wrapper")[1];
+    prepareTimeline(wrapper);
+
+    selectBucket(wrapper, 0);
+
+    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
+    expect(screen.getByText("No work-session evidence observed in this interval."))
+      .toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Zero Activity" }))
+      .toHaveAttribute("aria-busy", "false");
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("aborts immediately and never paints stale evidence after frame reselection", async () => {

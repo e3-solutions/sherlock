@@ -26,7 +26,7 @@ const source = databaseUrl && validWorkspaceId && validMaxPeople
   ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
   : null;
 const evidenceSource = source
-  ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople, maxConnections: 2 })
+  ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
   : null;
 const frameEvidence = source
   ? new FrameEvidenceCoordinator({
@@ -193,7 +193,7 @@ const server = createServer(async (request, response) => {
     const start = url.searchParams.get("start") ?? "";
     const snapshot = url.searchParams.get("snapshot") ?? "";
     try {
-      const result = await frameEvidence.read({
+      const payload = await frameEvidence.read({
         kind: "combined",
         personId,
         start,
@@ -203,7 +203,7 @@ const server = createServer(async (request, response) => {
           personId, start, snapshot, signal: sharedSignal,
         }),
       });
-      sendJson(response, 200, result.payload, { "Server-Timing": result.serverTiming });
+      sendJson(response, 200, payload);
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
@@ -230,7 +230,7 @@ const server = createServer(async (request, response) => {
       ? evidenceSource.fetchIntervalWork.bind(evidenceSource)
       : evidenceSource.fetchIntervalPrompts.bind(evidenceSource);
     try {
-      const result = await frameEvidence.read({
+      const payload = await frameEvidence.read({
         kind,
         personId,
         start,
@@ -240,7 +240,7 @@ const server = createServer(async (request, response) => {
           personId, start, snapshot, signal: sharedSignal,
         }),
       });
-      sendJson(response, 200, result.payload, { "Server-Timing": result.serverTiming });
+      sendJson(response, 200, payload);
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code

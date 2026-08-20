@@ -1187,12 +1187,12 @@ export function buildFlamePayload({ rows, roster, start, read, snapshot }) {
 }
 
 export class DirectFlameSource {
-  constructor({ databaseUrl, workspaceId, maxPeople = 500, maxConnections = 2 }) {
+  constructor({ databaseUrl, workspaceId, maxPeople = 500 }) {
     this.workspaceId = workspaceId;
     this.maxPeople = maxPeople;
     this.sql = postgres(databaseUrl, {
       prepare: false,
-      max: maxConnections,
+      max: 2,
       idle_timeout: 20,
       connect_timeout: 10,
     });

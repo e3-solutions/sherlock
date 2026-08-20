@@ -3,8 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeSnapshotToken, FlameSourceError } from "./flame-source.js";
 import {
   FrameEvidenceCoordinator,
-  FrameEvidenceGate,
   FrameEvidenceLru,
+  FRAME_EVIDENCE_MAX_IN_FLIGHT,
 } from "./frame-evidence-coordinator.js";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
@@ -25,77 +25,6 @@ function deferred() {
 function snapshot(readMs) {
   return encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: new Date(readMs) });
 }
-
-describe("frame evidence admission", () => {
-  it("admits two transactions and starts queued work in FIFO order", async () => {
-    const gate = new FrameEvidenceGate({ limit: 2 });
-    const blockers = [deferred(), deferred(), deferred()];
-    const started = [];
-    const calls = blockers.map((blocker, index) => gate.run(async () => {
-      started.push(index);
-      await blocker.promise;
-      return index;
-    }));
-
-    await vi.waitFor(() => expect(started).toEqual([0, 1]));
-    blockers[0].resolve();
-    await vi.waitFor(() => expect(started).toEqual([0, 1, 2]));
-    blockers[1].resolve();
-    blockers[2].resolve();
-    await expect(Promise.all(calls)).resolves.toEqual([
-      { value: 0, waitMs: expect.any(Number) },
-      { value: 1, waitMs: expect.any(Number) },
-      { value: 2, waitMs: expect.any(Number) },
-    ]);
-  });
-
-  it("removes an aborted queued waiter without releasing an active permit", async () => {
-    const gate = new FrameEvidenceGate({ limit: 1 });
-    const blocker = deferred();
-    const active = gate.run(() => blocker.promise);
-    await vi.waitFor(() => expect(gate.active).toBe(1));
-
-    const controller = new AbortController();
-    const queuedCallback = vi.fn();
-    const queued = gate.run(queuedCallback, { signal: controller.signal });
-    await vi.waitFor(() => expect(gate.queue).toHaveLength(1));
-    controller.abort();
-    await expect(queued).rejects.toMatchObject({ code: "flame_request_aborted" });
-    expect(queuedCallback).not.toHaveBeenCalled();
-    expect(gate.active).toBe(1);
-    expect(gate.queue).toHaveLength(0);
-
-    blocker.resolve("done");
-    await expect(active).resolves.toMatchObject({ value: "done" });
-    expect(gate.active).toBe(0);
-  });
-
-  it("bounds both the queue and queue wait with the stable unavailable error", async () => {
-    let expire;
-    const gate = new FrameEvidenceGate({
-      limit: 1,
-      maxQueue: 1,
-      maxWaitMs: 10,
-      setTimer: (callback) => {
-        expire = callback;
-        return { unref: vi.fn() };
-      },
-      clearTimer: vi.fn(),
-    });
-    const blocker = deferred();
-    const active = gate.run(() => blocker.promise);
-    await vi.waitFor(() => expect(gate.active).toBe(1));
-    const waiting = gate.run(vi.fn());
-    await vi.waitFor(() => expect(gate.queue).toHaveLength(1));
-    await expect(gate.run(vi.fn())).rejects.toMatchObject({
-      code: "flame_database_unavailable",
-    });
-    expire();
-    await expect(waiting).rejects.toMatchObject({ code: "flame_database_unavailable" });
-    blocker.resolve();
-    await active;
-  });
-});
 
 describe("frame evidence LRU", () => {
   it("enforces LRU order, TTL, entry count, and byte caps", () => {
@@ -155,10 +84,12 @@ describe("frame evidence coordination", () => {
   it("shares one load, detaches one waiter, and serves the successful cache hit", async () => {
     const now = Date.parse("2026-08-20T12:00:00.000Z");
     const receipt = snapshot(now - 1000);
+    const log = vi.fn();
     const coordinator = new FrameEvidenceCoordinator({
       workspaceId: WORKSPACE_ID,
       now: () => now,
       cache: new FrameEvidenceLru({ now: () => now }),
+      log,
     });
     const blocker = deferred();
     const load = vi.fn(() => blocker.promise);
@@ -173,12 +104,23 @@ describe("frame evidence coordination", () => {
     await expect(first).rejects.toMatchObject({ code: "flame_request_aborted" });
     expect(load.mock.calls[0][0].signal.aborted).toBe(false);
     blocker.resolve({ personId: PERSON_ID, work: [] });
-    await expect(second).resolves.toMatchObject({
-      payload: { personId: PERSON_ID, work: [] },
-      metrics: { cacheState: "shared" },
-    });
-    await expect(request()).resolves.toMatchObject({ metrics: { cacheState: "hit" } });
+    await expect(second).resolves.toEqual({ personId: PERSON_ID, work: [] });
+    await expect(request()).resolves.toEqual({ personId: PERSON_ID, work: [] });
     expect(load).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls.map(([event]) => event.cacheState)).toEqual([
+      "shared", "hit",
+    ]);
+    expect(log).toHaveBeenLastCalledWith({
+      event: "frame_evidence",
+      kind: "work",
+      cacheState: "hit",
+      loadMs: 0,
+      totalMs: 0,
+    });
+    const serialized = JSON.stringify(log.mock.calls);
+    expect(serialized).not.toContain(PERSON_ID);
+    expect(serialized).not.toContain(receipt);
+    expect(serialized).not.toContain(START);
   });
 
   it("cancels the underlying load only after its final waiter aborts", async () => {
@@ -205,7 +147,6 @@ describe("frame evidence coordination", () => {
     await expect(request).rejects.toMatchObject({ code: "flame_request_aborted" });
     await vi.waitFor(() => expect(sharedSignal.aborted).toBe(true));
     await vi.waitFor(() => expect(coordinator.flights.size).toBe(0));
-    await vi.waitFor(() => expect(coordinator.gate.active).toBe(0));
   });
 
   it("starts a fresh flight immediately after the final waiter aborts", async () => {
@@ -236,11 +177,8 @@ describe("frame evidence coordination", () => {
     expect(signals[1].aborted).toBe(false);
     blockers[0].resolve({ work: ["stale"] });
     blockers[1].resolve({ work: ["fresh"] });
-    await expect(second).resolves.toMatchObject({ payload: { work: ["fresh"] } });
-    await expect(coordinator.read(args)).resolves.toMatchObject({
-      payload: { work: ["fresh"] },
-      metrics: { cacheState: "hit" },
-    });
+    await expect(second).resolves.toEqual({ work: ["fresh"] });
+    await expect(coordinator.read(args)).resolves.toEqual({ work: ["fresh"] });
     expect(load).toHaveBeenCalledTimes(2);
   });
 
@@ -263,7 +201,6 @@ describe("frame evidence coordination", () => {
     const rejected = expect(request).rejects.toMatchObject({ code: "flame_request_aborted" });
     await coordinator.close();
     await rejected;
-    expect(coordinator.gate.active).toBe(0);
     expect(coordinator.flights.size).toBe(0);
     await expect(coordinator.read({
       kind: "prompts",
@@ -274,32 +211,72 @@ describe("frame evidence coordination", () => {
     })).rejects.toMatchObject({ code: "flame_database_unavailable" });
   });
 
-  it("limits underlying loads across kinds and never assembles combined from split", async () => {
+  it("caches work, prompts, and combined responses independently", async () => {
     const now = Date.parse("2026-08-20T12:00:00.000Z");
-    const gate = new FrameEvidenceGate({ limit: 2 });
-    const coordinator = new FrameEvidenceCoordinator({ workspaceId: WORKSPACE_ID, gate });
-    const blockers = [deferred(), deferred(), deferred()];
-    const started = [];
-    const kinds = ["work", "prompts", "combined"];
-    const requests = kinds.map((kind, index) => coordinator.read({
-      kind,
+    const log = vi.fn();
+    const coordinator = new FrameEvidenceCoordinator({ workspaceId: WORKSPACE_ID, log });
+    for (const kind of ["work", "prompts", "combined"]) {
+      const load = vi.fn().mockResolvedValue({ kind });
+      const args = {
+        kind,
+        personId: PERSON_ID,
+        start: START,
+        snapshot: snapshot(now),
+        load,
+      };
+      await expect(coordinator.read(args)).resolves.toEqual({ kind });
+      await expect(coordinator.read(args)).resolves.toEqual({ kind });
+      expect(load).toHaveBeenCalledOnce();
+    }
+    expect(log.mock.calls.map(([event]) => event.cacheState)).toEqual([
+      "miss", "hit", "miss", "hit", "miss", "hit",
+    ]);
+  });
+
+  it("keeps aborted-but-unsettled reloads charged until close can settle them", async () => {
+    const now = Date.parse("2026-08-20T12:00:00.000Z");
+    const blockers = [deferred(), deferred()];
+    let loadIndex = 0;
+    const load = vi.fn(() => blockers[loadIndex++].promise);
+    const coordinator = new FrameEvidenceCoordinator({
+      workspaceId: WORKSPACE_ID,
+      maxInFlight: 2,
+    });
+    expect(FRAME_EVIDENCE_MAX_IN_FLIGHT).toBe(16);
+    const args = {
+      kind: "work",
       personId: PERSON_ID,
       start: START,
       snapshot: snapshot(now),
-      load: async () => {
-        started.push(kind);
-        await blockers[index].promise;
-        return { kind };
-      },
-    }));
-    await vi.waitFor(() => expect(started).toEqual(["work", "prompts"]));
-    blockers[0].resolve();
-    await vi.waitFor(() => expect(started).toEqual(["work", "prompts", "combined"]));
-    blockers[1].resolve();
-    blockers[2].resolve();
-    await expect(Promise.all(requests)).resolves.toEqual(expect.arrayContaining([
-      expect.objectContaining({ payload: { kind: "combined" } }),
-    ]));
+      load,
+    };
+    for (let index = 0; index < 2; index += 1) {
+      const controller = new AbortController();
+      const request = coordinator.read({ ...args, signal: controller.signal });
+      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(index + 1));
+      controller.abort();
+      await expect(request).rejects.toMatchObject({ code: "flame_request_aborted" });
+      expect(coordinator.flights.size).toBe(0);
+      expect(coordinator.pendingFlights.size).toBe(index + 1);
+    }
+
+    for (let index = 0; index < 4; index += 1) {
+      await expect(coordinator.read(args)).rejects.toMatchObject({
+        code: "flame_database_unavailable",
+      });
+      expect(coordinator.pendingFlights.size).toBe(2);
+    }
+    expect(load).toHaveBeenCalledTimes(2);
+
+    let closed = false;
+    const closing = coordinator.close().then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    for (const blocker of blockers) blocker.resolve({ work: [] });
+    await closing;
+    expect(coordinator.pendingFlights.size).toBe(0);
   });
 
   it("does not cache errors, oversized responses, or entries past receipt expiry", async () => {
@@ -335,35 +312,5 @@ describe("frame evidence coordination", () => {
     now += 1001;
     await coordinator.read({ ...args, kind: "combined", load: expiringLoad });
     expect(expiringLoad).toHaveBeenCalledTimes(2);
-  });
-
-  it("logs and times only bounded non-identifying metadata", async () => {
-    const now = Date.parse("2026-08-20T12:00:00.000Z");
-    const log = vi.fn();
-    const coordinator = new FrameEvidenceCoordinator({ workspaceId: WORKSPACE_ID, log });
-    const receipt = snapshot(now);
-    const result = await coordinator.read({
-      kind: "work",
-      personId: PERSON_ID,
-      start: START,
-      snapshot: receipt,
-      load: vi.fn().mockResolvedValue({ work: [] }),
-    });
-    expect(result.serverTiming).toMatch(
-      /^frame_cache;desc="miss", frame_gate;dur=\d+\.\d, frame_load;dur=\d+\.\d, frame_total;dur=\d+\.\d$/,
-    );
-    const serialized = JSON.stringify(log.mock.calls);
-    expect(serialized).not.toContain(PERSON_ID);
-    expect(serialized).not.toContain(receipt);
-    expect(serialized).not.toContain(START);
-    expect(log).toHaveBeenCalledWith({
-      event: "frame_evidence",
-      kind: "work",
-      cacheState: "miss",
-      gateWaitMs: expect.any(Number),
-      loadMs: expect.any(Number),
-      totalMs: expect.any(Number),
-      bytes: expect.any(Number),
-    });
   });
 });
