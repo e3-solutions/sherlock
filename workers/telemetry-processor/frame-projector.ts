@@ -24,6 +24,13 @@ export const FRAME_BEGIN_SQL = "begin isolation level repeatable read";
 export const FRAME_COMMIT_SQL = "commit";
 export const FRAME_ROLLBACK_SQL = "rollback";
 
+export function frameTimestampForWrite(
+  sql: Sql,
+  value: string,
+) {
+  return sql`${value}::text::timestamptz`;
+}
+
 export interface FrameProjectionOptions {
   workspaceId: string;
   sessionId: string;
@@ -440,8 +447,11 @@ export class PostgresFrameEvidenceProjector {
               frame_version: FRAME_VERSION,
               evidence_kind: change.evidence_kind,
               source_event_id: change.source_event_id.toString(),
-              anchor_observed_at: change.anchor_observed_at,
-              observed_at: change.observed_at,
+              anchor_observed_at: frameTimestampForWrite(
+                tx,
+                change.anchor_observed_at,
+              ),
+              observed_at: frameTimestampForWrite(tx, change.observed_at),
               actor_role: change.actor_role,
               event_kind: change.event_kind,
               event_subtype: change.event_subtype,
@@ -451,8 +461,10 @@ export class PostgresFrameEvidenceProjector {
               is_summary_candidate: change.is_summary_candidate,
               is_tombstone: change.is_tombstone,
             }));
+            // postgres.js supports Query fragments in its runtime values
+            // builder, but its object-helper type excludes those fragments.
             await tx`insert into analytics.frame_evidence_revisions ${
-              tx(inserts, ...REVISION_COLUMNS)
+              tx(inserts as never, ...REVISION_COLUMNS)
             }`;
           }
           return {

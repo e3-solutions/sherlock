@@ -9,6 +9,7 @@ import {
   FRAME_RESET_TIMEOUT_SQL,
   FRAME_SOURCE_COORDINATES_SQL,
   FRAME_SOURCE_EVENTS_SQL,
+  frameTimestampForWrite,
   PostgresFrameEvidenceProjector,
   type SourceEvent,
 } from "./frame-projector.ts";
@@ -174,6 +175,19 @@ Deno.test("canonical rank preserves PostgreSQL timestamp microseconds", () => {
   assert(activity.length === 1);
   assert(activity[0].source_event_id === earlier.id);
   assert(activity[0].observed_at.endsWith(".000100Z"));
+});
+
+Deno.test("revision writes preserve timestamp text until PostgreSQL casts it", () => {
+  const timestampWrite = frameTimestampForWrite.toString();
+  assert(timestampWrite.includes("::text::timestamptz"));
+  const projector = PostgresFrameEvidenceProjector.prototype.projectSession
+    .toString();
+  assert(projector.includes("change.anchor_observed_at"));
+  assert(projector.includes("change.observed_at"));
+  assert(
+    projector.match(/frameTimestampForWrite/g)?.length === 2,
+    "both revision timestamps must bypass the client timestamptz serializer",
+  );
 });
 
 Deno.test("projector reads only bounded source metadata and never copies content", () => {
