@@ -21,10 +21,17 @@ function assert(
 async function assertRejects(
   operation: () => Promise<unknown>,
   message: string,
+  expectedError?: string,
 ): Promise<void> {
   try {
     await operation();
-  } catch {
+  } catch (error) {
+    if (expectedError) {
+      assert(
+        String(error).includes(expectedError),
+        `${message}: unexpected error ${String(error)}`,
+      );
+    }
     return;
   }
   throw new Error(message);
@@ -334,6 +341,7 @@ Deno.test({
             activate: false,
           }),
         "target-workspace normalization backlog must block activation",
+        "normalization or reduction jobs",
       );
       const completedNormalize = await sql.unsafe(
         `update processing.telemetry_jobs
