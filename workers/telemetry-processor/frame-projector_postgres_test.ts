@@ -184,6 +184,37 @@ Deno.test({
       );
       const earlierTimestampEventId = BigInt(String(earlierTimestamp[0].id));
       assert(earlierTimestampEventId > laterTimestampEventId);
+      const rawMicroseconds = await sql.unsafe(
+        `select id::text id,
+                to_char(occurred_at at time zone 'UTC',
+                  'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') occurred_at
+           from telemetry.events
+          where workspace_id = $1 and id in ($2::bigint, $3::bigint)
+          order by id`,
+        [
+          workspaceId,
+          laterTimestampEventId.toString(),
+          earlierTimestampEventId.toString(),
+        ],
+      );
+      assert(
+        rawMicroseconds.length === 2,
+        `microsecond fixture row count: ${JSON.stringify(rawMicroseconds)}`,
+      );
+      assert(
+        rawMicroseconds[0].id === laterTimestampEventId.toString() &&
+          rawMicroseconds[0].occurred_at ===
+            "2026-08-20T19:59:03.000900Z",
+        `later microsecond fixture changed: ${JSON.stringify(rawMicroseconds)}`,
+      );
+      assert(
+        rawMicroseconds[1].id === earlierTimestampEventId.toString() &&
+          rawMicroseconds[1].occurred_at ===
+            "2026-08-20T19:59:03.000100Z",
+        `earlier microsecond fixture changed: ${
+          JSON.stringify(rawMicroseconds)
+        }`,
+      );
 
       const rolePrivileges = await sql.unsafe(
         `select has_table_privilege(
@@ -236,12 +267,24 @@ Deno.test({
         [workspaceId, sessionId, FRAME_VERSION],
       );
       assert(
-        microsecondCanonical.length === 1 &&
-          microsecondCanonical[0].source_event_id ===
-            earlierTimestampEventId.toString() &&
-          microsecondCanonical[0].observed_at ===
-            "2026-08-20T19:59:03.000100Z",
-        "PostgreSQL microseconds must survive canonical ranking and storage",
+        microsecondCanonical.length === 1,
+        `canonical microsecond row count: ${
+          JSON.stringify(microsecondCanonical)
+        }`,
+      );
+      assert(
+        microsecondCanonical[0].source_event_id ===
+          earlierTimestampEventId.toString(),
+        `canonical microsecond source id: ${
+          JSON.stringify(microsecondCanonical)
+        }`,
+      );
+      assert(
+        microsecondCanonical[0].observed_at ===
+          "2026-08-20T19:59:03.000100Z",
+        `stored canonical microseconds: ${
+          JSON.stringify(microsecondCanonical)
+        }`,
       );
       await proveAndActivateFrameProjection(sql, {
         workspaceId,
