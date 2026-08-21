@@ -184,6 +184,8 @@ revoke all on sequence telemetry.scm_projections_id_seq,
        sherlock_reader, sherlock_github_sync;
 
 grant insert on telemetry.scm_projections to sherlock_normalizer;
+grant select (source_record_id, scm_version)
+  on telemetry.scm_projections to sherlock_normalizer;
 grant usage, select on sequence telemetry.scm_projections_id_seq to sherlock_normalizer;
 
 grant usage on schema telemetry, github to sherlock_github_sync;

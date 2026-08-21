@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(140);
+select plan(141);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -162,6 +162,16 @@ select ok(
     'sherlock_normalizer', 'telemetry.scm_projections', 'select'
   ),
   'normalizer cannot read SCM projection outcomes'
+);
+select ok(
+  has_column_privilege(
+    'sherlock_normalizer', 'telemetry.scm_projections', 'source_record_id', 'select'
+  ) and has_column_privilege(
+    'sherlock_normalizer', 'telemetry.scm_projections', 'scm_version', 'select'
+  ) and not has_column_privilege(
+    'sherlock_normalizer', 'telemetry.scm_projections', 'projection_status', 'select'
+  ),
+  'normalizer may read only the SCM idempotency key'
 );
 select ok(
   has_table_privilege(
@@ -1078,7 +1088,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 140,
+  'assertion_count', 141,
   'tables', 14,
   'private_bucket', 'telemetry-raw'
 ) as verification;
