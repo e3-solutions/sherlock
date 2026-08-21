@@ -893,7 +893,12 @@ input { font: inherit; }
   list-style: none;
 }
 
-.flame-detail__work li { border-bottom: 1px solid var(--flame-rule); }
+.flame-detail__work li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  border-bottom: 1px solid var(--flame-rule);
+}
 
 .flame-detail__work button {
   display: grid;
@@ -956,6 +961,20 @@ input { font: inherit; }
   color: var(--flame-muted);
   font-size: 22px;
 }
+
+.flame-detail__pull-request {
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border-left: 1px solid var(--flame-rule);
+  color: var(--flame-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.flame-detail__pull-request:hover,
+.flame-detail__pull-request:focus-visible { color: var(--flame-ink); }
 
 .flame-detail__work-expander {
   width: 100%;

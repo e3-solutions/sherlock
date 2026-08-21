@@ -7,6 +7,7 @@ import {
   decodeSnapshotToken,
   DirectFlameSource,
   FRAME_VERSION,
+  INTERVAL_PULL_REQUESTS_SQL,
   NORMALIZER_VERSION,
   PROJECTION_INTERVAL_WORK_SQL,
 } from "./flame-source.js";
@@ -51,6 +52,8 @@ function collectPlanIndexes(value, indexes = new Set()) {
 }
 
 async function cleanup(sql, workspaceId) {
+  await sql.unsafe("delete from github.commit_pr_lookups where workspace_id = $1", [workspaceId]);
+  await sql.unsafe("delete from telemetry.session_scm where workspace_id = $1", [workspaceId]);
   await sql.unsafe(
     "delete from processing.telemetry_jobs where workspace_id = $1",
     [workspaceId],
@@ -102,6 +105,121 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
     } finally {
       await source.close();
+    }
+  }, 30_000);
+
+  it("keeps exact PR links snapshot-stable and fail-closed", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const observedAt = new Date(Date.now() - 5 * 60_000);
+    const shas = ["1".repeat(40), "2".repeat(40)];
+    let initialReceipt;
+
+    const linksAt = (receipt) => sql.unsafe(INTERVAL_PULL_REQUESTS_SQL, [
+      workspaceId, receipt.snapshot, receipt.read.toISOString(), [sessionId],
+    ]);
+
+    try {
+      await sql.unsafe(
+        `with workspace as (
+           insert into telemetry.workspaces (id, slug, name)
+             values ($1, $2, 'PR fixture') returning id
+         ), person as (
+           insert into telemetry.people
+             (id, workspace_id, identity_key, display_name, email)
+             select $3, id, $4, 'PR User', 'pr-user@e3group.ai' from workspace
+             returning id
+         ) insert into telemetry.sessions
+           (id, workspace_id, person_id, collector_key, native_session_id,
+            actor_role, role_version, started_at)
+           select $5::uuid, $1, id, 'fixture', $5::uuid::text,
+                  'primary', 'fixture.v1', $6 from person`,
+        [workspaceId, `pr-${workspaceId}`, personId, `person-${personId}`,
+          sessionId, observedAt.toISOString()],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_kind,
+           source_stream_key, generation_key, generation_seq, start_offset,
+           end_offset, source_byte_count, source_sha256, storage_path,
+           storage_encoding, stored_byte_count, stored_sha256, record_count,
+           contract_version
+         ) values ($1, $2, $3, 'fixture', 'rollout', $4, 'generation', 0,
+                   0, 2, 2, repeat('a', 64), $5, 'identity', 2,
+                   repeat('b', 64), 2, 'fixture.v1')`,
+        [batchId, workspaceId, personId, `stream-${batchId}`, `fixture/${batchId}`],
+      );
+      const records = await sql.unsafe(
+        `insert into telemetry.native_records (
+           workspace_id, batch_id, record_index, source_start_offset,
+           source_end_offset, record_sha256, parse_status
+         ) values
+           ($1, $2, 0, 0, 1, repeat('c', 64), 'ok'),
+           ($1, $2, 1, 1, 2, repeat('d', 64), 'ok')
+         returning id, record_index`,
+        [workspaceId, batchId],
+      );
+      const recordByIndex = new Map(
+        records.map((row) => [Number(row.record_index), row.id]),
+      );
+      await sql.unsafe(
+        `insert into telemetry.session_scm (
+           workspace_id, source_record_id, session_id, source_version,
+           repository_full_name, commit_sha, observed_at
+         ) values
+           ($1, $2, $3, 'sherlock.github-scm.v1', 'e3-solutions/sherlock', $4, $6),
+           ($1, $5, $3, 'sherlock.github-scm.v1', 'e3-solutions/sherlock', $7,
+            $6::timestamptz + interval '1 minute')`,
+        [workspaceId, recordByIndex.get(0), sessionId, shas[0],
+          recordByIndex.get(1), observedAt.toISOString(), shas[1]],
+      );
+      await sql.unsafe(
+        `insert into github.commit_pr_lookups (
+           workspace_id, source_version, repository_full_name, commit_sha,
+           outcome, candidate_count, pull_request_number, pull_request_terminal_at
+         ) values
+           ($1, 'sherlock.github-associated-pulls.v1', 'e3-solutions/sherlock', $2,
+            'matched', 1, 54, null),
+           ($1, 'sherlock.github-associated-pulls.v1', 'e3-solutions/sherlock', $3,
+            'matched', 1, 99, $4::timestamptz + interval '30 seconds')`,
+        [workspaceId, shas[0], shas[1], observedAt.toISOString()],
+      );
+
+      [initialReceipt] = await sql.unsafe(
+        "select pg_current_snapshot()::text snapshot, now() read",
+      );
+      await expect(linksAt(initialReceipt)).resolves.toEqual([{
+        session_id: sessionId,
+        repository_full_name: "e3-solutions/sherlock",
+        pull_request_number: 54,
+      }]);
+
+      for (const outcome of ["failed", "ambiguous"]) {
+        await sql.unsafe(
+          `insert into github.commit_pr_lookups (
+             workspace_id, source_version, repository_full_name, commit_sha,
+             outcome, candidate_count, error_code
+           ) values ($1, 'sherlock.github-associated-pulls.v1',
+                     'e3-solutions/sherlock', $2, $3,
+                     case when $3 = 'ambiguous' then 2 end,
+                     case when $3 = 'failed' then 'github_http_error' end)`,
+          [workspaceId, shas[0], outcome],
+        );
+        const [currentReceipt] = await sql.unsafe(
+          "select pg_current_snapshot()::text snapshot, now() read",
+        );
+        await expect(linksAt(currentReceipt)).resolves.toEqual([]);
+      }
+      await expect(linksAt(initialReceipt)).resolves.toHaveLength(1);
+    } finally {
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
     }
   }, 30_000);
 

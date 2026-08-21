@@ -770,6 +770,61 @@ select prompt_identity, session_id::text session_id, observed_at,
  limit $11
 `;
 
+// Enrich work only when the snapshot's latest exact commit lookup has one PR.
+export const INTERVAL_PULL_REQUESTS_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::pg_snapshot snapshot,
+         $3::timestamptz snapshot_read, $4::uuid[] session_ids
+), visible_scm as materialized (
+  select scm.session_id, scm.repository_full_name, scm.commit_sha, scm.observed_at
+    from telemetry.session_scm scm cross join p
+   where scm.workspace_id = p.workspace_id
+     and scm.session_id = any(p.session_ids)
+     and scm.source_version = 'sherlock.github-scm.v1'
+     and pg_visible_in_snapshot(scm.xmin::text::xid8, p.snapshot)
+), visible_lookups as materialized (
+  select lookup.*,
+         row_number() over (
+           partition by lookup.repository_full_name, lookup.commit_sha
+           order by lookup.id desc
+         ) latest_rank
+    from github.commit_pr_lookups lookup
+    join (
+      select distinct repository_full_name, commit_sha from visible_scm
+    ) scm using (repository_full_name, commit_sha)
+    cross join p
+   where lookup.workspace_id = p.workspace_id
+     and lookup.source_version = 'sherlock.github-associated-pulls.v1'
+     and pg_visible_in_snapshot(lookup.xmin::text::xid8, p.snapshot)
+), exact_matches as materialized (
+  select distinct scm.session_id, lookup.repository_full_name,
+         lookup.pull_request_number
+    from visible_scm scm
+    join visible_lookups lookup
+      on lookup.repository_full_name = scm.repository_full_name
+     and lookup.commit_sha = scm.commit_sha
+     and lookup.latest_rank = 1
+     and lookup.outcome = 'matched'
+     and lookup.candidate_count = 1
+     and lookup.pull_request_number is not null
+    cross join p
+   where lookup.created_at >= p.snapshot_read - interval '15 minutes'
+     and scm.observed_at <= coalesce(
+           lookup.pull_request_terminal_at,
+           'infinity'::timestamptz
+         )
+), session_matches as materialized (
+  select exact_matches.*,
+         count(*) over (partition by session_id) match_count
+    from exact_matches
+)
+select session_id::text session_id, repository_full_name,
+       pull_request_number
+  from session_matches
+ where match_count = 1
+ order by session_id
+`;
+
 export const WORK_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
@@ -1309,7 +1364,22 @@ function snapshotBounds(snapshotReceipt, startAt, read, prefix) {
   };
 }
 
-function workFromRow(row) {
+function pullRequestFromRow(row) {
+  const repository = String(row.repository_full_name);
+  const number = Number(row.pull_request_number);
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) ||
+      repository.split("/").some((part) => part === "." || part === "..") ||
+      !Number.isSafeInteger(number) || number <= 0) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+  return {
+    repository,
+    number,
+    url: `https://github.com/${repository}/pull/${number}`,
+  };
+}
+
+function workFromRow(row, pullRequest = null) {
   const role = String(row.semantic_role);
   const sessionId = String(row.session_id);
   const summary = row.summary === null || row.summary === undefined
@@ -1323,6 +1393,7 @@ function workFromRow(row) {
     lastAt: asDate(row.last_at).toISOString(),
     eventCount: count(row.event_count),
     summary,
+    ...(pullRequest === null ? {} : { pullRequest }),
   };
 }
 
@@ -1633,6 +1704,18 @@ export class DirectFlameSource {
       if (work.length === workLimit) {
         throw new FlameSourceError("flame_interval_work_result_too_large");
       }
+      const pullRequests = work.length === 0
+        ? []
+        : await runQuery(tx, INTERVAL_PULL_REQUESTS_SQL, [
+          this.workspaceId,
+          snapshotReceipt.snapshot,
+          snapshotReceipt.read.toISOString(),
+          tx.array([...new Set(work.map((row) => String(row.session_id)))]),
+        ], signal);
+      const pullRequestBySession = new Map(pullRequests.map((row) => [
+        String(row.session_id),
+        pullRequestFromRow(row),
+      ]));
       const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
       const prompts = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
@@ -1667,7 +1750,10 @@ export class DirectFlameSource {
         personId,
         start: startAt.toISOString(),
         snapshot,
-        work: work.map(workFromRow),
+        work: work.map((row) => workFromRow(
+          row,
+          pullRequestBySession.get(String(row.session_id)) ?? null,
+        )),
         prompts: prompts.map(promptFromRow),
       };
     }, { signal });

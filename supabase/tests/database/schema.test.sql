@@ -3,11 +3,12 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(120);
+select plan(123);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
 select has_schema('processing', 'processing schema exists');
+select has_schema('github', 'github source schema exists');
 
 select has_table('telemetry', 'workspaces', 'workspaces table exists');
 select has_table('telemetry', 'people', 'people table exists');
@@ -15,6 +16,14 @@ select has_table('telemetry', 'sessions', 'sessions table exists');
 select has_table('telemetry', 'ingest_batches', 'ingest_batches table exists');
 select has_table('telemetry', 'native_records', 'native_records table exists');
 select has_table('telemetry', 'events', 'events table exists');
+select has_table(
+  'telemetry', 'session_scm',
+  'session SCM facts are auditable'
+);
+select has_table(
+  'github', 'commit_pr_lookups',
+  'GitHub commit lookup outcomes are auditable'
+);
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
 select has_table(
   'analytics', 'frame_projection_receipts',
@@ -864,12 +873,15 @@ begin
     to_regnamespace('telemetry') is not null and
     to_regnamespace('analytics') is not null and
     to_regnamespace('processing') is not null and
+    to_regnamespace('github') is not null and
     to_regclass('telemetry.workspaces') is not null and
     to_regclass('telemetry.people') is not null and
     to_regclass('telemetry.sessions') is not null and
     to_regclass('telemetry.ingest_batches') is not null and
     to_regclass('telemetry.native_records') is not null and
     to_regclass('telemetry.events') is not null and
+    to_regclass('telemetry.session_scm') is not null and
+    to_regclass('github.commit_pr_lookups') is not null and
     to_regclass('analytics.activity_spans') is not null and
     to_regclass('processing.telemetry_jobs') is not null and
     (select count(*) = 5 from pg_roles where rolname in (
@@ -880,6 +892,7 @@ begin
     pg_has_role('postgres', 'sherlock_normalizer', 'member') and
     pg_has_role('postgres', 'sherlock_reducer', 'member') and
     pg_has_role('postgres', 'sherlock_processor', 'member') and
+    pg_has_role('postgres', 'sherlock_github_sync', 'member') and
     exists (
       select 1 from storage.buckets
       where id = 'telemetry-raw' and public = false
@@ -888,6 +901,8 @@ begin
     not has_schema_privilege('anon', 'analytics', 'usage') and
     not has_schema_privilege('authenticated', 'telemetry', 'usage') and
     not has_schema_privilege('authenticated', 'analytics', 'usage') and
+    not has_schema_privilege('anon', 'github', 'usage') and
+    not has_schema_privilege('authenticated', 'github', 'usage') and
     not has_schema_privilege('anon', 'processing', 'usage') and
     not has_schema_privilege('authenticated', 'processing', 'usage') and
     not has_table_privilege('anon', 'telemetry.ingest_batches', 'select') and
@@ -919,6 +934,11 @@ begin
     not has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'delete') and
     not has_table_privilege('sherlock_normalizer', 'telemetry.events', 'update') and
     not has_table_privilege('sherlock_normalizer', 'telemetry.events', 'delete') and
+    has_table_privilege('sherlock_normalizer', 'telemetry.session_scm', 'insert') and
+    not has_table_privilege('sherlock_normalizer', 'telemetry.session_scm', 'update') and
+    has_table_privilege('sherlock_github_sync', 'telemetry.session_scm', 'select') and
+    has_table_privilege('sherlock_github_sync', 'github.commit_pr_lookups', 'insert') and
+    not has_table_privilege('sherlock_github_sync', 'github.commit_pr_lookups', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'delete') and
     has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'select') and
@@ -952,8 +972,8 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 120,
-  'tables', 11,
+  'assertion_count', 123,
+  'tables', 13,
   'private_bucket', 'telemetry-raw'
 ) as verification;
 

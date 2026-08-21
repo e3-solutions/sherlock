@@ -1,5 +1,9 @@
 import { SupabaseRawStorage, TelemetryProcessor } from "./processor.ts";
 import {
+  PostgresLookupStore,
+  syncPending,
+} from "../../scripts/sync-github-prs.ts";
+import {
   PostgresJobQueue,
   type TelemetryJob,
   type WorkloadClass,
@@ -18,7 +22,14 @@ export interface WorkerConfig {
   retryMaxSeconds: number;
   storageTimeoutMilliseconds: number;
   reductionTimeoutMilliseconds: number;
+  github: {
+    workspaceId: string;
+    token: string;
+  } | null;
 }
+
+const UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export function loadConfig(
   env: Record<string, string | undefined>,
@@ -39,6 +50,16 @@ export function loadConfig(
   const supabaseUrl = required(env, "SUPABASE_URL").replace(/\/$/, "");
   if (!supabaseUrl.startsWith("https://")) {
     throw new Error("SUPABASE_URL must use HTTPS");
+  }
+  const githubToken = env.GITHUB_TOKEN?.trim() || null;
+  const githubWorkspaceId = env.SHERLOCK_WORKSPACE_ID?.trim() || null;
+  if ((githubToken === null) !== (githubWorkspaceId === null)) {
+    throw new Error(
+      "GITHUB_TOKEN and SHERLOCK_WORKSPACE_ID must be configured together",
+    );
+  }
+  if (githubWorkspaceId !== null && !UUID.test(githubWorkspaceId)) {
+    throw new Error("SHERLOCK_WORKSPACE_ID must be a canonical UUID");
   }
   return {
     databaseUrl: required(env, "SUPABASE_DB_URL"),
@@ -65,6 +86,12 @@ export function loadConfig(
       env.SHERLOCK_WORKER_REDUCTION_TIMEOUT_SECONDS,
       60,
     ) * 1_000,
+    github: githubToken && githubWorkspaceId
+      ? {
+        workspaceId: githubWorkspaceId,
+        token: githubToken,
+      }
+      : null,
   };
 }
 
@@ -111,10 +138,17 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     ),
   );
   const active = new Map<Promise<void>, WorkloadClass>();
+  const githubStore = config.github
+    ? PostgresLookupStore.connect(config.databaseUrl)
+    : null;
+  let githubTask: Promise<void> | null = null;
+  let nextGithubSyncAt = 0;
   let stopping = false;
+  const shutdown = new AbortController();
   let lastReaperAt = 0;
   const stop = () => {
     stopping = true;
+    shutdown.abort(new Error("worker shutdown"));
     log("shutdown_requested", { active_jobs: active.size });
   };
   Deno.addSignalListener("SIGTERM", stop);
@@ -124,9 +158,27 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     concurrency: config.concurrency,
     live_reserved: config.liveReserved,
     lease_seconds: config.leaseSeconds,
+    github_sync_enabled: config.github !== null,
   });
   try {
     while (!stopping) {
+      if (
+        config.github && githubStore && githubTask === null &&
+        Date.now() >= nextGithubSyncAt
+      ) {
+        nextGithubSyncAt = Date.now() + 60_000;
+        githubTask = syncPending(githubStore, {
+          workspaceId: config.github.workspaceId,
+          token: config.github.token,
+          signal: shutdown.signal,
+        }).then((result) => log("github_sync_complete", result))
+          .catch((error) =>
+            log("github_sync_failed", { error_code: errorCode(error) })
+          )
+          .finally(() => {
+            githubTask = null;
+          });
+      }
       if (Date.now() - lastReaperAt >= 10_000) {
         const terminalized = await queue.terminalizeExpired();
         if (terminalized > 0) log("expired_jobs_failed", { terminalized });
@@ -175,11 +227,18 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         await delay(config.pollMilliseconds);
       }
     }
-    await Promise.allSettled(active.keys());
+    await Promise.allSettled([
+      ...active.keys(),
+      ...(githubTask ? [githubTask] : []),
+    ]);
   } finally {
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
-    await Promise.allSettled([processor.close(), queue.close()]);
+    await Promise.allSettled([
+      processor.close(),
+      queue.close(),
+      ...(githubStore ? [githubStore.close()] : []),
+    ]);
     log("worker_stopped", {});
   }
 }
