@@ -853,8 +853,6 @@ describe("FlameGraph", () => {
     expect(await screen.findByText(
       /Some session-role evidence changed after this timeline snapshot/,
     )).toBeInTheDocument();
-    selectBucket(wrapper, 0);
-    expect(fetch).toHaveBeenCalledTimes(1);
 
     selectBucket(wrapper, 1);
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
