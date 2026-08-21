@@ -2,15 +2,17 @@
 
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
-uses SHERLOCK_WORKSPACE_ID and two small connection pools whose transactions are
-repeatable-read, read-only, and pinned to `sherlock_reader`.
+uses SHERLOCK_WORKSPACE_ID, requires the service's approved
+SHERLOCK_DASHBOARD_EMAIL_DOMAIN, and uses one small connection pool whose
+transactions are repeatable-read, read-only, and pinned to `sherlock_reader`.
 
 The browser and MCP clients never receive database credentials. The page and
-aggregate API are public; the MCP endpoint requires a separate bearer token.
-Every database query remains pinned to one configured workspace.
-The aggregate API does not return prompt text. Lazy interval and work-detail
-endpoints return only canonical normalized evidence for one person and one
-ten-minute bucket. Message content is limited to
+all browser APIs are public and unauthenticated, including lazy interval and
+work-detail endpoints that can return prompt excerpts. Only the MCP endpoint
+requires a separate bearer token. Every database query remains pinned to one
+configured workspace. The aggregate API does not return prompt text. Lazy
+interval and work-detail endpoints return only canonical normalized evidence
+for one person and one ten-minute bucket. Message content is limited to
 `telemetry.events.content_excerpt`; the dashboard never reads full raw Storage
 objects.
 
@@ -104,13 +106,6 @@ objects.
   first submitted `user_message` excerpt in the frame; response-only runtime
   context is excluded and no title is synthesized. The drawer keeps Active Work
   primary and exposes prompt excerpts through a compact, collapsed disclosure.
-- `GET /api/flame/interval/work?...` and `GET /api/flame/interval/prompts?...`
-  expose the same bounded work and prompt evidence independently. The dashboard
-  requests the nonempty sections concurrently, validates both, and reveals the
-  frame evidence together. The aggregate response header
-  `X-Sherlock-Interval-Evidence: split-v1` selects this path; an older server
-  without it uses the combined interval endpoint directly. The combined endpoint
-  remains unchanged for compatibility and rollback.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
   excerpts. The default page size is 50 and the maximum is 100. Cursors are
@@ -130,6 +125,18 @@ objects.
   work evidence are pinned to the aggregate's immutable MVCC visibility token. This is a
   read-consistency boundary, not a durable pipeline publication cutoff: a later
   timeline refresh can correctly include newly normalized evidence.
+- Snapshot tokens remain source-explicit during the frame-projection rollout.
+  Legacy `v1` tokens always use the canonical raw-event queries. Once an owner
+  activates the exact immutable `frame-evidence-v1` version for the workspace,
+  a projection-backed timeline emits `v2` tokens containing that version and
+  every lazy evidence read stays on the matching append-only projection. A v2
+  failure is surfaced; it never silently falls back to a different evidence
+  universe. Existing v1 tokens remain usable through their normal expiry.
+- Projection-backed timeline reads touch only the indexed analytics receipts
+  and evidence revisions. Interval summaries, prompt excerpts, and conversation
+  pages select bounded source event IDs first and then use primary-key joins to
+  immutable `telemetry.events` for stored excerpts. They do not rescan sessions,
+  native-record locators, or ingest batches on the click path.
 - Initial page load makes one `GET /api/flame` request and renders the complete
   144-bucket timeline as a single view. The graph never shrinks to a different
   preview window while the full aggregate is loading. People can be ranked in
@@ -165,38 +172,16 @@ expires; health then reports `timeline_expired` until a refresh succeeds.
 Cross-restart outage survival would require a separate durable publication and
 immutable publication-time session facts.
 
-## Frame-evidence cache
-
-Lazy frame evidence has a dedicated two-connection process pool, separate from
-the two-connection core pool used by timeline refresh, readiness, paginated work
-detail, and MCP. Each replica therefore opens at most four database connections.
-This isolates connection admission between the paths, not database CPU or I/O.
-The server permits at most 16 unsettled evidence loads per process, enough for
-eight simultaneous split-frame clicks while keeping the database pool's queued
-work and retained request memory bounded. Duplicate callers share an admitted
-load; new unique overload receives the existing database-unavailable response.
-The legacy combined endpoint retains its original single transaction and still
-runs work before prompts.
-
-Exact successful work, prompt, and combined responses have separate
-process-local singleflights and a small LRU keyed by workspace, code contract,
-kind, opaque snapshot, person, and canonical bucket start. Entries live for at
-most three minutes and never beyond snapshot expiry. The LRU holds at most 128
-entries, 16 MiB total, and 512 KiB per entry. Errors, cancellations, overflow,
-and oversized responses are not cached; combined responses are never assembled
-from split results. Prompt excerpts can therefore remain in process memory for
-this short bounded interval, but are not logged or persisted and disappear on
-restart. An unreferenced timer evicts expired payloads even when they are never
-requested again. HTTP responses remain `Cache-Control: no-store`.
-Identifier-free structured logs record only evidence kind, cache state, source
-load duration, and total request duration.
-
 ## Environment
 
-SUPABASE_DB_URL and SHERLOCK_WORKSPACE_ID are required. SUPABASE_DB_URL reuses
-the existing Sherlock worker login contract, which must be granted
-`sherlock_reader`; every dashboard transaction pins itself to that read-only
-role. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not exceed 1000.
+SUPABASE_DB_URL, SHERLOCK_WORKSPACE_ID, and SHERLOCK_DASHBOARD_EMAIL_DOMAIN are
+required. The email domain must be exactly `e3group.ai` or `sixtyfour.ai`; it
+filters every roster, detail, and MCP evidence read for that one-workspace
+service. SUPABASE_DB_URL reuses
+the existing Sherlock worker login contract, which can assume
+sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
+exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
+the additive frame-projection migration or when stopping new v2 token minting.
 
 ## Bonaparte MCP
 

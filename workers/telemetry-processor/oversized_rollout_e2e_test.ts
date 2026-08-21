@@ -1,4 +1,5 @@
 import postgres from "npm:postgres@3.4.7";
+import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
 import { handler as ingestHandler } from "../../supabase/functions/sherlock-rollout-ingest/index.ts";
 import {
   type BatchManifest,
@@ -126,10 +127,19 @@ async function assertClaudeDashboard(
   }
   const receipt = JSON.parse(
     new TextDecoder().decode(output.stdout),
-  ) as { roles: string[]; promptCount: number; detailCount: number };
+  ) as {
+    roles: string[];
+    promptCount: number;
+    detailCount: number;
+    snapshotVersion: string;
+  };
   assert(receipt.roles.join(",") === "agent,subagent");
   assert(receipt.promptCount >= 1);
   assert(receipt.detailCount >= 2);
+  assert(
+    receipt.snapshotVersion === "v2",
+    "dashboard did not use frame projection",
+  );
 }
 
 async function loadSpool(path: string): Promise<SpoolEnvelope[]> {
@@ -264,11 +274,15 @@ async function runOversizedE2E(
     prefix: `sherlock-oversized-${provider}-e2e-`,
   });
   const workspaceId = crypto.randomUUID();
+  const sixtyfourWorkspaceId = workspaceId ===
+      "00000000-0000-4000-8000-000000000002"
+    ? "00000000-0000-4000-8000-000000000003"
+    : "00000000-0000-4000-8000-000000000002";
   const workspaceSlug = `oversized-e2e-${workspaceId}`;
   const collector = {
     name: provider === "claude_code" ? "Oversized Claude E2E" : "Oversized E2E",
     github_id: `oversized-${workspaceId.slice(0, 24)}`,
-    email: `oversized-${workspaceId}@example.com`,
+    email: `oversized-${workspaceId}@e3group.ai`,
     installation_id: crypto.randomUUID(),
   };
   const storagePaths: string[] = [];
@@ -278,7 +292,8 @@ async function runOversizedE2E(
       SUPABASE_DB_URL: databaseUrl!,
       SUPABASE_URL: supabaseUrl!,
       SUPABASE_SERVICE_ROLE_KEY: serviceRoleKey!,
-      SHERLOCK_WORKSPACE_ID: workspaceId,
+      SHERLOCK_E3_WORKSPACE_ID: workspaceId,
+      SHERLOCK_SIXTYFOUR_WORKSPACE_ID: sixtyfourWorkspaceId,
     })
   ) {
     previousEnvironment.set(name, Deno.env.get(name));
@@ -314,6 +329,10 @@ async function runOversizedE2E(
     const receiptByManifest = new Map<string, CommittedReceipt>();
     for (const envelope of [...envelopes].reverse()) {
       const receipt = await uploadEnvelope(envelope, collector);
+      assert(
+        receipt.workspace_id === workspaceId,
+        "ingest receipt was attributed to the wrong workspace",
+      );
       receiptByManifest.set(manifestIdentity(envelope.manifest), receipt);
       storagePaths.push(receipt.storage_path);
     }
@@ -584,6 +603,10 @@ async function runOversizedE2E(
     assert(Number(spans[0].count) >= 1, "later activity was not reduced");
     if (provider === "claude_code") {
       assert(Number(spans[0].tools) >= 1, "later Claude tool was not reduced");
+      await proveAndActivateFrameProjection(sql, {
+        workspaceId,
+        activate: true,
+      });
       await sql.unsafe("grant sherlock_reader to postgres");
       await assertClaudeDashboard(databaseUrl!, workspaceId);
     }
@@ -604,7 +627,23 @@ async function runOversizedE2E(
       [workspaceId],
     ).catch(() => undefined);
     await sql.unsafe(
+      "delete from analytics.frame_projection_activations where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
+      "delete from analytics.frame_evidence_revisions where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
+      "delete from analytics.frame_projection_receipts where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
       "delete from telemetry.events where workspace_id = $1",
+      [workspaceId],
+    ).catch(() => undefined);
+    await sql.unsafe(
+      "delete from telemetry.native_records where workspace_id = $1",
       [workspaceId],
     ).catch(() => undefined);
     await sql.unsafe(

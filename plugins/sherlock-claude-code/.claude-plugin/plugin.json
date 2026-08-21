@@ -1,6 +1,6 @@
 {
   "name": "sherlock-claude-code",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Capture Claude Code transcript telemetry durably without blocking hooks.",
   "author": {
     "name": "E3 Solutions",

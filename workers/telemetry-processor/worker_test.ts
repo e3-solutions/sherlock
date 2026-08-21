@@ -4,7 +4,11 @@ import {
   loadConfig,
   retryDelaySeconds,
 } from "./main.ts";
-import { recordLocatorFromRow, reduceAffectedSessions } from "./processor.ts";
+import {
+  AFFECTED_SESSIONS_SQL,
+  recordLocatorFromRow,
+  reduceAffectedSessions,
+} from "./processor.ts";
 
 function assert(
   condition: unknown,
@@ -98,6 +102,12 @@ Deno.test("worker reloads immutable native fragment metadata", () => {
   assert(locator.native_record_sha256 === "b".repeat(64));
   assert(locator.fragment_index === 1);
   assert(locator.fragment_count === 6);
+});
+
+Deno.test("parent repair retargets both normalized parents and their children", () => {
+  assert(AFFECTED_SESSIONS_SQL.includes("id = any($2::uuid[])"));
+  assert(AFFECTED_SESSIONS_SQL.includes("parent_session_id = any($2::uuid[])"));
+  assert(!AFFECTED_SESSIONS_SQL.includes("limit"));
 });
 
 Deno.test("reduction targets only normalized sessions with no workspace scan", async () => {

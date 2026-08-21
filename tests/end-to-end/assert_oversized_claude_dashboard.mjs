@@ -12,7 +12,11 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-const source = new DirectFlameSource({ databaseUrl, workspaceId });
+const source = new DirectFlameSource({
+  databaseUrl,
+  workspaceId,
+  expectedEmailDomain: "e3group.ai",
+});
 try {
   const now = new Date(Date.now() + 60_000);
   const day = await source.fetchDay({ now });
@@ -92,6 +96,7 @@ try {
     promptCount: interval.prompts.length,
     detailCount: detail.items.length,
     subagentDetailCount: subagentDetail.items.length,
+    snapshotVersion: day.snapshot.split(".", 1)[0],
   }));
 } finally {
   await source.close();

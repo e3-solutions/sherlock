@@ -142,6 +142,19 @@ describe("FlameDayCache", () => {
     await cache.close();
   });
 
+  it("publishes a structurally valid empty workspace payload", async () => {
+    const empty = { ...payload(), people: [] };
+    const load = vi.fn().mockResolvedValue(empty);
+    const cache = new FlameDayCache({
+      load,
+      now: () => Date.parse("2026-08-19T12:00:30.000Z"),
+    });
+
+    await expect(cache.read()).resolves.toEqual({ payload: empty, state: "hit" });
+    expect(cache.readiness()).toEqual({ status: "ok", mode: "sherlock_cached_aggregate" });
+    await cache.close();
+  });
+
   it("does not publish an invalid replacement", async () => {
     let now = Date.parse("2026-08-19T12:00:30.000Z");
     const good = payload();

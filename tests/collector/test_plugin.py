@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -12,9 +13,21 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from sherlock_collector.config import ConfigurationError, load_config
+from sherlock_collector.config import (
+    ConfigurationError,
+    load_config,
+    validate_install_email,
+    validate_install_email_for_home,
+)
 from sherlock_collector.discovery import discover_rollouts
-from sherlock_collector.hook import run_hook
+from sherlock_collector.hook import (
+    CODEX_HOOK_EVENTS,
+    HOOK_EVENTS,
+    POST_TOOL_DEBOUNCE_SECONDS,
+    HookResult,
+    run_hook,
+)
+from sherlock_collector.spool import secure_lock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -141,6 +154,36 @@ class DiscoveryTests(unittest.TestCase):
                 result.native_session_ids[str(rollout.resolve())], session_id
             )
 
+    def test_subagent_payload_path_uses_agent_native_session_id(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            rollout = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "08"
+                / "15"
+                / "rollout-agent.jsonl"
+            )
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"type":"event"}\n', encoding="utf-8")
+            parent_session_id = str(uuid.uuid4())
+            agent_id = str(uuid.uuid4())
+
+            result = discover_rollouts(
+                codex_home,
+                hook_payload={
+                    "session_id": parent_session_id,
+                    "agent_id": agent_id,
+                    "agent_transcript_path": str(rollout),
+                },
+            )
+
+            self.assertEqual(result.paths, (rollout.resolve(),))
+            self.assertEqual(
+                result.native_session_ids[str(rollout.resolve())], agent_id
+            )
+
     def test_payload_path_is_prioritized_and_outside_files_are_rejected(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -206,6 +249,179 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_install_email_domain_accepts_only_e3_and_sixtyfour(self):
+        self.assertEqual(validate_install_email("Ada@E3GROUP.AI"), "ada@e3group.ai")
+        self.assertEqual(
+            validate_install_email("Dev@SixtyFour.AI"), "dev@sixtyfour.ai"
+        )
+        for email in (
+            "outsider@example.com",
+            "user@sub.e3group.ai",
+            "user@e3group.ai.example",
+        ):
+            with self.subTest(email=email):
+                with self.assertRaisesRegex(ConfigurationError, "work domain"):
+                    validate_install_email(email)
+
+    def test_install_email_change_requires_a_separate_clean_collector_home(self):
+        with TemporaryDirectory() as temporary:
+            collector_home = Path(temporary) / "codex"
+            config = collector_home / "sherlock" / "collector.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps({**IDENTITY_CONFIG, "email": "user@e3group.ai"}),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+
+            self.assertEqual(
+                validate_install_email_for_home("USER@E3GROUP.AI", collector_home),
+                "user@e3group.ai",
+            )
+            with self.assertRaisesRegex(ConfigurationError, "separate clean"):
+                validate_install_email_for_home("user@sixtyfour.ai", collector_home)
+
+    def test_install_rejects_orphaned_pending_and_processing_spool_items(self):
+        for state in ("pending", "processing"):
+            with self.subTest(state=state), TemporaryDirectory() as temporary:
+                collector_home = Path(temporary) / "codex"
+                artifact = (
+                    collector_home
+                    / "sherlock"
+                    / "telemetry"
+                    / "queue"
+                    / state
+                    / "orphaned.json"
+                )
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text('{"immutable":"telemetry"}\n', encoding="utf-8")
+
+                with self.assertRaisesRegex(ConfigurationError, "recover the config"):
+                    validate_install_email_for_home("user@e3group.ai", collector_home)
+                self.assertEqual(
+                    artifact.read_text(encoding="utf-8"),
+                    '{"immutable":"telemetry"}\n',
+                )
+
+    def test_installed_config_pins_drain_email_and_installation_id(self):
+        with TemporaryDirectory() as temporary:
+            collector_home = Path(temporary) / "codex"
+            config = collector_home / "sherlock" / "collector.json"
+            pending = (
+                collector_home
+                / "sherlock"
+                / "telemetry"
+                / "queue"
+                / "pending"
+                / "queued.json"
+            )
+            config.parent.mkdir(parents=True)
+            pending.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps(
+                    {
+                        "endpoint": "https://example.test/functions/v1/ingest",
+                        **IDENTITY_CONFIG,
+                        "email": "user@e3group.ai",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            pending.write_text('{"immutable":"telemetry"}\n', encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"SHERLOCK_EMAIL": "USER@E3GROUP.AI"},
+                clear=True,
+            ):
+                self.assertEqual(load_config(config).identity.email, "user@e3group.ai")
+            with patch.dict(
+                os.environ,
+                {"SHERLOCK_EMAIL": "user@sixtyfour.ai"},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ConfigurationError, "must match"):
+                    load_config(config)
+            with patch.dict(
+                os.environ,
+                {
+                    "SHERLOCK_INSTALLATION_ID":
+                        "00000000-0000-4000-8000-000000000002"
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ConfigurationError, "must match"):
+                    load_config(config)
+            self.assertEqual(
+                pending.read_text(encoding="utf-8"),
+                '{"immutable":"telemetry"}\n',
+            )
+
+    def test_env_only_drain_rejects_orphaned_source_home_spool(self):
+        environment = {
+            "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+            "SHERLOCK_NAME": "Moved User",
+            "SHERLOCK_GITHUB_ID": "moved-user",
+            "SHERLOCK_EMAIL": "user@sixtyfour.ai",
+            "SHERLOCK_INSTALLATION_ID":
+                "00000000-0000-4000-8000-000000000002",
+        }
+        for state in ("pending", "processing"):
+            with self.subTest(state=state), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source_home = root / "codex"
+                custom_config = root / "custom" / "missing.json"
+                artifact = (
+                    source_home
+                    / "sherlock"
+                    / "telemetry"
+                    / "queue"
+                    / state
+                    / "orphaned.json"
+                )
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text(
+                    '{"immutable":"telemetry"}\n', encoding="utf-8"
+                )
+
+                with patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(
+                        ConfigurationError, "recover the config"
+                    ):
+                        load_config(custom_config, codex_home=source_home)
+
+                self.assertEqual(
+                    artifact.read_text(encoding="utf-8"),
+                    '{"immutable":"telemetry"}\n',
+                )
+
+    def test_env_only_config_loads_when_source_home_has_no_spool(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "codex"
+            custom_config = root / "custom" / "missing.json"
+            with patch.dict(
+                os.environ,
+                {
+                    "SHERLOCK_INGEST_URL":
+                        "https://example.test/functions/v1/ingest",
+                    "SHERLOCK_NAME": "Clean User",
+                    "SHERLOCK_GITHUB_ID": "clean-user",
+                    "SHERLOCK_EMAIL": "user@e3group.ai",
+                    "SHERLOCK_INSTALLATION_ID":
+                        "00000000-0000-4000-8000-000000000001",
+                },
+                clear=True,
+            ):
+                loaded = load_config(custom_config, codex_home=source_home)
+
+            self.assertEqual(loaded.identity.email, "user@e3group.ai")
+            self.assertEqual(
+                loaded.identity.installation_id,
+                "00000000-0000-4000-8000-000000000001",
+            )
+
     def test_owner_only_config_loads_and_group_readable_config_is_rejected(self):
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "collector.json"
@@ -262,7 +478,7 @@ class ConfigurationTests(unittest.TestCase):
                     "--github-id",
                     "test-user",
                     "--email",
-                    "TEST@example.com",
+                    "TEST@e3group.ai",
                 ],
                 check=True,
                 capture_output=True,
@@ -282,7 +498,7 @@ class ConfigurationTests(unittest.TestCase):
             )
             installed = json.loads(config.read_text(encoding="utf-8"))
             self.assertNotIn("token", installed)
-            self.assertEqual(installed["email"], "test@example.com")
+            self.assertEqual(installed["email"], "test@e3group.ai")
             self.assertEqual(installed["github_id"], "test-user")
             self.assertEqual(
                 uuid.UUID(installed["installation_id"]).version,
@@ -305,7 +521,7 @@ class ConfigurationTests(unittest.TestCase):
                     "--github-id",
                     "test-user",
                     "--email",
-                    "test@example.com",
+                    "test@e3group.ai",
                 ],
                 check=False,
                 capture_output=True,
@@ -330,19 +546,165 @@ class ConfigurationTests(unittest.TestCase):
                 "--github-id",
                 "test-user",
                 "--email",
-                "test@example.com",
+                "test@e3group.ai",
             ]
 
             subprocess.run(command, check=True, capture_output=True)
             config = codex_home / "sherlock" / "collector.json"
             first = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
+            command[-1] = "TEST@E3GROUP.AI"
             subprocess.run(command, check=True, capture_output=True)
             second = json.loads(config.read_text(encoding="utf-8"))["installation_id"]
 
             self.assertEqual(first, second)
 
+    def test_installer_rejects_email_change_without_mutating_collector_home(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            sherlock_root = codex_home / "sherlock"
+            runtime_marker = sherlock_root / "runtime" / "existing.txt"
+            spool_marker = (
+                sherlock_root
+                / "telemetry"
+                / "queue"
+                / "pending"
+                / "pending.json"
+            )
+            config = sherlock_root / "collector.json"
+            runtime_marker.parent.mkdir(parents=True)
+            spool_marker.parent.mkdir(parents=True)
+            runtime_marker.write_text("existing runtime", encoding="utf-8")
+            spool_marker.write_text("pending telemetry", encoding="utf-8")
+            config.write_text(
+                json.dumps(
+                    {
+                        "endpoint": "https://example.test/functions/v1/ingest",
+                        "name": "Existing User",
+                        "github_id": "existing-user",
+                        "email": "user@e3group.ai",
+                        "installation_id": "00000000-0000-4000-8000-000000000001",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            before = {
+                path: path.read_bytes()
+                for path in (config, runtime_marker, spool_marker)
+            }
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--endpoint",
+                    "https://example.test/functions/v1/ingest",
+                    "--codex-home",
+                    str(codex_home),
+                    "--name",
+                    "Moved User",
+                    "--github-id",
+                    "moved-user",
+                    "--email",
+                    "user@sixtyfour.ai",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("separate clean collector home", completed.stderr)
+            for path, contents in before.items():
+                self.assertEqual(path.read_bytes(), contents)
+
+    def test_installer_rejects_orphaned_spool_without_mutation(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            pending = (
+                codex_home
+                / "sherlock"
+                / "telemetry"
+                / "queue"
+                / "processing"
+                / "orphaned.json"
+            )
+            pending.parent.mkdir(parents=True)
+            pending.write_text('{"immutable":"telemetry"}\n', encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--endpoint",
+                    "https://example.test/functions/v1/ingest",
+                    "--codex-home",
+                    str(codex_home),
+                    "--name",
+                    "Recovered User",
+                    "--github-id",
+                    "recovered-user",
+                    "--email",
+                    "user@e3group.ai",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("recover the config", completed.stderr)
+            self.assertEqual(
+                pending.read_text(encoding="utf-8"),
+                '{"immutable":"telemetry"}\n',
+            )
+            self.assertFalse((codex_home / "sherlock" / "runtime").exists())
+            self.assertFalse((codex_home / "sherlock" / "collector.json").exists())
+
+    def test_installer_rejects_unapproved_domain_before_writing_runtime_or_config(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--endpoint",
+                    "https://example.test/functions/v1/ingest",
+                    "--codex-home",
+                    str(codex_home),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "outsider@example.com",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("work domain", completed.stderr)
+            self.assertFalse((codex_home / "sherlock").exists())
+
 
 class HookCompanionTests(unittest.TestCase):
+    def test_manifest_events_match_supported_events(self):
+        hooks = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]
+
+        self.assertEqual(set(hooks), CODEX_HOOK_EVENTS)
+        self.assertTrue(set(hooks).issubset(HOOK_EVENTS))
+        for event_name in (
+            "PostToolUse",
+            "PostCompact",
+            "SubagentStart",
+            "SubagentStop",
+        ):
+            command = hooks[event_name][0]["hooks"][0]
+            self.assertIs(command["async"], True)
+            self.assertEqual(command["timeout"], 30)
+
     def test_configured_hook_commands_are_fail_open(self):
         hooks = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]
         with TemporaryDirectory() as temporary:
@@ -506,18 +868,217 @@ class HookIntegrationTests(unittest.TestCase):
             self.assertEqual(second.enqueued, 0)
             self.assertEqual(popen.call_count, 2)
 
-    def test_ordinary_post_tool_use_is_skipped(self):
+    def test_ordinary_post_tool_use_is_captured_then_debounced(self):
         with TemporaryDirectory() as temporary:
-            with patch("sherlock_collector.hook.subprocess.Popen") as popen:
-                result = run_hook(
+            root = Path(temporary)
+            codex_home, _ = self._fixture(root)
+            state_root = root / "telemetry"
+            first_ns = 1_000_000_000_000
+            with (
+                patch("sherlock_collector.hook.subprocess.Popen") as popen,
+                patch(
+                    "sherlock_collector.hook.time.time_ns",
+                    side_effect=[
+                        first_ns,
+                        first_ns + 1,
+                        first_ns
+                        + POST_TOOL_DEBOUNCE_SECONDS * 1_000_000_000,
+                    ],
+                ),
+            ):
+                first = run_hook(
                     "PostToolUse",
                     {"tool_name": "functions.exec"},
-                    codex_home=Path(temporary),
+                    codex_home=codex_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                second = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=codex_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                third = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=codex_home,
+                    state_root=state_root,
                     drain_command=[sys.executable, "-c", "pass"],
                 )
 
-            self.assertEqual(result.skipped, "ordinary_tool")
+            self.assertEqual(first.enqueued, 1)
+            self.assertIsNone(first.skipped)
+            self.assertEqual(second.skipped, "debounced")
+            self.assertEqual(third.enqueued, 0)
+            self.assertIsNone(third.skipped)
+            self.assertEqual(popen.call_count, 2)
+            throttle = state_root / "codex-post-tool-capture.json"
+            self.assertEqual(throttle.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(state_root.stat().st_mode & 0o777, 0o700)
+
+    def test_coordination_tools_bypass_ordinary_tool_debounce(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home, _ = self._fixture(root)
+            state_root = root / "telemetry"
+            with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+                first = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=codex_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                coordination = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "collaboration.spawn_agent"},
+                    codex_home=codex_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertEqual(first.enqueued, 1)
+            self.assertIsNone(coordination.skipped)
+            self.assertEqual(popen.call_count, 2)
+
+    def test_busy_ordinary_tool_capture_fails_open_without_a_drain(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "telemetry"
+            with secure_lock(state_root / "codex-post-tool-capture.lock") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+                    result = run_hook(
+                        "PostToolUse",
+                        {"tool_name": "functions.exec"},
+                        codex_home=root / "codex",
+                        state_root=state_root,
+                        drain_command=[sys.executable, "-c", "pass"],
+                    )
+
+            self.assertEqual(result.skipped, "busy")
             popen.assert_not_called()
+
+    def test_capture_lock_contention_does_not_consume_debounce_window(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "telemetry"
+            with patch(
+                "sherlock_collector.hook._capture_hook",
+                side_effect=[
+                    HookResult("PostToolUse", locked=True),
+                    HookResult("PostToolUse"),
+                ],
+            ) as capture:
+                first = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=root / "codex",
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                second = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=root / "codex",
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertTrue(first.locked)
+            self.assertIsNone(second.skipped)
+            self.assertEqual(capture.call_count, 2)
+
+    def test_capture_failure_does_not_consume_debounce_window(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "telemetry"
+            with patch(
+                "sherlock_collector.hook._capture_hook",
+                side_effect=[RuntimeError("capture failed"), HookResult("PostToolUse")],
+            ) as capture:
+                with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                    run_hook(
+                        "PostToolUse",
+                        {"tool_name": "functions.exec"},
+                        codex_home=root / "codex",
+                        state_root=state_root,
+                        drain_command=[sys.executable, "-c", "pass"],
+                    )
+                recovered = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=root / "codex",
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertIsNone(recovered.skipped)
+            self.assertEqual(capture.call_count, 2)
+
+    def test_corrupt_or_future_debounce_state_retries_capture(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "telemetry"
+            state_root.mkdir()
+            state_path = state_root / "codex-post-tool-capture.json"
+            state_path.write_bytes(b"\xff\xfe")
+            with patch(
+                "sherlock_collector.hook._capture_hook",
+                return_value=HookResult("PostToolUse"),
+            ) as capture:
+                corrupt = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=root / "codex",
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "state_version": 1,
+                            "last_capture_ns": time.time_ns() + 60_000_000_000,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                future = run_hook(
+                    "PostToolUse",
+                    {"tool_name": "functions.exec"},
+                    codex_home=root / "codex",
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertIsNone(corrupt.skipped)
+            self.assertIsNone(future.skipped)
+            self.assertEqual(capture.call_count, 2)
+
+    def test_new_lifecycle_hooks_always_capture(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home, _ = self._fixture(root)
+            with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+                results = [
+                    run_hook(
+                        event_name,
+                        {},
+                        codex_home=codex_home,
+                        state_root=root / "telemetry",
+                        drain_command=[sys.executable, "-c", "pass"],
+                    )
+                    for event_name in (
+                        "PostCompact",
+                        "SubagentStart",
+                        "SubagentStop",
+                    )
+                ]
+
+            self.assertTrue(all(result.skipped is None for result in results))
+            self.assertEqual(popen.call_count, 3)
 
 
 if __name__ == "__main__":

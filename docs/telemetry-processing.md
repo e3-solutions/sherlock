@@ -1,9 +1,9 @@
 # Asynchronous telemetry processing
 
 Sherlock acknowledges uploads after the immutable Storage object, ingest batch,
-native-record locators, and one processing job are durable. Normalization and
-activity reduction run in the Railway worker and are not part of receipt
-latency.
+native-record locators, and one processing job are durable. Normalization,
+activity reduction, and frame projection run in the Railway worker and are not
+part of receipt latency.
 
 ## Data flow
 
@@ -19,7 +19,9 @@ latency.
    revalidates it, and runs the idempotent provider-specific normalizer. A
    successful normalization upserts one dirty cutoff per affected session into
    the same queue. Duplicate and concurrent batches therefore coalesce before
-   Railway reduces only those targeted sessions.
+   Railway reduces only those targeted sessions. The same coalesced reduce job
+   then projects the session into append-only frame receipts and evidence
+   revisions before the fenced job may complete.
 6. PostgreSQL fills the generated message `tsvector` and GIN index when the
    normalized event rows are inserted. There is no separate search worker.
 
@@ -34,6 +36,18 @@ SubagentStop projects a completed turn.
 record locators stay in `telemetry`; rebuildable product projections stay in
 `analytics`.
 
+Frame projection retries compare a deterministic source-state fingerprint and
+append only real changes. A lower-ID late commit or repaired child parent can
+therefore append a correction at the same maximum event cutoff. Projection
+receipts preserve their half-open covered window, the maximum ID and exact
+count of all committed non-replay events for accepted frame normalizer
+versions, the observed session `updated_at`, and consumed request generation.
+Their source-state SHA-256 fingerprints the bounded selected evidence and
+effective session state. Evidence revisions contain selection and display metadata only; excerpts stay
+normalized event facts and complete text stays in private Storage. Because the
+stored actor role is effective, normalization must enqueue every child whose
+previously unresolved parent is repaired.
+
 ## Scheduling and backpressure
 
 The normal collector remains unchanged and defaults to automatic scheduling.
@@ -45,6 +59,15 @@ work and one backfill slot; live work may borrow the backfill slot, never the
 reverse. Concurrency and database pools are bounded, session reductions have a
 retryable deadline, and dirty cutoffs coalesce. There is no workspace-wide
 session scan or permanent record or session ceiling.
+
+Frame projection uses the existing per-session reduce job and advisory-lock
+boundary rather than a bucket queue. Workspace/anchor-time and
+person/session-time indexes serve timeline and detail reads; the projector
+diffs revisions through a session/anchor-time rolling-window index. Its narrow
+role can read normalized
+sessions/events plus only the record-adjacency, native-type, collector, stream,
+and generation columns required to reproduce canonical representation pairing.
+It cannot read source hashes or Storage paths.
 
 ## Run locally
 
@@ -89,9 +112,11 @@ locks and every completion/retry is fenced by the active lease token.
 
 `SUPABASE_DB_URL` must use the dedicated `sherlock_worker_login`, not the
 `postgres` owner. The login has `NOINHERIT` and can assume only
-`sherlock_processor`, `sherlock_normalizer`, and `sherlock_reducer`; each
-transaction explicitly selects the narrow role it needs. Set or rotate its
-password out of band and store it only as a sealed Railway variable. Prefer
+`sherlock_processor`, `sherlock_normalizer`, `sherlock_reducer`, and
+`sherlock_frame_projector`; each transaction explicitly selects the narrow
+role it needs. The projector may append receipts and revisions but cannot
+update or delete them or activate a version. Set or rotate its password out of
+band and store it only as a sealed Railway variable. Prefer
 Supabase's session pooler on port 5432 so Railway does not depend on the direct
 database host's IPv6-only DNS record. Store a current Supabase secret key in
 `SUPABASE_SERVICE_ROLE_KEY`; the variable name is retained for compatibility,
@@ -137,18 +162,30 @@ safe.
 
 ## Deploy and rollback order
 
-1. Apply database migrations, including the already-hosted Cron migrations and
-   the later async migration. The async migration creates the queue trigger and
-   unschedules the full-workspace Cron.
-2. Deploy Railway with the required secrets and verify it stays healthy.
-3. Deploy the async ingest function, upload a smoke batch, and verify events,
-   search, and targeted spans.
-4. Disable the superseded reducer Edge Function after Railway verification.
+1. Apply the additive frame tables and projector-role migration. Old workers
+   ignore the new tables.
+2. Deploy the projector-aware Railway worker, enqueue every existing relevant
+   session, and verify receipts cover the intended source state.
+3. Drain and review the queue. In one repeatable-read owner transaction, prove
+   each latest receipt exactly matches the session's accepted-version event
+   maximum, event count, and `updated_at`, then insert the one
+   workspace/version activation fact. The worker cannot self-activate.
+4. Enable the dashboard's versioned projection path. Existing v1 snapshot
+   tokens continue on the raw path for their bounded lifetime.
+5. Upload a smoke batch and verify normalized events, search, activity spans,
+   frame receipts, revisions, and indexed frame reads.
 
-For application rollback, first redeploy the previous synchronous ingest while
-Railway remains running, then let all queued/leased jobs drain and review or
-requeue terminal failures. Only then may Railway be stopped. Keep the migration,
-queue history, raw objects, normalized events, and activity revisions. Because
+For application rollback, stop minting projection-backed tokens before rolling
+the worker back, then let all queued or leased jobs drain and review or requeue
+terminal failures. An activation row is an immutable capability fact, not a
+mutable on/off flag: the reader checks whether the exact workspace/version row
+exists, and rollback does not delete it. A dashboard version that retains the v2
+reader must continue honoring already-issued v2 tokens until their normal
+25-hour expiry; a dashboard rollback that removes v2 support must reject those
+tokens explicitly instead of falling back to raw reads. Keep the migration,
+queue history, raw objects, normalized events, activity revisions, and frame
+projection history. Never delete frame receipts or revisions to roll back a
+reader. Because
 the old full-scan Cron remains disabled, stopping Railway also intentionally
 disables automatic activity reduction; this is a degraded emergency mode, not
 a steady state. Do not stop Railway with backlog present, delete queue/raw rows,

@@ -21,7 +21,7 @@ function payloadEnd(payload) {
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(read) ||
       start % BUCKET_MS !== 0 || end !== Math.floor(read / BUCKET_MS) * BUCKET_MS ||
       typeof payload.snapshot !== "string" || payload.snapshot.length === 0 ||
-      !Array.isArray(payload.people) || payload.people.length === 0) {
+      !Array.isArray(payload.people)) {
     throw new FlameSourceError("flame_database_result_invalid");
   }
   return { end, read };

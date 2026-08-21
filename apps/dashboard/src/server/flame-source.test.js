@@ -6,8 +6,10 @@ import {
   BUCKET_MS,
   CLAUDE_NORMALIZER_VERSION,
   DEFAULT_WORK_DETAIL_LIMIT,
+  FRAME_VERSION,
   FLAME_SQL,
   INTERVAL_PROMPTS_SQL,
+  INTERVAL_PROMPT_LIMIT,
   INTERVAL_WORK_SQL,
   INTERVAL_WORK_LIMIT,
   MAX_WORK_DETAIL_LIMIT,
@@ -16,7 +18,11 @@ import {
   NORMALIZER_VERSIONS,
   PEOPLE_SQL,
   PREFERRED_DASHBOARD_EMAIL_DOMAIN,
-  REPLACED_DASHBOARD_EMAIL_DOMAIN,
+  PROJECTION_FLAME_SQL,
+  PROJECTION_INTERVAL_PROMPTS_SQL,
+  PROJECTION_INTERVAL_WORK_SQL,
+  PROJECTION_WORK_DETAIL_SQL,
+  SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN,
   WORK_DETAIL_SQL,
   ASSISTANT_REPRESENTATION_MATCH_SECONDS,
   DirectFlameSource,
@@ -27,7 +33,9 @@ import {
   decodeWorkCursor,
   decodeSnapshotToken,
   encodeWorkCursor,
+  encodeProjectionSnapshotToken,
   encodeSnapshotToken,
+  validateDashboardEmailDomain,
 } from "./flame-source.js";
 
 const START = new Date("2026-08-16T12:00:00.000Z");
@@ -125,16 +133,31 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.activity_spans");
   });
 
-  it("pins every source transaction to the read-only database role", async () => {
+  it("configures default source transactions before pinning the read-only role", async () => {
     const unsafe = vi.fn().mockResolvedValue([]);
     const source = Object.create(DirectFlameSource.prototype);
     source.sql = { begin: (callback) => callback({ unsafe }) };
 
     await source.transaction(async () => "ok");
 
-    expect(unsafe.mock.calls.map(([sql]) => sql)).toContain(
-      "set local role sherlock_reader",
-    );
+    expect(unsafe.mock.calls).toEqual([
+      ["set transaction isolation level repeatable read, read only"],
+      ["select set_config('statement_timeout', $1, true)", ["20000"]],
+      ["set local role sherlock_reader"],
+    ]);
+  });
+
+  it("allows a source transaction to select a 30-second statement timeout", async () => {
+    const unsafe = vi.fn().mockResolvedValue([]);
+    const source = Object.create(DirectFlameSource.prototype);
+    source.sql = { begin: (callback) => callback({ unsafe }) };
+
+    await source.transaction(async () => "ok", { statementTimeoutMs: 30_000 });
+
+    expect(unsafe.mock.calls[1]).toEqual([
+      "select set_config('statement_timeout', $1, true)",
+      ["30000"],
+    ]);
   });
 
   it("rejects incomplete result grids", () => {
@@ -143,6 +166,34 @@ describe("Sherlock Flame payload", () => {
       roster: [{ person_id: "ada", display_name: "Ada" }],
       start: START,
       read: START,
+      snapshot: PG_SNAPSHOT,
+    })).toThrow(FlameSourceError);
+  });
+
+  it("returns a valid empty payload for a new workspace", () => {
+    const payload = buildFlamePayload({
+      rows: [],
+      roster: [],
+      start: START,
+      read: READ,
+      snapshot: PG_SNAPSHOT,
+    });
+
+    expect(payload).toMatchObject({
+      start: START.toISOString(),
+      read: READ.toISOString(),
+      latest: null,
+      people: [],
+    });
+    expect(decodeSnapshotToken(payload.snapshot)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+    });
+    expect(() => buildFlamePayload({
+      rows: [{ person_id: "unexpected" }],
+      roster: [],
+      start: START,
+      read: READ,
       snapshot: PG_SNAPSHOT,
     })).toThrow(FlameSourceError);
   });
@@ -264,18 +315,34 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
   });
 
-  it("prefers the E3 dashboard identity over a matching Core Edge identity", () => {
+  it("requires one approved dashboard email domain", () => {
     expect(PREFERRED_DASHBOARD_EMAIL_DOMAIN).toBe("e3group.ai");
-    expect(REPLACED_DASHBOARD_EMAIL_DOMAIN).toBe("coreedgesolution.com");
-    for (const query of [PEOPLE_SQL, FLAME_SQL]) {
-      expect(query).toContain("from telemetry.people preferred");
-      expect(query).toContain("preferred.github_id = pe.github_id");
+    expect(SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN).toBe("sixtyfour.ai");
+    expect(validateDashboardEmailDomain("e3group.ai")).toBe("e3group.ai");
+    expect(validateDashboardEmailDomain("sixtyfour.ai")).toBe("sixtyfour.ai");
+    expect(() => validateDashboardEmailDomain("example.com")).toThrow(TypeError);
+    expect(() => validateDashboardEmailDomain("sub.e3group.ai")).toThrow(TypeError);
+  });
+
+  it("binds expected-domain visibility across roster, day, and detail SQL", () => {
+    expect(PEOPLE_SQL).toContain("split_part(pe.email, '@', 2) = $3");
+    expect(PEOPLE_SQL).toContain("split_part(pe.email, '@', 3) = ''");
+    for (const query of [FLAME_SQL, INTERVAL_WORK_SQL, INTERVAL_PROMPTS_SQL, WORK_DETAIL_SQL]) {
+      expect(query).toContain("expected_email_domain");
+      expect(query).toContain("split_part(pe.email, '@', 2) = p.expected_email_domain");
+      expect(query).toContain("split_part(pe.email, '@', 3) = ''");
+    }
+    for (const query of [
+      PROJECTION_FLAME_SQL,
+      PROJECTION_INTERVAL_WORK_SQL,
+      PROJECTION_INTERVAL_PROMPTS_SQL,
+      PROJECTION_WORK_DETAIL_SQL,
+    ]) {
+      expect(query).toContain("expected_email_domain");
       expect(query).toContain(
-        "split_part(pe.email, '@', 2) = 'coreedgesolution.com'",
+        "split_part(evidence_person.email, '@', 2) = p.expected_email_domain",
       );
-      expect(query).toContain(
-        "split_part(preferred.email, '@', 2) = 'e3group.ai'",
-      );
+      expect(query).toContain("split_part(evidence_person.email, '@', 3) = ''");
     }
   });
 
@@ -299,9 +366,35 @@ describe("Sherlock Flame payload", () => {
     expect(decodeSnapshotToken(token)).toEqual({ snapshot: PG_SNAPSHOT, read: READ });
   });
 
+  it("pins projection snapshots to the exact immutable frame version", () => {
+    const token = encodeProjectionSnapshotToken({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: FRAME_VERSION,
+    });
+
+    expect(token).toMatch(/^v2\.[A-Za-z0-9_-]+$/);
+    expect(decodeSnapshotToken(token)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: FRAME_VERSION,
+    });
+    expect(() => encodeProjectionSnapshotToken({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: "frame-evidence-v2",
+    })).toThrow(FlameSourceError);
+    const unsupported = Buffer.from(JSON.stringify([
+      PG_SNAPSHOT,
+      READ.toISOString(),
+      "frame-evidence-v2",
+    ])).toString("base64url");
+    expect(() => decodeSnapshotToken(`v2.${unsupported}`)).toThrow(FlameSourceError);
+  });
+
   it.each([
     "",
-    "v2.Zm9v",
+    "v3.Zm9v",
     "v1.not+base64url",
     "v1.WyIxOjI6MyIsIjIwMjYtMDgtMTdUMTI6MDA6MDEuMDAwWiJd",
   ])("rejects invalid prompt snapshot token %s", (token) => {
@@ -311,6 +404,7 @@ describe("Sherlock Flame payload", () => {
   it("captures the aggregate snapshot in the same transaction as its rows", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
     source.maxPeople = 5;
     const roster = [{ person_id: "ada", display_name: "Ada" }];
     const unsafe = vi.fn()
@@ -335,7 +429,95 @@ describe("Sherlock Flame payload", () => {
       "2026-08-17T12:00:00.000Z",
       NORMALIZER_VERSIONS,
       READ.toISOString(),
+      "e3group.ai",
     ]);
+  });
+
+  it.each([
+    [true, PROJECTION_FLAME_SQL, "v2"],
+    [false, FLAME_SQL, "v1"],
+    [null, FLAME_SQL, "v1"],
+  ])("routes an exact-version activation value of %s", async (
+    frameProjectionActive,
+    expectedSql,
+    expectedTokenVersion,
+  ) => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
+    source.maxPeople = 5;
+    const roster = [{ person_id: "ada", display_name: "Ada" }];
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{
+        now: READ,
+        snapshot: PG_SNAPSHOT,
+        frame_projection_active: frameProjectionActive,
+      }])
+      .mockResolvedValueOnce(roster)
+      .mockResolvedValueOnce(rowsFor("ada"));
+    source.transaction = (callback) => callback({
+      unsafe,
+      array: (values) => values,
+    });
+
+    const payload = await source.fetchDay();
+
+    expect(unsafe.mock.calls[0][0]).toContain("exists (");
+    expect(unsafe.mock.calls[0][0]).toContain("activation.frame_version = $2");
+    expect(unsafe.mock.calls[0][0]).not.toContain("order by activation");
+    expect(unsafe.mock.calls[0][1]).toEqual([source.workspaceId, FRAME_VERSION]);
+    expect(unsafe.mock.calls[2][0]).toBe(expectedSql);
+    const expectedSnapshot = {
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+    };
+    if (frameProjectionActive) {
+      expectedSnapshot.frameVersion = FRAME_VERSION;
+      expect(unsafe.mock.calls[2][1]).toEqual([
+        source.workspaceId,
+        START.toISOString(),
+        "2026-08-17T12:00:00.000Z",
+        FRAME_VERSION,
+        READ.toISOString(),
+        "e3group.ai",
+      ]);
+    }
+    expect(payload.snapshot).toMatch(new RegExp(`^${expectedTokenVersion}\\.`));
+    expect(decodeSnapshotToken(payload.snapshot)).toEqual(expectedSnapshot);
+  });
+
+  it("can disable projection lookup before the additive migration is present", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
+    source.maxPeople = 5;
+    source.projectionEnabled = false;
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: READ, snapshot: PG_SNAPSHOT, frame_projection_active: false }])
+      .mockResolvedValueOnce([{ person_id: "ada", display_name: "Ada" }])
+      .mockResolvedValueOnce(rowsFor("ada"));
+    source.transaction = (callback) => callback({ unsafe, array: (values) => values });
+
+    const payload = await source.fetchDay();
+
+    expect(unsafe.mock.calls[0][0]).not.toContain("analytics.frame_projection_activations");
+    expect(unsafe.mock.calls[0][1]).toBeUndefined();
+    expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
+    expect(payload.snapshot).toMatch(/^v1\./);
+  });
+
+  it("selects the 30-second transaction timeout only for the cached timeline", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    const signal = new AbortController().signal;
+    source.transaction = vi.fn().mockResolvedValue("timeline");
+
+    await expect(source.fetchDay({ signal })).resolves.toBe("timeline");
+
+    expect(source.transaction).toHaveBeenCalledOnce();
+    expect(source.transaction).toHaveBeenCalledWith(
+      expect.any(Function),
+      { signal, statementTimeoutMs: 30_000 },
+    );
   });
 
   it("uses stable prompt identifiers before a mutually unique source-stream bridge", () => {
@@ -492,20 +674,20 @@ describe("Sherlock Flame payload", () => {
       ") >= date_trunc('milliseconds', s.started_at)",
     );
     expect(INTERVAL_WORK_SQL).toContain("select distinct e.session_id");
-    expect(INTERVAL_WORK_SQL).toContain("limit $10");
+    expect(INTERVAL_WORK_SQL).toContain("limit $11");
     expect(WORK_DETAIL_SQL).toContain("and e.session_id = p.session_id");
     expect(ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS).toBe(6);
     expect(WORK_DETAIL_SQL).toContain("p.bucket_start - interval '6 seconds'");
     expect(WORK_DETAIL_SQL).toContain("from header left join selected on true");
     expect(WORK_DETAIL_SQL).toContain(") > (p.cursor_at_microseconds, p.cursor_id)");
     expect(WORK_DETAIL_SQL).toContain("order by selected.observed_at nulls first");
-    expect(WORK_DETAIL_SQL).toContain("limit $14");
+    expect(WORK_DETAIL_SQL).toContain("limit $15");
     expect(INTERVAL_PROMPTS_SQL).toContain("e.message_origin = 'human'");
     expect(INTERVAL_PROMPTS_SQL).toContain("e.message_role = 'user'");
     expect(INTERVAL_PROMPTS_SQL).toContain("e.actor_role = 'primary'");
     expect(INTERVAL_PROMPTS_SQL).toContain("and s.person_id = p.person_id");
     expect(INTERVAL_PROMPTS_SQL).toContain("pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)");
-    expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
+    expect(INTERVAL_PROMPTS_SQL).toContain("limit $11");
   });
 
   it("keeps Claude system meta messages out of user summaries and detail", () => {
@@ -533,10 +715,64 @@ describe("Sherlock Flame payload", () => {
     );
     expect(INTERVAL_PROMPTS_SQL).toContain("and s.person_id = p.person_id");
     expect(INTERVAL_PROMPTS_SQL).toContain("count(*) over ()::bigint");
-    expect(INTERVAL_PROMPTS_SQL).toContain("limit $10");
+    expect(INTERVAL_PROMPTS_SQL).toContain("limit $11");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("activity_candidates as materialized");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("context_before");
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
+  });
+
+  it("keeps projection reads bounded, snapshot-visible, and semantically exact", () => {
+    expect(PROJECTION_FLAME_SQL).toContain("analytics.frame_evidence_revisions");
+    expect(PROJECTION_FLAME_SQL).not.toContain("analytics.frame_projection_receipts");
+    expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.events");
+    expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.sessions");
+    for (const query of [
+      PROJECTION_INTERVAL_WORK_SQL,
+      PROJECTION_INTERVAL_PROMPTS_SQL,
+      PROJECTION_WORK_DETAIL_SQL,
+    ]) {
+      expect(query).toContain("revision.evidence_kind = 'activity'");
+      expect(query).toContain(
+        `revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`,
+      );
+      expect(query).toContain("revision.evidence_kind = 'prompt'");
+      expect(query).toContain(
+        `revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`,
+      );
+      expect(query).toContain(
+        `or revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`,
+      );
+      expect(query).toContain("pg_visible_in_snapshot(revision.xmin::text::xid8");
+      expect(query).not.toContain("frame_projection_receipts");
+      expect(query).not.toContain("telemetry.sessions");
+      expect(query).not.toContain("telemetry.native_records");
+      expect(query).not.toContain("telemetry.ingest_batches");
+    }
+    expect(PROJECTION_INTERVAL_WORK_SQL.indexOf("limit $8")).toBeLessThan(
+      PROJECTION_INTERVAL_WORK_SQL.indexOf("join telemetry.events summary"),
+    );
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("limit $10")).toBeLessThan(
+      PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("join telemetry.events source"),
+    );
+    expect(PROJECTION_WORK_DETAIL_SQL.indexOf("limit $12")).toBeLessThan(
+      PROJECTION_WORK_DETAIL_SQL.indexOf("left join telemetry.events source"),
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "and observed_at >= p.start_at and observed_at < p.read_at",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "where evidence.observed_at < p.end_at",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "and evidence.observed_at < p.end_at",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "latest_frame_evidence.anchor_observed_at,",
+    );
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL).toContain(
+      "latest_frame_evidence.anchor_observed_at,",
+    );
+    expect(PROJECTION_INTERVAL_WORK_SQL).not.toContain("p.read_at");
   });
 
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
@@ -606,10 +842,8 @@ describe("Sherlock Flame payload", () => {
     });
 
     expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
-    expect(unsafe.mock.calls[1][1][3]).toEqual(NORMALIZER_VERSIONS);
     expect(unsafe.mock.calls[1][1].at(-1)).toBe(201);
     expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PROMPTS_SQL);
-    expect(unsafe.mock.calls[2][1][3]).toEqual(NORMALIZER_VERSIONS);
     expect(unsafe.mock.calls[2][1].at(-1)).toBe(201);
     expect(interval).toMatchObject({
       personId,
@@ -631,115 +865,27 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
-  it("returns independently bounded work and prompt interval evidence", async () => {
+  it("never silently falls a failing v2 interval back to raw SQL", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
     const personId = "22222222-2222-4222-8222-222222222222";
-    const sessionId = "33333333-3333-4333-8333-333333333333";
-    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
-    const createSource = (rows) => {
-      const source = Object.create(DirectFlameSource.prototype);
-      source.workspaceId = "11111111-1111-4111-8111-111111111111";
-      const unsafe = vi.fn()
-        .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-        .mockResolvedValueOnce(rows);
-      source.transaction = (callback) => callback({
-        unsafe,
-        array: (values) => values,
-      });
-      return { source, unsafe };
-    };
+    const failure = new Error("projection unavailable");
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockRejectedValueOnce(failure);
+    source.transaction = (callback) => callback({ unsafe });
 
-    const work = createSource([{
-      session_id: sessionId,
-      semantic_role: "agent",
-      first_at: new Date("2026-08-16T12:00:09.000Z"),
-      last_at: new Date("2026-08-16T12:04:00.000Z"),
-      event_count: 4,
-      summary: "Inspect the query",
-    }]);
-    await expect(work.source.fetchIntervalWork({
+    await expect(source.fetchInterval({
       personId,
       start: START.toISOString(),
-      snapshot,
-    })).resolves.toMatchObject({
-      personId,
-      start: START.toISOString(),
-      snapshot,
-      work: [{
-        id: `${sessionId}:agent`,
-        sessionId,
-        role: "agent",
-        eventCount: 4,
-        summary: "Inspect the query",
-      }],
-    });
-    expect(work.unsafe).toHaveBeenCalledTimes(2);
-    expect(work.unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
-    expect(work.unsafe.mock.calls[1][1][3]).toEqual([
-      NORMALIZER_VERSION,
-      CLAUDE_NORMALIZER_VERSION,
-    ]);
-    expect(work.unsafe.mock.calls[1][1].at(-1)).toBe(201);
-
-    const prompts = createSource([{
-      prompt_identity: "native:msg_1",
-      session_id: sessionId,
-      observed_at: new Date("2026-08-16T12:00:10.000Z"),
-      content_byte_size: 17,
-      content_excerpt: "Inspect the query",
-    }]);
-    await expect(prompts.source.fetchIntervalPrompts({
-      personId,
-      start: START.toISOString(),
-      snapshot,
-    })).resolves.toMatchObject({
-      personId,
-      start: START.toISOString(),
-      snapshot,
-      prompts: [{
-        id: "native:msg_1",
-        sessionId,
-        content: "Inspect the query",
-        truncated: false,
-      }],
-    });
-    expect(prompts.unsafe).toHaveBeenCalledTimes(2);
-    expect(prompts.unsafe.mock.calls[1][0]).toBe(INTERVAL_PROMPTS_SQL);
-    expect(prompts.unsafe.mock.calls[1][1][3]).toEqual(NORMALIZER_VERSIONS);
-    expect(prompts.unsafe.mock.calls[1][1].at(-1)).toBe(201);
-  });
-
-  it("preserves interval validation and overflow errors for split evidence", async () => {
-    const personId = "22222222-2222-4222-8222-222222222222";
-    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
-    for (const [method, code] of [
-      ["fetchIntervalWork", "flame_interval_work_result_too_large"],
-      ["fetchIntervalPrompts", "flame_interval_prompt_result_too_large"],
-    ]) {
-      const source = Object.create(DirectFlameSource.prototype);
-      source.workspaceId = "11111111-1111-4111-8111-111111111111";
-      const unsafe = vi.fn()
-        .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-        .mockResolvedValueOnce(Array.from({ length: 201 }, () => ({})));
-      source.transaction = (callback) => callback({
-        unsafe,
-        array: (values) => values,
-      });
-      await expect(source[method]({
-        personId,
-        start: START.toISOString(),
-        snapshot,
-      })).rejects.toMatchObject({ code });
-      expect(unsafe).toHaveBeenCalledTimes(2);
-    }
-
-    const invalidSource = Object.create(DirectFlameSource.prototype);
-    invalidSource.transaction = vi.fn();
-    await expect(invalidSource.fetchIntervalPrompts({
-      personId: "invalid",
-      start: START.toISOString(),
-      snapshot,
-    })).rejects.toMatchObject({ code: "flame_interval_request_invalid" });
-    expect(invalidSource.transaction).not.toHaveBeenCalled();
+      snapshot: encodeProjectionSnapshotToken({
+        snapshot: PG_SNAPSHOT,
+        read: READ,
+        frameVersion: FRAME_VERSION,
+      }),
+    })).rejects.toBe(failure);
+    expect(unsafe).toHaveBeenCalledTimes(2);
+    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
   });
 
   it("distinguishes an expired snapshot from an invalid frame range", async () => {
@@ -949,6 +1095,37 @@ describe("Sherlock Flame payload", () => {
     expect(result.prompts[0]).toEqual({
       excerpt: "Short",
       excerptTruncated: true,
+    });
+  });
+
+  it("serves a v2 MCP sample from projected prompt identities", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([{
+        content_byte_size: 9,
+        content_excerpt: "Projected",
+        eligible_prompt_count: 1,
+      }]);
+    source.transaction = (callback) => callback({ unsafe });
+
+    const result = await source.fetchPromptEvidence({
+      personId,
+      start: START.toISOString(),
+      snapshot: encodeProjectionSnapshotToken({
+        snapshot: PG_SNAPSHOT,
+        read: READ,
+        frameVersion: FRAME_VERSION,
+      }),
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(MCP_PROMPT_EVIDENCE_LIMIT);
+    expect(result).toMatchObject({
+      eligiblePromptCount: 1,
+      prompts: [{ excerpt: "Projected", excerptTruncated: false }],
     });
   });
 

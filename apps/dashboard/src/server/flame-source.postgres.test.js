@@ -4,8 +4,11 @@ import { beforeAll, describe, expect, it } from "vitest";
 import {
   BUCKET_MS,
   CLAUDE_NORMALIZER_VERSION,
+  decodeSnapshotToken,
   DirectFlameSource,
+  FRAME_VERSION,
   NORMALIZER_VERSION,
+  PROJECTION_INTERVAL_WORK_SQL,
 } from "./flame-source.js";
 
 const DATABASE_URL = process.env.SHERLOCK_TEST_DATABASE_URL;
@@ -21,6 +24,30 @@ function bucketIndex(at) {
   const end = Math.floor(FIXED_NOW.getTime() / BUCKET_MS) * BUCKET_MS;
   const start = end - 24 * 60 * 60 * 1000;
   return Math.floor((at.getTime() - start) / BUCKET_MS);
+}
+
+function collectPlanRelations(value, relations = new Set()) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectPlanRelations(item, relations);
+  } else if (value && typeof value === "object") {
+    if (typeof value["Relation Name"] === "string") {
+      relations.add(value["Relation Name"]);
+    }
+    for (const child of Object.values(value)) collectPlanRelations(child, relations);
+  }
+  return relations;
+}
+
+function collectPlanIndexes(value, indexes = new Set()) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectPlanIndexes(item, indexes);
+  } else if (value && typeof value === "object") {
+    if (typeof value["Index Name"] === "string") {
+      indexes.add(value["Index Name"]);
+    }
+    for (const child of Object.values(value)) collectPlanIndexes(child, indexes);
+  }
+  return indexes;
 }
 
 async function cleanup(sql, workspaceId) {
@@ -62,18 +89,23 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     const source = new DirectFlameSource({
       databaseUrl: DATABASE_URL,
       workspaceId: crypto.randomUUID(),
+      expectedEmailDomain: "e3group.ai",
     });
     try {
       await expect(source.readiness()).resolves.toEqual({
         status: "ok",
         mode: "sherlock_backend_aggregate",
       });
+      await expect(source.fetchDay({ now: FIXED_NOW })).resolves.toMatchObject({
+        latest: null,
+        people: [],
+      });
     } finally {
       await source.close();
     }
   }, 30_000);
 
-  it("shows the E3 identity instead of a matching Core Edge identity", async () => {
+  it("shows only the dashboard's expected email domain", async () => {
     const workspaceId = crypto.randomUUID();
     const coreEdgeId = crypto.randomUUID();
     const e3Id = crypto.randomUUID();
@@ -105,12 +137,339 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         ],
       );
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const payload = await source.fetchDay({ now: FIXED_NOW });
 
-      expect(payload.people.map(({ id }) => id)).toEqual([e3Id, unmatchedId]);
+      expect(payload.people.map(({ id }) => id)).toEqual([e3Id]);
     } finally {
       if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
+  it("activates a snapshot-stable projection with exact legacy parity", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 2, prepare: false });
+    let source;
+    const bucketStart = new Date(
+      Math.floor(FIXED_NOW.getTime() / BUCKET_MS) * BUCKET_MS - BUCKET_MS,
+    );
+    const observedAt = new Date(bucketStart.getTime() + 1_000);
+    const promptSourceAt = new Date(bucketStart.getTime() - 10_000);
+    const promptNativeItemId = nativeItemId(observedAt);
+    const partialRead = new Date(FIXED_NOW.getTime() + 2_000);
+    const partialActivityAt = new Date(FIXED_NOW.getTime() + 1_000);
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Frame projection fixture')`,
+        [workspaceId, `projection-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (
+           id, workspace_id, identity_key, display_name, email
+         ) values ($1, $2, $3, 'Projected User', 'projected@e3group.ai')`,
+        [personId, workspaceId, `projection-person-${personId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         ) values ($1, $2, $3, 'projection-collector', 'projection-session',
+                   'primary', 'projection-role.v1', $4)`,
+        [sessionId, workspaceId, personId, bucketStart.toISOString()],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_provider,
+           source_kind, source_stream_key, generation_key, generation_seq,
+           start_offset, end_offset, source_byte_count, source_sha256,
+           storage_path, storage_encoding, stored_byte_count, stored_sha256,
+           record_count, contract_version, first_occurred_at, last_occurred_at
+         ) values (
+           $1, $2, $3, 'projection-collector', 'codex', 'rollout',
+           'projection-stream', 'projection-generation', 0, 0, 1, 1, $4,
+           $5, 'gzip', 1, $6, 1, 'sherlock.rollout-batch.v1', $7, $7
+         )`,
+        [
+          batchId,
+          workspaceId,
+          personId,
+          "a".repeat(64),
+          `projection-tests/${batchId}.jsonl.gz`,
+          "b".repeat(64),
+          observedAt.toISOString(),
+        ],
+      );
+      const nativeRows = await sql.unsafe(
+        `insert into telemetry.native_records (
+           workspace_id, batch_id, record_index, source_start_offset,
+           source_end_offset, record_sha256, native_type,
+           native_payload_type, occurred_at, parse_status
+         ) values ($1, $2, 0, 0, 1, $3, 'event_msg', 'user_message', $4, 'ok')
+         returning id::text id`,
+        [workspaceId, batchId, "c".repeat(64), observedAt.toISOString()],
+      );
+      const eventRows = await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, source_priority, event_kind, event_subtype,
+           actor_role, occurred_at, observed_at, server_received_at,
+           native_item_id, message_role, message_origin, content_sha256,
+           content_byte_size, content_excerpt
+         ) values (
+           $1, $2, $3, $4, 0, 100, 'message', 'user_message', 'primary',
+           $5, $5, $5, $6, 'user', 'human', $7, 16, 'Projected prompt'
+         ) returning id::text id`,
+        [
+          workspaceId,
+          sessionId,
+          nativeRows[0].id,
+          NORMALIZER_VERSION,
+          promptSourceAt.toISOString(),
+          promptNativeItemId,
+          "d".repeat(64),
+        ],
+      );
+      const eventId = eventRows[0].id;
+      const partialEventRows = await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, source_priority, event_kind, event_subtype,
+           actor_role, occurred_at, observed_at, server_received_at
+         ) values ($1, $2, $3, $4, 1, 100, 'reasoning', 'reasoning',
+                   'primary', $5, $5, $5)
+         returning id::text id`,
+        [
+          workspaceId,
+          sessionId,
+          nativeRows[0].id,
+          NORMALIZER_VERSION,
+          partialActivityAt.toISOString(),
+        ],
+      );
+      const partialEventId = partialEventRows[0].id;
+      const receiptRows = await sql.unsafe(
+         `insert into analytics.frame_projection_receipts (
+           workspace_id, session_id, person_id, frame_version,
+           covered_from, covered_through, through_event_id,
+           source_event_count, source_state_sha256, request_generation,
+           session_updated_at
+         ) values (
+           $1, $2, $3, $4, $5, $6, $7, 2, $8, 1,
+           (select updated_at from telemetry.sessions
+             where workspace_id = $1 and id = $2)
+         )
+         returning id::text id`,
+        [
+          workspaceId,
+          sessionId,
+          personId,
+          FRAME_VERSION,
+          bucketStart.toISOString(),
+          partialRead.toISOString(),
+          partialEventId,
+          "e".repeat(64),
+        ],
+      );
+      await sql.unsafe(
+        `insert into analytics.frame_evidence_revisions (
+           receipt_id, workspace_id, session_id, person_id, frame_version,
+           evidence_kind, source_event_id, anchor_observed_at, observed_at,
+           actor_role, event_kind, event_subtype, message_role, message_origin,
+           prompt_identity, is_summary_candidate, is_tombstone
+         ) values
+           ($1, $2, $3, $4, $5, 'activity', $6, $7, $7, 'primary',
+            'message', 'user_message', 'user', 'human', null, true, false),
+           ($1, $2, $3, $4, $5, 'prompt', $6, $11, $7, 'primary',
+            'message', 'user_message', 'user', 'human', $8, false, false),
+           ($1, $2, $3, $4, $5, 'activity', $9, $10, $10, 'primary',
+            'reasoning', 'reasoning', null, null, null, false, false)`,
+        [
+          receiptRows[0].id,
+          workspaceId,
+          sessionId,
+          personId,
+          FRAME_VERSION,
+          eventId,
+          observedAt.toISOString(),
+          `native:${promptNativeItemId}`,
+          partialEventId,
+          partialActivityAt.toISOString(),
+          promptSourceAt.toISOString(),
+        ],
+      );
+
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
+      const legacyDay = await source.fetchDay({ now: partialRead });
+      const legacyInterval = await source.fetchInterval({
+        personId,
+        start: bucketStart.toISOString(),
+        snapshot: legacyDay.snapshot,
+        now: partialRead,
+      });
+      expect(legacyDay.snapshot).toMatch(/^v1\./);
+
+      await sql.unsafe(
+        `insert into analytics.frame_projection_activations (
+           workspace_id, frame_version
+         ) values ($1, $2)`,
+        [workspaceId, FRAME_VERSION],
+      );
+      const projectedDay = await source.fetchDay({ now: partialRead });
+      const projectedInterval = await source.fetchInterval({
+        personId,
+        start: bucketStart.toISOString(),
+        snapshot: projectedDay.snapshot,
+        now: partialRead,
+      });
+
+      expect(projectedDay.snapshot).toMatch(/^v2\./);
+      expect(projectedDay.people).toEqual(legacyDay.people);
+      expect(projectedDay.latest).toBe(partialActivityAt.toISOString());
+      expect(projectedDay.people[0].lastActivity).toBe(
+        partialActivityAt.toISOString(),
+      );
+      expect(projectedDay.people[0].total[0]).toBe(1);
+      expect(projectedInterval.work).toEqual(legacyInterval.work);
+      expect(projectedInterval.prompts).toEqual(legacyInterval.prompts);
+      const projectedSnapshot = decodeSnapshotToken(projectedDay.snapshot);
+      const planRows = await sql.begin(async (tx) => {
+        await tx.unsafe("set local role sherlock_reader");
+        await tx.unsafe("set local enable_seqscan = off");
+        return await tx.unsafe(
+          `explain (format json, costs off) ${PROJECTION_INTERVAL_WORK_SQL}`,
+          [
+            workspaceId,
+            FRAME_VERSION,
+            projectedSnapshot.snapshot,
+            personId,
+            bucketStart.toISOString(),
+            new Date(bucketStart.getTime() + BUCKET_MS).toISOString(),
+            "e3group.ai",
+            201,
+          ],
+        );
+      });
+      const rawPlan = Object.values(planRows[0])[0];
+      const plan = typeof rawPlan === "string" ? JSON.parse(rawPlan) : rawPlan;
+      const relations = collectPlanRelations(plan);
+      const indexes = collectPlanIndexes(plan);
+      expect(relations.has("frame_evidence_revisions")).toBe(true);
+      expect(relations.has("frame_projection_receipts")).toBe(false);
+      expect(relations.has("events")).toBe(true);
+      expect(relations.has("sessions")).toBe(false);
+      expect(relations.has("native_records")).toBe(false);
+      expect(relations.has("ingest_batches")).toBe(false);
+      expect([...indexes].some((name) =>
+        name.startsWith("frame_evidence_revisions_")
+      )).toBe(true);
+      expect([...indexes].some((name) => name.startsWith("events_"))).toBe(true);
+
+      const secondEventRows = await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, source_priority, event_kind, event_subtype,
+           actor_role, occurred_at, observed_at, server_received_at
+         ) values ($1, $2, $3, $4, 2, 100, 'reasoning', 'reasoning',
+                   'primary', $5, $5, $5)
+         returning id::text id`,
+        [
+          workspaceId,
+          sessionId,
+          nativeRows[0].id,
+          NORMALIZER_VERSION,
+          new Date(observedAt.getTime() + 500).toISOString(),
+        ],
+      );
+      const secondReceiptRows = await sql.unsafe(
+         `insert into analytics.frame_projection_receipts (
+           workspace_id, session_id, person_id, frame_version,
+           covered_from, covered_through, through_event_id,
+           source_event_count, source_state_sha256, request_generation,
+           session_updated_at
+         ) values (
+           $1, $2, $3, $4, $5, $6, $7, 3, $8, 2,
+           (select updated_at from telemetry.sessions
+             where workspace_id = $1 and id = $2)
+         )
+         returning id::text id`,
+        [
+          workspaceId,
+          sessionId,
+          personId,
+          FRAME_VERSION,
+          bucketStart.toISOString(),
+          partialRead.toISOString(),
+          secondEventRows[0].id,
+          "f".repeat(64),
+        ],
+      );
+      await sql.unsafe(
+        `insert into analytics.frame_evidence_revisions (
+           receipt_id, workspace_id, session_id, person_id, frame_version,
+           evidence_kind, source_event_id, anchor_observed_at, observed_at,
+           actor_role, event_kind, event_subtype, message_role, message_origin,
+           prompt_identity, is_summary_candidate, is_tombstone
+         ) values ($1, $2, $3, $4, $5, 'prompt', $6, $7, $9, 'primary',
+                   'message', 'user_message', 'user', 'human', $8, false, true)`,
+        [
+          secondReceiptRows[0].id,
+          workspaceId,
+          sessionId,
+          personId,
+          FRAME_VERSION,
+          eventId,
+          promptSourceAt.toISOString(),
+          `native:${promptNativeItemId}`,
+          observedAt.toISOString(),
+        ],
+      );
+
+      const oldSnapshotInterval = await source.fetchInterval({
+        personId,
+        start: bucketStart.toISOString(),
+        snapshot: projectedDay.snapshot,
+        now: partialRead,
+      });
+      const newDay = await source.fetchDay({ now: partialRead });
+      const newInterval = await source.fetchInterval({
+        personId,
+        start: bucketStart.toISOString(),
+        snapshot: newDay.snapshot,
+        now: partialRead,
+      });
+      expect(oldSnapshotInterval.prompts).toHaveLength(1);
+      expect(newInterval.prompts).toEqual([]);
+    } finally {
+      if (source) await source.close();
+      await sql.unsafe(
+        "delete from analytics.frame_projection_activations where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
+      await sql.unsafe(
+        "delete from analytics.frame_evidence_revisions where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
+      await sql.unsafe(
+        "delete from analytics.frame_projection_receipts where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
       try {
         await cleanup(sql, workspaceId);
       } finally {
@@ -211,8 +570,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       );
       await sql.unsafe(
         `insert into telemetry.people (
-           id, workspace_id, identity_key, display_name
-         ) values ($1, $2, $3, 'Claude User')`,
+           id, workspace_id, identity_key, display_name, email
+         ) values ($1, $2, $3, 'Claude User', 'claude@e3group.ai')`,
         [personId, workspaceId, `claude-person-${personId}`],
       );
       await sql.unsafe(
@@ -329,7 +688,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const payload = await source.fetchDay({ now });
       const person = payload.people[0];
       const bucketStart = bucketStartDate.toISOString();
@@ -500,8 +863,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `flame-${workspaceId}`, "Flame boundary fixture"],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, $4)`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, $4, 'boundary@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`, "Boundary Person"],
       );
 
@@ -581,7 +944,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const payload = await source.fetchDay({ now: FIXED_NOW });
       const person = payload.people[0];
 
@@ -670,8 +1037,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `boundary-${workspaceId}`, "Representation boundary fixture"],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, 'Boundary Person')`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Boundary Person', 'boundary@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`],
       );
       await sql.unsafe(
@@ -733,7 +1100,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const day = await source.fetchDay({ now: FIXED_NOW });
       expect(day.people[0].buckets[bucketIndex(frameStart)].slice(0, 3)).toEqual([1, 0, 0]);
 
@@ -793,8 +1164,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `prompt-${workspaceId}`, "Prompt identity fixture"],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, 'Prompt Person')`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Prompt Person', 'prompt@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`],
       );
       await sql.unsafe(
@@ -882,7 +1253,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const day = await source.fetchDay({ now: FIXED_NOW });
       const person = day.people[0];
       expect(person.buckets[bucketIndex(frameStart)][3]).toBe(3);
@@ -955,8 +1330,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [workspaceId, `mcp-${workspaceId}`],
       );
       await sql.unsafe(
-        `insert into telemetry.people (id, workspace_id, identity_key, display_name)
-         values ($1, $2, $3, 'Prompt Person')`,
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Prompt Person', 'prompt@e3group.ai')`,
         [personId, workspaceId, `person-${personId}`],
       );
       await sql.unsafe(
@@ -1027,7 +1402,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         );
       }
 
-      source = new DirectFlameSource({ databaseUrl: DATABASE_URL, workspaceId });
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
       const aggregate = await source.fetchDay({ now: FIXED_NOW });
       const bucket = aggregate.people[0].buckets[bucketIndex(new Date(bucketStart))];
       const evidence = await source.fetchPromptEvidence({
