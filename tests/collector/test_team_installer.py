@@ -766,6 +766,17 @@ class TeamInstallerTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             codex_home = root / "codex"
+            session_id = "55555555-5555-4555-8555-555555555555"
+            rollout = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "08"
+                / "21"
+                / f"rollout-2026-08-21T00-00-00-{session_id}.jsonl"
+            )
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"type":"event_msg"}\n', encoding="utf-8")
             fake_codex = root / "fake-codex"
             capture = root / "calls.jsonl"
             old_checkout = root / "old-checkout"
@@ -820,7 +831,18 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertEqual(configured["github_id"], "test-user")
             self.assertEqual(configured["email"], "test@e3group.ai")
             self.assertNotIn("token", configured)
+            self.assertIn("Codex 24-hour backfill", completed.stdout)
+            self.assertIn('"discovered": 1', completed.stdout)
+            self.assertIn('"status": "complete"', completed.stdout)
             self.assertIn("Trusted 7 Sherlock hooks", completed.stdout)
+            self.assertTrue(
+                (
+                    codex_home
+                    / "sherlock"
+                    / "telemetry"
+                    / "rollout-state.json"
+                ).is_file()
+            )
             calls = [json.loads(line) for line in capture.read_text().splitlines()]
             self.assertEqual(
                 calls[0]["argv"][:4],
