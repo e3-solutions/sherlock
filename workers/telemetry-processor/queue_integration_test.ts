@@ -230,22 +230,22 @@ Deno.test({
       );
       const planNodes = explainPlanNodes(Object.values(explained[0])[0]);
       assert(
-        planNodes.some((node) =>
-          node["Index Name"] === "ingest_batches_range_key"
-        ),
-        "predecessor lookup must use the immutable ingest range index",
-      );
-      assert(
         !planNodes.some((node) =>
           node["Node Type"] === "Seq Scan" &&
-          node["Relation Name"] === "ingest_batches"
+          ["ingest_batches", "telemetry_jobs"].includes(
+            String(node["Relation Name"]),
+          )
         ),
-        "predecessor lookup must not scan all immutable batches",
+        "claim planning must not scan immutable batches or queue history",
       );
+      const examinedRows = (node: Record<string, unknown>) =>
+        Number(node["Actual Rows"] ?? 0) +
+        Number(node["Rows Removed by Filter"] ?? 0) +
+        Number(node["Rows Removed by Join Filter"] ?? 0) +
+        Number(node["Rows Removed by Index Recheck"] ?? 0);
       assert(
-        Math.max(...planNodes.map((node) => Number(node["Actual Rows"] ?? 0))) <
-          64,
-        "claim planning must inspect bounded candidate rows under backlog",
+        Math.max(...planNodes.map(examinedRows)) < 64,
+        "claim planning must use bounded indexed access under backlog",
       );
       await sql.unsafe(
         `delete from processing.telemetry_jobs job

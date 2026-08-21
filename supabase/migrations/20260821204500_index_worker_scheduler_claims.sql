@@ -29,5 +29,8 @@ comment on index processing.telemetry_jobs_live_normalize_age_idx is
 -- created with telemetry.ingest_batches. Its equality prefix is
 -- (workspace_id, collector_key, source_kind, source_stream_key,
 -- generation_seq, generation_key), followed by the start_offset range.
--- Do not add a duplicate scheduler-specific ingest index; the queue
--- integration test proves this query uses ingest_batches_range_key at scale.
+-- Do not add a duplicate scheduler-specific ingest index. The queue
+-- integration test proves the full claim plan avoids immutable-batch scans and
+-- examines a bounded number of rows under a representative backlog; PostgreSQL
+-- may satisfy that plan through the range key, the batch primary key, or the
+-- normalize-job batch key depending on statistics.
