@@ -286,6 +286,22 @@ export function adaptFlamePayload(value) {
 const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
 const CONVERSATION_ROLES = ["user", "assistant"];
 
+function requirePullRequest(value, path) {
+  if (value === null || value === undefined) return null;
+  const pullRequest = requireObject(value, path);
+  const repository = requireNonemptyString(pullRequest.repository, `${path}.repository`);
+  const number = requirePositiveCount(pullRequest.number, `${path}.number`);
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) ||
+      repository.split("/").some((part) => part === "." || part === "..")) {
+    fail(`${path}.repository`, "a canonical GitHub owner/repository name");
+  }
+  const url = requireNonemptyString(pullRequest.url, `${path}.url`);
+  if (url !== `https://github.com/${repository}/pull/${number}`) {
+    fail(`${path}.url`, "the canonical GitHub pull request URL");
+  }
+  return { repository, number, url };
+}
+
 /** Validates the bounded, snapshot-pinned interval overview response. */
 export function adaptIntervalEvidence(value, expected) {
   const payload = requireObject(value, "interval evidence");
@@ -316,6 +332,7 @@ export function adaptIntervalEvidence(value, expected) {
       eventCount: requirePositiveCount(item.eventCount, `${path}.eventCount`),
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
       summary,
+      pullRequest: requirePullRequest(item.pullRequest, `${path}.pullRequest`),
     };
   });
 

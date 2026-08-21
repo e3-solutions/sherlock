@@ -1,5 +1,10 @@
 import { SupabaseRawStorage, TelemetryProcessor } from "./processor.ts";
 import {
+  type LookupStore,
+  PostgresLookupStore,
+  syncPending,
+} from "../../scripts/sync-github-prs.ts";
+import {
   PostgresJobQueue,
   type TelemetryJob,
   type WorkloadClass,
@@ -18,7 +23,16 @@ export interface WorkerConfig {
   retryMaxSeconds: number;
   storageTimeoutMilliseconds: number;
   reductionTimeoutMilliseconds: number;
+  github: {
+    workspaceId: string;
+    token: string;
+    intervalMilliseconds: number;
+    limit: number;
+  } | null;
 }
+
+const UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export function loadConfig(
   env: Record<string, string | undefined>,
@@ -39,6 +53,36 @@ export function loadConfig(
   const supabaseUrl = required(env, "SUPABASE_URL").replace(/\/$/, "");
   if (!supabaseUrl.startsWith("https://")) {
     throw new Error("SUPABASE_URL must use HTTPS");
+  }
+  const githubToken = env.GITHUB_TOKEN?.trim() || null;
+  const githubWorkspaceId = env.SHERLOCK_WORKSPACE_ID?.trim() || null;
+  if ((githubToken === null) !== (githubWorkspaceId === null)) {
+    throw new Error(
+      "GITHUB_TOKEN and SHERLOCK_WORKSPACE_ID must be configured together",
+    );
+  }
+  if (githubWorkspaceId !== null && !UUID.test(githubWorkspaceId)) {
+    throw new Error("SHERLOCK_WORKSPACE_ID must be a canonical UUID");
+  }
+  const githubIntervalSeconds = boundedInteger(
+    env.SHERLOCK_GITHUB_SYNC_INTERVAL_SECONDS,
+    60,
+    60,
+    600,
+  );
+  const githubLimit = boundedInteger(
+    env.SHERLOCK_GITHUB_SYNC_LIMIT,
+    25,
+    1,
+    25,
+  );
+  if (
+    githubToken && githubWorkspaceId &&
+    Math.floor(900 / githubIntervalSeconds) * githubLimit < 75
+  ) {
+    throw new Error(
+      "GitHub sync settings must refresh at least 75 pairs per 15 minutes",
+    );
   }
   return {
     databaseUrl: required(env, "SUPABASE_DB_URL"),
@@ -65,6 +109,14 @@ export function loadConfig(
       env.SHERLOCK_WORKER_REDUCTION_TIMEOUT_SECONDS,
       60,
     ) * 1_000,
+    github: githubToken && githubWorkspaceId
+      ? {
+        workspaceId: githubWorkspaceId,
+        token: githubToken,
+        intervalMilliseconds: githubIntervalSeconds * 1_000,
+        limit: githubLimit,
+      }
+      : null,
   };
 }
 
@@ -111,10 +163,17 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     ),
   );
   const active = new Map<Promise<void>, WorkloadClass>();
+  const githubStore = config.github
+    ? PostgresLookupStore.connect(config.databaseUrl)
+    : null;
+  let githubTask: Promise<void> | null = null;
+  let nextGithubSyncAt = 0;
   let stopping = false;
+  const shutdown = new AbortController();
   let lastReaperAt = 0;
   const stop = () => {
     stopping = true;
+    shutdown.abort(new Error("worker shutdown"));
     log("shutdown_requested", { active_jobs: active.size });
   };
   Deno.addSignalListener("SIGTERM", stop);
@@ -124,9 +183,25 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     concurrency: config.concurrency,
     live_reserved: config.liveReserved,
     lease_seconds: config.leaseSeconds,
+    github_sync_enabled: config.github !== null,
   });
   try {
     while (!stopping) {
+      if (
+        config.github && githubStore && githubTask === null &&
+        Date.now() >= nextGithubSyncAt
+      ) {
+        nextGithubSyncAt = Date.now() + config.github.intervalMilliseconds;
+        githubTask = runGitHubSyncTick(
+          githubStore,
+          config.github,
+          shutdown.signal,
+        ).finally(
+          () => {
+            githubTask = null;
+          },
+        );
+      }
       if (Date.now() - lastReaperAt >= 10_000) {
         const terminalized = await queue.terminalizeExpired();
         if (terminalized > 0) log("expired_jobs_failed", { terminalized });
@@ -175,12 +250,38 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         await delay(config.pollMilliseconds);
       }
     }
-    await Promise.allSettled(active.keys());
+    await Promise.allSettled([
+      ...active.keys(),
+      ...(githubTask ? [githubTask] : []),
+    ]);
   } finally {
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
-    await Promise.allSettled([processor.close(), queue.close()]);
+    await Promise.allSettled([
+      processor.close(),
+      queue.close(),
+      ...(githubStore ? [githubStore.close()] : []),
+    ]);
     log("worker_stopped", {});
+  }
+}
+
+export async function runGitHubSyncTick(
+  store: LookupStore,
+  config: NonNullable<WorkerConfig["github"]>,
+  signal?: AbortSignal,
+  runner: typeof syncPending = syncPending,
+): Promise<void> {
+  try {
+    const result = await runner(store, {
+      workspaceId: config.workspaceId,
+      token: config.token,
+      limit: config.limit,
+      signal,
+    });
+    log("github_sync_complete", result);
+  } catch (error) {
+    log("github_sync_failed", { error_code: errorCode(error) });
   }
 }
 
@@ -296,6 +397,19 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error("worker numeric settings must be positive integers");
+  }
+  return parsed;
+}
+
+function boundedInteger(
+  value: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const parsed = positiveInteger(value, fallback);
+  if (parsed < minimum || parsed > maximum) {
+    throw new Error(`worker numeric setting must be ${minimum}..${maximum}`);
   }
   return parsed;
 }

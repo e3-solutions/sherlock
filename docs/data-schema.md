@@ -1,15 +1,16 @@
 # Sherlock v0 Data Architecture
 
 Status: the Supabase database foundation, provider-aware JSONL collector drain,
-asynchronous Codex and Claude Code normalizers, targeted versioned activity
+asynchronous Codex and Claude Code normalizers, exact GitHub commit lookup
+receipts, targeted versioned activity
 reducer, append-only indexed frame-evidence projection, and workspace-scoped
 dashboard Flame read API are implemented. Durable cross-version snapshot
 resolution remains future work; frame projection activation is explicit.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
-views separate from source data. Ten source/product tables remain across two
-private schemas, with one private operational queue table in `processing` and
-one private Storage bucket.
+views separate from source data. Source and product facts remain in the private
+`telemetry`, `github`, and `analytics` schemas, with one private operational
+queue table in `processing` and one private Storage bucket.
 
 ## Sources of truth
 
@@ -30,8 +31,10 @@ Keeping one exact definition prevents the architecture notes from drifting.
 - Supabase local configuration targets PostgreSQL 17.
 - `telemetry` stores source receipts, native record locators, and normalized
   facts.
+- `github` stores complete, immutable commit-to-pull-request lookup receipts.
 - `analytics` stores rebuildable activity projections.
-- Both schemas are private and excluded from the configured Data API schemas.
+- All three source/product schemas are private and excluded from the configured
+  Data API schemas.
 - `public`, `anon`, and `authenticated` have no access to either schema or its
   tables and sequences.
 - The private `telemetry-raw` bucket accepts gzip and binary objects up to
@@ -68,6 +71,8 @@ flowchart LR
     B --> N["telemetry.native_records"]
     N --> Q["processing.telemetry_jobs"]
     Q --> E["Railway → telemetry.events"]
+    Q --> S["telemetry.scm_projections"]
+    S --> G["github commit lookup receipts"]
     E --> A["analytics.activity_spans"]
     E --> P["Railway frame projector"]
     P --> R["analytics.frame_projection_receipts"]
@@ -91,6 +96,9 @@ database columns.
 | `telemetry.ingest_batches` | Receipt for one committed source byte range and Storage object | Ingest may insert only |
 | `telemetry.native_records` | Exact locator and parse status for each native record | Ingest may insert only |
 | `telemetry.events` | Versioned semantic projections of native records | Normalizer may insert only |
+| `telemetry.scm_projections` | Versioned matched or no-match SCM outcome for each native session metadata record | Normalizer may insert only |
+| `github.commit_pull_attempts` | Complete or failed exact commit-associated pull-request lookup attempt | GitHub sync may insert only |
+| `github.commit_pull_candidates` | Minimal validated PR facts tied to one complete attempt and numeric base repository | GitHub sync may insert only |
 | `analytics.activity_spans` | Versioned, rebuildable activity intervals | Reducer may insert only |
 | `analytics.frame_projection_receipts` | Bounded, fingerprinted proof of one session source state consumed by a frame version | Frame projector may insert only |
 | `analytics.frame_evidence_revisions` | Payload-free activity and prompt selection revisions tied to source events and receipts | Frame projector may insert only |
@@ -168,6 +176,12 @@ observable.
 
 Normalizer versions must be immutable build or content identifiers. Mutable
 aliases such as `latest` cannot reproduce an older interpretation.
+
+SCM projections use a separate immutable projector version and record both
+matches and no-matches, so coverage and bounded historical replay are
+auditable without changing the event normalizer version. GitHub attempts record
+complete and failed outcomes; only complete, single-candidate attempts can
+become display evidence. Branch names are not matching evidence.
 
 ### Activity spans are rebuildable
 

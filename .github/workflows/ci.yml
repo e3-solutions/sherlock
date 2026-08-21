@@ -64,6 +64,9 @@ jobs:
           deno check workers/telemetry-processor/main.ts
           deno check scripts/reduce-activity.ts
           deno check scripts/backfill-frame-evidence.ts
+          deno check scripts/requeue-scm-backfill.ts
+          deno check scripts/requeue-scm-backfill_postgres_test.ts
+          deno check scripts/sync-github-prs.ts
           deno check workers/telemetry-processor/frame-projector.ts
 
       - name: Run collector tests
@@ -76,6 +79,8 @@ jobs:
           deno test supabase/functions/sherlock-rollout-ingest
           deno test supabase/functions/sherlock-activity-reducer
           deno test workers/telemetry-processor
+          deno test scripts/requeue-scm-backfill_test.ts
+          deno test scripts/sync-github-prs_test.ts
 
       - name: Verify dashboard
         working-directory: apps/dashboard
@@ -112,6 +117,20 @@ jobs:
         run: >-
           deno test --allow-env --allow-net
           supabase/functions/sherlock-rollout-ingest/normalizer_postgres_integration_test.ts
+
+      - name: Run GitHub sync database integration test
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: >-
+          deno test --allow-env --allow-net
+          scripts/sync-github-prs_postgres_test.ts
+
+      - name: Run SCM replay database integration test
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: >-
+          deno test --allow-env --allow-net
+          scripts/requeue-scm-backfill_postgres_test.ts
 
       - name: Run queue database integration test
         env:

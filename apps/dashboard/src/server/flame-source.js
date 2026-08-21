@@ -770,6 +770,87 @@ select prompt_identity, session_id::text session_id, observed_at,
  limit $11
 `;
 
+// A pull request is product enrichment for an already-selected work session. Rank
+// only rows visible in the timeline snapshot so later refreshes cannot change an
+// open drawer, then fail closed unless the complete GitHub lookup has one candidate.
+export const INTERVAL_PULL_REQUESTS_SQL = `
+with p as materialized (
+  select $1::uuid workspace_id, $2::pg_snapshot snapshot,
+         $3::timestamptz snapshot_read, $4::uuid[] session_ids
+), visible_projections as materialized (
+  select projection.session_id, projection.repository_full_name,
+         projection.commit_sha, projection.observed_at
+    from telemetry.scm_projections projection cross join p
+   where projection.workspace_id = p.workspace_id
+     and projection.session_id = any(p.session_ids)
+     and projection.scm_version = 'sherlock.github-scm.v1'
+     and projection.projection_status = 'matched'
+     and pg_visible_in_snapshot(projection.xmin::text::xid8, p.snapshot)
+), visible_attempts as materialized (
+  select attempt.*
+    from github.commit_pull_attempts attempt
+    join (
+      select distinct repository_full_name, commit_sha
+        from visible_projections
+    ) projection using (repository_full_name, commit_sha)
+    cross join p
+   where attempt.workspace_id = p.workspace_id
+     and attempt.lookup_version = 'sherlock.github-associated-pulls.v1'
+     and attempt.api_version = '2026-03-10'
+     and pg_visible_in_snapshot(attempt.xmin::text::xid8, p.snapshot)
+), ranked_attempts as materialized (
+  select attempt.*,
+         row_number() over (
+           partition by attempt.repository_full_name, attempt.commit_sha
+           order by attempt.id desc
+         ) latest_rank
+    from visible_attempts attempt
+), visible_candidate_facts as materialized (
+  select candidate.*
+    from github.commit_pull_candidates candidate
+    join ranked_attempts attempt
+      on attempt.id = candidate.attempt_id and attempt.latest_rank = 1
+    cross join p
+   where candidate.workspace_id = p.workspace_id
+     and pg_visible_in_snapshot(candidate.xmin::text::xid8, p.snapshot)
+), visible_candidates as materialized (
+  select candidate.*,
+         count(*) over (partition by candidate.attempt_id) visible_candidate_count
+    from visible_candidate_facts candidate
+), exact_matches as materialized (
+  select distinct projection.session_id, attempt.repository_full_name,
+         candidate.github_pull_request_id, candidate.pull_request_number
+    from visible_projections projection
+    join ranked_attempts attempt
+      on attempt.repository_full_name = projection.repository_full_name
+     and attempt.commit_sha = projection.commit_sha
+     and attempt.latest_rank = 1
+     and attempt.outcome = 'complete'
+     and attempt.candidate_count = 1
+    join visible_candidates candidate
+      on candidate.workspace_id = attempt.workspace_id
+     and candidate.attempt_id = attempt.id
+     and candidate.visible_candidate_count = 1
+     and candidate.github_repository_id = attempt.github_repository_id
+    cross join p
+   where attempt.created_at >= p.snapshot_read - interval '15 minutes'
+     and projection.observed_at <= coalesce(
+           candidate.pull_request_merged_at,
+           candidate.pull_request_closed_at,
+           'infinity'::timestamptz
+         )
+), session_matches as materialized (
+  select exact_matches.*,
+         count(*) over (partition by session_id) session_match_count
+    from exact_matches
+)
+select session_id::text session_id, repository_full_name,
+       pull_request_number
+  from session_matches
+ where session_match_count = 1
+ order by session_id
+`;
+
 export const WORK_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
@@ -1309,7 +1390,22 @@ function snapshotBounds(snapshotReceipt, startAt, read, prefix) {
   };
 }
 
-function workFromRow(row) {
+function pullRequestFromRow(row) {
+  const repository = String(row.repository_full_name);
+  const number = Number(row.pull_request_number);
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) ||
+      repository.split("/").some((part) => part === "." || part === "..") ||
+      !Number.isSafeInteger(number) || number <= 0) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+  return {
+    repository,
+    number,
+    url: `https://github.com/${repository}/pull/${number}`,
+  };
+}
+
+function workFromRow(row, pullRequest = null) {
   const role = String(row.semantic_role);
   const sessionId = String(row.session_id);
   const summary = row.summary === null || row.summary === undefined
@@ -1323,6 +1419,7 @@ function workFromRow(row) {
     lastAt: asDate(row.last_at).toISOString(),
     eventCount: count(row.event_count),
     summary,
+    ...(pullRequest === null ? {} : { pullRequest }),
   };
 }
 
@@ -1633,6 +1730,18 @@ export class DirectFlameSource {
       if (work.length === workLimit) {
         throw new FlameSourceError("flame_interval_work_result_too_large");
       }
+      const pullRequests = work.length === 0
+        ? []
+        : await runQuery(tx, INTERVAL_PULL_REQUESTS_SQL, [
+          this.workspaceId,
+          snapshotReceipt.snapshot,
+          snapshotReceipt.read.toISOString(),
+          tx.array([...new Set(work.map((row) => String(row.session_id)))]),
+        ], signal);
+      const pullRequestBySession = new Map(pullRequests.map((row) => [
+        String(row.session_id),
+        pullRequestFromRow(row),
+      ]));
       const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
       const prompts = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
@@ -1667,7 +1776,10 @@ export class DirectFlameSource {
         personId,
         start: startAt.toISOString(),
         snapshot,
-        work: work.map(workFromRow),
+        work: work.map((row) => workFromRow(
+          row,
+          pullRequestBySession.get(String(row.session_id)) ?? null,
+        )),
         prompts: prompts.map(promptFromRow),
       };
     }, { signal });

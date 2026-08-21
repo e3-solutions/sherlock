@@ -893,7 +893,12 @@ input { font: inherit; }
   list-style: none;
 }
 
-.flame-detail__work li { border-bottom: 1px solid var(--flame-rule); }
+.flame-detail__work li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  border-bottom: 1px solid var(--flame-rule);
+}
 
 .flame-detail__work button {
   display: grid;
@@ -956,6 +961,23 @@ input { font: inherit; }
   color: var(--flame-muted);
   font-size: 22px;
 }
+
+.flame-detail__pull-request {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 10px 0;
+  padding: 0 8px;
+  border-left: 1px solid var(--flame-rule);
+  color: var(--flame-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.flame-detail__pull-request:hover,
+.flame-detail__pull-request:focus-visible { color: var(--flame-ink); }
 
 .flame-detail__work-expander {
   width: 100%;

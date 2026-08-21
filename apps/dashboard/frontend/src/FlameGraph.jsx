@@ -425,11 +425,15 @@ function IntervalOverview({
   closing,
 }) {
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const promptedWork = evidence.work.filter(({ summary }) => summary !== null);
-  const additionalWork = evidence.work.filter(({ summary }) => summary === null);
+  const primaryWork = evidence.work.filter(({ summary, pullRequest }) =>
+    summary !== null || pullRequest !== null
+  );
+  const additionalWork = evidence.work.filter(({ summary, pullRequest }) =>
+    summary === null && pullRequest === null
+  );
   const visibleWork = showAdditionalWork
-    ? [...promptedWork, ...additionalWork]
-    : promptedWork;
+    ? [...primaryWork, ...additionalWork]
+    : primaryWork;
 
   function workRow(work) {
     const label = work.summary ?? `${roleLabel(work.role)} session`;
@@ -454,6 +458,17 @@ function IntervalOverview({
     return (
       <li key={work.id}>
         <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
+        {work.pullRequest && (
+          <a
+            className="flame-detail__pull-request"
+            href={work.pullRequest.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={`Open ${work.pullRequest.repository} pull request #${work.pullRequest.number} on GitHub in a new tab`}
+          >
+            PR #{work.pullRequest.number}<span aria-hidden="true">↗</span>
+          </a>
+        )}
       </li>
     );
   }

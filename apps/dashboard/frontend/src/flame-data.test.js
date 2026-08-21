@@ -304,6 +304,11 @@ describe("interval and work evidence adapters", () => {
         firstAt: new Date(startMs + 1000).toISOString(),
         lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
         summary: "Investigate the cursor",
+        pullRequest: {
+          repository: "e3-solutions/sherlock",
+          number: 54,
+          url: "https://github.com/e3-solutions/sherlock/pull/54",
+        },
       }],
       prompts: [{
         id: "native:msg-1", sessionId: "s1",
@@ -314,10 +319,50 @@ describe("interval and work evidence adapters", () => {
 
     expect(result.work[0]).toMatchObject({
       id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2,
+      pullRequest: {
+        repository: "e3-solutions/sherlock",
+        number: 54,
+        url: "https://github.com/e3-solutions/sherlock/pull/54",
+      },
     });
     expect(result.prompts).toEqual([expect.objectContaining({
       id: "native:msg-1", content: "Investigate the cursor",
     })]);
+  });
+
+  it.each([
+    ["non-canonical repository", {
+      repository: "https://github.com/e3-solutions/sherlock",
+      number: 54,
+      url: "https://github.com/e3-solutions/sherlock/pull/54",
+    }],
+    ["non-positive number", {
+      repository: "e3-solutions/sherlock",
+      number: 0,
+      url: "https://github.com/e3-solutions/sherlock/pull/0",
+    }],
+    ["non-canonical URL", {
+      repository: "e3-solutions/sherlock",
+      number: 54,
+      url: "https://example.com/e3-solutions/sherlock/pull/54",
+    }],
+  ])("rejects %s in pull request evidence", (_label, pullRequest) => {
+    expect(() => adaptIntervalEvidence({
+      personId: expected.personId,
+      start: new Date(startMs).toISOString(),
+      snapshot: expected.snapshot,
+      work: [{
+        id: "s1:agent", sessionId: "s1", role: "agent",
+        firstAt: new Date(startMs + 1000).toISOString(),
+        lastAt: new Date(startMs + 5000).toISOString(),
+        eventCount: 2, summary: null, pullRequest,
+      }],
+      prompts: [{
+        id: "native:msg-1", sessionId: "s1",
+        at: new Date(startMs + 1500).toISOString(),
+        content: "Investigate the cursor", truncated: false,
+      }],
+    }, expected)).toThrow(FlameDataError);
   });
 
   it("rejects prompt rows whose identities do not match the aggregate count", () => {

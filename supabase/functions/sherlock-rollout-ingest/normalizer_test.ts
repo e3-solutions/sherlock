@@ -1,9 +1,11 @@
 import { type BatchManifest, CONTRACT_VERSION, sha256Hex } from "./contract.ts";
 import {
   CLAUDE_NORMALIZER_VERSION,
+  githubRepositoryFullName,
   NORMALIZER_VERSION,
   normalizerVersionFor,
   projectBatch,
+  SCM_VERSION,
 } from "./normalizer.ts";
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -148,6 +150,7 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
         git: {
           repository_url: "https://github.com/e3-solutions/sherlock.git",
           branch: "arya/test",
+          commit_hash: "A".repeat(40),
         },
       },
     },
@@ -237,6 +240,16 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
   assert(projection.session?.model === "gpt-5");
   assert(projection.session?.cwd === "/repo/current");
   assert(projection.events.length === manifest.record_count);
+  assert(projection.scm_projections.length === 1);
+  assert(projection.scm_projections[0].record_index === 0);
+  assert(projection.scm_projections[0].scm_version === SCM_VERSION);
+  assert(projection.scm_projections[0].projection_status === "matched");
+  assert(
+    projection.scm_projections[0].repository_full_name ===
+      "e3-solutions/sherlock",
+  );
+  assert(projection.scm_projections[0].commit_sha === "a".repeat(40));
+  assert(projection.scm_projections[0].observed_at === "2026-08-15T00:00:00Z");
 
   const messages = projection.events.filter((event) =>
     event.event_kind === "message"
@@ -268,6 +281,60 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
   );
   assert(tool?.tool_call_id === "call-1");
   assert(tool?.tool_name === "functions.exec");
+});
+
+Deno.test("GitHub repository identity accepts only canonical remote shapes", () => {
+  assert(
+    githubRepositoryFullName("git@github.com:E3-Solutions/Sherlock.git") ===
+      "e3-solutions/sherlock",
+  );
+  assert(
+    githubRepositoryFullName("ssh://git@github.com/e3-solutions/sherlock") ===
+      "e3-solutions/sherlock",
+  );
+  assert(
+    githubRepositoryFullName("https://gitlab.com/e3-solutions/sherlock") ===
+      null,
+  );
+  assert(
+    githubRepositoryFullName(
+      "https://github.com/e3-solutions/sherlock/issues",
+    ) === null,
+  );
+});
+
+Deno.test("SCM projection records no-match for incomplete session metadata", async () => {
+  const { manifest, source } = await fixture([{
+    timestamp: "2026-08-15T00:00:00Z",
+    type: "session_meta",
+    payload: {
+      id: "invalid-scm-session",
+      git: {
+        repository_url: "https://github.com/e3-solutions/sherlock.git",
+        commit_hash: "branch-name",
+      },
+    },
+  }]);
+  const projection = await projectBatch(manifest, source);
+  assert(projection.session !== null);
+  assert(projection.scm_projections.length === 1);
+  assert(projection.scm_projections[0].projection_status === "no_match");
+  assert(projection.scm_projections[0].repository_full_name === null);
+  assert(projection.scm_projections[0].commit_sha === null);
+  assert(projection.scm_projections[0].observed_at === null);
+});
+
+Deno.test("every session metadata locator gets a terminal SCM outcome", async () => {
+  const { manifest, source } = await fixture([{
+    timestamp: "2026-08-15T00:00:00Z",
+    type: "session_meta",
+    payload: "structurally-invalid",
+  }]);
+  const projection = await projectBatch(manifest, source);
+  assert(manifest.records[0].native_type === "session_meta");
+  assert(projection.scm_projections.length === 1);
+  assert(projection.scm_projections[0].record_index === 0);
+  assert(projection.scm_projections[0].projection_status === "no_match");
 });
 
 Deno.test("normalizer emits observable unknown events for malformed records", async () => {

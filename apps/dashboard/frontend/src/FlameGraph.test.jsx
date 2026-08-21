@@ -179,12 +179,22 @@ describe("FlameGraph", () => {
               id: "session-1:agent", sessionId: "session-1", role: "agent",
               firstAt: start, lastAt: new Date(Date.parse(start) + 3000).toISOString(),
               eventCount: 3, summary: "First exact prompt",
+              pullRequest: {
+                repository: "e3-solutions/sherlock",
+                number: 54,
+                url: "https://github.com/e3-solutions/sherlock/pull/54",
+              },
             },
             {
               id: "session-2:subagent", sessionId: "session-2", role: "subagent",
               firstAt: new Date(Date.parse(start) + 4000).toISOString(),
               lastAt: new Date(Date.parse(start) + 5000).toISOString(),
               eventCount: 1, summary: null,
+              pullRequest: {
+                repository: "e3-solutions/sherlock",
+                number: 55,
+                url: "https://github.com/e3-solutions/sherlock/pull/55",
+              },
             },
             {
               id: "session-3:agent", sessionId: "session-3", role: "agent",
@@ -672,7 +682,7 @@ describe("FlameGraph", () => {
     const promptDisclosure = await screen.findByText("3 human prompts");
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
     expect(detail).not.toHaveTextContent("prompts recorded in this interval");
-    expect(detail.querySelectorAll(".flame-detail__work li")).toHaveLength(1);
+    expect(detail.querySelectorAll(".flame-detail__work li")).toHaveLength(2);
     expect(detail).not.toHaveTextContent("What happened");
     expect(promptDisclosure.closest("details")).not.toHaveAttribute("open");
     expect(detail).not.toHaveTextContent("Stored excerpt");
@@ -683,10 +693,23 @@ describe("FlameGraph", () => {
     expect(screen.getByText("Repeat the exact request")).toBeInTheDocument();
     expect(screen.getByText("Excerpt")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Subagent session evidence/ })).not.toBeInTheDocument();
+    const pullRequest = screen.getByRole("link", {
+      name: "Open e3-solutions/sherlock pull request #54 on GitHub in a new tab",
+    });
+    expect(pullRequest).toHaveTextContent("PR #54");
+    expect(pullRequest).toHaveAttribute(
+      "href",
+      "https://github.com/e3-solutions/sherlock/pull/54",
+    );
+    expect(pullRequest).toHaveAttribute("target", "_blank");
+    expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
+    expect(screen.getByRole("link", {
+      name: "Open e3-solutions/sherlock pull request #55 on GitHub in a new tab",
+    })).toHaveAttribute("href", "https://github.com/e3-solutions/sherlock/pull/55");
+    expect(screen.getByRole("button", { name: /Subagent session/ })).toBeInTheDocument();
     expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();
 
-    const workExpander = screen.getByRole("button", { name: "Show 3 more sessions" });
+    const workExpander = screen.getByRole("button", { name: "Show 2 more sessions" });
     expect(workExpander).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(workExpander);
     expect(workExpander).toHaveAttribute("aria-expanded", "true");

@@ -52,6 +52,18 @@ function collectPlanIndexes(value, indexes = new Set()) {
 
 async function cleanup(sql, workspaceId) {
   await sql.unsafe(
+    "delete from github.commit_pull_candidates where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
+    "delete from github.commit_pull_attempts where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
+    "delete from telemetry.scm_projections where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
     "delete from processing.telemetry_jobs where workspace_id = $1",
     [workspaceId],
   );
@@ -102,6 +114,280 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
     } finally {
       await source.close();
+    }
+  }, 30_000);
+
+  it("keeps exact pull enrichment pinned to the timeline snapshot", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 2, prepare: false });
+    let source;
+    const bucketStart = new Date(FIXED_NOW.getTime() - BUCKET_MS);
+    const observedAt = new Date(bucketStart.getTime() + 60_000);
+    const commitSha = "1".repeat(40);
+    const postTerminalSha = "3".repeat(40);
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Pull request evidence fixture')`,
+        [workspaceId, `pull-evidence-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (
+           id, workspace_id, identity_key, display_name, email
+         ) values ($1, $2, $3, 'Pull Evidence', 'pull-evidence@e3group.ai')`,
+        [personId, workspaceId, `pull-evidence-person-${personId}`],
+      );
+      await sql.unsafe(
+         `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         ) values ($1, $2, $3, 'fixture', $1::text, 'primary', 'fixture.v1', $4)`,
+        [sessionId, workspaceId, personId, bucketStart.toISOString()],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_kind,
+           source_stream_key, generation_key, generation_seq, start_offset,
+           end_offset, source_byte_count, source_sha256, storage_path,
+           storage_encoding, stored_byte_count, stored_sha256, record_count,
+           contract_version
+         ) values (
+           $1, $2, $3, 'fixture', 'rollout', $4, 'fixture-generation', 0,
+           0, 300, 300, repeat('a', 64), $5, 'identity', 300,
+           repeat('b', 64), 3, 'fixture.v1'
+         )`,
+        [batchId, workspaceId, personId, `stream-${batchId}`, `fixture/${batchId}`],
+      );
+      const records = await sql.unsafe(
+        `insert into telemetry.native_records (
+           workspace_id, batch_id, record_index, source_start_offset,
+           source_end_offset, record_sha256, parse_status, native_type,
+           native_payload_type
+         ) values
+           ($1, $2, 0, 0, 100, repeat('c', 64), 'ok', 'event_msg', 'user_message'),
+           ($1, $2, 1, 100, 200, repeat('d', 64), 'ok', 'session_meta', null),
+           ($1, $2, 2, 200, 300, repeat('e', 64), 'ok', 'session_meta', null)
+         returning id, record_index`,
+        [workspaceId, batchId],
+      );
+      const recordByIndex = new Map(records.map((row) => [Number(row.record_index), row.id]));
+      await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, source_priority, event_kind, event_subtype,
+           actor_role, occurred_at, observed_at, server_received_at,
+           message_role, message_origin, content_sha256, content_byte_size,
+           content_excerpt
+         ) values (
+           $1, $2, $3, $4, 0, 100, 'message', 'user_message', 'primary',
+           $5, $5, $5, 'user', 'human', repeat('3', 64), 27,
+           'Implement exact PR evidence'
+         )`,
+        [
+          workspaceId, sessionId, recordByIndex.get(0), NORMALIZER_VERSION,
+          observedAt.toISOString(),
+        ],
+      );
+      await sql.unsafe(
+        `insert into telemetry.scm_projections (
+           workspace_id, session_id, source_record_id, scm_version,
+           projection_status, repository_full_name, commit_sha, observed_at
+         ) values
+           ($1, $2, $3, 'sherlock.github-scm.v1', 'matched', 'e3-solutions/sherlock', $5, $7),
+           ($1, $2, $4, 'sherlock.github-scm.v1', 'matched', 'e3-solutions/sherlock', $6, $8)`,
+        [
+          workspaceId, sessionId, recordByIndex.get(1), recordByIndex.get(2),
+          commitSha, postTerminalSha, observedAt.toISOString(),
+          new Date(observedAt.getTime() + 120_000).toISOString(),
+        ],
+      );
+      const [attempt] = await sql.unsafe(
+        `insert into github.commit_pull_attempts (
+           workspace_id, lookup_version, api_version, repository_full_name,
+           commit_sha, outcome, github_repository_id, response_sha256,
+           candidate_count, created_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1', '2026-03-10',
+                   'e3-solutions/sherlock', $2, 'complete', 1001,
+                   repeat('e', 64), 1, $3)
+         returning id`,
+        [workspaceId, commitSha, new Date(FIXED_NOW.getTime() - 60_000).toISOString()],
+      );
+      await sql.unsafe(
+        `insert into github.commit_pull_candidates (
+           workspace_id, attempt_id, github_repository_id,
+           github_pull_request_id, pull_request_number, state, pull_request_created_at,
+           pull_request_closed_at
+         ) values ($1, $2, 1001, 2001, 54, 'closed', $3, $4)`,
+        [
+          workspaceId, attempt.id, bucketStart.toISOString(),
+          new Date(observedAt.getTime() + 60_000).toISOString(),
+        ],
+      );
+
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+        projectionEnabled: false,
+      });
+      const oldDay = await source.fetchDay({ now: FIXED_NOW });
+
+      const failedAt = new Date(FIXED_NOW.getTime() + 1_000);
+      await sql.unsafe(
+        `insert into github.commit_pull_attempts (
+           workspace_id, lookup_version, api_version, repository_full_name,
+           commit_sha, outcome, error_code, http_status, created_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1', '2026-03-10',
+                   'e3-solutions/sherlock', $2, 'failed',
+                   'github_lookup_http_503', 503, $3)`,
+        [workspaceId, commitSha, failedAt.toISOString()],
+      );
+
+      const oldInterval = await source.fetchInterval({
+        personId, start: bucketStart.toISOString(), snapshot: oldDay.snapshot, now: FIXED_NOW,
+      });
+      expect(oldInterval.work.find((work) => work.sessionId === sessionId))
+        .toMatchObject({ pullRequest: { number: 54 } });
+
+      const failedDay = await source.fetchDay({ now: failedAt });
+      const failedInterval = await source.fetchInterval({
+        personId, start: bucketStart.toISOString(), snapshot: failedDay.snapshot, now: failedAt,
+      });
+      expect(failedInterval.work.find((work) => work.sessionId === sessionId))
+        .not.toHaveProperty("pullRequest");
+
+      const recoveryAt = new Date(FIXED_NOW.getTime() + 2_000);
+      const recoveryCreatedAt = new Date(FIXED_NOW.getTime() - 30_000);
+      const [recoveryAttempt] = await sql.unsafe(
+        `insert into github.commit_pull_attempts (
+           workspace_id, lookup_version, api_version, repository_full_name,
+           commit_sha, outcome, github_repository_id, response_sha256,
+           candidate_count, created_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1', '2026-03-10',
+                   'e3-solutions/sherlock', $2, 'complete', 1001,
+                   repeat('7', 64), 1, $3)
+         returning id`,
+        [workspaceId, commitSha, recoveryCreatedAt.toISOString()],
+      );
+      await sql.unsafe(
+        `insert into github.commit_pull_candidates (
+           workspace_id, attempt_id, github_repository_id,
+           github_pull_request_id, pull_request_number, state,
+           pull_request_created_at, pull_request_closed_at
+         ) values ($1, $2, 1001, 2001, 54, 'closed', $3, $4)`,
+        [
+          workspaceId, recoveryAttempt.id, bucketStart.toISOString(),
+          new Date(observedAt.getTime() + 60_000).toISOString(),
+        ],
+      );
+      const recoveryDay = await source.fetchDay({ now: recoveryAt });
+      const recoveryInterval = await source.fetchInterval({
+        personId, start: bucketStart.toISOString(), snapshot: recoveryDay.snapshot,
+        now: recoveryAt,
+      });
+      expect(recoveryInterval.work.find((work) => work.sessionId === sessionId))
+        .toMatchObject({ pullRequest: { number: 54 } });
+
+      const ambiguousAt = new Date(FIXED_NOW.getTime() + 3_000);
+      const ambiguousAttempts = await sql.unsafe(
+        `insert into github.commit_pull_attempts (
+           workspace_id, lookup_version, api_version, repository_full_name,
+           commit_sha, outcome, github_repository_id, response_sha256,
+           candidate_count, created_at
+         ) values
+           ($1, 'sherlock.github-associated-pulls.v1', '2026-03-10',
+            'e3-solutions/sherlock', $2, 'complete', 1001, repeat('5', 64), 2, $4),
+           ($1, 'sherlock.github-associated-pulls.v1', '2026-03-10',
+            'e3-solutions/sherlock', $3, 'complete', 1001, repeat('6', 64), 1, $4)
+         returning id, commit_sha`,
+        [workspaceId, commitSha, postTerminalSha, ambiguousAt.toISOString()],
+      );
+      const attemptBySha = new Map(ambiguousAttempts.map((row) => [row.commit_sha, row.id]));
+      await sql.unsafe(
+        `insert into github.commit_pull_candidates (
+           workspace_id, attempt_id, github_repository_id,
+           github_pull_request_id, pull_request_number, state,
+           pull_request_created_at, pull_request_closed_at
+         ) values
+           ($1, $2, 1001, 2002, 55, 'closed', $4, $5),
+           ($1, $2, 1001, 2003, 56, 'closed', $4, $5),
+           ($1, $3, 1001, 2004, 57, 'closed', $4, $6)`,
+        [
+          workspaceId, attemptBySha.get(commitSha),
+          attemptBySha.get(postTerminalSha), bucketStart.toISOString(),
+          new Date(observedAt.getTime() + 180_000).toISOString(),
+          new Date(observedAt.getTime() + 60_000).toISOString(),
+        ],
+      );
+      const ambiguousDay = await source.fetchDay({ now: ambiguousAt });
+      const ambiguousInterval = await source.fetchInterval({
+        personId, start: bucketStart.toISOString(), snapshot: ambiguousDay.snapshot,
+        now: ambiguousAt,
+      });
+      expect(ambiguousInterval.work.find((work) => work.sessionId === sessionId))
+        .not.toHaveProperty("pullRequest");
+
+      const finalAt = new Date(FIXED_NOW.getTime() + 4_000);
+      await sql.unsafe(
+        `insert into github.commit_pull_attempts (
+           workspace_id, lookup_version, api_version, repository_full_name,
+           commit_sha, outcome, response_sha256, candidate_count, created_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1', '2026-03-10',
+                   'e3-solutions/sherlock', $2, 'complete',
+                   repeat('4', 64), 0, $3)`,
+        [workspaceId, commitSha, finalAt.toISOString()],
+      );
+      const finalDay = await source.fetchDay({ now: finalAt });
+      const finalInterval = await source.fetchInterval({
+        personId, start: bucketStart.toISOString(), snapshot: finalDay.snapshot, now: finalAt,
+      });
+      expect(finalInterval.work.find((work) => work.sessionId === sessionId))
+        .not.toHaveProperty("pullRequest");
+
+      const staleReadAt = new Date(FIXED_NOW.getTime() + 5_000);
+      const [staleAttempt] = await sql.unsafe(
+        `insert into github.commit_pull_attempts (
+           workspace_id, lookup_version, api_version, repository_full_name,
+           commit_sha, outcome, github_repository_id, response_sha256,
+           candidate_count, created_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1', '2026-03-10',
+                   'e3-solutions/sherlock', $2, 'complete', 1001,
+                   repeat('8', 64), 1, $3)
+         returning id`,
+        [
+          workspaceId, commitSha,
+          new Date(staleReadAt.getTime() - 16 * 60_000).toISOString(),
+        ],
+      );
+      await sql.unsafe(
+        `insert into github.commit_pull_candidates (
+           workspace_id, attempt_id, github_repository_id,
+           github_pull_request_id, pull_request_number, state,
+           pull_request_created_at, pull_request_closed_at
+         ) values ($1, $2, 1001, 2001, 54, 'closed', $3, $4)`,
+        [
+          workspaceId, staleAttempt.id, bucketStart.toISOString(),
+          new Date(observedAt.getTime() + 60_000).toISOString(),
+        ],
+      );
+      const staleDay = await source.fetchDay({ now: staleReadAt });
+      const staleInterval = await source.fetchInterval({
+        personId, start: bucketStart.toISOString(), snapshot: staleDay.snapshot,
+        now: staleReadAt,
+      });
+      expect(staleInterval.work.find((work) => work.sessionId === sessionId))
+        .not.toHaveProperty("pullRequest");
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
     }
   }, 30_000);
 

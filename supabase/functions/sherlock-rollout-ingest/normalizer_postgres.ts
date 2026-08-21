@@ -109,6 +109,46 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
       const normalizedSession = projection.session
         ? await upsertSession(tx, receipt, projection.session)
         : null;
+      if (
+        projection.scm_projections.some(({ projection_status }) =>
+          projection_status === "matched"
+        ) && !normalizedSession
+      ) {
+        throw new IngestError(
+          "normalization_scm_session_missing",
+          "matched SCM projections require a normalized session",
+          500,
+        );
+      }
+      const scmProjections = projection.scm_projections.map((
+        item,
+      ) => ({
+        workspace_id: receipt.workspace_id,
+        source_record_id: sourceRecords[item.record_index].id,
+        scm_version: item.scm_version,
+        projection_status: item.projection_status,
+        session_id: item.projection_status === "matched"
+          ? normalizedSession!.id
+          : null,
+        repository_full_name: item.repository_full_name,
+        commit_sha: item.commit_sha,
+        observed_at: item.observed_at,
+      }));
+      if (scmProjections.length > 0) {
+        await tx`insert into telemetry.scm_projections ${
+          tx(
+            scmProjections,
+            "workspace_id",
+            "source_record_id",
+            "scm_version",
+            "projection_status",
+            "session_id",
+            "repository_full_name",
+            "commit_sha",
+            "observed_at",
+          )
+        } on conflict (source_record_id, scm_version) do nothing`;
+      }
       const projectedEvents = normalizedSession &&
           normalizerVersion === CLAUDE_NORMALIZER_VERSION
         ? await rebindClaudePromptTurns(

@@ -3,11 +3,12 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(120);
+select plan(140);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
 select has_schema('processing', 'processing schema exists');
+select has_schema('github', 'github source schema exists');
 
 select has_table('telemetry', 'workspaces', 'workspaces table exists');
 select has_table('telemetry', 'people', 'people table exists');
@@ -15,6 +16,18 @@ select has_table('telemetry', 'sessions', 'sessions table exists');
 select has_table('telemetry', 'ingest_batches', 'ingest_batches table exists');
 select has_table('telemetry', 'native_records', 'native_records table exists');
 select has_table('telemetry', 'events', 'events table exists');
+select has_table(
+  'telemetry', 'scm_projections',
+  'SCM projections preserve matched and no-match source-record outcomes'
+);
+select has_table(
+  'github', 'commit_pull_attempts',
+  'GitHub commit lookup attempts are auditable'
+);
+select has_table(
+  'github', 'commit_pull_candidates',
+  'GitHub pull-request candidates remain tied to complete attempts'
+);
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
 select has_table(
   'analytics', 'frame_projection_receipts',
@@ -127,6 +140,97 @@ select ok(
 select ok(
   exists (select 1 from pg_roles where rolname = 'sherlock_frame_projector'),
   'frame projector role exists'
+);
+select ok(
+  exists (select 1 from pg_roles where rolname = 'sherlock_github_sync'),
+  'GitHub source sync role exists'
+);
+select ok(
+  has_table_privilege(
+    'sherlock_normalizer', 'telemetry.scm_projections', 'insert'
+  ),
+  'normalizer may append SCM projection outcomes'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_normalizer', 'telemetry.scm_projections', 'update'
+  ),
+  'normalizer cannot rewrite SCM projection outcomes'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_normalizer', 'telemetry.scm_projections', 'select'
+  ),
+  'normalizer cannot read SCM projection outcomes'
+);
+select ok(
+  has_table_privilege(
+    'sherlock_github_sync', 'telemetry.scm_projections', 'select'
+  ),
+  'GitHub sync may read exact matched SCM projections'
+);
+select ok(
+  has_table_privilege(
+    'sherlock_github_sync', 'github.commit_pull_attempts', 'insert'
+  ),
+  'GitHub sync may append lookup attempts'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_github_sync', 'github.commit_pull_attempts', 'update'
+  ),
+  'GitHub sync cannot rewrite lookup attempts'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_github_sync', 'github.commit_pull_candidates', 'delete'
+  ),
+  'GitHub sync cannot delete candidates'
+);
+select ok(
+  not has_table_privilege(
+    'sherlock_github_sync', 'github.commit_pull_candidates', 'select'
+  ),
+  'GitHub sync cannot read stored candidates'
+);
+select ok(
+  has_table_privilege(
+    'sherlock_reader', 'github.commit_pull_candidates', 'select'
+  ),
+  'read backend may resolve exact pull-request candidates'
+);
+select ok(
+  not has_schema_privilege('anon', 'github', 'usage'),
+  'anon cannot use private GitHub source facts'
+);
+select ok(
+  not has_schema_privilege('authenticated', 'github', 'usage'),
+  'authenticated cannot use private GitHub source facts'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'github.commit_pull_candidates'::regclass
+       and conname = 'commit_pull_candidates_attempt_fkey'
+       and contype = 'f'
+  ),
+  'candidate base repository identity is attempt-bound'
+);
+select ok(
+  to_regclass('telemetry.scm_projections_lookup_idx') is not null,
+  'SCM lookup has a workspace, repository, and SHA index'
+);
+select ok(
+  has_column_privilege(
+    'sherlock_processor', 'telemetry.native_records', 'native_type', 'select'
+  ),
+  'bounded SCM replay may identify session metadata records'
+);
+select ok(
+  not has_column_privilege(
+    'sherlock_processor', 'telemetry.native_records', 'record_sha256', 'select'
+  ),
+  'bounded SCM replay cannot read source record hashes'
 );
 select ok(
   exists (
@@ -864,12 +968,17 @@ begin
     to_regnamespace('telemetry') is not null and
     to_regnamespace('analytics') is not null and
     to_regnamespace('processing') is not null and
+    to_regnamespace('github') is not null and
     to_regclass('telemetry.workspaces') is not null and
     to_regclass('telemetry.people') is not null and
     to_regclass('telemetry.sessions') is not null and
     to_regclass('telemetry.ingest_batches') is not null and
     to_regclass('telemetry.native_records') is not null and
     to_regclass('telemetry.events') is not null and
+    to_regclass('telemetry.scm_projections') is not null and
+    to_regclass('telemetry.scm_projections_lookup_idx') is not null and
+    to_regclass('github.commit_pull_attempts') is not null and
+    to_regclass('github.commit_pull_candidates') is not null and
     to_regclass('analytics.activity_spans') is not null and
     to_regclass('processing.telemetry_jobs') is not null and
     (select count(*) = 5 from pg_roles where rolname in (
@@ -880,6 +989,7 @@ begin
     pg_has_role('postgres', 'sherlock_normalizer', 'member') and
     pg_has_role('postgres', 'sherlock_reducer', 'member') and
     pg_has_role('postgres', 'sherlock_processor', 'member') and
+    pg_has_role('postgres', 'sherlock_github_sync', 'member') and
     exists (
       select 1 from storage.buckets
       where id = 'telemetry-raw' and public = false
@@ -888,6 +998,8 @@ begin
     not has_schema_privilege('anon', 'analytics', 'usage') and
     not has_schema_privilege('authenticated', 'telemetry', 'usage') and
     not has_schema_privilege('authenticated', 'analytics', 'usage') and
+    not has_schema_privilege('anon', 'github', 'usage') and
+    not has_schema_privilege('authenticated', 'github', 'usage') and
     not has_schema_privilege('anon', 'processing', 'usage') and
     not has_schema_privilege('authenticated', 'processing', 'usage') and
     not has_table_privilege('anon', 'telemetry.ingest_batches', 'select') and
@@ -919,12 +1031,26 @@ begin
     not has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'delete') and
     not has_table_privilege('sherlock_normalizer', 'telemetry.events', 'update') and
     not has_table_privilege('sherlock_normalizer', 'telemetry.events', 'delete') and
+    has_table_privilege('sherlock_normalizer', 'telemetry.scm_projections', 'insert') and
+    not has_table_privilege('sherlock_normalizer', 'telemetry.scm_projections', 'select') and
+    not has_table_privilege('sherlock_normalizer', 'telemetry.scm_projections', 'update') and
+    has_table_privilege('sherlock_github_sync', 'telemetry.scm_projections', 'select') and
+    has_table_privilege('sherlock_github_sync', 'github.commit_pull_attempts', 'insert') and
+    not has_table_privilege('sherlock_github_sync', 'github.commit_pull_attempts', 'update') and
+    not has_table_privilege('sherlock_github_sync', 'github.commit_pull_candidates', 'select') and
+    not has_table_privilege('sherlock_github_sync', 'github.commit_pull_candidates', 'delete') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'delete') and
     has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'select') and
     has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'update') and
     has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'insert') and
     not has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'delete') and
+    has_column_privilege(
+      'sherlock_processor', 'telemetry.native_records', 'native_type', 'select'
+    ) and
+    not has_column_privilege(
+      'sherlock_processor', 'telemetry.native_records', 'record_sha256', 'select'
+    ) and
     not has_table_privilege('sherlock_processor', 'telemetry.ingest_batches', 'select') and
     has_schema_privilege('sherlock_processor', 'telemetry', 'usage') and
     has_column_privilege(
@@ -952,8 +1078,8 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 120,
-  'tables', 11,
+  'assertion_count', 140,
+  'tables', 14,
   'private_bucket', 'telemetry-raw'
 ) as verification;
 
