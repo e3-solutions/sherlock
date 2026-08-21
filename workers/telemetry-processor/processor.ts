@@ -13,9 +13,10 @@ import { validateStoredBatch } from "../../supabase/functions/sherlock-rollout-i
 import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";
 import {
   createPostgresPool,
+  createReservedTransactionRunner,
   remainingMilliseconds,
-  type ReservedSql,
   type Sql,
+  type TransactionRunner,
   withReservedConnection,
 } from "./database.ts";
 import type { NormalizationJob, ReductionJob, WorkloadClass } from "./queue.ts";
@@ -92,7 +93,15 @@ export class TelemetryProcessor {
       this.sql,
       deadlineAtMs,
       async (connection) => {
-        const batch = await this.loadBatch(connection, job, deadlineAtMs);
+        const transactionRunner = createReservedTransactionRunner(
+          connection,
+          () => remainingMilliseconds(deadlineAtMs),
+        );
+        const batch = await this.loadBatch(
+          transactionRunner,
+          job,
+          deadlineAtMs,
+        );
         const stored = await this.storage.download(
           batch.receipt.storage_path,
           batch.receipt.stored_byte_count,
@@ -100,8 +109,8 @@ export class TelemetryProcessor {
         );
         const source = await validateStoredBatch(batch.manifest, stored);
         remainingMilliseconds(deadlineAtMs);
-        const normalized = await new PostgresBatchNormalizer(connection)
-          .normalize(
+        const normalized = await PostgresBatchNormalizer
+          .fromReservedConnection(connection, transactionRunner).normalize(
             batch.receipt,
             batch.manifest,
             source,
@@ -109,7 +118,7 @@ export class TelemetryProcessor {
             deadlineAtMs,
           );
         const affectedSessionIds = await this.resolveAffectedSessionIds(
-          connection,
+          transactionRunner,
           job.workspace_id,
           normalized.session_ids,
           deadlineAtMs,
@@ -117,7 +126,7 @@ export class TelemetryProcessor {
         const targets: ReductionTarget[] = [];
         for (const sessionId of affectedSessionIds) {
           const targetEventId = await this.resolveSessionCutoff(
-            connection,
+            transactionRunner,
             job.workspace_id,
             sessionId,
             normalized.normalizer_version,
@@ -147,8 +156,15 @@ export class TelemetryProcessor {
     const reduced = await withReservedConnection(
       this.sql,
       deadlineAtMs,
-      (connection) =>
-        new PostgresActivityReducer(connection).reduceSession({
+      (connection) => {
+        const transactionRunner = createReservedTransactionRunner(
+          connection,
+          () => remainingMilliseconds(deadlineAtMs),
+        );
+        return PostgresActivityReducer.fromReservedConnection(
+          connection,
+          transactionRunner,
+        ).reduceSession({
           workspaceId: job.workspace_id,
           sessionId: job.session_id,
           normalizerVersion: job.normalizer_version,
@@ -157,7 +173,8 @@ export class TelemetryProcessor {
           eventPageSize: 1_000,
           statementTimeoutMs: maximumDurationMs,
           deadlineAtMs,
-        }),
+        });
+      },
     );
     const remaining = remainingMilliseconds(deadlineAtMs);
     const projected = await this.frameProjector.projectSession({
@@ -176,11 +193,11 @@ export class TelemetryProcessor {
   }
 
   private async loadBatch(
-    sql: ReservedSql,
+    transactionRunner: TransactionRunner,
     job: NormalizationJob,
     deadlineAtMs: number,
   ): Promise<StoredBatch> {
-    return await sql.begin(async (tx) => {
+    return await transactionRunner(async (tx) => {
       await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
       await tx.unsafe("set local role sherlock_normalizer");
       const batches = await tx.unsafe(
@@ -276,13 +293,13 @@ export class TelemetryProcessor {
   }
 
   private async resolveSessionCutoff(
-    sql: ReservedSql,
+    transactionRunner: TransactionRunner,
     workspaceId: string,
     sessionId: string,
     normalizerVersion: string,
     deadlineAtMs: number,
   ): Promise<bigint> {
-    return await sql.begin(async (tx) => {
+    return await transactionRunner(async (tx) => {
       await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
       await tx.unsafe("set local role sherlock_normalizer");
       const rows = await tx.unsafe(
@@ -297,13 +314,13 @@ export class TelemetryProcessor {
   }
 
   private async resolveAffectedSessionIds(
-    sql: ReservedSql,
+    transactionRunner: TransactionRunner,
     workspaceId: string,
     normalizedSessionIds: readonly string[],
     deadlineAtMs: number,
   ): Promise<string[]> {
     if (normalizedSessionIds.length === 0) return [];
-    return await sql.begin(async (tx) => {
+    return await transactionRunner(async (tx) => {
       await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
       await tx.unsafe("set local role sherlock_normalizer");
       const rows = await tx.unsafe(

@@ -17,6 +17,7 @@ import {
   recordLocatorFromRow,
   reduceAffectedSessions,
 } from "./processor.ts";
+import { createReservedTransactionRunner } from "./database.ts";
 const railwayConfig = await Deno.readTextFile(
   new URL("../../railway.toml", import.meta.url),
 );
@@ -104,6 +105,118 @@ Deno.test("connection pools and overload reservations stay within bounds", () =>
     }
     assert(rejected, JSON.stringify(invalid));
   }
+});
+
+Deno.test("reserved transactions commit without pool transaction methods", async () => {
+  const calls: string[] = [];
+  let poolMethodCalls = 0;
+  const connection = {
+    unsafe(sql: string) {
+      calls.push(sql);
+      return Promise.resolve([]);
+    },
+    begin() {
+      poolMethodCalls += 1;
+      throw new Error("reserved connections do not support begin");
+    },
+    reserve() {
+      poolMethodCalls += 1;
+      throw new Error("must not acquire a nested connection");
+    },
+  };
+  const run = createReservedTransactionRunner(connection as never);
+  const result = await run(async (tx) => {
+    await tx.unsafe("work");
+    return 42;
+  });
+  assert(result === 42);
+  assert(calls.join(",") === "begin,work,commit");
+  assert(poolMethodCalls === 0);
+});
+
+Deno.test("reserved transactions roll back and preserve the work error", async () => {
+  const calls: string[] = [];
+  const workError = new Error("work failed");
+  const connection = {
+    unsafe(sql: string) {
+      calls.push(sql);
+      if (sql === "rollback") {
+        return Promise.reject(new Error("rollback also failed"));
+      }
+      return Promise.resolve([]);
+    },
+  };
+  const run = createReservedTransactionRunner(connection as never);
+  let caught: unknown;
+  try {
+    await run(async (tx) => {
+      await tx.unsafe("work");
+      throw workError;
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught === workError);
+  assert(calls.join(",") === "begin,work,rollback");
+});
+
+Deno.test("reserved transaction BEGIN failure does not issue ROLLBACK", async () => {
+  const calls: string[] = [];
+  const beginError = new Error("begin failed");
+  const run = createReservedTransactionRunner({
+    unsafe(sql: string) {
+      calls.push(sql);
+      return Promise.reject(beginError);
+    },
+  } as never);
+  let caught: unknown;
+  try {
+    await run(() => Promise.resolve(undefined));
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught === beginError);
+  assert(calls.join(",") === "begin");
+});
+
+Deno.test("reserved transaction COMMIT failure rolls back the same session", async () => {
+  const calls: string[] = [];
+  const commitError = new Error("commit failed");
+  const run = createReservedTransactionRunner({
+    unsafe(sql: string) {
+      calls.push(sql);
+      if (sql === "commit") return Promise.reject(commitError);
+      return Promise.resolve([]);
+    },
+  } as never);
+  let caught: unknown;
+  try {
+    await run(async (tx) => {
+      await tx.unsafe("work");
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught === commitError);
+  assert(calls.join(",") === "begin,work,commit,rollback");
+});
+
+Deno.test("reserved transaction runner rejects nesting and cleans up", async () => {
+  const calls: string[] = [];
+  const run = createReservedTransactionRunner({
+    unsafe(sql: string) {
+      calls.push(sql);
+      return Promise.resolve([]);
+    },
+  } as never);
+  let message = "";
+  try {
+    await run(async () => await run(() => Promise.resolve(undefined)));
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  assert(message === "nested reserved transactions are not supported");
+  assert(calls.join(",") === "begin,rollback");
 });
 
 Deno.test("Railway rebuilds only for the complete worker dependency closure", () => {

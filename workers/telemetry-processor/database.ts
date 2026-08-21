@@ -2,6 +2,10 @@ import postgres from "npm:postgres@3.4.7";
 
 export type Sql = ReturnType<typeof postgres>;
 export type ReservedSql = Awaited<ReturnType<Sql["reserve"]>>;
+export type TransactionSql = postgres.TransactionSql;
+export interface TransactionRunner {
+  <T>(callback: (tx: TransactionSql) => Promise<T>): Promise<T>;
+}
 
 export class ProcessingDeadlineError extends Error {
   readonly code = "processing_deadline_exceeded";
@@ -68,4 +72,42 @@ export async function withReservedConnection<T>(
   } finally {
     connection.release();
   }
+}
+
+export function createReservedTransactionRunner(
+  connection: ReservedSql,
+  beforeBoundary: () => void = () => {},
+): TransactionRunner {
+  let transactionOpen = false;
+  return async <T>(
+    callback: (tx: TransactionSql) => Promise<T>,
+  ): Promise<T> => {
+    if (transactionOpen) {
+      throw new Error("nested reserved transactions are not supported");
+    }
+    transactionOpen = true;
+    try {
+      beforeBoundary();
+      await connection.unsafe("begin");
+      let result: T;
+      try {
+        result = await callback(connection as unknown as TransactionSql);
+        beforeBoundary();
+        await connection.unsafe("commit");
+      } catch (error) {
+        try {
+          await connection.unsafe("rollback");
+        } catch {
+          // Preserve the callback/commit/deadline error. Releasing the
+          // reservation remains the caller's responsibility.
+        }
+        throw error;
+      }
+      return result;
+    } finally {
+      // BEGIN failure has no transaction to roll back. All post-BEGIN failure
+      // paths attempt ROLLBACK above before the runner can be reused.
+      transactionOpen = false;
+    }
+  };
 }

@@ -17,6 +17,14 @@ import type { NormalizationResult } from "./service.ts";
 
 type Sql = ReturnType<typeof postgres>;
 type TransactionSql = postgres.TransactionSql;
+export interface NormalizerTransactionRunner {
+  <T>(callback: (tx: TransactionSql) => Promise<T>): Promise<T>;
+}
+
+function pooledTransactionRunner(sql: Sql): NormalizerTransactionRunner {
+  return <T>(callback: (tx: TransactionSql) => Promise<T>) =>
+    sql.begin(callback) as Promise<T>;
+}
 
 export function normalizationStatementTimeout(
   statementTimeoutMs?: number,
@@ -84,16 +92,31 @@ const EVENT_COLUMNS = [
 ] as const;
 
 export class PostgresBatchNormalizer implements BatchNormalizer {
-  constructor(private readonly sql: Sql) {}
+  constructor(
+    private readonly sql: Sql,
+    private readonly transactionRunner: NormalizerTransactionRunner =
+      pooledTransactionRunner(sql),
+    private readonly ownsSql = true,
+  ) {}
 
   static connect(databaseUrl: string): PostgresBatchNormalizer {
-    return new PostgresBatchNormalizer(
-      postgres(databaseUrl, { prepare: false, max: 2, idle_timeout: 20 }),
-    );
+    const sql = postgres(databaseUrl, {
+      prepare: false,
+      max: 2,
+      idle_timeout: 20,
+    });
+    return new PostgresBatchNormalizer(sql);
+  }
+
+  static fromReservedConnection(
+    sql: Sql,
+    transactionRunner: NormalizerTransactionRunner,
+  ): PostgresBatchNormalizer {
+    return new PostgresBatchNormalizer(sql, transactionRunner, false);
   }
 
   async close(): Promise<void> {
-    await this.sql.end();
+    if (this.ownsSql) await this.sql.end();
   }
 
   async normalize(
@@ -109,7 +132,7 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
       statementTimeoutMs,
       deadlineAtMs,
     );
-    return await this.sql.begin(async (tx) => {
+    return await this.transactionRunner(async (tx) => {
       if (timeout !== undefined) {
         await tx.unsafe("select set_config('statement_timeout', $1, true)", [
           `${Math.max(1, Math.floor(timeout))}ms`,
