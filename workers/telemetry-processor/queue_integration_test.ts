@@ -198,7 +198,7 @@ Deno.test({
          ) values (
            gen_random_uuid(), $1, $2, 'queue-plan-collector', 'claude_code',
            'transcript', 'queue-plan-stream', 'queue-plan-generation', 0,
-           0, 2, 1, repeat('f', 64),
+           0, 2, 2, repeat('f', 64),
            'queue-plan/' || ($1::uuid)::text || '/same-offset.jsonl.gz',
            'gzip', 1, repeat('0', 64), 1,
            'sherlock.transcript-batch.v1', now(), now(), 'backfill'
