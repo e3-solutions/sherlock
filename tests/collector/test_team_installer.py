@@ -19,6 +19,7 @@ UNIFIED_INSTALLER = ROOT / "sherlock"
 FAKE_CODEX = r'''#!/usr/bin/env python3
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -47,10 +48,28 @@ if sys.argv[1:4] == ["plugin", "marketplace", "remove"]:
     raise SystemExit(0)
 if sys.argv[1:4] == ["plugin", "marketplace", "add"]:
     record({"argv": sys.argv[1:]})
+    codex_home = Path(os.environ["CODEX_HOME"])
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "fake-marketplace-root").write_text(
+        sys.argv[4], encoding="utf-8"
+    )
     print('{"ok":true}')
     raise SystemExit(0)
 if sys.argv[1:3] == ["plugin", "add"]:
     record({"argv": sys.argv[1:]})
+    codex_home = Path(os.environ["CODEX_HOME"])
+    marketplace_root = Path(
+        (codex_home / "fake-marketplace-root").read_text(encoding="utf-8")
+    )
+    installed = (
+        codex_home
+        / "plugins"
+        / "cache"
+        / "sherlock"
+        / "sherlock"
+        / "v1"
+    )
+    shutil.copytree(marketplace_root / "plugins" / "sherlock", installed)
     print('{"ok":true}')
     raise SystemExit(0)
 if sys.argv[1:] == ["--version"]:
@@ -867,6 +886,31 @@ class TeamInstallerTests(unittest.TestCase):
                 )
             )
             self.assertNotIn("other@market", json.dumps(edits))
+            installed_hooks = json.loads(
+                (
+                    codex_home
+                    / "plugins"
+                    / "cache"
+                    / "sherlock"
+                    / "sherlock"
+                    / "v1"
+                    / "hooks"
+                    / "hooks.json"
+                ).read_text(encoding="utf-8")
+            )["hooks"]
+            for event_name, entries in installed_hooks.items():
+                with self.subTest(event_name=event_name):
+                    hook = subprocess.run(
+                        entries[0]["hooks"][0]["command"],
+                        shell=True,
+                        input="{}",
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                    )
+                    self.assertEqual(hook.returncode, 0, hook.stderr)
+                    self.assertEqual(hook.stdout, '{"continue":true}\n')
 
     def test_one_command_installs_claude_plugin_and_runtime(self):
         with TemporaryDirectory() as temporary:
