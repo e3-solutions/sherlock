@@ -24,7 +24,7 @@ atomic complete-batch candidate submission, and one fixed-high-water candidate
 listing. Sherlock never performs candidate analysis or persists review
 decisions. Candidate free text is bounded and structurally validated but
 remains untrusted, potentially sensitive, and not semantically sanitized.
-Requests are capped at 262,144 body bytes before MCP parsing. Submission alone
+Requests are capped at 2,097,152 body bytes before MCP parsing. Submission alone
 is process-locally limited to 10 attempts per workspace per rolling 60 seconds;
 evidence and listing calls are unaffected and the limiter resets on restart.
 
@@ -216,16 +216,25 @@ Set `SHERLOCK_MCP_TOKEN` to a random bearer of at least 32 characters. Set
 least 32 characters. Clients receive only the bearer; the cursor secret remains
 inside the dashboard process and authenticates workspace/version/high-water
 cursor state. Browser-origin requests are rejected. Declared and chunked MCP
-request bodies are capped at 262,144 bytes before protocol handling.
+request bodies are capped at 2,097,152 bytes before protocol handling.
 
 Usage cursors bind one exact cached v2 snapshot and expire when it refreshes.
 Candidate-list cursors bind one authenticated workspace high-water mark, so
-later inserts cannot enter that traversal. The first two tools return bounded
-observed evidence. `submit_candidate_batch` atomically persists one complete
-ordered batch of zero to 50 structurally validated untrusted claims, and
+later inserts cannot enter that traversal; an optional receipt `submissionId`
+is also authenticated into the cursor and restricts the traversal to that
+batch. The first two tools return bounded
+observed evidence. `submit_candidate_batch` atomically persists one
+agent-declared-complete ordered batch of zero to 50 structurally validated
+untrusted claims, and
 `list_bottleneck_candidates` deterministically reads those immutable product
-facts. Submission is process-locally limited to 10 attempts per workspace per
+facts. The completeness literal is itself an untrusted agent declaration about
+the conversationally recorded method, not a server-verified claim of exhaustive
+prompt coverage. Submission is process-locally limited to 10 attempts per workspace per
 rolling 60 seconds; evidence and list calls are unaffected.
+
+Tool results expose the same full JSON payload in MCP text content and
+`structuredContent`, preserving compatibility with both text-only and typed
+structured-output clients.
 
 The dashboard performs no semantic analysis, ranking, inference, clustering,
 identity verification, or review-decision persistence. Prompt excerpts and
@@ -244,6 +253,9 @@ edge from `postgres`, granted by `supabase_admin`. Readiness accepts only its
 exact `ADMIN true`, `INHERIT false`, `SET false` posture;
 `sherlock_worker_login` remains the only `SET`-capable runtime member. Any other
 inbound writer membership or option change fails readiness.
+Successful product-readiness receipts are cached for at most 30 seconds and
+unavailable receipts for at most one second; an expired entry blocks on one
+coalesced refresh rather than serving stale readiness.
 
 ## Local verification
 

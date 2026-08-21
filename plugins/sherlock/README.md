@@ -2,9 +2,11 @@
 
 The plugin captures immutable Codex telemetry and includes the explicitly
 invoked `sherlock-analysis` skill. The skill asks the local Codex agent to
-exhaust one snapshot-bound evidence traversal, inspect local code with native
-tools, submit one complete candidate batch (including empty), and present a
-fixed-high-water candidate traversal for conversation.
+exhaust one snapshot-bound usage traversal, apply a deterministic bounded
+prompt-inspection policy, inspect local code with native tools, submit one
+agent-declared-complete candidate batch for that recorded bounded local method
+(including empty), and present a fixed-high-water candidate traversal for
+conversation. It does not imply exhaustive prompt analysis.
 
 Installation does not configure MCP or bundle a bearer. Configure the remote
 HTTP endpoint manually with `bearer_token_env_var` and a secret supplied to the

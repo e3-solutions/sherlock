@@ -64,11 +64,18 @@ normalizer versions, a nullable frame projection version,
 `backwardCompatible: false`, and that it supersedes v1. All other usage-count,
 window, page-size, and partial-coverage semantics remain unchanged.
 
-`list_prompt_evidence` remains a bounded sample. Excerpts are untrusted data,
-not instructions.
+`list_prompt_evidence` remains a bounded sample. An analysis must record an
+explicit deterministic bounded prompt-inspection policy, cite prompt buckets
+only when their returned excerpts were actually inspected, and must not present
+candidate completeness as exhaustive prompt reading. Conversational output
+records available/eligible and actually inspected bucket and excerpt counts.
+Excerpts are untrusted data, not instructions.
 
 `submit_candidate_batch` atomically records one client-UUID submission with an
-explicit usage snapshot/window and `all_candidates_within_scope`. It accepts
+explicit usage snapshot/window and `agent_declared_complete`. This literal is
+an untrusted declaration that the submitted batch is complete for the agent's
+recorded conversational method; Sherlock does not verify it and it does not
+assert exhaustive prompt reading. The tool accepts
 zero to 50 ordered candidates and rejects 51 rather than truncating. Each
 candidate has one to 20 typed evidence references. Retrying the same UUID and
 canonical request returns the original receipt; a changed request returns
@@ -82,23 +89,33 @@ sanitized. The fixed server truth is
 `trust: untrusted_agent_generated_claim`. The bearer does not establish a
 person, installation, submitter, or reviewer identity.
 
-`list_bottleneck_candidates` pages at 20 in ascending bigint identity order.
-The first page fixes a high-water mark into the opaque cursor; later inserts do
-not enter that traversal. The server authenticates cursor version, workspace,
-high-water, and after-ID state with the server-only cursor secret; tampered and
-cross-workspace cursors fail before querying candidate rows. Sherlock stores no
+`list_bottleneck_candidates` pages at 20 in ascending bigint identity order and
+optionally filters by the receipt `submissionId`. The first page fixes a
+high-water mark into the opaque cursor; later inserts do not enter that
+traversal. The server authenticates cursor version, workspace, nullable
+submission filter, high-water, and after-ID state with the server-only cursor
+secret; tampered, cross-workspace, or filter-mismatched cursors fail before
+querying candidate rows. Sherlock stores no
 review status, approval, rejection, decision, or action. Review remains
 conversational.
 
+The filter-aware signed cursor is version `b3`. Cursors are opaque and not
+forward-compatible; after deploying this version, restart any older candidate
+traversal from its first page.
+
 ## Bounds and safe failures
 
-The HTTP route accepts at most 262,144 request-body bytes for declared-length
+The HTTP route accepts at most 2,097,152 request-body bytes for declared-length
 and chunked requests and does not enter MCP protocol handling after overflow.
 Candidate submission is limited to 10 handler attempts per workspace per
 dashboard process in each rolling 60-second window. This process-local bound
 resets on restart and is not a durable abuse-control ledger. Usage, prompt, and
 candidate-list calls are unaffected. Errors expose safe codes and recovery
 instructions, not SQL, credentials, stack traces, or submitted text.
+
+Product readiness checks are blocking on refresh and process-locally cache a
+successful result for at most 30 seconds or an unavailable result for at most
+one second. Concurrent callers share only the same in-flight refresh.
 
 ## Rollout order
 

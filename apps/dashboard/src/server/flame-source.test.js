@@ -817,7 +817,8 @@ describe("Sherlock Flame payload", () => {
   it("returns bounded semantic-role work rows for one interval", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
-    const personId = "22222222-2222-4222-8222-222222222222";
+    const personId = "018f22e2-79b0-8cc3-98c4-dc0c0c07398f";
+    const requestedPersonId = personId.toUpperCase();
     const sessionId = "33333333-3333-4333-8333-333333333333";
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
@@ -843,14 +844,16 @@ describe("Sherlock Flame payload", () => {
     const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 
     const interval = await source.fetchInterval({
-      personId,
+      personId: requestedPersonId,
       start: START.toISOString(),
       snapshot,
     });
 
     expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[1][1][6]).toBe(personId);
     expect(unsafe.mock.calls[1][1].at(-1)).toBe(201);
     expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[2][1][6]).toBe(personId);
     expect(unsafe.mock.calls[2][1].at(-1)).toBe(201);
     expect(interval).toMatchObject({
       personId,
@@ -1103,6 +1106,49 @@ describe("Sherlock Flame payload", () => {
       excerpt: "Short",
       excerptTruncated: true,
     });
+  });
+
+  it("accepts exact Zod prompt UUIDs canonically and rejects other variants", async () => {
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+    for (const personId of [
+      "018f22e2-79b0-7cc3-98c4-dc0c0c07398f",
+      "018f22e2-79b0-8cc3-98c4-dc0c0c07398f",
+      "00000000-0000-0000-0000-000000000000",
+      "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    ]) {
+      const source = Object.create(DirectFlameSource.prototype);
+      source.workspaceId = "11111111-1111-4111-8111-111111111111";
+      const unsafe = vi.fn()
+        .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+        .mockResolvedValueOnce([]);
+      source.transaction = (callback) => callback({
+        unsafe,
+        array: (values) => values,
+      });
+
+      await expect(source.fetchPromptEvidence({
+        personId: personId.toUpperCase(),
+        start: START.toISOString(),
+        snapshot,
+      })).resolves.toMatchObject({ personId });
+      expect(unsafe.mock.calls[1][1][6]).toBe(personId);
+    }
+
+    for (const personId of [
+      "018f22e2-79b0-0cc3-98c4-dc0c0c07398f",
+      "018f22e2-79b0-9cc3-98c4-dc0c0c07398f",
+      "018f22e2-79b0-7cc3-78c4-dc0c0c07398f",
+    ]) {
+      const source = Object.create(DirectFlameSource.prototype);
+      source.workspaceId = "11111111-1111-4111-8111-111111111111";
+      source.transaction = vi.fn();
+      await expect(source.fetchPromptEvidence({
+        personId,
+        start: START.toISOString(),
+        snapshot,
+      })).rejects.toMatchObject({ code: "flame_prompt_request_invalid" });
+      expect(source.transaction).not.toHaveBeenCalled();
+    }
   });
 
   it("serves a v2 MCP sample from projected prompt identities", async () => {

@@ -147,7 +147,7 @@ select ok(
           and product_function.prorettype = 'boolean'::regtype
           and product_function.provolatile = 'i'
           and product_function.proisstrict
-          and md5(product_function.prosrc) = '159c970f44390bc15d287c611924e57b'
+          and md5(product_function.prosrc) = '7cbea8e215fc261adc13fa4e52e14ad7'
         when 'product.enforce_bottleneck_candidate_count()'::regprocedure then
           product_function.pronargs = 0
           and product_function.prorettype = 'trigger'::regtype
@@ -667,7 +667,7 @@ select ok(
           when 'bottleneck_reports.bottleneck_reports_scope_snapshot_token_check'
             then '1d8f539474fc619b9146e461cc4c215c'
           when 'bottleneck_reports.bottleneck_reports_scope_completeness_check'
-            then 'ca055b5efbf5da2c4974ef8f79b5c91c'
+            then '176d3ab604eb78670837118e401f8480'
           when 'bottleneck_reports.bottleneck_reports_candidate_count_check'
             then 'de60cc02913cef93177813ba41868168'
           when 'bottleneck_reports.bottleneck_reports_id_positive_check'
@@ -783,7 +783,7 @@ insert into product.bottleneck_reports (
   'f0000000-0000-4000-8000-000000000001',
   'f0000000-0000-4000-8000-000000000002', repeat('a', 64), 'snapshot',
   '2026-08-20T00:00:00Z', '2026-08-21T00:00:00Z', '2026-08-21T00:00:01Z',
-  'all_candidates_within_scope', 0
+  'agent_declared_complete', 0
 );
 set constraints all immediate;
 select results_eq(
@@ -802,9 +802,21 @@ select throws_ok(
 select ok(
   product.valid_bottleneck_evidence_refs(
     '[{"type":"usage_summary","personId":"f0000000-0000-4000-8000-000000000001"},
-      {"type":"prompt_bucket","personId":"f0000000-0000-4000-8000-000000000001","bucketStart":"2026-08-20T00:00:00.000Z"}]'::jsonb
+      {"type":"prompt_bucket","personId":"018f22e2-79b0-7000-8000-000000000001","bucketStart":"2026-08-20T00:00:00.000Z"},
+      {"type":"usage_summary","personId":"018f22e2-79b0-8000-8000-000000000001"},
+      {"type":"usage_summary","personId":"00000000-0000-0000-0000-000000000000"},
+      {"type":"usage_summary","personId":"ffffffff-ffff-ffff-ffff-ffffffffffff"}]'::jsonb
+  )
+  and not product.valid_bottleneck_evidence_refs(
+    '[{"type":"usage_summary","personId":"018f22e2-79b0-0000-8000-000000000001"}]'::jsonb
+  )
+  and not product.valid_bottleneck_evidence_refs(
+    '[{"type":"usage_summary","personId":"018f22e2-79b0-9000-8000-000000000001"}]'::jsonb
+  )
+  and not product.valid_bottleneck_evidence_refs(
+    '[{"type":"usage_summary","personId":"018f22e2-79b0-7000-7000-000000000001"}]'::jsonb
   ),
-  'typed evidence references accept the two exact variants in order'
+  'typed evidence references accept exact Zod UUID variants and reject v0, v9, and invalid variants'
 );
 select ok(
   not product.valid_bottleneck_evidence_refs(
@@ -821,7 +833,7 @@ select throws_ok(
       -1, 'f0000000-0000-4000-8000-000000000001',
       'f0000000-0000-4000-8000-000000000010', repeat('c', 64), 'snapshot',
       '2026-08-20T00:00:00Z', '2026-08-21T00:00:00Z',
-      '2026-08-21T00:00:01Z', 'all_candidates_within_scope', 0
+      '2026-08-21T00:00:01Z', 'agent_declared_complete', 0
     )$$,
   '23514',
   'new row for relation "bottleneck_reports" violates check constraint "bottleneck_reports_id_positive_check"',
@@ -850,7 +862,7 @@ select throws_ok(
       'f0000000-0000-4000-8000-000000000001',
       'f0000000-0000-4000-8000-000000000011', repeat('d', 64), 'snapshot',
       '-infinity', '2026-08-21T00:00:00Z', '2026-08-21T00:00:01Z',
-      'all_candidates_within_scope', 0
+      'agent_declared_complete', 0
     )$$,
   '23514',
   'new row for relation "bottleneck_reports" violates check constraint "bottleneck_reports_scope_window_start_finite_check"',
@@ -865,7 +877,7 @@ select throws_ok(
       'f0000000-0000-4000-8000-000000000001',
       'f0000000-0000-4000-8000-000000000012', repeat('e', 64), 'snapshot',
       '2026-08-20T00:00:00Z', 'infinity', 'infinity',
-      'all_candidates_within_scope', 0
+      'agent_declared_complete', 0
     )$$,
   '23514',
   'new row for relation "bottleneck_reports" violates check constraint "bottleneck_reports_scope_read_at_finite_check"',
@@ -880,7 +892,7 @@ select throws_ok(
       'f0000000-0000-4000-8000-000000000001',
       'f0000000-0000-4000-8000-000000000013', repeat('f', 64), 'snapshot',
       '2026-08-20T00:00:00Z', '2026-08-21T00:00:00Z', 'infinity',
-      'all_candidates_within_scope', 0
+      'agent_declared_complete', 0
     )$$,
   '23514',
   'new row for relation "bottleneck_reports" violates check constraint "bottleneck_reports_scope_read_at_finite_check"',
@@ -895,7 +907,7 @@ select throws_ok(
       'f0000000-0000-4000-8000-000000000001',
       'f0000000-0000-4000-8000-000000000014', repeat('1', 64), 'snapshot',
       '2026-08-20T00:00:00Z', '2026-08-21T00:00:00Z',
-      '2026-08-21T00:00:01Z', 'all_candidates_within_scope', 0, 'infinity'
+      '2026-08-21T00:00:01Z', 'agent_declared_complete', 0, 'infinity'
     )$$,
   '23514',
   'new row for relation "bottleneck_reports" violates check constraint "bottleneck_reports_created_at_finite_check"',
@@ -926,7 +938,7 @@ insert into product.bottleneck_reports (
   'f0000000-0000-4000-8000-000000000001',
   'f0000000-0000-4000-8000-000000000003', repeat('b', 64), 'mismatch-snapshot',
   '2026-08-20T00:00:00Z', '2026-08-21T00:00:00Z', '2026-08-21T00:00:01Z',
-  'all_candidates_within_scope', 2
+  'agent_declared_complete', 2
 );
 insert into product.bottleneck_candidates (
   workspace_id, report_id, ordinal, candidate_key, title, claim, evidence_refs

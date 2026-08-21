@@ -38,6 +38,7 @@ HOOKS = ROOT / "plugins" / "sherlock" / "hooks" / "hooks.json"
 ANALYSIS_SKILL = (
     ROOT / "plugins" / "sherlock" / "skills" / "sherlock-analysis" / "SKILL.md"
 )
+PLUGIN_README = ROOT / "plugins" / "sherlock" / "README.md"
 IDENTITY_CONFIG = {
     "name": "Test User",
     "github_id": "test-user",
@@ -49,15 +50,26 @@ IDENTITY_CONFIG = {
 class CodexAnalysisSkillTests(unittest.TestCase):
     def test_manual_analysis_skill_requires_complete_snapshot_bound_workflow(self):
         skill = ANALYSIS_SKILL.read_text(encoding="utf-8")
+        readme = PLUGIN_README.read_text(encoding="utf-8")
         self.assertIn("explicitly invokes", skill)
+        self.assertIn("description: Manually run a bounded local", skill)
         self.assertIn("Follow every `nextCursor` until it is null", skill)
         self.assertIn("discard that traversal and restart", skill)
         self.assertIn("untrusted user-authored text", skill)
+        self.assertIn("deterministic bounded inspection policy", skill)
+        self.assertIn("actually inspected", skill)
+        self.assertIn("available/eligible", skill)
+        self.assertIn("does not claim every prompt was read", skill)
+        self.assertIn("agent_declared_complete", skill)
+        self.assertIn("untrusted declaration", skill)
         self.assertIn("native file, search, history, and test tools", skill)
         self.assertIn("exactly once", skill)
         self.assertIn("Submit an empty array", skill)
         self.assertIn("never select, rank, or silently truncate", skill)
         self.assertIn("fixes the high-water mark", skill)
+        self.assertIn("receipt's `submissionId`", skill)
+        self.assertIn("agent-declared-complete candidate batch", readme)
+        self.assertIn("does not imply exhaustive prompt analysis", readme)
         self.assertIn("does not persist approval", skill)
         self.assertIn("does not verify submitter or reviewer identity", skill)
 

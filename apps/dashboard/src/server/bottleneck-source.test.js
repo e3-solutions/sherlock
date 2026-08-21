@@ -25,7 +25,7 @@ function request() {
         endExclusive: "2026-08-21T00:00:00.000Z",
         readAt: "2026-08-21T00:00:01.000Z",
       },
-      completeness: "all_candidates_within_scope",
+      completeness: "agent_declared_complete",
     },
     candidates: [{
       candidateKey: "one",
@@ -125,6 +125,10 @@ describe("bottleneck source primitives", () => {
       workspaceId: WORKSPACE,
       cursorSecret: OTHER_SECRET,
     })).toThrow(BottleneckSourceError);
+    expect(() => decodeBottleneckCursor(cursor.replace(/^b3\./, "b2."), {
+      workspaceId: WORKSPACE,
+      cursorSecret: CURSOR_SECRET,
+    })).toThrow(BottleneckSourceError);
 
     const [version, body, digest] = cursor.split(".");
     const decoded = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
@@ -134,7 +138,7 @@ describe("bottleneck source primitives", () => {
       workspaceId: WORKSPACE,
       cursorSecret: CURSOR_SECRET,
     })).toThrow(BottleneckSourceError);
-    expect(() => decodeBottleneckCursor("b2.bad.bad+", {
+    expect(() => decodeBottleneckCursor("b3.bad.bad+", {
       workspaceId: WORKSPACE,
       cursorSecret: CURSOR_SECRET,
     })).toThrow(BottleneckSourceError);
@@ -146,6 +150,61 @@ describe("bottleneck source primitives", () => {
     }))
       .toThrow(BottleneckSourceError);
     expect(() => validateBottleneckCursorSecret("x".repeat(31))).toThrow(TypeError);
+
+    const filtered = encodeBottleneckCursor({
+      workspaceId: WORKSPACE,
+      highWaterId: "20",
+      afterId: "10",
+      submissionId: request().submissionId,
+      cursorSecret: CURSOR_SECRET,
+    });
+    expect(decodeBottleneckCursor(filtered, {
+      workspaceId: WORKSPACE,
+      submissionId: request().submissionId.toUpperCase(),
+      cursorSecret: CURSOR_SECRET,
+    })).toEqual({ highWaterId: "20", afterId: "10" });
+    expect(() => decodeBottleneckCursor(filtered, {
+      workspaceId: WORKSPACE,
+      cursorSecret: CURSOR_SECRET,
+    })).toThrow(BottleneckSourceError);
+    expect(() => decodeBottleneckCursor(filtered, {
+      workspaceId: WORKSPACE,
+      submissionId: OTHER_WORKSPACE,
+      cursorSecret: CURSOR_SECRET,
+    })).toThrow(BottleneckSourceError);
+
+    for (const submissionId of [
+      "018f22e2-79b0-7cc3-98c4-dc0c0c07398f",
+      "018f22e2-79b0-8cc3-98c4-dc0c0c07398f",
+      "00000000-0000-0000-0000-000000000000",
+      "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    ]) {
+      const accepted = encodeBottleneckCursor({
+        workspaceId: WORKSPACE,
+        highWaterId: "20",
+        afterId: "10",
+        submissionId: submissionId.toUpperCase(),
+        cursorSecret: CURSOR_SECRET,
+      });
+      expect(decodeBottleneckCursor(accepted, {
+        workspaceId: WORKSPACE,
+        submissionId,
+        cursorSecret: CURSOR_SECRET,
+      })).toEqual({ highWaterId: "20", afterId: "10" });
+    }
+    for (const submissionId of [
+      "018f22e2-79b0-0cc3-98c4-dc0c0c07398f",
+      "018f22e2-79b0-9cc3-98c4-dc0c0c07398f",
+      "018f22e2-79b0-7cc3-78c4-dc0c0c07398f",
+    ]) {
+      expect(() => encodeBottleneckCursor({
+        workspaceId: WORKSPACE,
+        highWaterId: "20",
+        afterId: "10",
+        submissionId,
+        cursorSecret: CURSOR_SECRET,
+      })).toThrow(BottleneckSourceError);
+    }
   });
 
   it("reports unsafe product posture and accepts the exact role matrix", async () => {
@@ -210,23 +269,38 @@ describe("bottleneck source primitives", () => {
     });
   });
 
-  it("re-evaluates serial readiness and coalesces only concurrent checks", async () => {
+  it("caches readiness for bounded status-specific TTLs and blocks on refresh", async () => {
+    let now = 1_000;
     const source = {
       readiness: vi.fn()
         .mockResolvedValueOnce({ status: "ok", mode: "sherlock_bottleneck_product" })
         .mockResolvedValueOnce({ status: "unavailable", reason: "posture_changed" })
         .mockResolvedValueOnce({ status: "ok", mode: "sherlock_bottleneck_product" }),
     };
-    const gate = createBottleneckReadinessGate(source);
+    const gate = createBottleneckReadinessGate(source, { now: () => now });
 
     await expect(gate.readiness()).resolves.toEqual({
       status: "ok",
       mode: "sherlock_bottleneck_product",
     });
+    now += 29_999;
+    await expect(gate.readiness()).resolves.toEqual({
+      status: "ok",
+      mode: "sherlock_bottleneck_product",
+    });
+    expect(source.readiness).toHaveBeenCalledTimes(1);
+    now += 1;
     await expect(gate.readiness()).resolves.toEqual({
       status: "unavailable",
       reason: "posture_changed",
     });
+    now += 999;
+    await expect(gate.readiness()).resolves.toEqual({
+      status: "unavailable",
+      reason: "posture_changed",
+    });
+    expect(source.readiness).toHaveBeenCalledTimes(2);
+    now += 1;
     await expect(gate.readiness()).resolves.toEqual({
       status: "ok",
       mode: "sherlock_bottleneck_product",
@@ -234,6 +308,7 @@ describe("bottleneck source primitives", () => {
     expect(source.readiness).toHaveBeenCalledTimes(3);
 
     let resolveReadiness;
+    now += 30_000;
     source.readiness.mockImplementationOnce(() => new Promise((resolve) => {
       resolveReadiness = resolve;
     }));

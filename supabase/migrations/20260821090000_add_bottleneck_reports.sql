@@ -103,7 +103,7 @@ create table product.bottleneck_reports (
   scope_read_at timestamptz not null,
   scope_completeness text not null
     constraint bottleneck_reports_scope_completeness_check
-    check (scope_completeness = 'all_candidates_within_scope'),
+    check (scope_completeness = 'agent_declared_complete'),
   candidate_count smallint not null
     constraint bottleneck_reports_candidate_count_check
     check (candidate_count between 0 and 50),
@@ -153,7 +153,7 @@ begin
        or not (item ? 'personId')
        or jsonb_typeof(item->'type') <> 'string'
        or jsonb_typeof(item->'personId') <> 'string'
-       or (item->>'personId') !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' then
+       or (item->>'personId') !~* '^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$' then
       return false;
     end if;
     select array_agg(key order by key) into keys

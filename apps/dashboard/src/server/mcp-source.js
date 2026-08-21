@@ -6,7 +6,7 @@ export const MCP_USAGE_PAGE_LIMIT = 20;
 
 const USAGE_CURSOR_VERSION = "u2";
 export const MAX_USAGE_CURSOR_LENGTH = 512;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID_PATTERN = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/i;
 
 function snapshotDigest(snapshot) {
   if (typeof snapshot !== "string" || snapshot.length < 1 || snapshot.length > 8192) {
@@ -19,7 +19,7 @@ export function encodeUsageCursor(snapshot, personId) {
   if (typeof personId !== "string" || !UUID_PATTERN.test(personId)) {
     throw new FlameSourceError("flame_usage_cursor_invalid");
   }
-  const body = JSON.stringify({ s: snapshotDigest(snapshot), a: personId });
+  const body = JSON.stringify({ s: snapshotDigest(snapshot), a: personId.toLowerCase() });
   return `${USAGE_CURSOR_VERSION}.${Buffer.from(body, "utf8").toString("base64url")}`;
 }
 
@@ -45,7 +45,7 @@ export function decodeUsageCursor(cursor) {
       !UUID_PATTERN.test(value.a) || !/^[0-9a-f]{64}$/.test(value.s)) {
     throw new FlameSourceError("flame_usage_cursor_invalid");
   }
-  return { snapshotSha256: value.s, afterPersonId: value.a };
+  return { snapshotSha256: value.s, afterPersonId: value.a.toLowerCase() };
 }
 
 export function pageCachedUsageEvidence(payload, cursor = "") {
@@ -57,7 +57,13 @@ export function pageCachedUsageEvidence(payload, cursor = "") {
     throw new FlameSourceError("flame_usage_snapshot_expired");
   }
   const afterPersonId = decodedCursor?.afterPersonId ?? null;
-  const people = [...payload.people].sort((left, right) => {
+  const people = payload.people.map((person) => {
+    const personId = person?.id;
+    if (typeof personId !== "string" || !UUID_PATTERN.test(personId)) {
+      throw new FlameSourceError("flame_database_result_invalid");
+    }
+    return { ...person, id: personId.toLowerCase() };
+  }).sort((left, right) => {
     const leftId = String(left?.id ?? "");
     const rightId = String(right?.id ?? "");
     return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
@@ -65,7 +71,7 @@ export function pageCachedUsageEvidence(payload, cursor = "") {
   const ids = new Set();
   for (const person of people) {
     const personId = person?.id;
-    if (typeof personId !== "string" || !UUID_PATTERN.test(personId) || ids.has(personId)) {
+    if (ids.has(personId)) {
       throw new FlameSourceError("flame_database_result_invalid");
     }
     ids.add(personId);

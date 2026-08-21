@@ -71,17 +71,85 @@ describe("Bonaparte MCP tools", () => {
     }
     expect(tools.get("list_prompt_evidence").config.description)
       .toContain("untrusted evidence");
+    expect(tools.get("submit_candidate_batch").config).toMatchObject({
+      title: expect.stringContaining("agent-declared"),
+      description: expect.stringContaining("explicit bounded local analysis scope"),
+    });
+    expect(tools.get("submit_candidate_batch").config.description)
+      .toContain("does not verify completeness");
   });
 
-  it("returns usage facts as both text and validated structured content", async () => {
+  it("rejects lone surrogates in every persisted string before submission", () => {
+    const source = { submitCandidateBatch: vi.fn() };
+    const submitSchema = registeredTools(source)
+      .get("submit_candidate_batch").config.inputSchema;
+    const candidate = {
+      candidateKey: "unicode",
+      title: "valid-😀",
+      claim: "valid-😀",
+      evidence: [{
+        type: "usage_summary",
+        personId: "11111111-1111-4111-8111-111111111111",
+      }],
+    };
+    const request = {
+      submissionId: "11111111-1111-4111-8111-111111111111",
+      analysisScope: {
+        usageSnapshotToken: "valid-😀",
+        window: {
+          startInclusive: "2026-08-20T00:00:00.000Z",
+          endExclusive: "2026-08-21T00:00:00.000Z",
+          readAt: "2026-08-21T00:00:01.000Z",
+        },
+        completeness: "agent_declared_complete",
+      },
+      candidates: [candidate],
+    };
+
+    expect(submitSchema.safeParse(request).success).toBe(true);
+    for (const malformed of ["\ud800", "\udc00"]) {
+      for (const invalidRequest of [
+        {
+          ...request,
+          analysisScope: { ...request.analysisScope, usageSnapshotToken: malformed },
+        },
+        { ...request, candidates: [{ ...candidate, title: malformed }] },
+        { ...request, candidates: [{ ...candidate, claim: malformed }] },
+      ]) {
+        expect(submitSchema.safeParse(invalidRequest).success).toBe(false);
+      }
+    }
+    expect(source.submitCandidateBatch).not.toHaveBeenCalled();
+  });
+
+  it("returns full JSON text alongside structured content for compatible clients", async () => {
     const source = { fetchUsageEvidence: vi.fn().mockResolvedValue(payload()) };
     const tools = registeredTools(source);
 
     const result = await tools.get("list_usage_evidence").handler({});
 
     expect(result.isError).toBeUndefined();
-    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
     expect(result.structuredContent.schemaVersion).toBe("bonaparte.usage-evidence.v2");
+    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+  });
+
+  it("keeps a full candidate page available to text-only clients", async () => {
+    const page = {
+      schemaVersion: "bonaparte.bottleneck-candidates.v1",
+      candidates: Array.from({ length: 20 }, (_, index) => ({
+        candidateKey: `candidate-${index}`,
+        claim: "sensitive".repeat(500),
+      })),
+      nextCursor: null,
+    };
+    const source = {
+      listBottleneckCandidates: vi.fn().mockResolvedValue(page),
+    };
+    const result = await registeredTools(source)
+      .get("list_bottleneck_candidates").handler({});
+
+    expect(result.structuredContent).toBe(page);
+    expect(JSON.parse(result.content[0].text)).toEqual(page);
   });
 
   it("enforces an exact process-local submit window without limiting reads", async () => {
@@ -119,7 +187,7 @@ describe("Bonaparte MCP tools", () => {
           endExclusive: "2026-08-21T00:00:00.000Z",
           readAt: "2026-08-21T00:00:01.000Z",
         },
-        completeness: "all_candidates_within_scope",
+        completeness: "agent_declared_complete",
       },
       candidates: [],
     };
@@ -129,8 +197,15 @@ describe("Bonaparte MCP tools", () => {
     }
     expect(JSON.parse((await tools.get("submit_candidate_batch").handler(request))
       .content[0].text).error.code).toBe("rate_limited");
-    expect((await tools.get("list_bottleneck_candidates").handler({})).isError)
+    const listSubmissionId = "22222222-2222-4222-8222-222222222222";
+    expect((await tools.get("list_bottleneck_candidates").handler({
+      submissionId: listSubmissionId,
+    })).isError)
       .toBeUndefined();
+    expect(source.listBottleneckCandidates).toHaveBeenCalledWith({
+      submissionId: listSubmissionId,
+      signal: undefined,
+    });
     now += 60_000;
     expect((await tools.get("submit_candidate_batch").handler(request)).isError)
       .toBeUndefined();

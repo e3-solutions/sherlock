@@ -88,6 +88,7 @@ describe("Bonaparte MCP HTTP route", () => {
   });
 
   it("accepts the exact declared boundary and rejects one byte more before protocol", async () => {
+    expect(MAX_MCP_BODY_BYTES).toBe(2 * 1024 * 1024);
     const protocolHandler = vi.fn();
     const route = createMcpHttpRoute({ protocolHandler, token: TOKEN });
     const accepted = responseRecorder();

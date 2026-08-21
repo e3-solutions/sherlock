@@ -20,7 +20,7 @@ function batch(submissionId, count, claim = "claim") {
     analysisScope: {
       usageSnapshotToken: "v2.integration-snapshot",
       window: { startInclusive: START, endExclusive: END, readAt: READ },
-      completeness: "all_candidates_within_scope",
+      completeness: "agent_declared_complete",
     },
     candidates: Array.from({ length: count }, (_, index) => ({
       candidateKey: `candidate-${String(index).padStart(2, "0")}`,
@@ -164,7 +164,10 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
         cursorSecret: CURSOR_SECRET,
       });
       workerSql = postgres(workerDatabaseUrl, { max: 1, prepare: false });
-      const gate = createBottleneckReadinessGate(source);
+      const gate = createBottleneckReadinessGate(source, {
+        successTtlMs: 0,
+        unavailableTtlMs: 0,
+      });
       const ready = {
         status: "ok",
         mode: "sherlock_bottleneck_product",
@@ -191,7 +194,7 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
           scope_window_start, scope_window_end, scope_read_at,
           scope_completeness, candidate_count
         ) values ($1, $2, $3, 'snapshot', $4, $5, $6,
-                  'all_candidates_within_scope', 0)
+                  'agent_declared_complete', 0)
         returning id::text
       `, [
         insertBoundaryWorkspace, insertBoundarySubmission, "c".repeat(64),
@@ -205,7 +208,7 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
             scope_read_at, scope_completeness, candidate_count
           ) overriding system value values (
             9001, $1, $2, $3, 'snapshot', $4, $5, $6,
-            'all_candidates_within_scope', 0
+            'agent_declared_complete', 0
           )
         `, [
           insertBoundaryWorkspace, crypto.randomUUID(), "d".repeat(64),
@@ -218,7 +221,7 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
             scope_read_at, scope_completeness, candidate_count, created_at
           ) values (
             $1, $2, $3, 'snapshot', $4, $5, $6,
-            'all_candidates_within_scope', 0, $6
+            'agent_declared_complete', 0, $6
           )
         `, [
           insertBoundaryWorkspace, crypto.randomUUID(), "e".repeat(64),
@@ -232,7 +235,7 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
             attribution_mode, trust
           ) values (
             $1, $2, $3, 'snapshot', $4, $5, $6,
-            'all_candidates_within_scope', 0, default, default
+            'agent_declared_complete', 0, default, default
           )
         `, [
           insertBoundaryWorkspace, crypto.randomUUID(), "f".repeat(64),
@@ -435,7 +438,7 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
           scope_window_start, scope_window_end, scope_read_at,
           scope_completeness, candidate_count
         ) values ($1, $2, $3, 'snapshot', $4, $5, $6,
-                  'all_candidates_within_scope', 0)
+                  'agent_declared_complete', 0)
       `, [immutableWorkspace, immutableSubmission, "a".repeat(64), START, END, READ]);
       await expect(sql.unsafe(
         "update product.bottleneck_reports set candidate_count = 1 where submission_id = $1",
@@ -621,6 +624,58 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
       await expect(source.submitCandidateBatch(changed))
         .rejects.toMatchObject({ code: "idempotency_conflict" });
 
+      const acceptedSubmissionIds = [
+        "018f22e2-79b0-7cc3-98c4-dc0c0c07398f",
+        "018f22e2-79b0-8cc3-98c4-dc0c0c07398f",
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+      ];
+      for (const [index, submissionId] of acceptedSubmissionIds.entries()) {
+        const acceptedRequest = batch(
+          index === 0 ? submissionId.toUpperCase() : submissionId,
+          1,
+          `accepted-${index}`,
+        );
+        acceptedRequest.candidates[0].evidence = [{
+          type: "usage_summary",
+          personId: index === 0 ? submissionId.toUpperCase() : submissionId,
+        }];
+        if (index === 0) {
+          acceptedRequest.analysisScope.usageSnapshotToken = "snapshot\u0001persisted-🕵️";
+          acceptedRequest.candidates[0].title = "title\u0001persisted-🕵️";
+          acceptedRequest.candidates[0].claim = "claim\u0001persisted-🕵️";
+        }
+        const acceptedReceipt = await source.submitCandidateBatch(acceptedRequest);
+        expect(acceptedReceipt).toMatchObject({
+          submissionId,
+          candidateCount: 1,
+        });
+        if (index === 0) {
+          const lowercaseRetry = structuredClone(acceptedRequest);
+          lowercaseRetry.submissionId = submissionId;
+          await expect(source.submitCandidateBatch(lowercaseRetry))
+            .resolves.toEqual(acceptedReceipt);
+          const changedRetry = structuredClone(lowercaseRetry);
+          changedRetry.candidates[0].claim += " changed";
+          await expect(source.submitCandidateBatch(changedRetry))
+            .rejects.toMatchObject({ code: "idempotency_conflict" });
+        }
+        const listed = await source.listBottleneckCandidates({ submissionId });
+        expect(listed.candidates).toHaveLength(1);
+        expect(listed.candidates[0].submissionId).toBe(submissionId);
+        expect(listed.candidates[0].evidence).toEqual([{
+          type: "usage_summary",
+          personId: index === 0 ? submissionId.toUpperCase() : submissionId,
+        }]);
+        if (index === 0) {
+          expect(listed.candidates[0]).toMatchObject({
+            title: "title\u0001persisted-🕵️",
+            claim: "claim\u0001persisted-🕵️",
+            analysisScope: { usageSnapshotToken: "snapshot\u0001persisted-🕵️" },
+          });
+        }
+      }
+
       const raceId = crypto.randomUUID();
       const race = await Promise.allSettled([
         source.submitCandidateBatch(batch(raceId, 1, "left")),
@@ -662,23 +717,64 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
         cursorSecret: CURSOR_SECRET,
       });
       try {
-        await pagingSource.submitCandidateBatch(batch(crypto.randomUUID(), 21));
+        await pagingSource.submitCandidateBatch(batch(crypto.randomUUID(), 3, "history"));
+        const initialSubmissionId = crypto.randomUUID();
+        await pagingSource.submitCandidateBatch(batch(initialSubmissionId, 50));
         const first = await pagingSource.listBottleneckCandidates({});
         expect(first.candidates).toHaveLength(20);
         expect(first.nextCursor).toBeTypeOf("string");
-        await pagingSource.submitCandidateBatch(batch(crypto.randomUUID(), 1, "later"));
+        const filteredFirst = await pagingSource.listBottleneckCandidates({
+          submissionId: initialSubmissionId,
+        });
+        expect(filteredFirst.candidates).toHaveLength(20);
+        expect(filteredFirst.nextCursor).toBeTypeOf("string");
+        expect(filteredFirst.candidates.every(
+          (candidate) => candidate.submissionId === initialSubmissionId
+        )).toBe(true);
+        const laterSubmissionId = crypto.randomUUID();
+        await pagingSource.submitCandidateBatch(batch(laterSubmissionId, 1, "later"));
         const second = await pagingSource.listBottleneckCandidates({
           cursor: first.nextCursor,
         });
-        expect(second.candidates).toHaveLength(1);
-        expect(second.candidates[0].candidateKey).toBe("candidate-20");
+        expect(second.candidates).toHaveLength(20);
         expect(second.candidates[0].evidence).toEqual([{
           type: "usage_summary",
           personId: "11111111-1111-4111-8111-111111111111",
         }]);
-        expect(second.nextCursor).toBeNull();
+        expect(second.nextCursor).toBeTypeOf("string");
         const fresh = await pagingSource.listBottleneckCandidates({});
         expect(BigInt(fresh.candidates[0].candidateId)).toBeGreaterThan(0n);
+
+        const filteredSecond = await pagingSource.listBottleneckCandidates({
+          submissionId: initialSubmissionId,
+          cursor: filteredFirst.nextCursor,
+        });
+        expect(filteredSecond.candidates).toHaveLength(20);
+        expect(filteredSecond.nextCursor).toBeTypeOf("string");
+        const filteredThird = await pagingSource.listBottleneckCandidates({
+          submissionId: initialSubmissionId,
+          cursor: filteredSecond.nextCursor,
+        });
+        expect(filteredThird.candidates).toHaveLength(10);
+        expect(filteredThird.nextCursor).toBeNull();
+        const filteredCandidates = [
+          ...filteredFirst.candidates,
+          ...filteredSecond.candidates,
+          ...filteredThird.candidates,
+        ];
+        expect(filteredCandidates).toHaveLength(50);
+        expect(filteredCandidates.every(
+          (candidate) => candidate.submissionId === initialSubmissionId
+        )).toBe(true);
+        expect(filteredCandidates.map((candidate) => candidate.candidateKey)).toEqual(
+          Array.from({ length: 50 }, (_, index) =>
+            `candidate-${String(index).padStart(2, "0")}`
+          ),
+        );
+        await expect(pagingSource.listBottleneckCandidates({
+          submissionId: laterSubmissionId,
+          cursor: filteredFirst.nextCursor,
+        })).rejects.toMatchObject({ code: "cursor_invalid" });
       } finally {
         await pagingSource.close();
       }
@@ -731,7 +827,7 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
               scope_window_start, scope_window_end, scope_read_at,
               scope_completeness, candidate_count
             ) values ($1, $2, $3, 'v2.locked-snapshot', $4, $5, $6,
-                      'all_candidates_within_scope', 1)
+                      'agent_declared_complete', 1)
             returning id::text
           `, [workspaceId, submissionId, "9".repeat(64), START, END, READ]))[0];
           await tx.unsafe(`
@@ -790,7 +886,7 @@ describePostgres("bottleneck candidate PostgreSQL source", () => {
         submissionId,
         analysisScope: {
           usageSnapshotToken: "v2.locked-snapshot",
-          completeness: "all_candidates_within_scope",
+          completeness: "agent_declared_complete",
         },
       });
     } finally {

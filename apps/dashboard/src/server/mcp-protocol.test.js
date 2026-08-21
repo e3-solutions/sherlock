@@ -3,7 +3,11 @@ import { createServer } from "node:http";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { MCP_TOKEN_MIN_LENGTH, createMcpHttpRoute } from "./mcp-http.js";
+import {
+  MAX_MCP_BODY_BYTES,
+  MCP_TOKEN_MIN_LENGTH,
+  createMcpHttpRoute,
+} from "./mcp-http.js";
 import { createBonaparteMcpProtocol } from "./mcp-server.js";
 import { createCachedMcpSource } from "./mcp-source.js";
 
@@ -20,7 +24,179 @@ afterEach(async () => {
 });
 
 describe("Bonaparte MCP protocol", () => {
-  it("discovers and completes the typed two-tool flow through Streamable HTTP", async () => {
+  it("accepts a max schema-valid worst-escaping submission from the official client", async () => {
+    const token = "m".repeat(MCP_TOKEN_MIN_LENGTH);
+    const source = {
+      workspaceKey: "workspace-max-body",
+      submitCandidateBatch: vi.fn().mockImplementation(async (request) => ({
+        schemaVersion: "bonaparte.bottleneck-report-receipt.v1",
+        reportId: "1",
+        submissionId: request.submissionId,
+        requestSha256: "a".repeat(64),
+        candidateCount: request.candidates.length,
+        attributionMode: "workspace_shared_bearer",
+        trust: "untrusted_agent_generated_claim",
+        createdAt: "2026-08-21T00:00:00.000Z",
+      })),
+      listBottleneckCandidates: vi.fn().mockResolvedValue({
+        schemaVersion: "bonaparte.bottleneck-candidates.v1",
+        candidates: [],
+        nextCursor: null,
+      }),
+    };
+    const protocol = createBonaparteMcpProtocol(source);
+    openProtocols.push(protocol);
+    const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token });
+    let submittedBodyBytes = 0;
+    const httpServer = createServer((request, response) => {
+      const declared = Number(request.headers["content-length"] ?? 0);
+      if (declared > submittedBodyBytes) submittedBodyBytes = declared;
+      void route(request, response);
+    });
+    openServers.push(httpServer);
+    await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const client = new Client(
+      { name: "bonaparte-max-body-test", version: "1.0.0" },
+      { versionNegotiation: { mode: "auto" } },
+    );
+    openClients.push(client);
+    const address = httpServer.address();
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${address.port}/mcp`),
+      { requestInit: { headers: { authorization: `Bearer ${token}` } } },
+    ));
+
+    const escaped = "\u0001";
+    const personId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const evidence = Array.from({ length: 20 }, () => ({
+      type: "prompt_bucket",
+      personId,
+      bucketStart: "2026-08-20T01:00:00.000Z",
+    }));
+    const candidates = Array.from({ length: 50 }, (_, index) => {
+      const prefix = `${index.toString(36)}.`;
+      return {
+        candidateKey: `${prefix}${"a".repeat(64 - prefix.length)}`,
+        title: escaped.repeat(160),
+        claim: escaped.repeat(4_000),
+        evidence,
+      };
+    });
+    const submittedId = crypto.randomUUID();
+    const submissionId = submittedId.toUpperCase();
+    const result = await client.callTool({
+      name: "submit_candidate_batch",
+      arguments: {
+        submissionId,
+        analysisScope: {
+          usageSnapshotToken: escaped.repeat(8_192),
+          window: {
+            startInclusive: "2026-08-20T00:00:00.000Z",
+            endExclusive: "2026-08-21T00:00:00.000Z",
+            readAt: "2026-08-21T00:00:01.000Z",
+          },
+          completeness: "agent_declared_complete",
+        },
+        candidates,
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      submissionId: submittedId,
+      candidateCount: 50,
+    });
+    expect(source.submitCandidateBatch.mock.calls[0][0].submissionId).toBe(submittedId);
+    expect(source.submitCandidateBatch.mock.calls[0][0]
+      .candidates[0].evidence[0].personId).toBe(personId);
+    expect(source.submitCandidateBatch).toHaveBeenCalledTimes(1);
+    expect(submittedBodyBytes).toBeGreaterThan(262_144);
+    expect(submittedBodyBytes).toBeLessThanOrEqual(MAX_MCP_BODY_BYTES);
+
+    const acceptedSubmissionIds = [
+      "018f22e2-79b0-7cc3-98c4-dc0c0c07398f",
+      "018f22e2-79b0-8cc3-98c4-dc0c0c07398f",
+      "00000000-0000-0000-0000-000000000000",
+      "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    ];
+    for (const acceptedSubmissionId of acceptedSubmissionIds) {
+      const listed = await client.callTool({
+        name: "list_bottleneck_candidates",
+        arguments: { submissionId: acceptedSubmissionId },
+      });
+      expect(listed.isError).not.toBe(true);
+    }
+    expect(source.listBottleneckCandidates.mock.calls.map(([request]) =>
+      request.submissionId
+    )).toEqual(acceptedSubmissionIds);
+
+    const minimalCandidate = {
+      candidateKey: "nul-rejected",
+      title: "title",
+      claim: "claim",
+      evidence: [{ type: "usage_summary", personId }],
+    };
+    const minimalSubmission = {
+      submissionId: crypto.randomUUID(),
+      analysisScope: {
+        usageSnapshotToken: "snapshot",
+        window: {
+          startInclusive: "2026-08-20T00:00:00.000Z",
+          endExclusive: "2026-08-21T00:00:00.000Z",
+          readAt: "2026-08-21T00:00:01.000Z",
+        },
+        completeness: "agent_declared_complete",
+      },
+      candidates: [minimalCandidate],
+    };
+    for (const invalidArguments of [
+      {
+        ...minimalSubmission,
+        analysisScope: { ...minimalSubmission.analysisScope, usageSnapshotToken: "\0" },
+      },
+      {
+        ...minimalSubmission,
+        analysisScope: {
+          ...minimalSubmission.analysisScope,
+          usageSnapshotToken: "é".repeat(4_097),
+        },
+      },
+      {
+        ...minimalSubmission,
+        candidates: [{ ...minimalCandidate, title: "\0" }],
+      },
+      {
+        ...minimalSubmission,
+        candidates: [{ ...minimalCandidate, claim: "\0" }],
+      },
+      ...["\ud800", "\udc00"].flatMap((malformed) => [
+        {
+          ...minimalSubmission,
+          analysisScope: {
+            ...minimalSubmission.analysisScope,
+            usageSnapshotToken: malformed,
+          },
+        },
+        {
+          ...minimalSubmission,
+          candidates: [{ ...minimalCandidate, title: malformed }],
+        },
+        {
+          ...minimalSubmission,
+          candidates: [{ ...minimalCandidate, claim: malformed }],
+        },
+      ]),
+    ]) {
+      const rejected = await client.callTool({
+        name: "submit_candidate_batch",
+        arguments: invalidArguments,
+      }).catch((error) => error);
+      expect(rejected instanceof Error || rejected.isError === true).toBe(true);
+    }
+    expect(source.submitCandidateBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("discovers and completes the typed four-tool flow through Streamable HTTP", async () => {
     const personId = "11111111-1111-4111-8111-111111111111";
     const bucketStart = "2026-08-18T03:50:00.000Z";
     const buckets = Array.from({ length: 144 }, () => [0, 0, 0, 0]);
@@ -157,7 +333,7 @@ describe("Bonaparte MCP protocol", () => {
         analysisScope: {
           usageSnapshotToken: result.structuredContent.snapshotToken,
           window: result.structuredContent.window,
-          completeness: "all_candidates_within_scope",
+          completeness: "agent_declared_complete",
         },
         candidates: [
           candidate,
@@ -180,7 +356,7 @@ describe("Bonaparte MCP protocol", () => {
         analysisScope: {
           usageSnapshotToken: result.structuredContent.snapshotToken,
           window: result.structuredContent.window,
-          completeness: "all_candidates_within_scope",
+          completeness: "agent_declared_complete",
         },
         candidates: Array.from({ length: 51 }, (_, index) => ({
           ...candidate,
@@ -197,7 +373,7 @@ describe("Bonaparte MCP protocol", () => {
         analysisScope: {
           usageSnapshotToken: result.structuredContent.snapshotToken,
           window: result.structuredContent.window,
-          completeness: "all_candidates_within_scope",
+          completeness: "agent_declared_complete",
         },
         candidates: [candidate, candidate],
       },
@@ -211,7 +387,7 @@ describe("Bonaparte MCP protocol", () => {
         analysisScope: {
           usageSnapshotToken: result.structuredContent.snapshotToken,
           window: result.structuredContent.window,
-          completeness: "all_candidates_within_scope",
+          completeness: "agent_declared_complete",
         },
         candidates: [],
         reviewerId: personId,
@@ -228,7 +404,7 @@ describe("Bonaparte MCP protocol", () => {
           analysisScope: {
             usageSnapshotToken: result.structuredContent.snapshotToken,
             window: result.structuredContent.window,
-            completeness: "all_candidates_within_scope",
+            completeness: "agent_declared_complete",
           },
           candidates: [],
         },
@@ -242,7 +418,7 @@ describe("Bonaparte MCP protocol", () => {
         analysisScope: {
           usageSnapshotToken: result.structuredContent.snapshotToken,
           window: result.structuredContent.window,
-          completeness: "all_candidates_within_scope",
+          completeness: "agent_declared_complete",
         },
         candidates: [],
       },
@@ -251,12 +427,16 @@ describe("Bonaparte MCP protocol", () => {
     expect(JSON.parse(limited.content[0].text).error.code).toBe("rate_limited");
     const candidates = await client.callTool({
       name: "list_bottleneck_candidates",
-      arguments: {},
+      arguments: { submissionId },
     });
     expect(candidates.structuredContent).toEqual({
       schemaVersion: "bonaparte.bottleneck-candidates.v1",
       candidates: [],
       nextCursor: null,
+    });
+    expect(candidateSource.listBottleneckCandidates).toHaveBeenCalledWith({
+      submissionId,
+      signal: undefined,
     });
 
     expect(candidateSource.submitCandidateBatch).toHaveBeenCalledTimes(10);

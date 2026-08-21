@@ -35,22 +35,34 @@ LAUNCHER = PLUGIN / "scripts" / "run_hook.py"
 HOOKS = PLUGIN / "hooks" / "hooks.json"
 MANIFEST = PLUGIN / ".claude-plugin" / "plugin.json"
 ANALYSIS_SKILL = PLUGIN / "skills" / "sherlock-analysis" / "SKILL.md"
+PLUGIN_README = PLUGIN / "README.md"
 MARKETPLACE = ROOT / ".claude-plugin" / "marketplace.json"
 
 
 class ClaudePluginTests(unittest.TestCase):
     def test_analysis_skill_is_manual_and_matches_complete_review_workflow(self):
         skill = ANALYSIS_SKILL.read_text(encoding="utf-8")
+        readme = PLUGIN_README.read_text(encoding="utf-8")
         self.assertIn("disable-model-invocation: true", skill)
+        self.assertIn("description: Manually run a bounded local", skill)
         self.assertIn("Follow every `nextCursor` until it is null", skill)
         self.assertIn("discard that traversal and restart", skill)
         self.assertIn("untrusted user-authored text", skill)
+        self.assertIn("deterministic bounded inspection policy", skill)
+        self.assertIn("actually inspected", skill)
+        self.assertIn("available/eligible", skill)
+        self.assertIn("does not claim every prompt was read", skill)
+        self.assertIn("agent_declared_complete", skill)
+        self.assertIn("untrusted declaration", skill)
         self.assertIn("native file, search, history, and test tools", skill)
         self.assertIn("exactly once", skill)
         self.assertIn("Submit an empty array", skill)
         self.assertIn("never select, rank, or silently truncate", skill)
         self.assertIn("fixes the high-water mark", skill)
+        self.assertIn("receipt's `submissionId`", skill)
         self.assertIn("does not persist approval", skill)
+        self.assertIn("agent-declared-complete candidate batch", readme)
+        self.assertIn("does not imply exhaustive prompt", readme)
         self.assertIn("does not verify submitter or reviewer identity", skill)
 
     def test_plugin_is_separate_and_covers_supported_lifecycle_events(self):

@@ -9,9 +9,12 @@ export const BOTTLENECK_ATTRIBUTION_MODE = "workspace_shared_bearer";
 export const BOTTLENECK_TRUST = "untrusted_agent_generated_claim";
 export const BOTTLENECK_CURSOR_SECRET_MIN_LENGTH = 32;
 export const BOTTLENECK_CURSOR_SECRET_MAX_LENGTH = 512;
+export const BOTTLENECK_READINESS_SUCCESS_TTL_MS = 30_000;
+export const BOTTLENECK_READINESS_UNAVAILABLE_TTL_MS = 1_000;
 
-const CURSOR_VERSION = "b2";
+const CURSOR_VERSION = "b3";
 const DECIMAL_BIGINT = /^(?:0|[1-9][0-9]*)$/;
+const UUID_TEXT = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/i;
 
 export class BottleneckSourceError extends Error {
   constructor(code, options) {
@@ -82,10 +85,19 @@ function cursorDigest(cursorSecret, body) {
     .digest();
 }
 
+function submissionFilter(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !UUID_TEXT.test(value)) {
+    throw new BottleneckSourceError("cursor_invalid");
+  }
+  return value.toLowerCase();
+}
+
 export function encodeBottleneckCursor({
   workspaceId,
   highWaterId,
   afterId,
+  submissionId = null,
   cursorSecret,
 }) {
   validateBottleneckCursorSecret(cursorSecret);
@@ -94,13 +106,22 @@ export function encodeBottleneckCursor({
       BigInt(afterId) > BigInt(highWaterId)) {
     throw new BottleneckSourceError("cursor_invalid");
   }
-  const body = Buffer.from(JSON.stringify({ w: workspaceId, h: highWaterId, a: afterId }))
+  const body = Buffer.from(JSON.stringify({
+    w: workspaceId,
+    h: highWaterId,
+    a: afterId,
+    s: submissionFilter(submissionId),
+  }))
     .toString("base64url");
   const digest = cursorDigest(cursorSecret, body).toString("base64url");
   return `${CURSOR_VERSION}.${body}.${digest}`;
 }
 
-export function decodeBottleneckCursor(cursor, { workspaceId, cursorSecret }) {
+export function decodeBottleneckCursor(cursor, {
+  workspaceId,
+  submissionId = null,
+  cursorSecret,
+}) {
   validateBottleneckCursorSecret(cursorSecret);
   if (typeof cursor !== "string" || cursor.length === 0 ||
       cursor.length > BOTTLENECK_CURSOR_MAX_LENGTH) {
@@ -122,8 +143,9 @@ export function decodeBottleneckCursor(cursor, { workspaceId, cursorSecret }) {
     const decoded = Buffer.from(body, "base64url").toString("utf8");
     if (Buffer.from(decoded).toString("base64url") !== body) throw new Error("encoding");
     const value = JSON.parse(decoded);
-    if (!value || Object.keys(value).sort().join(",") !== "a,h,w" ||
+    if (!value || Object.keys(value).sort().join(",") !== "a,h,s,w" ||
         value.w !== workspaceId ||
+        value.s !== submissionFilter(submissionId) ||
         !DECIMAL_BIGINT.test(value.h) || !DECIMAL_BIGINT.test(value.a) ||
         BigInt(value.a) > BigInt(value.h)) throw new Error("shape");
     return { highWaterId: value.h, afterId: value.a };
@@ -355,7 +377,7 @@ export class BottleneckSource {
                                 and product_function.provolatile = 'i'
                                 and product_function.proisstrict
                                 and md5(product_function.prosrc) =
-                                  '159c970f44390bc15d287c611924e57b'
+                                  '7cbea8e215fc261adc13fa4e52e14ad7'
                               when to_regprocedure(
                                 'product.enforce_bottleneck_candidate_count()'
                               ) then
@@ -873,7 +895,7 @@ export class BottleneckSource {
                               when 'bottleneck_reports.bottleneck_reports_scope_snapshot_token_check' then
                                 '1d8f539474fc619b9146e461cc4c215c'
                               when 'bottleneck_reports.bottleneck_reports_scope_completeness_check' then
-                                'ca055b5efbf5da2c4974ef8f79b5c91c'
+                                '176d3ab604eb78670837118e401f8480'
                               when 'bottleneck_reports.bottleneck_reports_candidate_count_check' then
                                 'de60cc02913cef93177813ba41868168'
                               when 'bottleneck_reports.bottleneck_reports_id_positive_check' then
@@ -971,7 +993,12 @@ export class BottleneckSource {
   }
 
   async submitCandidateBatch(request, { signal } = {}) {
-    const requestSha256 = hashCandidateBatch(request);
+    const normalizedSubmissionId = submissionFilter(request.submissionId);
+    const canonicalRequest = {
+      ...request,
+      submissionId: normalizedSubmissionId,
+    };
+    const requestSha256 = hashCandidateBatch(canonicalRequest);
     return await this.transaction(async (tx) => {
       await run(tx, "select pg_advisory_xact_lock(hashtextextended($1, 730241))", [this.workspaceId], signal);
       const existing = (await run(tx, `
@@ -979,7 +1006,7 @@ export class BottleneckSource {
                attribution_mode, trust, created_at
           from product.bottleneck_reports
          where workspace_id = $1 and submission_id = $2
-      `, [this.workspaceId, request.submissionId], signal))[0];
+      `, [this.workspaceId, normalizedSubmissionId], signal))[0];
       if (existing) {
         if (existing.request_sha256 !== requestSha256) {
           throw new BottleneckSourceError("idempotency_conflict");
@@ -998,7 +1025,7 @@ export class BottleneckSource {
                   attribution_mode, trust, created_at
       `, [
         this.workspaceId,
-        request.submissionId,
+        normalizedSubmissionId,
         requestSha256,
         scope.usageSnapshotToken,
         scope.window.startInclusive,
@@ -1008,29 +1035,43 @@ export class BottleneckSource {
         request.candidates.length,
       ], signal))[0];
 
-      for (const [ordinal, candidate] of request.candidates.entries()) {
+      if (request.candidates.length > 0) {
         await run(tx, `
           insert into product.bottleneck_candidates (
             workspace_id, report_id, ordinal, candidate_key, title, claim, evidence_refs
-          ) values ($1, $2, $3, $4, $5, $6, $7::jsonb)
+          )
+          select $1, $2, candidate.ordinal, candidate.candidate_key,
+                 candidate.title, candidate.claim, candidate.evidence_refs
+            from jsonb_to_recordset($3::jsonb) as candidate(
+              ordinal integer,
+              candidate_key text,
+              title text,
+              claim text,
+              evidence_refs jsonb
+            )
+           order by candidate.ordinal
         `, [
           this.workspaceId,
           inserted.id,
-          ordinal,
-          candidate.candidateKey,
-          candidate.title,
-          candidate.claim,
-          tx.json(candidate.evidence),
+          tx.json(request.candidates.map((candidate, ordinal) => ({
+            ordinal,
+            candidate_key: candidate.candidateKey,
+            title: candidate.title,
+            claim: candidate.claim,
+            evidence_refs: candidate.evidence,
+          }))),
         ], signal);
       }
       return reportReceipt(inserted);
     }, { signal });
   }
 
-  async listBottleneckCandidates({ cursor = "", signal } = {}) {
+  async listBottleneckCandidates({ cursor = "", submissionId = null, signal } = {}) {
+    const normalizedSubmissionId = submissionFilter(submissionId);
     const requestedBoundary = cursor
       ? decodeBottleneckCursor(cursor, {
         workspaceId: this.workspaceId,
+        submissionId: normalizedSubmissionId,
         cursorSecret: this.cursorSecret,
       })
       : null;
@@ -1041,9 +1082,13 @@ export class BottleneckSource {
       } else {
         await run(tx, "select pg_advisory_xact_lock(hashtextextended($1, 730241))", [this.workspaceId], signal);
         const row = (await run(tx, `
-          select coalesce(max(id), 0)::text high_water_id
-            from product.bottleneck_candidates where workspace_id = $1
-        `, [this.workspaceId], signal))[0];
+          select coalesce(max(c.id), 0)::text high_water_id
+            from product.bottleneck_candidates c
+            join product.bottleneck_reports r
+              on r.workspace_id = c.workspace_id and r.id = c.report_id
+           where c.workspace_id = $1
+             and ($2::uuid is null or r.submission_id = $2::uuid)
+        `, [this.workspaceId, normalizedSubmissionId], signal))[0];
         boundary = { highWaterId: String(row?.high_water_id ?? "0"), afterId: "0" };
       }
       const rows = await run(tx, `
@@ -1057,12 +1102,14 @@ export class BottleneckSource {
           join product.bottleneck_reports r
             on r.workspace_id = c.workspace_id and r.id = c.report_id
          where c.workspace_id = $1 and c.id > $2::bigint and c.id <= $3::bigint
+           and ($4::uuid is null or r.submission_id = $4::uuid)
          order by c.id asc
-         limit $4
+         limit $5
       `, [
         this.workspaceId,
         boundary.afterId,
         boundary.highWaterId,
+        normalizedSubmissionId,
         BOTTLENECK_PAGE_LIMIT + 1,
       ], signal);
       const hasMore = rows.length > BOTTLENECK_PAGE_LIMIT;
@@ -1097,6 +1144,7 @@ export class BottleneckSource {
             workspaceId: this.workspaceId,
             highWaterId: boundary.highWaterId,
             afterId: candidates.at(-1).candidateId,
+            submissionId: normalizedSubmissionId,
             cursorSecret: this.cursorSecret,
           })
           : null,
@@ -1109,17 +1157,33 @@ export class BottleneckSource {
   }
 }
 
-export function createBottleneckReadinessGate(source) {
+export function createBottleneckReadinessGate(source, {
+  now = Date.now,
+  successTtlMs = BOTTLENECK_READINESS_SUCCESS_TTL_MS,
+  unavailableTtlMs = BOTTLENECK_READINESS_UNAVAILABLE_TTL_MS,
+} = {}) {
   if (typeof source?.readiness !== "function") {
     throw new TypeError("A bottleneck source with readiness is required");
   }
   let pending = null;
+  let cached = null;
+  let expiresAt = Number.NEGATIVE_INFINITY;
   return Object.freeze({
     async readiness(options) {
+      if (cached && now() < expiresAt) return cached;
       if (!pending) {
-        pending = Promise.resolve().then(() => source.readiness(options)).finally(() => {
-          pending = null;
-        });
+        pending = Promise.resolve()
+          .then(() => source.readiness(options))
+          .then((receipt) => {
+            cached = receipt;
+            expiresAt = now() + (
+              receipt?.status === "ok" ? successTtlMs : unavailableTtlMs
+            );
+            return receipt;
+          })
+          .finally(() => {
+            pending = null;
+          });
       }
       return await pending;
     },

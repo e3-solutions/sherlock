@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { PassThrough } from "node:stream";
 
 export const MCP_TOKEN_MIN_LENGTH = 32;
-export const MAX_MCP_BODY_BYTES = 262_144;
+export const MAX_MCP_BODY_BYTES = 2_097_152;
 const MCP_TOKEN_MAX_LENGTH = 512;
 
 function headerValue(value) {
