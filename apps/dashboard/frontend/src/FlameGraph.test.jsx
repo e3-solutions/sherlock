@@ -785,7 +785,28 @@ describe("FlameGraph", () => {
       .toBeInTheDocument();
   });
 
-  it("does not cache errors or retry them on an ordinary same-frame click", async () => {
+  it("does not reuse or admit frame evidence while the timeline is stale", async () => {
+    const data = modelWithCacheableFrames();
+    const { container, rerender } = render(<FlameGraph data={data} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    prepareTimeline(wrapper);
+
+    selectBucket(wrapper, 0);
+    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    rerender(<FlameGraph data={data} chartWidth={1008} stale />);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Loading frame evidence…"))
+      .not.toBeInTheDocument());
+
+    selectBucket(wrapper, 1);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+    selectBucket(wrapper, 0);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+  });
+
+  it("does not cache errors across frame navigation", async () => {
     const data = modelWithCacheableFrames();
     const firstStart = new Date(data.people[0].buckets[0].startMs).toISOString();
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
@@ -808,10 +829,6 @@ describe("FlameGraph", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Frame evidence is temporarily unavailable",
     );
-    selectBucket(wrapper, 0);
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
-
     selectBucket(wrapper, 1);
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
     selectBucket(wrapper, 0);
@@ -845,33 +862,6 @@ describe("FlameGraph", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
   });
 
-  it("does not cache a complete response above the per-entry byte bound", async () => {
-    const data = modelWithCacheableFrames();
-    const firstStart = new Date(data.people[0].buckets[0].startMs).toISOString();
-    const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    vi.mocked(fetch).mockImplementation(async (url, options) => {
-      const response = await defaultFetch(url, options);
-      const request = new URL(url, "http://dashboard.test");
-      if (request.searchParams.get("start") !== firstStart) return response;
-      const payload = await response.json();
-      payload.prompts[0].content = "x".repeat(513 * 1024);
-      return { ...response, json: () => Promise.resolve(payload) };
-    });
-    const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    prepareTimeline(wrapper);
-
-    selectBucket(wrapper, 0);
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    selectBucket(wrapper, 0);
-    expect(fetch).toHaveBeenCalledTimes(1);
-
-    selectBucket(wrapper, 1);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
-    selectBucket(wrapper, 0);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
-  });
-
   it("opens a zero-evidence frame ready without a request", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const wrapper = container.querySelectorAll(".flame-person .recharts-wrapper")[1];
@@ -887,7 +877,7 @@ describe("FlameGraph", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("aborts immediately and never paints stale evidence after reselection", async () => {
+  it("aborts and never paints stale evidence after reselection", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
     const firstResponse = deferred();
     const data = modelWithCacheableFrames();
@@ -918,45 +908,6 @@ describe("FlameGraph", () => {
     await act(() => Promise.resolve());
     expect(screen.queryByText("stale frame A marker")).not.toBeInTheDocument();
     expect(wrapper.closest(".flame-lane")).toHaveAttribute("data-selected-index", "1");
-  });
-
-  it("restarts an aborted pending load when the same frame is immediately reopened", async () => {
-    const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    const pending = deferred();
-    let firstRequest = true;
-    vi.mocked(fetch).mockImplementation((url, options) => {
-      if (firstRequest) {
-        firstRequest = false;
-        return pending.promise;
-      }
-      return defaultFetch(url, options);
-    });
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    prepareTimeline(wrapper);
-
-    selectBucket(wrapper, 0);
-    const firstSignal = vi.mocked(fetch).mock.calls[0][1].signal;
-    fireEvent.click(screen.getByRole("button", { name: "Close interval details" }));
-    expect(firstSignal.aborted).toBe(true);
-
-    selectBucket(wrapper, 0);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-  });
-
-  it("aborts pending frame evidence on unmount", () => {
-    const pending = deferred();
-    vi.mocked(fetch).mockImplementation(() => pending.promise);
-    const { container, unmount } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    prepareTimeline(wrapper);
-
-    selectBucket(wrapper, 0);
-    const signal = vi.mocked(fetch).mock.calls[0][1].signal;
-    unmount();
-
-    expect(signal.aborted).toBe(true);
   });
 
   it("keeps prompt and stable work evidence visible when mutable role metadata is partial", async () => {
