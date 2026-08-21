@@ -552,6 +552,105 @@ Deno.test({
       assert(newest?.job_kind === "reduce");
       assert(newest.target_event_id === 30n);
       assert(await queue.complete(newest) === "succeeded");
+
+      const batchSessions = await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         )
+         select gen_random_uuid(), $1::uuid, $2::uuid, 'queue-batch',
+                'queue-batch-' || ordinal, 'worker', 'test.v1', now()
+           from generate_series(1, 75) ordinal
+         returning id::text as id`,
+        [workspaceId, personId],
+      );
+      const batchTargets = batchSessions.map((row, index) => ({
+        workspaceId,
+        sessionId: String(row.id),
+        normalizerVersion: "test.batch-normalizer.v1",
+        activityVersion: "test.batch-activity.v1",
+        targetEventId: BigInt(index + 1),
+        workloadClass: "backfill" as const,
+      }));
+      await queue.enqueueReductions([
+        ...batchTargets,
+        {
+          ...batchTargets[0],
+          targetEventId: 500n,
+          workloadClass: "live",
+        },
+      ]);
+      const firstBatchState = await sql.unsafe(
+        `select count(*)::int as count,
+                min(request_generation)::int as min_generation,
+                max(request_generation)::int as max_generation,
+                max(target_event_id)::text as max_target,
+                count(*) filter (where workload_class = 'live')::int as live
+           from processing.telemetry_jobs
+          where workspace_id = $1
+            and normalizer_version = 'test.batch-normalizer.v1'`,
+        [workspaceId],
+      );
+      assert(
+        Number(firstBatchState[0].count) === 75 &&
+          Number(firstBatchState[0].min_generation) === 1 &&
+          Number(firstBatchState[0].max_generation) === 1 &&
+          firstBatchState[0].max_target === "500" &&
+          Number(firstBatchState[0].live) === 1,
+        "a load-shaped reduction batch must insert every target once",
+      );
+      await sql.unsafe(
+        `update processing.telemetry_jobs set available_at = now()
+          where workspace_id = $1
+            and normalizer_version = 'test.batch-normalizer.v1'`,
+        [workspaceId],
+      );
+      const leasedBatchTarget = await queue.claim(
+        "backfill",
+        "batch-reducer",
+        60,
+        "reduce",
+      );
+      assert(leasedBatchTarget?.job_kind === "reduce");
+      await queue.enqueueReductions(batchTargets.map((target) => ({
+        ...target,
+        targetEventId: target.targetEventId + 100n,
+        workloadClass: "live" as const,
+      })));
+      const secondBatchState = await sql.unsafe(
+        `select count(*)::int as count,
+                min(request_generation)::int as min_generation,
+                max(request_generation)::int as max_generation,
+                count(*) filter (where workload_class = 'live')::int as live,
+                count(*) filter (where status = 'leased')::int as leased
+           from processing.telemetry_jobs
+          where workspace_id = $1
+            and normalizer_version = 'test.batch-normalizer.v1'`,
+        [workspaceId],
+      );
+      assert(
+        Number(secondBatchState[0].count) === 75 &&
+          Number(secondBatchState[0].min_generation) === 2 &&
+          Number(secondBatchState[0].max_generation) === 2 &&
+          Number(secondBatchState[0].live) === 75 &&
+          Number(secondBatchState[0].leased) === 1,
+        "batch upsert must preserve convergence and leased dirty-generation semantics",
+      );
+      assert(
+        await queue.complete(leasedBatchTarget) === "requeued",
+        "a batched update must fence an in-flight stale reduction generation",
+      );
+      await sql.unsafe(
+        `delete from processing.telemetry_jobs
+          where workspace_id = $1
+            and normalizer_version = 'test.batch-normalizer.v1'`,
+        [workspaceId],
+      );
+      await sql.unsafe(
+        `delete from telemetry.sessions
+          where workspace_id = $1 and collector_key = 'queue-batch'`,
+        [workspaceId],
+      );
     } finally {
       await sql.unsafe(
         "delete from processing.telemetry_jobs where workspace_id = $1",

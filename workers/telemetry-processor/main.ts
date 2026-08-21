@@ -1,7 +1,12 @@
-import { SupabaseRawStorage, TelemetryProcessor } from "./processor.ts";
+import {
+  type ReductionTarget,
+  SupabaseRawStorage,
+  TelemetryProcessor,
+} from "./processor.ts";
 import {
   type JobKind,
   PostgresJobQueue,
+  type ReductionEnqueueOptions,
   type TelemetryJob,
   type WorkloadClass,
 } from "./queue.ts";
@@ -640,22 +645,29 @@ async function normalizeAndEnqueue(
   tombstone_count: number;
 }> {
   const targets = await processor.normalize(job, maximumDurationMs);
-  for (const target of targets) {
-    await queue.enqueueReduction({
-      workspaceId: target.workspace_id,
-      sessionId: target.session_id,
-      normalizerVersion: target.normalizer_version,
-      activityVersion: target.activity_version,
-      targetEventId: target.target_event_id,
-      workloadClass: target.workload_class,
-    });
-  }
+  await enqueueReductionTargets(queue, targets);
   return {
     session_count: targets.length,
     candidate_count: 0,
     inserted_count: 0,
     tombstone_count: 0,
   };
+}
+
+export async function enqueueReductionTargets(
+  queue: Pick<PostgresJobQueue, "enqueueReductions">,
+  targets: readonly ReductionTarget[],
+): Promise<void> {
+  await queue.enqueueReductions(
+    targets.map((target): ReductionEnqueueOptions => ({
+      workspaceId: target.workspace_id,
+      sessionId: target.session_id,
+      normalizerVersion: target.normalizer_version,
+      activityVersion: target.activity_version,
+      targetEventId: target.target_event_id,
+      workloadClass: target.workload_class,
+    })),
+  );
 }
 
 function required(

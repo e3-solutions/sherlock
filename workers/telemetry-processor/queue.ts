@@ -29,6 +29,46 @@ export interface ReductionJob extends BaseJob {
 export type TelemetryJob = NormalizationJob | ReductionJob;
 export type CompletionResult = "succeeded" | "requeued" | "fenced";
 
+export interface ReductionEnqueueOptions {
+  workspaceId: string;
+  sessionId: string;
+  normalizerVersion: string;
+  activityVersion: string;
+  targetEventId: bigint;
+  workloadClass: WorkloadClass;
+}
+
+export function coalesceReductionTargets(
+  options: readonly ReductionEnqueueOptions[],
+): ReductionEnqueueOptions[] {
+  const targets = new Map<string, ReductionEnqueueOptions>();
+  for (const option of options) {
+    if (option.targetEventId <= 0n) continue;
+    const key = JSON.stringify([
+      option.workspaceId,
+      option.sessionId,
+      option.normalizerVersion,
+      option.activityVersion,
+    ]);
+    const existing = targets.get(key);
+    if (existing === undefined) {
+      targets.set(key, option);
+      continue;
+    }
+    targets.set(key, {
+      ...existing,
+      targetEventId: existing.targetEventId > option.targetEventId
+        ? existing.targetEventId
+        : option.targetEventId,
+      workloadClass: existing.workloadClass === "live" ||
+          option.workloadClass === "live"
+        ? "live"
+        : "backfill",
+    });
+  }
+  return [...targets.values()];
+}
+
 export class PostgresJobQueue {
   private handoffConnection: ReservedSql | null = null;
 
@@ -164,15 +204,15 @@ export class PostgresJobQueue {
     });
   }
 
-  async enqueueReduction(options: {
-    workspaceId: string;
-    sessionId: string;
-    normalizerVersion: string;
-    activityVersion: string;
-    targetEventId: bigint;
-    workloadClass: WorkloadClass;
-  }): Promise<void> {
-    if (options.targetEventId <= 0n) return;
+  async enqueueReduction(options: ReductionEnqueueOptions): Promise<void> {
+    await this.enqueueReductions([options]);
+  }
+
+  async enqueueReductions(
+    options: readonly ReductionEnqueueOptions[],
+  ): Promise<void> {
+    const targets = coalesceReductionTargets(options);
+    if (targets.length === 0) return;
     await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       await tx.unsafe(
@@ -180,11 +220,20 @@ export class PostgresJobQueue {
            workspace_id, job_kind, session_id, normalizer_version,
            activity_version, target_event_id, request_generation,
            workload_class, available_at
-         ) values (
-           $1, 'reduce', $2, $3, $4, $5, 1, $6,
-           now() + case when $6 = 'live' then interval '100 milliseconds'
-                        else interval '2 seconds' end
-         ) on conflict (
+         )
+         select target.workspace_id, 'reduce', target.session_id,
+                target.normalizer_version, target.activity_version,
+                target.target_event_id, 1, target.workload_class,
+                now() + case when target.workload_class = 'live'
+                  then interval '100 milliseconds' else interval '2 seconds' end
+           from unnest(
+             $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::bigint[],
+             $6::text[]
+           ) as target(
+             workspace_id, session_id, normalizer_version, activity_version,
+             target_event_id, workload_class
+           )
+         on conflict (
            workspace_id, session_id, normalizer_version, activity_version
          ) where job_kind = 'reduce' do update set
            target_event_id = greatest(
@@ -221,12 +270,12 @@ export class PostgresJobQueue {
            end,
            updated_at = now()`,
         [
-          options.workspaceId,
-          options.sessionId,
-          options.normalizerVersion,
-          options.activityVersion,
-          options.targetEventId.toString(),
-          options.workloadClass,
+          targets.map((target) => target.workspaceId),
+          targets.map((target) => target.sessionId),
+          targets.map((target) => target.normalizerVersion),
+          targets.map((target) => target.activityVersion),
+          targets.map((target) => target.targetEventId.toString()),
+          targets.map((target) => target.workloadClass),
         ],
       );
     });

@@ -4,6 +4,7 @@ import {
   capacityRetryMilliseconds,
   chooseLane,
   chooseOverloadJobKind,
+  enqueueReductionTargets,
   handoffOverlapConnectionBudget,
   isCapacityError,
   loadConfig,
@@ -16,8 +17,14 @@ import {
   AFFECTED_SESSIONS_SQL,
   recordLocatorFromRow,
   reduceAffectedSessions,
+  resolveSessionCutoffs,
+  SESSION_CUTOFFS_SQL,
 } from "./processor.ts";
 import { createReservedTransactionRunner } from "./database.ts";
+import {
+  coalesceReductionTargets,
+  type ReductionEnqueueOptions,
+} from "./queue.ts";
 const railwayConfig = await Deno.readTextFile(
   new URL("../../railway.toml", import.meta.url),
 );
@@ -378,6 +385,86 @@ Deno.test("parent repair retargets both normalized parents and their children", 
   assert(AFFECTED_SESSIONS_SQL.includes("id = any($2::uuid[])"));
   assert(AFFECTED_SESSIONS_SQL.includes("parent_session_id = any($2::uuid[])"));
   assert(!AFFECTED_SESSIONS_SQL.includes("limit"));
+});
+
+Deno.test("session cutoffs use one index-preserving transaction", async () => {
+  const sessions = Array.from(
+    { length: 75 },
+    (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+  );
+  let transactions = 0;
+  let cutoffQueries = 0;
+  let cutoffParameters: unknown[] = [];
+  const result = await resolveSessionCutoffs(
+    async (callback) => {
+      transactions += 1;
+      return await callback({
+        unsafe(sql: string, parameters: unknown[] = []) {
+          if (sql === SESSION_CUTOFFS_SQL) {
+            cutoffQueries += 1;
+            cutoffParameters = parameters;
+            return Promise.resolve(sessions.map((sessionId, index) => ({
+              session_id: sessionId,
+              cutoff: index === 0 ? "0" : String(index),
+            })));
+          }
+          return Promise.resolve([]);
+        },
+      } as never);
+    },
+    "00000000-0000-4000-8000-000000000999",
+    sessions,
+    "test.normalizer.v1",
+    performance.now() + 10_000,
+  );
+  assert(transactions === 1 && cutoffQueries === 1);
+  assert(cutoffParameters[1] === sessions);
+  assert(result.length === 74 && result[0].target_event_id === 1n);
+  assert(SESSION_CUTOFFS_SQL.includes("left join lateral"));
+  assert(SESSION_CUTOFFS_SQL.includes("order by e.id desc"));
+  assert(SESSION_CUTOFFS_SQL.includes("limit 1"));
+  assert(!SESSION_CUTOFFS_SQL.includes("group by"));
+});
+
+Deno.test("normalization schedules all reductions with one queue call", async () => {
+  const targets = Array.from({ length: 75 }, (_, index) => ({
+    workspace_id: "00000000-0000-4000-8000-000000000999",
+    session_id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    normalizer_version: "test.normalizer.v1",
+    activity_version: "test.activity.v1",
+    target_event_id: BigInt(index + 1),
+    workload_class: "live" as const,
+  }));
+  let calls = 0;
+  let scheduled: readonly unknown[] = [];
+  await enqueueReductionTargets({
+    enqueueReductions(options: readonly ReductionEnqueueOptions[]) {
+      calls += 1;
+      scheduled = options;
+      return Promise.resolve();
+    },
+  } as never, targets);
+  assert(calls === 1 && scheduled.length === targets.length);
+});
+
+Deno.test("batched reductions coalesce duplicate queue identities", () => {
+  const base: ReductionEnqueueOptions = {
+    workspaceId: "00000000-0000-4000-8000-000000000999",
+    sessionId: "00000000-0000-4000-8000-000000000001",
+    normalizerVersion: "test.normalizer.v1",
+    activityVersion: "test.activity.v1",
+    targetEventId: 10n,
+    workloadClass: "backfill",
+  };
+  const coalesced = coalesceReductionTargets([
+    base,
+    { ...base, targetEventId: 30n },
+    { ...base, targetEventId: 20n, workloadClass: "live" },
+    { ...base, targetEventId: 0n },
+  ]);
+  assert(coalesced.length === 1);
+  assert(coalesced[0].targetEventId === 30n);
+  assert(coalesced[0].workloadClass === "live");
 });
 
 Deno.test("reduction targets only normalized sessions with no workspace scan", async () => {

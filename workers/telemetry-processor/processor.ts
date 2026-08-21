@@ -29,6 +29,22 @@ select id::text as id
  order by id
 `;
 
+export const SESSION_CUTOFFS_SQL = `
+select requested.session_id::text as session_id,
+       coalesce(latest.cutoff, 0)::text as cutoff
+  from unnest($2::uuid[]) as requested(session_id)
+  left join lateral (
+    select e.id as cutoff
+      from telemetry.events e
+     where e.workspace_id = $1
+       and e.session_id = requested.session_id
+       and e.normalizer_version = $3
+     order by e.id desc
+     limit 1
+  ) latest on true
+ order by requested.session_id
+`;
+
 export interface ProcessingResult {
   session_count: number;
   candidate_count: number;
@@ -123,27 +139,21 @@ export class TelemetryProcessor {
           normalized.session_ids,
           deadlineAtMs,
         );
-        const targets: ReductionTarget[] = [];
-        for (const sessionId of affectedSessionIds) {
-          const targetEventId = await this.resolveSessionCutoff(
-            transactionRunner,
-            job.workspace_id,
-            sessionId,
-            normalized.normalizer_version,
-            deadlineAtMs,
-          );
-          if (targetEventId > 0n) {
-            targets.push({
-              workspace_id: job.workspace_id,
-              session_id: sessionId,
-              normalizer_version: normalized.normalizer_version,
-              activity_version: ACTIVITY_VERSION,
-              target_event_id: targetEventId,
-              workload_class: job.workload_class,
-            });
-          }
-        }
-        return targets;
+        const cutoffs = await resolveSessionCutoffs(
+          transactionRunner,
+          job.workspace_id,
+          affectedSessionIds,
+          normalized.normalizer_version,
+          deadlineAtMs,
+        );
+        return cutoffs.map(({ session_id, target_event_id }) => ({
+          workspace_id: job.workspace_id,
+          session_id,
+          normalizer_version: normalized.normalizer_version,
+          activity_version: ACTIVITY_VERSION,
+          target_event_id,
+          workload_class: job.workload_class,
+        }));
       },
     );
   }
@@ -292,27 +302,6 @@ export class TelemetryProcessor {
     });
   }
 
-  private async resolveSessionCutoff(
-    transactionRunner: TransactionRunner,
-    workspaceId: string,
-    sessionId: string,
-    normalizerVersion: string,
-    deadlineAtMs: number,
-  ): Promise<bigint> {
-    return await transactionRunner(async (tx) => {
-      await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
-      await tx.unsafe("set local role sherlock_normalizer");
-      const rows = await tx.unsafe(
-        `select coalesce(max(id), 0)::text as cutoff
-           from telemetry.events
-          where workspace_id = $1 and session_id = $2
-            and normalizer_version = $3`,
-        [workspaceId, sessionId, normalizerVersion],
-      );
-      return BigInt(String(rows[0].cutoff));
-    });
-  }
-
   private async resolveAffectedSessionIds(
     transactionRunner: TransactionRunner,
     workspaceId: string,
@@ -330,6 +319,33 @@ export class TelemetryProcessor {
       return rows.map((row) => String(row.id));
     });
   }
+}
+
+export async function resolveSessionCutoffs(
+  transactionRunner: TransactionRunner,
+  workspaceId: string,
+  sessionIds: readonly string[],
+  normalizerVersion: string,
+  deadlineAtMs: number,
+): Promise<Array<{ session_id: string; target_event_id: bigint }>> {
+  if (sessionIds.length === 0) return [];
+  return await transactionRunner(async (tx) => {
+    await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
+    await tx.unsafe("set local role sherlock_normalizer");
+    const rows = await tx.unsafe(
+      SESSION_CUTOFFS_SQL,
+      [workspaceId, sessionIds, normalizerVersion],
+    );
+    return rows.flatMap((row) => {
+      const targetEventId = BigInt(String(row.cutoff));
+      return targetEventId > 0n
+        ? [{
+          session_id: String(row.session_id),
+          target_event_id: targetEventId,
+        }]
+        : [];
+    });
+  });
 }
 
 export async function reduceAffectedSessions(
