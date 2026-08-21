@@ -22,8 +22,7 @@ function model() {
   adaBuckets[72] = [0, 0, 0, 2];
   adaBuckets[143] = [1, 0, 0, 0];
 
-  return {
-    ...adaptFlamePayload({
+  return adaptFlamePayload({
     start: "2026-08-14T07:00:00.000Z",
     read: "2026-08-15T07:01:00.000Z",
     snapshot: "v1.snapshot-token",
@@ -51,9 +50,7 @@ function model() {
         buckets: emptyBuckets(),
       },
     ],
-    }),
-    intervalEvidenceSplit: true,
-  };
+  });
 }
 
 function deferred() {
@@ -62,7 +59,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function modelWithCacheableFrames(count = 4) {
+function modelWithCacheableFrames(count = 2) {
   const data = model();
   for (let index = 0; index < count; index += 1) {
     data.people[0].buckets[index] = {
@@ -729,109 +726,42 @@ describe("FlameGraph", () => {
     expect(screen.getByText("Subagent session")).toBeInTheDocument();
     expect(screen.getByText("Agent session")).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining("/api/flame/interval/work?"),
+      expect.stringContaining("/api/flame/interval?"),
       expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
     );
   });
 
-  it("starts split evidence concurrently and reveals the validated frame atomically", async () => {
-    const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    const releaseWork = deferred();
-    const releasePrompts = deferred();
-    vi.mocked(fetch).mockImplementation((url, options) => {
-      const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work") {
-        return releaseWork.promise.then(() => defaultFetch(url, options));
-      }
-      if (request.pathname === "/api/flame/interval/prompts") {
-        return releasePrompts.promise.then(() => defaultFetch(url, options));
-      }
-      return defaultFetch(url, options);
-    });
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
-
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(fetch).mock.calls.map(([url]) => new URL(url, "http://dashboard.test").pathname))
-      .toEqual(["/api/flame/interval/work", "/api/flame/interval/prompts"]);
-
-    releaseWork.resolve();
-    await act(() => Promise.resolve());
-    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
-    expect(screen.queryByText("3 human prompts")).not.toBeInTheDocument();
-
-    releasePrompts.resolve();
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-  });
-
-  it("reuses a complete split result for A to B to A without a loading flash", async () => {
-    const data = modelWithCacheableFrames(2);
-    const { container, rerender } = render(<FlameGraph data={data} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    prepareTimeline(wrapper);
-
-    selectBucket(wrapper, 0);
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(2);
-
-    selectBucket(wrapper, 1);
-    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByText("Loading frame evidence…"))
-      .not.toBeInTheDocument());
-    expect(fetch).toHaveBeenCalledTimes(4);
-
-    selectBucket(wrapper, 0);
-    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
-    expect(screen.getByText("3 human prompts")).toBeInTheDocument();
-    expect(screen.getByRole("complementary", { name: "Ada Lovelace" }))
-      .toHaveAttribute("aria-busy", "false");
-    expect(fetch).toHaveBeenCalledTimes(4);
-
-    rerender(<FlameGraph data={{ ...data }} chartWidth={1008} />);
-    await act(() => Promise.resolve());
-    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(4);
-  });
-
-  it("also reuses complete combined-endpoint evidence", async () => {
-    const data = modelWithCacheableFrames(2);
-    data.intervalEvidenceSplit = false;
+  it("reuses complete combined evidence for A to B to A without a loading paint", async () => {
+    const data = modelWithCacheableFrames();
     const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
     prepareTimeline(wrapper);
 
     selectBucket(wrapper, 0);
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
     selectBucket(wrapper, 1);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByText("Loading frame evidence…"))
       .not.toBeInTheDocument());
+    expect(fetch).toHaveBeenCalledTimes(2);
 
     selectBucket(wrapper, 0);
     expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
+    expect(screen.getByText("3 human prompts")).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Ada Lovelace" }))
+      .toHaveAttribute("aria-busy", "false");
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it("clears cached evidence on a snapshot change without painting the old frame", async () => {
+  it("invalidates cached evidence when the opaque snapshot token changes", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    const nextWork = deferred();
-    const nextPrompts = deferred();
+    const nextResponse = deferred();
     vi.mocked(fetch).mockImplementation((url, options) => {
       const request = new URL(url, "http://dashboard.test");
-      if (request.searchParams.get("snapshot") === "v1.next-snapshot") {
-        if (request.pathname === "/api/flame/interval/work") {
-          return nextWork.promise.then(() => defaultFetch(url, options));
-        }
-        if (request.pathname === "/api/flame/interval/prompts") {
-          return nextPrompts.promise.then(() => defaultFetch(url, options));
-        }
+      if (request.searchParams.get("snapshot") === "v2.next-snapshot") {
+        return nextResponse.promise.then(() => defaultFetch(url, options));
       }
       return defaultFetch(url, options);
     });
@@ -844,30 +774,24 @@ describe("FlameGraph", () => {
     expect(await screen.findByRole("button", { name: /First exact prompt/ }))
       .toBeInTheDocument();
 
-    rerender(<FlameGraph data={{ ...data, snapshot: "v1.next-snapshot" }} chartWidth={1008} />);
+    rerender(<FlameGraph data={{ ...data, snapshot: "v2.next-snapshot" }} chartWidth={1008} />);
     expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /First exact prompt/ }))
       .not.toBeInTheDocument();
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
 
-    nextWork.resolve();
-    await act(() => Promise.resolve());
-    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /First exact prompt/ }))
-      .not.toBeInTheDocument();
-    nextPrompts.resolve();
+    nextResponse.resolve();
     expect(await screen.findByRole("button", { name: /First exact prompt/ }))
       .toBeInTheDocument();
   });
 
-  it("does not cache a frame with an evidence error", async () => {
-    const data = modelWithCacheableFrames(2);
+  it("does not cache errors or retry them on an ordinary same-frame click", async () => {
+    const data = modelWithCacheableFrames();
     const firstStart = new Date(data.people[0].buckets[0].startMs).toISOString();
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
     vi.mocked(fetch).mockImplementation((url, options) => {
       const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work" &&
-          request.searchParams.get("start") === firstStart) {
+      if (request.searchParams.get("start") === firstStart) {
         return Promise.resolve({
           ok: false,
           status: 503,
@@ -885,25 +809,20 @@ describe("FlameGraph", () => {
       "Frame evidence is temporarily unavailable",
     );
     selectBucket(wrapper, 0);
+    expect(fetch).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Frame evidence is temporarily unavailable",
-    );
-    expect(fetch).toHaveBeenCalledTimes(2);
 
     selectBucket(wrapper, 1);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
-    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
-
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
     selectBucket(wrapper, 0);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(6));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Frame evidence is temporarily unavailable",
     );
   });
 
-  it("does not cache an incomplete work result", async () => {
-    const data = modelWithCacheableFrames(2);
+  it("does not cache incomplete work evidence across frame navigation", async () => {
+    const data = modelWithCacheableFrames();
     data.people[0].buckets[0] = {
       ...data.people[0].buckets[0],
       agent: 3,
@@ -918,56 +837,25 @@ describe("FlameGraph", () => {
       /Some session-role evidence changed after this timeline snapshot/,
     )).toBeInTheDocument();
     selectBucket(wrapper, 0);
-    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
-    expect(screen.getByText(
-      /Some session-role evidence changed after this timeline snapshot/,
-    )).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
 
     selectBucket(wrapper, 1);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
-    await waitFor(() => expect(screen.queryByText("Loading frame evidence…"))
-      .not.toBeInTheDocument());
-
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
     selectBucket(wrapper, 0);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(6));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
   });
 
-  it("preserves a complete oversized result when the same bucket is clicked again", async () => {
-    const data = modelWithCacheableFrames(1);
+  it("does not cache a complete response above the per-entry byte bound", async () => {
+    const data = modelWithCacheableFrames();
+    const firstStart = new Date(data.people[0].buckets[0].startMs).toISOString();
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    vi.mocked(fetch).mockImplementation((url, options) => {
+    vi.mocked(fetch).mockImplementation(async (url, options) => {
+      const response = await defaultFetch(url, options);
       const request = new URL(url, "http://dashboard.test");
-      if (request.pathname !== "/api/flame/interval/prompts") {
-        return defaultFetch(url, options);
-      }
-      const start = request.searchParams.get("start");
-      const personId = request.searchParams.get("personId");
-      const snapshot = request.searchParams.get("snapshot");
-      return Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({
-          personId,
-          start,
-          snapshot,
-          prompts: [
-            {
-              id: "oversized", sessionId: "session-1", at: start,
-              content: "x".repeat(513 * 1024), truncated: true,
-            },
-            {
-              id: "prompt-2", sessionId: "session-2",
-              at: new Date(Date.parse(start) + 1000).toISOString(),
-              content: "Second prompt", truncated: false,
-            },
-            {
-              id: "prompt-3", sessionId: "session-3",
-              at: new Date(Date.parse(start) + 2000).toISOString(),
-              content: "Third prompt", truncated: false,
-            },
-          ],
-        }),
-      });
+      if (request.searchParams.get("start") !== firstStart) return response;
+      const payload = await response.json();
+      payload.prompts[0].content = "x".repeat(513 * 1024);
+      return { ...response, json: () => Promise.resolve(payload) };
     });
     const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
@@ -975,187 +863,16 @@ describe("FlameGraph", () => {
 
     selectBucket(wrapper, 0);
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(2);
-
     selectBucket(wrapper, 0);
-    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
-    expect(screen.getByText("3 human prompts")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(2);
-  });
-
-  it("falls back once and remembers combined compatibility for later frames", async () => {
-    const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    let splitRouteMissing = true;
-    vi.mocked(fetch).mockImplementation((url, options) => {
-      const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work" && splitRouteMissing) {
-        splitRouteMissing = false;
-        return Promise.resolve({
-          ok: false,
-          status: 404,
-          json: () => Promise.resolve({ error: "not_found" }),
-        });
-      }
-      return defaultFetch(url, options);
-    });
-    const { container, rerender } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
-
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(fetch).mock.calls.map(([url]) => new URL(url, "http://dashboard.test").pathname))
-      .toEqual([
-        "/api/flame/interval/work",
-        "/api/flame/interval/prompts",
-        "/api/flame/interval",
-      ]);
-
-    fireEvent.click(wrapper, { clientX: 508, clientY: 34 });
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
-    expect(new URL(vi.mocked(fetch).mock.calls[3][0], "http://dashboard.test").pathname)
-      .toBe("/api/flame/interval");
-
-    const refreshed = model();
-    rerender(<FlameGraph data={refreshed} chartWidth={1008} />);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
-    expect(vi.mocked(fetch).mock.calls.slice(4).map(([url]) =>
-      new URL(url, "http://dashboard.test").pathname)).toEqual([
-      "/api/flame/interval/prompts",
-    ]);
-  });
-
-  it("uses the combined endpoint immediately when the aggregate capability is absent", async () => {
-    const legacy = model();
-    legacy.intervalEvidenceSplit = false;
-    const { container } = render(<FlameGraph data={legacy} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
-
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(new URL(vi.mocked(fetch).mock.calls[0][0], "http://dashboard.test").pathname)
-      .toBe("/api/flame/interval");
-  });
 
-  it("does not treat an evidence-level 404 as a missing split route", async () => {
-    vi.mocked(fetch).mockImplementation((url) => {
-      const request = new URL(url, "http://dashboard.test");
-      return Promise.resolve({
-        ok: false,
-        status: 404,
-        json: () => Promise.resolve({ error: "flame_interval_request_not_found" }),
-      });
-    });
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
-
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-
-    expect(await screen.findByRole("button", { name: "Refresh timeline" })).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(fetch).mock.calls.every(([url]) =>
-      new URL(url, "http://dashboard.test").pathname !== "/api/flame/interval"))
-      .toBe(true);
-  });
-
-  it("settles split failures atomically and retries the complete frame", async () => {
-    const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    const firstWork = deferred();
-    let workAttempts = 0;
-    let promptAttempts = 0;
-    vi.mocked(fetch).mockImplementation((url, options) => {
-      const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work" && workAttempts++ === 0) {
-        return firstWork.promise.then(() => defaultFetch(url, options));
-      }
-      if (request.pathname === "/api/flame/interval/prompts" && promptAttempts++ === 0) {
-        return Promise.resolve({
-          ok: false,
-          status: 503,
-          json: () => Promise.resolve({ error: "flame_database_unavailable" }),
-        });
-      }
-      return defaultFetch(url, options);
-    });
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
-
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    await act(() => Promise.resolve());
-    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /First exact prompt/ }))
-      .not.toBeInTheDocument();
-
-    firstWork.resolve();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Frame evidence is temporarily unavailable",
-    );
-    expect(screen.queryByRole("button", { name: /First exact prompt/ }))
-      .not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(screen.getByText("Loading frame evidence…")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(4);
-    expect(vi.mocked(fetch).mock.calls.slice(2).map(([url]) =>
-      new URL(url, "http://dashboard.test").pathname)).toEqual([
-      "/api/flame/interval/work",
-      "/api/flame/interval/prompts",
-    ]);
-  });
-
-  it("skips zero-count evidence requests without creating an N+1 path", async () => {
-    const counts = model();
-    counts.people[0].buckets[72].prompts = 3;
-    counts.people[0].buckets[143].activity = 4;
-    const { container } = render(<FlameGraph data={counts} chartWidth={1008} />);
-    const wrappers = container.querySelectorAll(".flame-person .recharts-wrapper");
-    for (const wrapper of wrappers) {
-      vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-        bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-        x: 0, y: 0, toJSON: () => ({}),
-      });
-    }
-
-    fireEvent.click(wrappers[0], { clientX: 508, clientY: 34 });
-    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(new URL(vi.mocked(fetch).mock.calls[0][0], "http://dashboard.test").pathname)
-      .toBe("/api/flame/interval/prompts");
-
-    fireEvent.click(wrappers[0], { clientX: 1004, clientY: 34 });
+    selectBucket(wrapper, 1);
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
-    expect(new URL(vi.mocked(fetch).mock.calls[1][0], "http://dashboard.test").pathname)
-      .toBe("/api/flame/interval/work");
-
-    fireEvent.click(wrappers[1], { clientX: 3, clientY: 34 });
-    await act(() => Promise.resolve());
-    expect(fetch).toHaveBeenCalledTimes(2);
+    selectBucket(wrapper, 0);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
   });
 
-  it("opens a zero-evidence frame ready without a loading paint or request", () => {
+  it("opens a zero-evidence frame ready without a request", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
     const wrapper = container.querySelectorAll(".flame-person .recharts-wrapper")[1];
     prepareTimeline(wrapper);
@@ -1170,69 +887,43 @@ describe("FlameGraph", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("aborts immediately and never paints stale evidence after frame reselection", async () => {
+  it("aborts immediately and never paints stale evidence after reselection", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    const firstWork = deferred();
+    const firstResponse = deferred();
+    const data = modelWithCacheableFrames();
+    const firstStart = new Date(data.people[0].buckets[0].startMs).toISOString();
     vi.mocked(fetch).mockImplementation((url, options) => {
       const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work" && request.searchParams.get("start") ===
-          "2026-08-14T07:00:00.000Z") {
-        return firstWork.promise.then(() => defaultFetch(url, options));
+      if (request.searchParams.get("start") === firstStart) {
+        return firstResponse.promise.then(() => defaultFetch(url, options));
       }
       return defaultFetch(url, options);
     });
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
     const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
+    prepareTimeline(wrapper);
 
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    selectBucket(wrapper, 0);
     const firstSignal = vi.mocked(fetch).mock.calls[0][1].signal;
-    const chart = screen.getByRole("application", { name: "Ada Lovelace activity timeline" });
-    fireEvent.keyDown(chart, { key: "ArrowRight" });
-    fireEvent.keyDown(chart, { key: "Enter" });
+    selectBucket(wrapper, 1);
 
     expect(firstSignal.aborted).toBe(true);
-    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
-    firstWork.resolve();
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
+    firstResponse.resolve();
     await act(() => Promise.resolve());
-    expect(screen.queryByRole("button", { name: /First exact prompt/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Ada Lovelace" }))
+      .toHaveTextContent(/12:10 AM.*12:20 AM/);
   });
 
-  it("aborts frame evidence as soon as the drawer is closed", () => {
-    const pending = deferred();
-    vi.mocked(fetch).mockImplementation(() => pending.promise);
-    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
-    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
-    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
-      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
-      x: 0, y: 0, toJSON: () => ({}),
-    });
-
-    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    const signal = vi.mocked(fetch).mock.calls[0][1].signal;
-    fireEvent.click(screen.getByRole("button", { name: "Close interval details" }));
-
-    expect(signal.aborted).toBe(true);
-  });
-
-  it("restarts an aborted load when the closing frame is immediately reselected", async () => {
+  it("restarts an aborted pending load when the same frame is immediately reopened", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
-    const pendingWork = deferred();
-    const pendingPrompts = deferred();
-    let firstWork = true;
-    let firstPrompts = true;
+    const pending = deferred();
+    let firstRequest = true;
     vi.mocked(fetch).mockImplementation((url, options) => {
-      const request = new URL(url, "http://dashboard.test");
-      if (request.pathname === "/api/flame/interval/work" && firstWork) {
-        firstWork = false;
-        return pendingWork.promise;
-      }
-      if (request.pathname === "/api/flame/interval/prompts" && firstPrompts) {
-        firstPrompts = false;
-        return pendingPrompts.promise;
+      if (firstRequest) {
+        firstRequest = false;
+        return pending.promise;
       }
       return defaultFetch(url, options);
     });
@@ -1241,18 +932,27 @@ describe("FlameGraph", () => {
     prepareTimeline(wrapper);
 
     selectBucket(wrapper, 0);
-    expect(fetch).toHaveBeenCalledTimes(2);
-    const firstSignals = vi.mocked(fetch).mock.calls.map(([, options]) => options.signal);
+    const firstSignal = vi.mocked(fetch).mock.calls[0][1].signal;
     fireEvent.click(screen.getByRole("button", { name: "Close interval details" }));
-    expect(firstSignals.every(({ aborted }) => aborted)).toBe(true);
+    expect(firstSignal.aborted).toBe(true);
 
     selectBucket(wrapper, 0);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
-    const restartedSignals = vi.mocked(fetch).mock.calls.slice(2)
-      .map(([, options]) => options.signal);
-    expect(restartedSignals.every(({ aborted }) => !aborted)).toBe(true);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
-    expect(screen.queryByText("Loading frame evidence…")).not.toBeInTheDocument();
+  });
+
+  it("aborts pending frame evidence on unmount", () => {
+    const pending = deferred();
+    vi.mocked(fetch).mockImplementation(() => pending.promise);
+    const { container, unmount } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    prepareTimeline(wrapper);
+
+    selectBucket(wrapper, 0);
+    const signal = vi.mocked(fetch).mock.calls[0][1].signal;
+    unmount();
+
+    expect(signal.aborted).toBe(true);
   });
 
   it("keeps prompt and stable work evidence visible when mutable role metadata is partial", async () => {
@@ -1277,7 +977,7 @@ describe("FlameGraph", () => {
   });
 
   it.each([
-    ["flame_database_timeout", /evidence took too long to load/],
+    ["flame_database_timeout", /Frame evidence took too long to load/],
     ["flame_interval_snapshot_expired", /timeline snapshot has expired/],
     ["flame_database_unavailable", /temporarily unavailable/],
   ])("explains interval failure %s", async (error, copy) => {
@@ -1295,9 +995,7 @@ describe("FlameGraph", () => {
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
 
-    await waitFor(() => {
-      expect(screen.getAllByRole("alert").some((alert) => copy.test(alert.textContent))).toBe(true);
-    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(copy);
   });
 
   it("refreshes the timeline instead of retrying an expired interval snapshot", async () => {
@@ -1320,7 +1018,7 @@ describe("FlameGraph", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Refresh timeline" }));
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes the timeline instead of retrying mismatched interval evidence", async () => {
@@ -1351,7 +1049,7 @@ describe("FlameGraph", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Refresh timeline" }));
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("keeps prompt text out of busy frame overviews and resets extra sessions by frame", async () => {
@@ -1484,7 +1182,7 @@ describe("FlameGraph", () => {
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(screen.getByText("Active work")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("loads later conversation turns", async () => {

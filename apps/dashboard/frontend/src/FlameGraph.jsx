@@ -20,8 +20,6 @@ import {
   BUCKET_COUNT,
   BUCKET_MS,
   adaptIntervalEvidence,
-  adaptIntervalPromptEvidence,
-  adaptIntervalWorkEvidence,
   adaptWorkEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
@@ -39,6 +37,16 @@ const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
 const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;
 const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
+
+function emptyIntervalEvidence(key = null) {
+  return {
+    key,
+    state: "idle",
+    work: [],
+    prompts: [],
+    workIncomplete: false,
+  };
+}
 
 export const PERSON_RANK_OPTIONS = [
   { value: "roster", label: "Name" },
@@ -130,26 +138,6 @@ function evidenceFailureReason(error) {
 function needsTimelineRefresh(reason) {
   return reason?.endsWith("_snapshot_expired") || reason?.endsWith("_request_not_found") ||
     reason === "flame_evidence_mismatch";
-}
-
-async function splitEndpointFailure(response, fallback) {
-  if (response.ok) return null;
-  const error = await apiFailure(response, fallback);
-  return {
-    error,
-    unsupported: response.status === 405 || response.status === 501 ||
-      (response.status === 404 && error.apiCode === "not_found"),
-  };
-}
-
-function emptyIntervalEvidence(key = null) {
-  return {
-    key,
-    state: "idle",
-    work: [],
-    prompts: [],
-    workIncomplete: false,
-  };
 }
 
 export function formatActiveTime(seconds) {
@@ -456,7 +444,6 @@ function IntervalOverview({
   const visibleWork = showAdditionalWork
     ? [...promptedWork, ...additionalWork]
     : promptedWork;
-  const loading = evidence.state === "loading" || evidence.state === "idle";
 
   function workRow(work) {
     const label = work.summary ?? `${roleLabel(work.role)} session`;
@@ -509,43 +496,38 @@ function IntervalOverview({
         <DrawerCloseButton closing={closing} onClose={onClose} />
       </header>
 
-      <div className="flame-detail__body">
-          {loading ? (
-            <p className="flame-detail__state" role="status">Loading frame evidence…</p>
-          ) : evidence.state === "error" ? (
-            <div className="flame-detail__state flame-detail__error" role="alert">
-              <p>{evidenceErrorCopy("frame", evidence.reason)}</p>
-              <button
-                type="button"
-                onClick={needsTimelineRefresh(evidence.reason) ? onRefresh : onRetry}
-              >
-                {needsTimelineRefresh(evidence.reason) ? "Refresh timeline" : "Retry"}
-              </button>
-            </div>
-          ) : (<>
-          <section aria-label="Prompt evidence">
-            {evidence.prompts.length > 0 && (
-              <details className="flame-detail__prompts">
-                <summary>{evidence.prompts.length} human {evidence.prompts.length === 1 ? "prompt" : "prompts"}</summary>
-                <ol>
-                  {evidence.prompts.map((prompt) => (
-                    <li key={prompt.id}>
-                      <header>
-                        <strong>Submitted prompt</strong>
-                        <time dateTime={new Date(prompt.atMs).toISOString()}>{formatTime(prompt.atMs)}</time>
-                        {prompt.truncated && <span>Excerpt</span>}
-                      </header>
-                      <p>{prompt.content || "Stored prompt excerpt was empty."}</p>
-                    </li>
-                  ))}
-                </ol>
-              </details>
-            )}
-          </section>
-          <section
-            className="flame-detail__section"
-            aria-labelledby={`${headingId}-work`}
+      {evidence.state === "loading" ? (
+        <p className="flame-detail__state" role="status">Loading frame evidence…</p>
+      ) : evidence.state === "error" ? (
+        <div className="flame-detail__state flame-detail__error" role="alert">
+          <p>{evidenceErrorCopy("frame", evidence.reason)}</p>
+          <button
+            type="button"
+            onClick={needsTimelineRefresh(evidence.reason) ? onRefresh : onRetry}
           >
+            {needsTimelineRefresh(evidence.reason) ? "Refresh timeline" : "Retry"}
+          </button>
+        </div>
+      ) : evidence.state === "ready" && (
+        <div className="flame-detail__body">
+          {evidence.prompts.length > 0 && (
+            <details className="flame-detail__prompts">
+              <summary>{evidence.prompts.length} human {evidence.prompts.length === 1 ? "prompt" : "prompts"}</summary>
+              <ol>
+                {evidence.prompts.map((prompt) => (
+                  <li key={prompt.id}>
+                    <header>
+                      <strong>Submitted prompt</strong>
+                      <time dateTime={new Date(prompt.atMs).toISOString()}>{formatTime(prompt.atMs)}</time>
+                      {prompt.truncated && <span>Excerpt</span>}
+                    </header>
+                    <p>{prompt.content || "Stored prompt excerpt was empty."}</p>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
+          <section className="flame-detail__section" aria-labelledby={`${headingId}-work`}>
             <h3 id={`${headingId}-work`}>Active work</h3>
             {evidence.workIncomplete && (
               <p className="flame-detail__partial" role="status">
@@ -573,8 +555,8 @@ function IntervalOverview({
               </>
             )}
           </section>
-          </>)}
         </div>
+      )}
     </div>
   );
 }
@@ -932,9 +914,8 @@ export default function FlameGraph({
   const peopleScrollRef = useRef(null);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
+  const intervalCacheHitKeyRef = useRef(null);
   const intervalRequestRef = useRef(null);
-  const intervalEvidenceStateRef = useRef(null);
-  const splitEvidenceSupportedRef = useRef(null);
   const workRequestRef = useRef(null);
   const [selection, setSelection] = useState(null);
   const [activeTooltipPersonId, setActiveTooltipPersonId] = useState(null);
@@ -989,14 +970,6 @@ export default function FlameGraph({
 
   useLayoutEffect(() => () => intervalEvidenceCache.clear(), [intervalEvidenceCache]);
 
-  useLayoutEffect(() => {
-    splitEvidenceSupportedRef.current = data.intervalEvidenceSplit === true ? null : false;
-  }, [data]);
-
-  useLayoutEffect(() => {
-    intervalEvidenceStateRef.current = intervalEvidence;
-  }, [intervalEvidence]);
-
   const beginCloseDetail = useCallback(() => {
     if (!selection || detailClosingRef.current) return;
     detailClosingRef.current = true;
@@ -1041,6 +1014,8 @@ export default function FlameGraph({
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
+      intervalRequestRef.current?.abort();
+      intervalRequestRef.current = null;
       setIntervalEvidence(emptyIntervalEvidence());
       return undefined;
     }
@@ -1053,18 +1028,11 @@ export default function FlameGraph({
     intervalRequestRef.current?.abort();
     if (selectedPoint.activity === 0 && selectedPoint.prompts === 0) {
       intervalRequestRef.current = null;
-      setIntervalEvidence((current) => current.key === evidenceKey &&
-        current.state === "ready" ? current : {
-          ...emptyIntervalEvidence(evidenceKey),
-          state: "ready",
-        });
+      setIntervalEvidence({ ...emptyIntervalEvidence(evidenceKey), state: "ready" });
       return undefined;
     }
-    const currentEvidence = intervalEvidenceStateRef.current;
-    if (currentEvidence?.key === evidenceKey && currentEvidence.state === "ready" &&
-        !currentEvidence.workIncomplete &&
-        currentEvidence.work.length === selectedPoint.activity &&
-        currentEvidence.prompts.length === selectedPoint.prompts) {
+    if (intervalCacheHitKeyRef.current === evidenceKey) {
+      intervalCacheHitKeyRef.current = null;
       intervalRequestRef.current = null;
       return undefined;
     }
@@ -1076,77 +1044,26 @@ export default function FlameGraph({
       start: new Date(selectedPoint.startMs).toISOString(),
       snapshot: data.snapshot,
     });
-    const expected = {
-      personId: selectedPerson.id,
-      startMs: selectedPoint.startMs,
-      snapshot: data.snapshot,
-      promptCount: selectedPoint.prompts,
-    };
-    const request = (path) => fetch(`${path}?${query}`, {
+    fetch(`/api/flame/interval?${query}`, {
       headers: { Accept: "application/json" },
       cache: "no-store",
       signal: controller.signal,
-    });
-    const loadCombined = async () => {
-      const response = await request("/api/flame/interval");
-      if (!response.ok) throw await apiFailure(response, `flame_interval_http_${response.status}`);
-      const evidence = adaptIntervalEvidence(await response.json(), expected);
-      if (evidence.work.length > selectedPoint.activity) {
-        throw new Error("Work evidence count does not match the timeline snapshot");
-      }
-      return evidence;
-    };
-    const loadPart = async (part) => {
-      const response = await request(`/api/flame/interval/${part}`);
-      const failure = await splitEndpointFailure(
-        response, `flame_interval_${part}_http_${response.status}`,
-      );
-      if (failure?.unsupported) return { unsupported: true };
-      if (failure) throw failure.error;
-      if (part === "work") {
-        const { work } = adaptIntervalWorkEvidence(await response.json(), expected);
-        if (work.length > selectedPoint.activity) {
+    })
+      .then(async (response) => {
+        if (!response.ok) throw await apiFailure(response, `flame_interval_http_${response.status}`);
+        return response.json();
+      })
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        const evidence = adaptIntervalEvidence(value, {
+          personId: selectedPerson.id,
+          startMs: selectedPoint.startMs,
+          snapshot: data.snapshot,
+          promptCount: selectedPoint.prompts,
+        });
+        if (evidence.work.length > selectedPoint.activity) {
           throw new Error("Work evidence count does not match the timeline snapshot");
         }
-        return { work };
-      }
-      return adaptIntervalPromptEvidence(await response.json(), expected);
-    };
-    const loadSplit = async () => {
-      const requests = [];
-      if (selectedPoint.activity > 0) requests.push(["work", loadPart("work")]);
-      if (selectedPoint.prompts > 0) requests.push(["prompts", loadPart("prompts")]);
-      const results = await Promise.all(requests.map(async ([part, pending]) => {
-        try {
-          return { part, value: await pending };
-        } catch (error) {
-          return { part, error };
-        }
-      }));
-      if (controller.signal.aborted) return null;
-      if (results.some(({ value }) => value?.unsupported)) {
-        splitEvidenceSupportedRef.current = false;
-        return loadCombined();
-      }
-      splitEvidenceSupportedRef.current = true;
-      const failures = results.filter(({ error }) => error);
-      if (failures.length > 0) {
-        const refreshFailure = failures.find(({ error }) =>
-          needsTimelineRefresh(evidenceFailureReason(error)));
-        throw (refreshFailure ?? failures[0]).error;
-      }
-      return results.reduce(
-        (evidence, { value }) => ({ ...evidence, ...value }),
-        { work: [], prompts: [] },
-      );
-    };
-    const load = async () => {
-      try {
-        const evidence = data.intervalEvidenceSplit === true &&
-          splitEvidenceSupportedRef.current !== false
-          ? await loadSplit()
-          : await loadCombined();
-        if (!evidence || controller.signal.aborted) return;
         const readyEvidence = {
           key: evidenceKey,
           state: "ready",
@@ -1154,22 +1071,22 @@ export default function FlameGraph({
           workIncomplete: evidence.work.length < selectedPoint.activity,
         };
         if (!readyEvidence.workIncomplete) {
-          intervalEvidenceCache.set(evidenceKey, readyEvidence);
+          intervalEvidenceCache.set(evidenceKey, evidence);
         }
         setIntervalEvidence((current) => current.key === evidenceKey ? readyEvidence : current);
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        setIntervalEvidence((current) => current.key === evidenceKey ? {
-          ...emptyIntervalEvidence(evidenceKey),
-          state: "error",
-          reason: evidenceFailureReason(error),
-        } : current);
-      }
-    };
-    load();
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setIntervalEvidence((current) => current.key === evidenceKey ? {
+            ...emptyIntervalEvidence(evidenceKey),
+            state: "error",
+            reason: evidenceFailureReason(error),
+          } : current);
+        }
+      });
     return () => controller.abort();
   }, [
-    data,
+    data.snapshot,
     intervalEvidenceCache,
     intervalRevision,
     selectedPerson?.id,
@@ -1245,15 +1162,21 @@ export default function FlameGraph({
     setShowAdditionalWork(false);
     setDrawerView({ screen: "overview" });
     if (cached) {
-      setIntervalEvidence(cached);
+      intervalCacheHitKeyRef.current = evidenceKey;
+      setIntervalEvidence({
+        key: evidenceKey,
+        state: "ready",
+        ...cached,
+        workIncomplete: false,
+      });
     } else if (!sameSelection) {
+      intervalCacheHitKeyRef.current = null;
       setIntervalEvidence({
         ...emptyIntervalEvidence(evidenceKey),
         state: point.activity === 0 && point.prompts === 0 ? "ready" : "loading",
       });
     } else if (intervalRequestRef.current?.signal.aborted &&
-        intervalEvidence.key === evidenceKey &&
-        intervalEvidence.state === "loading") {
+        intervalEvidence.key === evidenceKey && intervalEvidence.state === "loading") {
       setIntervalRevision((revision) => revision + 1);
     }
     if (!sameSelection) setSelection({ personId: person.id, startMs: point.startMs });
@@ -1397,8 +1320,7 @@ export default function FlameGraph({
           className={`flame-detail${detailClosing ? " flame-detail--closing" : ""}`}
           aria-busy={drawerView.screen === "work"
             ? workEvidence.state === "loading" || workEvidence.loadingMore === true
-            : visibleIntervalEvidence.state === "loading" ||
-              visibleIntervalEvidence.state === "idle"}
+            : visibleIntervalEvidence.state === "loading"}
           aria-labelledby={drawerView.screen === "work"
             ? `flame-work-${drawerView.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`
             : `flame-detail-${selectedPerson.id.replace(/[^a-zA-Z0-9_-]/g, "")}`}

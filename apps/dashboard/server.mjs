@@ -13,7 +13,6 @@ import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
 import { FlameDayCache } from "./src/server/flame-cache.js";
-import { FrameEvidenceCoordinator } from "./src/server/frame-evidence-coordinator.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -42,15 +41,6 @@ const source = databaseUrl && validWorkspaceId && validMaxPeople && validDashboa
       expectedEmailDomain: dashboardEmailDomain,
       maxPeople,
       projectionEnabled,
-    })
-  : null;
-const evidenceSource = source
-  ? new DirectFlameSource({ databaseUrl, workspaceId, maxPeople })
-  : null;
-const frameEvidence = source
-  ? new FrameEvidenceCoordinator({
-      workspaceId,
-      log: (event) => console.log(JSON.stringify(event)),
     })
   : null;
 
@@ -189,7 +179,6 @@ const server = createServer(async (request, response) => {
       });
       sendJson(response, 200, result.payload, {
         "X-Sherlock-Timeline-Cache": result.state,
-        "X-Sherlock-Interval-Evidence": "split-v1",
       });
     } catch (error) {
       const code = error instanceof FlameSourceError
@@ -209,63 +198,18 @@ const server = createServer(async (request, response) => {
       return;
     }
     const signal = requestAbortSignal(request, response);
-    const personId = url.searchParams.get("personId") ?? "";
-    const start = url.searchParams.get("start") ?? "";
-    const snapshot = url.searchParams.get("snapshot") ?? "";
     try {
-      const payload = await frameEvidence.read({
-        kind: "combined",
-        personId,
-        start,
-        snapshot,
+      sendJson(response, 200, await source.fetchInterval({
+        personId: url.searchParams.get("personId") ?? "",
+        start: url.searchParams.get("start") ?? "",
+        snapshot: url.searchParams.get("snapshot") ?? "",
         signal,
-        load: ({ signal: sharedSignal }) => evidenceSource.fetchInterval({
-          personId, start, snapshot, signal: sharedSignal,
-        }),
-      });
-      sendJson(response, 200, payload);
+      }));
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code
         : "flame_database_unavailable";
-      if (code !== "flame_request_aborted" || !signal.aborted) {
-        sendJson(response, apiStatus(code, "flame_interval"), { error: code });
-      }
-    }
-    return;
-  }
-
-  if (url.pathname === "/api/flame/interval/work" ||
-      url.pathname === "/api/flame/interval/prompts") {
-    if (!source) {
-      sendJson(response, 503, { error: "dashboard_not_configured" });
-      return;
-    }
-    const signal = requestAbortSignal(request, response);
-    const kind = url.pathname.endsWith("/work") ? "work" : "prompts";
-    const personId = url.searchParams.get("personId") ?? "";
-    const start = url.searchParams.get("start") ?? "";
-    const snapshot = url.searchParams.get("snapshot") ?? "";
-    const fetchEvidence = kind === "work"
-      ? evidenceSource.fetchIntervalWork.bind(evidenceSource)
-      : evidenceSource.fetchIntervalPrompts.bind(evidenceSource);
-    try {
-      const payload = await frameEvidence.read({
-        kind,
-        personId,
-        start,
-        snapshot,
-        signal,
-        load: ({ signal: sharedSignal }) => fetchEvidence({
-          personId, start, snapshot, signal: sharedSignal,
-        }),
-      });
-      sendJson(response, 200, payload);
-    } catch (error) {
-      const code = error instanceof FlameSourceError
-        ? error.code
-        : "flame_database_unavailable";
-      if (code !== "flame_request_aborted" || !signal.aborted) {
+      if (code !== "flame_request_aborted") {
         sendJson(response, apiStatus(code, "flame_interval"), { error: code });
       }
     }
@@ -326,9 +270,9 @@ server.listen(PORT, "0.0.0.0", () => {
 async function shutdown(signal) {
   console.log(JSON.stringify({ event: "dashboard_shutdown", signal }));
   const drained = new Promise((resolve) => server.close(resolve));
-  await Promise.all([cache?.close(), frameEvidence?.close()]);
+  await cache?.close();
   await drained;
-  await Promise.all([mcpProtocol?.close(), evidenceSource?.close(), source?.close()]);
+  await Promise.all([mcpProtocol?.close(), source?.close()]);
 }
 
 process.once("SIGINT", () => shutdown("SIGINT"));

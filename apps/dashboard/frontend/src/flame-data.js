@@ -286,17 +286,18 @@ export function adaptFlamePayload(value) {
 const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
 const CONVERSATION_ROLES = ["user", "assistant"];
 
-/** Validates the bounded, snapshot-pinned interval work response. */
-export function adaptIntervalWorkEvidence(value, expected) {
-  const payload = requireObject(value, "interval work evidence");
-  requireEcho(payload, expected, "interval work evidence");
+/** Validates the bounded, snapshot-pinned interval overview response. */
+export function adaptIntervalEvidence(value, expected) {
+  const payload = requireObject(value, "interval evidence");
+  requireEcho(payload, expected, "interval evidence");
   const { startMs } = expected;
-  if (!Array.isArray(payload.work)) fail("interval work evidence.work", "an array");
+  if (!Array.isArray(payload.work)) fail("interval evidence.work", "an array");
+  if (!Array.isArray(payload.prompts)) fail("interval evidence.prompts", "an array");
 
   const workIds = new Set();
   let previousWorkAt = null;
   const work = payload.work.map((value, index) => {
-    const path = `interval work evidence.work[${index}]`;
+    const path = `interval evidence.work[${index}]`;
     const item = requireObject(value, path);
     const id = requireNonemptyString(item.id, `${path}.id`);
     const sessionId = requireNonemptyString(item.sessionId, `${path}.sessionId`);
@@ -318,23 +319,13 @@ export function adaptIntervalWorkEvidence(value, expected) {
     };
   });
 
-  return { work };
-}
-
-/** Validates the bounded, snapshot-pinned interval prompt response. */
-export function adaptIntervalPromptEvidence(value, expected) {
-  const payload = requireObject(value, "interval prompt evidence");
-  requireEcho(payload, expected, "interval prompt evidence");
-  const { startMs } = expected;
-  if (!Array.isArray(payload.prompts)) fail("interval prompt evidence.prompts", "an array");
-
   if (payload.prompts.length !== expected.promptCount) {
-    fail("interval prompt evidence.prompts", `exactly ${expected.promptCount} canonical prompt rows`);
+    fail("interval evidence.prompts", `exactly ${expected.promptCount} canonical prompt rows`);
   }
   const promptIds = new Set();
   let previousPromptAt = null;
   const prompts = payload.prompts.map((value, index) => {
-    const path = `interval prompt evidence.prompts[${index}]`;
+    const path = `interval evidence.prompts[${index}]`;
     const item = requireObject(value, path);
     const id = requireNonemptyString(item.id, `${path}.id`);
     if (promptIds.has(id)) fail(`${path}.id`, "unique");
@@ -351,15 +342,7 @@ export function adaptIntervalPromptEvidence(value, expected) {
     };
   });
 
-  return { prompts };
-}
-
-/** Validates the bounded, snapshot-pinned combined interval overview response. */
-export function adaptIntervalEvidence(value, expected) {
-  return {
-    ...adaptIntervalWorkEvidence(value, expected),
-    ...adaptIntervalPromptEvidence(value, expected),
-  };
+  return { work, prompts };
 }
 
 /** Validates one bounded page of chronological work/session evidence. */

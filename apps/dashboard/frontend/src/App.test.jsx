@@ -12,12 +12,7 @@ vi.mock("./flame-data.js", () => ({
 
 vi.mock("./FlameGraph.jsx", () => ({
   default: ({ data, rankBy, stale, onRefresh, timelineMeta }) => (
-    <div
-      data-testid="flame-graph"
-      data-rank-by={rankBy}
-      data-stale={String(stale)}
-      data-split={String(data.intervalEvidenceSplit)}
-    >
+    <div data-testid="flame-graph" data-rank-by={rankBy} data-stale={String(stale)}>
       {timelineMeta}
       {data.marker}
       <button type="button" onClick={onRefresh}>Refresh timeline</button>
@@ -47,11 +42,10 @@ const model = {
   },
 };
 
-function response({ ok = true, status = 200, body = payload, split = false } = {}) {
+function response({ ok = true, status = 200, body = payload } = {}) {
   return {
     ok,
     status,
-    headers: { get: vi.fn(() => split ? "split-v1" : null) },
     json: vi.fn().mockResolvedValue(body),
   };
 }
@@ -95,16 +89,6 @@ describe("App", () => {
       signal: expect.any(AbortSignal),
     }));
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-split", "false");
-  });
-
-  it("passes split frame-evidence capability from the aggregate response header", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({ split: true })));
-
-    render(<App />);
-    await settle();
-
-    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-split", "true");
   });
 
   it("lets detail recovery request a fresh timeline snapshot", async () => {

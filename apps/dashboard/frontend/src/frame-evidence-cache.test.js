@@ -43,6 +43,10 @@ describe("frame evidence cache", () => {
     expect(cache.set("oversized", { bytes: 7 })).toBe(false);
     expect(cache.get("oversized")).toBeUndefined();
     expect(cache.bytes).toBe(9);
+
+    expect(cache.set("a", { bytes: 7 })).toBe(false);
+    expect(cache.get("a")).toEqual({ bytes: 4 });
+    expect(cache.bytes).toBe(9);
   });
 
   it("clears all values and byte accounting synchronously", () => {

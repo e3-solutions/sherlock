@@ -70,11 +70,7 @@ export default function App() {
         throw new Error(`Flame request failed with HTTP ${response.status}`);
       }
 
-      const nextData = {
-        ...adaptFlamePayload(await response.json()),
-        intervalEvidenceSplit:
-          response.headers?.get?.("X-Sherlock-Interval-Evidence") === "split-v1",
-      };
+      const nextData = adaptFlamePayload(await response.json());
       if (!mountedRef.current || controller.signal.aborted) return;
 
       lastGoodRef.current = nextData;

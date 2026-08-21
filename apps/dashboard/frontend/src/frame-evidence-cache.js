@@ -55,12 +55,12 @@ export function createFrameEvidenceCache({
     },
 
     set(key, value) {
-      remove(key);
       const entryBytes = measure(value);
       if (!Number.isSafeInteger(entryBytes) || entryBytes < 0 ||
           entryBytes > maxEntryBytes || entryBytes > maxBytes || maxEntries < 1) {
         return false;
       }
+      remove(key);
       while (entries.size >= maxEntries || bytes + entryBytes > maxBytes) {
         const oldestKey = entries.keys().next().value;
         if (oldestKey === undefined) return false;
