@@ -1387,7 +1387,9 @@ function promptEvidenceFromRow(row) {
 }
 
 export function buildFlamePayload({
-  rows, roster, start, read, snapshot, frameVersion = null,
+  rows, roster, start, read, snapshot,
+  normalizerVersions = NORMALIZER_VERSIONS,
+  frameVersion = null,
 }) {
   if (rows.length !== roster.length * BUCKET_COUNT) {
     throw new FlameSourceError("flame_database_result_incomplete");
@@ -1454,6 +1456,8 @@ export function buildFlamePayload({
       state: "partial",
       reason: "event_presence_not_continuous_attention",
     },
+    normalizerVersions: [...normalizerVersions],
+    frameVersion,
     people,
   };
 }
@@ -1588,6 +1592,7 @@ export class DirectFlameSource {
         start,
         read,
         snapshot: receipt.snapshot,
+        normalizerVersions: NORMALIZER_VERSIONS,
         frameVersion,
       });
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });

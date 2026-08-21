@@ -1,16 +1,26 @@
+import { createHash } from "node:crypto";
+
 import { FlameSourceError } from "./flame-source.js";
 
 export const MCP_USAGE_PAGE_LIMIT = 20;
 
-const USAGE_CURSOR_VERSION = "u1";
-const MAX_USAGE_CURSOR_LENGTH = 128;
+const USAGE_CURSOR_VERSION = "u2";
+export const MAX_USAGE_CURSOR_LENGTH = 512;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export function encodeUsageCursor(personId) {
+function snapshotDigest(snapshot) {
+  if (typeof snapshot !== "string" || snapshot.length < 1 || snapshot.length > 8192) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
+  }
+  return createHash("sha256").update(snapshot, "utf8").digest("hex");
+}
+
+export function encodeUsageCursor(snapshot, personId) {
   if (typeof personId !== "string" || !UUID_PATTERN.test(personId)) {
     throw new FlameSourceError("flame_usage_cursor_invalid");
   }
-  return `${USAGE_CURSOR_VERSION}.${Buffer.from(personId, "utf8").toString("base64url")}`;
+  const body = JSON.stringify({ s: snapshotDigest(snapshot), a: personId });
+  return `${USAGE_CURSOR_VERSION}.${Buffer.from(body, "utf8").toString("base64url")}`;
 }
 
 export function decodeUsageCursor(cursor) {
@@ -24,18 +34,29 @@ export function decodeUsageCursor(cursor) {
     throw new FlameSourceError("flame_usage_cursor_invalid");
   }
   const decoded = Buffer.from(body, "base64url").toString("utf8");
-  if (Buffer.from(decoded, "utf8").toString("base64url") !== body ||
-      !UUID_PATTERN.test(decoded)) {
+  let value;
+  try {
+    value = JSON.parse(decoded);
+  } catch {
     throw new FlameSourceError("flame_usage_cursor_invalid");
   }
-  return decoded;
+  if (Buffer.from(decoded, "utf8").toString("base64url") !== body ||
+      !value || Object.keys(value).sort().join(",") !== "a,s" ||
+      !UUID_PATTERN.test(value.a) || !/^[0-9a-f]{64}$/.test(value.s)) {
+    throw new FlameSourceError("flame_usage_cursor_invalid");
+  }
+  return { snapshotSha256: value.s, afterPersonId: value.a };
 }
 
 export function pageCachedUsageEvidence(payload, cursor = "") {
   if (!payload || !Array.isArray(payload.people)) {
     throw new FlameSourceError("flame_database_result_invalid");
   }
-  const afterPersonId = decodeUsageCursor(cursor);
+  const decodedCursor = decodeUsageCursor(cursor);
+  if (decodedCursor && decodedCursor.snapshotSha256 !== snapshotDigest(payload.snapshot)) {
+    throw new FlameSourceError("flame_usage_snapshot_expired");
+  }
+  const afterPersonId = decodedCursor?.afterPersonId ?? null;
   const people = [...payload.people].sort((left, right) => {
     const leftId = String(left?.id ?? "");
     const rightId = String(right?.id ?? "");
@@ -58,7 +79,7 @@ export function pageCachedUsageEvidence(payload, cursor = "") {
   return {
     ...payload,
     people: selected,
-    nextCursor: hasMore ? encodeUsageCursor(selected.at(-1).id) : null,
+    nextCursor: hasMore ? encodeUsageCursor(payload.snapshot, selected.at(-1).id) : null,
   };
 }
 

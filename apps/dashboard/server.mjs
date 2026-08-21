@@ -9,6 +9,7 @@ import {
   FlameSourceError,
   validateDashboardEmailDomain,
 } from "./src/server/flame-source.js";
+import { BottleneckSource } from "./src/server/bottleneck-source.js";
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
@@ -21,12 +22,14 @@ const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
 const dashboardEmailDomain = process.env.SHERLOCK_DASHBOARD_EMAIL_DOMAIN ?? "";
 const databaseUrl = process.env.SUPABASE_DB_URL ?? "";
 const mcpToken = process.env.SHERLOCK_MCP_TOKEN ?? "";
+const candidateWritesEnabled = process.env.SHERLOCK_MCP_CANDIDATE_WRITES_ENABLED === "true";
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
 const projectionEnabled = process.env.SHERLOCK_FRAME_PROJECTION_ENABLED !== "false";
 const validWorkspaceId =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
     .test(workspaceId);
 const validMaxPeople = Number.isInteger(maxPeople) && maxPeople > 0 && maxPeople <= 1000;
+const validMcpToken = mcpToken.length >= 32 && mcpToken.length <= 512;
 let validDashboardEmailDomain = false;
 try {
   validateDashboardEmailDomain(dashboardEmailDomain);
@@ -61,8 +64,19 @@ const cache = source
     })
   : null;
 cache?.start();
-const mcpSource = source && cache ? createCachedMcpSource({ cache, source }) : null;
-const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
+const bottleneckSource = databaseUrl && validWorkspaceId
+  ? new BottleneckSource({
+      databaseUrl,
+      workspaceId,
+      writesEnabled: candidateWritesEnabled,
+    })
+  : null;
+const mcpSource = source && cache && validMcpToken
+  ? createCachedMcpSource({ cache, source })
+  : null;
+const mcpProtocol = mcpSource
+  ? createBonaparteMcpProtocol(mcpSource, bottleneckSource)
+  : null;
 
 const SECURITY_HEADERS = {
   "Content-Security-Policy":
@@ -95,10 +109,16 @@ function sendJson(response, status, body, headers = {}) {
   response.end(JSON.stringify(body));
 }
 
-const mcpRoute = createMcpHttpRoute({
-  protocolHandler: mcpProtocol?.handler ?? ((request, response) => {
+async function mcpProtocolHandler(request, response) {
+  if (!mcpProtocol) {
     sendJson(response, 503, { error: "mcp_not_configured" });
-  }),
+    return;
+  }
+  await mcpProtocol.handler(request, response);
+}
+
+const mcpRoute = createMcpHttpRoute({
+  protocolHandler: mcpProtocolHandler,
   token: mcpToken,
 });
 
@@ -141,6 +161,7 @@ function configurationStatus() {
   if (!validWorkspaceId) missing.push("SHERLOCK_WORKSPACE_ID");
   if (!validDashboardEmailDomain) missing.push("SHERLOCK_DASHBOARD_EMAIL_DOMAIN");
   if (!validMaxPeople) missing.push("SHERLOCK_DASHBOARD_MAX_PEOPLE");
+  if (!validMcpToken) missing.push("SHERLOCK_MCP_TOKEN");
   return missing.length === 0
     ? null
     : { status: "unavailable", reason: "configuration_missing", missing };
@@ -272,7 +293,7 @@ async function shutdown(signal) {
   const drained = new Promise((resolve) => server.close(resolve));
   await cache?.close();
   await drained;
-  await Promise.all([mcpProtocol?.close(), source?.close()]);
+  await Promise.all([mcpProtocol?.close(), source?.close(), bottleneckSource?.close()]);
 }
 
 process.once("SIGINT", () => shutdown("SIGINT"));

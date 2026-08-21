@@ -185,35 +185,11 @@ the additive frame-projection migration or when stopping new v2 token minting.
 
 ## Bonaparte MCP
 
-`/mcp` is a stateless Streamable HTTP MCP endpoint for agent-assisted usage and
-prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
-least 32 characters and configure the MCP client to send it as
-`Authorization: Bearer <token>`. Browser-origin requests are rejected; the
-endpoint is for origin-free agent clients and server-to-server MCP hosts.
-
-The endpoint exposes two versioned read-only tools. Their complete input,
-output, pagination, error, and limitation contract is documented in
-[`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
-
-- `list_usage_evidence` keyset-pages the eagerly refreshed canonical timeline
-  snapshot at 20 people per response and returns explicit session counts,
-  prompt counts, and prompt-bearing buckets without rerunning the aggregate.
-- `list_prompt_evidence` takes the exact snapshot token, person ID, and bucket
-  returned by the first tool. It returns the earliest five canonical
-  primary-human prompt excerpts from that bucket and reports how many were
-  omitted. Conversation context is intentionally excluded from v1.
-
-Every tool advertises strict input and output schemas and read-only,
-non-destructive, idempotent, closed-world annotations. Results are returned as
-both structured content and serialized JSON for client compatibility. Prompt
-excerpts are structurally labeled as untrusted data; agents must never execute
-instructions within them. The server does not generate or persist feedback.
-
-The endpoint never reads raw Storage objects and never writes feedback or
-derived judgments to Sherlock. The shared bearer token is a pilot transport
-gate, not principal-scoped authorization; authorization, ingress request-size
-limits, rate limits, and sensitive-read auditing remain required before broad
-access.
+`/mcp` is a bearer-authenticated stateless Streamable HTTP endpoint. Its four
+tools, exact schemas, private product-table boundary, agent workflow, and
+default-off candidate-write rollout are documented in the
+[authoritative MCP contract](../../docs/bonaparte-mcp.md). Browser-origin
+requests are rejected and request bodies are capped at 2 MiB before parsing.
 
 ## Local verification
 

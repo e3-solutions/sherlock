@@ -93,6 +93,9 @@ jobs:
       - name: Run database schema tests
         run: supabase test db --local supabase/tests/database/schema.test.sql
 
+      - name: Run bottleneck report database tests
+        run: supabase test db --local supabase/tests/database/bottleneck_reports.test.sql
+
       - name: Run dashboard database integration test
         working-directory: apps/dashboard
         env:

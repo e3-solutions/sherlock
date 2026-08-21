@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  CLAUDE_NORMALIZER_VERSION,
+  FRAME_VERSION,
+  NORMALIZER_VERSION,
+} from "./flame-source.js";
+import {
   MCP_PROMPT_SCHEMA_VERSION,
   MCP_USAGE_SCHEMA_VERSION,
   collectPromptEvidence,
@@ -26,6 +31,8 @@ function dayPayload(people = null) {
     start: START,
     read: READ,
     snapshot: SNAPSHOT,
+    normalizerVersions: [NORMALIZER_VERSION, CLAUDE_NORMALIZER_VERSION],
+    frameVersion: null,
     nextCursor: null,
     coverage: {
       evidence: "observed_events",
@@ -65,7 +72,16 @@ describe("Bonaparte MCP usage evidence", () => {
         endExclusive: "2026-08-19T03:30:00.000Z",
         readAt: READ,
       },
-      provenance: { projectionVersion: "sherlock.codex-rollout.v1" },
+      provenance: {
+        evidenceContract: "sherlock.canonical-events.v1",
+        normalizerVersions: [
+          "sherlock.codex-rollout.v1",
+          "sherlock.claude-code-transcript.v1",
+        ],
+        frameVersion: null,
+        backwardCompatible: false,
+        supersedes: "bonaparte.usage-evidence.v1",
+      },
       coverage: {
         state: "partial",
         basis: "observed_canonical_events",
@@ -86,6 +102,19 @@ describe("Bonaparte MCP usage evidence", () => {
     });
     expect(result.people[0]).not.toHaveProperty("activeSeconds");
     expect(result.people[0]).not.toHaveProperty("lastActivity");
+  });
+
+  it("declares the frame projection without hiding its ordered normalizers", () => {
+    const payload = dayPayload([]);
+    payload.frameVersion = FRAME_VERSION;
+
+    expect(listUsageEvidence(payload).provenance).toEqual({
+      evidenceContract: "sherlock.canonical-events.v1",
+      normalizerVersions: [NORMALIZER_VERSION, CLAUDE_NORMALIZER_VERSION],
+      frameVersion: FRAME_VERSION,
+      backwardCompatible: false,
+      supersedes: "bonaparte.usage-evidence.v1",
+    });
   });
 
   it("preserves the database keyset cursor", () => {

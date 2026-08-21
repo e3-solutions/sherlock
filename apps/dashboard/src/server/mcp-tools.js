@@ -1,10 +1,11 @@
 import {
   BUCKET_COUNT,
   BUCKET_MS,
-  NORMALIZER_VERSION,
+  FRAME_VERSION,
+  NORMALIZER_VERSIONS,
 } from "./flame-source.js";
 
-export const MCP_USAGE_SCHEMA_VERSION = "bonaparte.usage-evidence.v1";
+export const MCP_USAGE_SCHEMA_VERSION = "bonaparte.usage-evidence.v2";
 export const MCP_PROMPT_SCHEMA_VERSION = "bonaparte.prompt-evidence.v1";
 
 export class McpEvidenceError extends Error {
@@ -61,8 +62,12 @@ export function listUsageEvidence(payload) {
   const people = Array.isArray(payload?.people) ? payload.people : null;
   const startMs = new Date(payload?.start).getTime();
   const readAt = new Date(payload?.read);
+  const validNormalizers = Array.isArray(payload?.normalizerVersions) &&
+    payload.normalizerVersions.length === NORMALIZER_VERSIONS.length &&
+    payload.normalizerVersions.every((value, index) => value === NORMALIZER_VERSIONS[index]);
   if (!people || !Number.isFinite(startMs) || !Number.isFinite(readAt.getTime()) ||
-      typeof payload?.snapshot !== "string" || !payload.snapshot) {
+      typeof payload?.snapshot !== "string" || !payload.snapshot ||
+      !validNormalizers || ![null, FRAME_VERSION].includes(payload?.frameVersion)) {
     throw new McpEvidenceError("evidence_invalid");
   }
   return {
@@ -73,7 +78,13 @@ export function listUsageEvidence(payload) {
       endExclusive: new Date(startMs + BUCKET_COUNT * BUCKET_MS).toISOString(),
       readAt: readAt.toISOString(),
     },
-    provenance: { projectionVersion: NORMALIZER_VERSION },
+    provenance: {
+      evidenceContract: "sherlock.canonical-events.v1",
+      normalizerVersions: [...payload.normalizerVersions],
+      frameVersion: payload.frameVersion,
+      backwardCompatible: false,
+      supersedes: "bonaparte.usage-evidence.v1",
+    },
     coverage: {
       state: "partial",
       basis: "observed_canonical_events",
