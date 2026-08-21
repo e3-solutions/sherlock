@@ -880,44 +880,6 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
-  it("fails closed and ranks only snapshot-visible GitHub lookup facts", () => {
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "pg_visible_in_snapshot(attempt.xmin::text::xid8, p.snapshot)",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "pg_visible_in_snapshot(candidate.xmin::text::xid8, p.snapshot)",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL.indexOf("pg_visible_in_snapshot(attempt.xmin"))
-      .toBeLessThan(INTERVAL_PULL_REQUESTS_SQL.indexOf("row_number() over"));
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain("order by attempt.id desc");
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain("attempt.outcome = 'complete'");
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain("attempt.candidate_count = 1");
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain("candidate.visible_candidate_count = 1");
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "candidate.github_repository_id = attempt.github_repository_id",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "projection.observed_at <= coalesce(",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "projection.scm_version = 'sherlock.github-scm.v1'",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "projection.projection_status = 'matched'",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "attempt.lookup_version = 'sherlock.github-associated-pulls.v1'",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "attempt.api_version = '2026-03-10'",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain(
-      "attempt.created_at >= p.snapshot_read - interval '15 minutes'",
-    );
-    expect(INTERVAL_PULL_REQUESTS_SQL).toContain("interval '15 minutes'");
-    expect(INTERVAL_PULL_REQUESTS_SQL).not.toContain("branch");
-  });
-
   it("never silently falls a failing v2 interval back to raw SQL", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";

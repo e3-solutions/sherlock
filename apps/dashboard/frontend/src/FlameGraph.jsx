@@ -464,9 +464,9 @@ function IntervalOverview({
             href={work.pullRequest.url}
             target="_blank"
             rel="noopener noreferrer"
-            aria-label={`Open ${work.pullRequest.repository} pull request #${work.pullRequest.number} on GitHub in a new tab`}
+            aria-label={`Open PR #${work.pullRequest.number} on GitHub`}
           >
-            PR #{work.pullRequest.number}<span aria-hidden="true">↗</span>
+            PR #{work.pullRequest.number}
           </a>
         )}
       </li>

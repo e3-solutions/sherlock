@@ -5,7 +5,7 @@ import {
   NORMALIZER_VERSION,
   normalizerVersionFor,
   projectBatch,
-  SCM_VERSION,
+  SCM_SOURCE_VERSION,
 } from "./normalizer.ts";
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -240,16 +240,14 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
   assert(projection.session?.model === "gpt-5");
   assert(projection.session?.cwd === "/repo/current");
   assert(projection.events.length === manifest.record_count);
-  assert(projection.scm_projections.length === 1);
-  assert(projection.scm_projections[0].record_index === 0);
-  assert(projection.scm_projections[0].scm_version === SCM_VERSION);
-  assert(projection.scm_projections[0].projection_status === "matched");
+  assert(projection.session_scm.length === 1);
+  assert(projection.session_scm[0].record_index === 0);
+  assert(projection.session_scm[0].source_version === SCM_SOURCE_VERSION);
   assert(
-    projection.scm_projections[0].repository_full_name ===
+    projection.session_scm[0].repository_full_name ===
       "e3-solutions/sherlock",
   );
-  assert(projection.scm_projections[0].commit_sha === "a".repeat(40));
-  assert(projection.scm_projections[0].observed_at === "2026-08-15T00:00:00Z");
+  assert(projection.session_scm[0].commit_sha === "a".repeat(40));
 
   const messages = projection.events.filter((event) =>
     event.event_kind === "message"
@@ -303,7 +301,7 @@ Deno.test("GitHub repository identity accepts only canonical remote shapes", () 
   );
 });
 
-Deno.test("SCM projection records no-match for incomplete session metadata", async () => {
+Deno.test("SCM facts require an exact GitHub repository and full commit", async () => {
   const { manifest, source } = await fixture([{
     timestamp: "2026-08-15T00:00:00Z",
     type: "session_meta",
@@ -317,24 +315,7 @@ Deno.test("SCM projection records no-match for incomplete session metadata", asy
   }]);
   const projection = await projectBatch(manifest, source);
   assert(projection.session !== null);
-  assert(projection.scm_projections.length === 1);
-  assert(projection.scm_projections[0].projection_status === "no_match");
-  assert(projection.scm_projections[0].repository_full_name === null);
-  assert(projection.scm_projections[0].commit_sha === null);
-  assert(projection.scm_projections[0].observed_at === null);
-});
-
-Deno.test("every session metadata locator gets a terminal SCM outcome", async () => {
-  const { manifest, source } = await fixture([{
-    timestamp: "2026-08-15T00:00:00Z",
-    type: "session_meta",
-    payload: "structurally-invalid",
-  }]);
-  const projection = await projectBatch(manifest, source);
-  assert(manifest.records[0].native_type === "session_meta");
-  assert(projection.scm_projections.length === 1);
-  assert(projection.scm_projections[0].record_index === 0);
-  assert(projection.scm_projections[0].projection_status === "no_match");
+  assert(projection.session_scm.length === 0);
 });
 
 Deno.test("normalizer emits observable unknown events for malformed records", async () => {

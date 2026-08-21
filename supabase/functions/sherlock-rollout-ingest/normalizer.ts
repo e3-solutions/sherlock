@@ -8,7 +8,7 @@ export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const ROLE_VERSION = "sherlock.codex-role.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 export const CLAUDE_ROLE_VERSION = "sherlock.claude-code-role.v1";
-export const SCM_VERSION = "sherlock.github-scm.v1";
+export const SCM_SOURCE_VERSION = "sherlock.github-scm.v1";
 
 const CLAUDE_HOOK_SCHEMA_VERSION = "sherlock.claude-hook.v1";
 const CANONICAL_UUID =
@@ -87,19 +87,18 @@ export interface EventProjection {
   attributes: JsonObject | null;
 }
 
-export interface ScmProjection {
+export interface SessionScmFact {
   record_index: number;
-  scm_version: string;
-  projection_status: "matched" | "no_match";
-  repository_full_name: string | null;
-  commit_sha: string | null;
-  observed_at: string | null;
+  source_version: string;
+  repository_full_name: string;
+  commit_sha: string;
+  observed_at: string;
 }
 
 export interface BatchProjection {
   session: SessionProjection | null;
   events: EventProjection[];
-  scm_projections: ScmProjection[];
+  session_scm: SessionScmFact[];
 }
 
 interface ParsedRecord {
@@ -111,29 +110,11 @@ export async function projectBatch(
   manifest: BatchManifest,
   source: Uint8Array,
 ): Promise<BatchProjection> {
-  const projection = manifest.source_provider === "claude_code"
+  return manifest.source_provider === "claude_code"
     ? manifest.source_kind === "hook"
       ? await projectClaudeHookBatch(manifest, source)
       : await projectClaudeBatch(manifest, source)
     : await projectCodexBatch(manifest, source);
-  const byRecord = new Map(
-    projection.scm_projections.map((item) => [item.record_index, item]),
-  );
-  return {
-    ...projection,
-    scm_projections: manifest.records
-      .filter(({ native_type }) => native_type === "session_meta")
-      .map((record) =>
-        byRecord.get(record.record_index) ?? {
-          record_index: record.record_index,
-          scm_version: SCM_VERSION,
-          projection_status: "no_match",
-          repository_full_name: null,
-          commit_sha: null,
-          observed_at: null,
-        }
-      ),
-  };
 }
 
 export function normalizerVersionFor(manifest: BatchManifest): string {
@@ -206,7 +187,7 @@ async function projectClaudeHookBatch(
       projectClaudeHookRecord(record, session, canonicalScopeKey)
     ),
   );
-  return { session, events: projected, scm_projections: [] };
+  return { session, events: projected, session_scm: [] };
 }
 
 async function projectClaudeHookRecord(
@@ -514,19 +495,18 @@ async function projectCodexBatch(
     session && observedAt && commitSha && GIT_COMMIT_SHA.test(commitSha) &&
       repositoryFullName,
   );
-  const scmProjections = metaRecord
+  const sessionScm = metaRecord && scmMatched
     ? [
       {
         record_index: metaRecord.locator.record_index,
-        scm_version: SCM_VERSION,
-        projection_status: scmMatched ? "matched" : "no_match",
-        repository_full_name: scmMatched ? repositoryFullName : null,
-        commit_sha: scmMatched ? commitSha : null,
-        observed_at: scmMatched ? observedAt : null,
-      } satisfies ScmProjection,
+        source_version: SCM_SOURCE_VERSION,
+        repository_full_name: repositoryFullName!,
+        commit_sha: commitSha!,
+        observed_at: observedAt!,
+      } satisfies SessionScmFact,
     ]
     : [];
-  return { session, events, scm_projections: scmProjections };
+  return { session, events, session_scm: sessionScm };
 }
 
 async function projectClaudeBatch(
@@ -601,7 +581,7 @@ async function projectClaudeBatch(
       )
     ),
   );
-  return { session, events: projected.flat(), scm_projections: [] };
+  return { session, events: projected.flat(), session_scm: [] };
 }
 
 async function projectClaudeRecord(

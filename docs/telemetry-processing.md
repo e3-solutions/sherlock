@@ -99,49 +99,6 @@ SHERLOCK_TEST_DATABASE_URL=... deno test --allow-env --allow-net \
   workers/telemetry-processor/queue_integration_test.ts
 ```
 
-Exact GitHub PR lookup runs as an independent periodic task inside the worker;
-it does not consume a telemetry-job concurrency slot, and an external API
-failure cannot fail normalization. Enable it with `GITHUB_TOKEN` and
-`SHERLOCK_WORKSPACE_ID`; configure both or neither, because partial
-configuration fails worker startup. Use a fine-grained personal access token
-with read access to pull requests and repository metadata. The default
-interval is one minute and the default batch is 25 commit pairs. The interval
-must remain between 60 and 600 seconds and the batch between 1 and 25; override
-them with `SHERLOCK_GITHUB_SYNC_INTERVAL_SECONDS` and
-`SHERLOCK_GITHUB_SYNC_LIMIT`. The configured cadence must cover at least 75
-pairs per 15 minutes so exact links remain fresh under steady ingestion.
-
-The same implementation remains available as a one-shot recovery command:
-
-```sh
-SUPABASE_DB_URL=... \
-SHERLOCK_WORKSPACE_ID=00000000-0000-4000-8000-000000000000 \
-GITHUB_TOKEN=... \
-deno run --allow-env --allow-net scripts/sync-github-prs.ts
-```
-
-The sync requests at most 100 PR candidates for each repository/SHA and records
-every complete or failed lookup attempt. Pagination or malformed repository
-identity fails closed. Matched SCM projections remain eligible for 26 hours;
-never-attempted pairs run first, then least-recently attempted pairs.
-GitHub retry headers pause the whole workspace, and a rate-limit response stops
-the current tick. Headerless secondary-rate-limit responses get a one-minute
-minimum pause. A reserved-connection workspace advisory lock prevents duplicate
-work across worker replicas and the one-shot command. No branch fallback exists.
-
-Existing terminal normalization jobs can be explicitly replayed in bounded
-backfill batches to project SCM facts added after those jobs completed:
-
-```sh
-SUPABASE_DB_URL=... \
-SHERLOCK_WORKSPACE_ID=00000000-0000-4000-8000-000000000000 \
-SHERLOCK_SCM_BACKFILL_LIMIT=100 \
-deno run --allow-env --allow-net scripts/requeue-scm-backfill.ts
-```
-
-Repeat until the command reports `requeued: 0`; replayed work uses the existing
-backfill lane and leaves raw telemetry unchanged.
-
 ## Railway deployment
 
 Create one private worker service from the repository root. The checked-in
@@ -155,10 +112,10 @@ locks and every completion/retry is fenced by the active lease token.
 
 `SUPABASE_DB_URL` must use the dedicated `sherlock_worker_login`, not the
 `postgres` owner. The login has `NOINHERIT` and can assume only
-`sherlock_processor`, `sherlock_normalizer`, `sherlock_reducer`,
-`sherlock_frame_projector`, and `sherlock_github_sync`; each transaction
-explicitly selects the narrow role it needs. The projector may append receipts
-and revisions but cannot update or delete them or activate a version. Set or rotate its password out of
+`sherlock_processor`, `sherlock_normalizer`, `sherlock_reducer`, and
+`sherlock_frame_projector`; each transaction explicitly selects the narrow
+role it needs. The projector may append receipts and revisions but cannot
+update or delete them or activate a version. Set or rotate its password out of
 band and store it only as a sealed Railway variable. Prefer
 Supabase's session pooler on port 5432 so Railway does not depend on the direct
 database host's IPv6-only DNS record. Store a current Supabase secret key in

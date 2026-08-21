@@ -694,7 +694,7 @@ describe("FlameGraph", () => {
     expect(screen.getByText("Excerpt")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
     const pullRequest = screen.getByRole("link", {
-      name: "Open e3-solutions/sherlock pull request #54 on GitHub in a new tab",
+      name: "Open PR #54 on GitHub",
     });
     expect(pullRequest).toHaveTextContent("PR #54");
     expect(pullRequest).toHaveAttribute(
@@ -704,7 +704,7 @@ describe("FlameGraph", () => {
     expect(pullRequest).toHaveAttribute("target", "_blank");
     expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
     expect(screen.getByRole("link", {
-      name: "Open e3-solutions/sherlock pull request #55 on GitHub in a new tab",
+      name: "Open PR #55 on GitHub",
     })).toHaveAttribute("href", "https://github.com/e3-solutions/sherlock/pull/55");
     expect(screen.getByRole("button", { name: /Subagent session/ })).toBeInTheDocument();
     expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();

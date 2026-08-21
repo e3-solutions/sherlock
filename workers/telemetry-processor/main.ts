@@ -1,6 +1,5 @@
 import { SupabaseRawStorage, TelemetryProcessor } from "./processor.ts";
 import {
-  type LookupStore,
   PostgresLookupStore,
   syncPending,
 } from "../../scripts/sync-github-prs.ts";
@@ -26,8 +25,6 @@ export interface WorkerConfig {
   github: {
     workspaceId: string;
     token: string;
-    intervalMilliseconds: number;
-    limit: number;
   } | null;
 }
 
@@ -64,26 +61,6 @@ export function loadConfig(
   if (githubWorkspaceId !== null && !UUID.test(githubWorkspaceId)) {
     throw new Error("SHERLOCK_WORKSPACE_ID must be a canonical UUID");
   }
-  const githubIntervalSeconds = boundedInteger(
-    env.SHERLOCK_GITHUB_SYNC_INTERVAL_SECONDS,
-    60,
-    60,
-    600,
-  );
-  const githubLimit = boundedInteger(
-    env.SHERLOCK_GITHUB_SYNC_LIMIT,
-    25,
-    1,
-    25,
-  );
-  if (
-    githubToken && githubWorkspaceId &&
-    Math.floor(900 / githubIntervalSeconds) * githubLimit < 75
-  ) {
-    throw new Error(
-      "GitHub sync settings must refresh at least 75 pairs per 15 minutes",
-    );
-  }
   return {
     databaseUrl: required(env, "SUPABASE_DB_URL"),
     supabaseUrl,
@@ -113,8 +90,6 @@ export function loadConfig(
       ? {
         workspaceId: githubWorkspaceId,
         token: githubToken,
-        intervalMilliseconds: githubIntervalSeconds * 1_000,
-        limit: githubLimit,
       }
       : null,
   };
@@ -191,16 +166,18 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         config.github && githubStore && githubTask === null &&
         Date.now() >= nextGithubSyncAt
       ) {
-        nextGithubSyncAt = Date.now() + config.github.intervalMilliseconds;
-        githubTask = runGitHubSyncTick(
-          githubStore,
-          config.github,
-          shutdown.signal,
-        ).finally(
-          () => {
+        nextGithubSyncAt = Date.now() + 60_000;
+        githubTask = syncPending(githubStore, {
+          workspaceId: config.github.workspaceId,
+          token: config.github.token,
+          signal: shutdown.signal,
+        }).then((result) => log("github_sync_complete", result))
+          .catch((error) =>
+            log("github_sync_failed", { error_code: errorCode(error) })
+          )
+          .finally(() => {
             githubTask = null;
-          },
-        );
+          });
       }
       if (Date.now() - lastReaperAt >= 10_000) {
         const terminalized = await queue.terminalizeExpired();
@@ -263,25 +240,6 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       ...(githubStore ? [githubStore.close()] : []),
     ]);
     log("worker_stopped", {});
-  }
-}
-
-export async function runGitHubSyncTick(
-  store: LookupStore,
-  config: NonNullable<WorkerConfig["github"]>,
-  signal?: AbortSignal,
-  runner: typeof syncPending = syncPending,
-): Promise<void> {
-  try {
-    const result = await runner(store, {
-      workspaceId: config.workspaceId,
-      token: config.token,
-      limit: config.limit,
-      signal,
-    });
-    log("github_sync_complete", result);
-  } catch (error) {
-    log("github_sync_failed", { error_code: errorCode(error) });
   }
 }
 
@@ -397,19 +355,6 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error("worker numeric settings must be positive integers");
-  }
-  return parsed;
-}
-
-function boundedInteger(
-  value: string | undefined,
-  fallback: number,
-  minimum: number,
-  maximum: number,
-): number {
-  const parsed = positiveInteger(value, fallback);
-  if (parsed < minimum || parsed > maximum) {
-    throw new Error(`worker numeric setting must be ${minimum}..${maximum}`);
   }
   return parsed;
 }

@@ -44,8 +44,6 @@ async function seedBatch(
     collectorKey: string;
     nativeSessionId: string;
     parentNativeSessionId?: string;
-    repositoryUrl?: string;
-    commitSha?: string;
   },
 ): Promise<BatchFixture> {
   const batchId = crypto.randomUUID();
@@ -61,14 +59,6 @@ async function seedBatch(
             session_id: input.parentNativeSessionId,
             parent_thread_id: input.parentNativeSessionId,
             source: { subagent: { other: "worker" } },
-          }
-          : {}),
-        ...(input.repositoryUrl && input.commitSha
-          ? {
-            git: {
-              repository_url: input.repositoryUrl,
-              commit_hash: input.commitSha,
-            },
           }
           : {}),
       },
@@ -617,8 +607,6 @@ Deno.test({
         personId,
         collectorKey,
         nativeSessionId: "parent-first-parent",
-        repositoryUrl: "https://github.com/e3-solutions/sherlock.git",
-        commitSha: "A".repeat(40),
       });
       const parentFirstChild = await seedBatch(sql, {
         workspaceId,
@@ -636,21 +624,6 @@ Deno.test({
         "parent-first-child",
         "parent-first-parent",
       );
-      await normalize(firstNormalizer, parentFirstParent);
-      const scm = await sql.unsafe(
-        `select projection_status, repository_full_name, commit_sha
-           from telemetry.scm_projections
-          where workspace_id = $1 and session_id = (
-            select id from telemetry.sessions
-             where workspace_id = $1 and collector_key = $2
-               and native_session_id = 'parent-first-parent'
-          )`,
-        [workspaceId, collectorKey],
-      );
-      assert(scm.length === 1, "SCM normalization replay must be idempotent");
-      assert(scm[0].projection_status === "matched");
-      assert(scm[0].repository_full_name === "e3-solutions/sherlock");
-      assert(scm[0].commit_sha === "a".repeat(40));
 
       const childFirstChild = await seedBatch(sql, {
         workspaceId,

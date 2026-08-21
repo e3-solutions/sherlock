@@ -3,9 +3,7 @@ import {
   chooseLane,
   loadConfig,
   retryDelaySeconds,
-  runGitHubSyncTick,
 } from "./main.ts";
-import type { LookupStore } from "../../scripts/sync-github-prs.ts";
 import {
   AFFECTED_SESSIONS_SQL,
   recordLocatorFromRow,
@@ -29,7 +27,6 @@ Deno.test("configuration is bounded and secrets remain required", () => {
   });
   assert(config.concurrency === 4);
   assert(config.liveReserved === 3);
-  assert(config.github === null);
   let rejected = false;
   try {
     loadConfig({
@@ -58,97 +55,6 @@ Deno.test("configuration is bounded and secrets remain required", () => {
     }
     assert(invalid, `${concurrency}/${liveReserved} must be rejected`);
   }
-});
-
-Deno.test("GitHub sync configuration is optional and bounded", () => {
-  const base = {
-    SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
-    SUPABASE_URL: "https://example.supabase.co",
-    SUPABASE_SERVICE_ROLE_KEY: "test-secret",
-  };
-  const configured = loadConfig({
-    ...base,
-    GITHUB_TOKEN: "github-secret",
-    SHERLOCK_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
-    SHERLOCK_GITHUB_SYNC_INTERVAL_SECONDS: "120",
-    SHERLOCK_GITHUB_SYNC_LIMIT: "25",
-  });
-  assert(configured.github?.intervalMilliseconds === 120_000);
-  assert(configured.github?.limit === 25);
-
-  for (
-    const invalidBounds of [
-      { SHERLOCK_GITHUB_SYNC_INTERVAL_SECONDS: "59" },
-      { SHERLOCK_GITHUB_SYNC_INTERVAL_SECONDS: "601" },
-      { SHERLOCK_GITHUB_SYNC_LIMIT: "26" },
-      {
-        SHERLOCK_GITHUB_SYNC_INTERVAL_SECONDS: "300",
-        SHERLOCK_GITHUB_SYNC_LIMIT: "24",
-      },
-    ]
-  ) {
-    let rejected = false;
-    try {
-      loadConfig({
-        ...base,
-        GITHUB_TOKEN: "github-secret",
-        SHERLOCK_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
-        ...invalidBounds,
-      });
-    } catch {
-      rejected = true;
-    }
-    assert(rejected, "out-of-bounds GitHub settings must fail startup");
-  }
-  const defaultCadence = loadConfig({
-    ...base,
-    GITHUB_TOKEN: "github-secret",
-    SHERLOCK_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
-  });
-  assert(defaultCadence.github?.intervalMilliseconds === 60_000);
-  assert(defaultCadence.github?.limit === 25);
-
-  for (
-    const incomplete of [
-      { ...base, GITHUB_TOKEN: "github-secret" },
-      {
-        ...base,
-        SHERLOCK_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
-      },
-    ]
-  ) {
-    let rejected = false;
-    try {
-      loadConfig(incomplete);
-    } catch {
-      rejected = true;
-    }
-    assert(rejected, "partial GitHub configuration must fail startup");
-  }
-});
-
-Deno.test("GitHub tick is independent of telemetry job capacity", async () => {
-  let called = false;
-  const store = {} as LookupStore;
-  const controller = new AbortController();
-  await runGitHubSyncTick(
-    store,
-    {
-      workspaceId: "00000000-0000-4000-8000-000000000001",
-      token: "secret",
-      intervalMilliseconds: 300_000,
-      limit: 17,
-    },
-    controller.signal,
-    (_store, options) => {
-      called = true;
-      assert(_store === store);
-      assert(options.limit === 17);
-      assert(options.signal === controller.signal);
-      return Promise.resolve({ attempted: 1, inserted: 1, failed: 0 });
-    },
-  );
-  assert(called);
 });
 
 Deno.test("live capacity is reserved and backfill remains bounded", () => {
