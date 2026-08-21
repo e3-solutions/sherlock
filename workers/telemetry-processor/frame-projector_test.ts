@@ -3,6 +3,7 @@ import {
   diffEvidence,
   type EvidenceState,
   FRAME_SOURCE_EVENTS_SQL,
+  PostgresFrameEvidenceProjector,
   revisionInsertBatches,
   type SourceEvent,
 } from "./frame-projector.ts";
@@ -160,4 +161,38 @@ Deno.test("large revision writes are split below PostgreSQL's parameter limit", 
   assert(batches.length === 2);
   assert(batches[0].length === 3_000);
   assert(batches[1].length === 1);
+});
+
+Deno.test("frame projection rechecks the absolute deadline after pool reserve", async () => {
+  let released = false;
+  let databaseOperations = 0;
+  const connection = {
+    unsafe() {
+      databaseOperations += 1;
+      return Promise.resolve([]);
+    },
+    release() {
+      released = true;
+    },
+  };
+  const deadlineAtMs = performance.now() + 1_000;
+  const projector = new PostgresFrameEvidenceProjector({
+    reserve: () => Promise.resolve(connection),
+  } as never);
+  let code = "";
+  try {
+    await projector.projectSession({
+      workspaceId: crypto.randomUUID(),
+      sessionId: crypto.randomUUID(),
+      requestGeneration: 1n,
+      statementTimeoutMs: 5_000,
+      deadlineAtMs,
+      monotonicNow: () => deadlineAtMs + 1,
+    });
+  } catch (error) {
+    code = error instanceof Error && "code" in error ? String(error.code) : "";
+  }
+  assert(code === "processing_deadline_exceeded");
+  assert(databaseOperations === 0, "expired work must not mutate the database");
+  assert(released, "the reserved connection must always be released");
 });

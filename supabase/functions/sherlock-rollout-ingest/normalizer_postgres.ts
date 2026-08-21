@@ -18,6 +18,23 @@ import type { NormalizationResult } from "./service.ts";
 type Sql = ReturnType<typeof postgres>;
 type TransactionSql = postgres.TransactionSql;
 
+export function normalizationStatementTimeout(
+  statementTimeoutMs?: number,
+  deadlineAtMs?: number,
+  now = () => performance.now(),
+): number | undefined {
+  if (deadlineAtMs === undefined) return statementTimeoutMs;
+  const remaining = Math.floor(deadlineAtMs - now());
+  if (remaining <= 0) {
+    const error = new Error("normalization deadline exceeded");
+    Object.assign(error, { code: "processing_deadline_exceeded" });
+    throw error;
+  }
+  return statementTimeoutMs === undefined
+    ? remaining
+    : Math.min(statementTimeoutMs, remaining);
+}
+
 const EVENT_COLUMNS = [
   "workspace_id",
   "session_id",
@@ -83,10 +100,21 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
     receipt: CommittedReceipt,
     manifest: BatchManifest,
     source: Uint8Array,
+    statementTimeoutMs?: number,
+    deadlineAtMs?: number,
   ): Promise<NormalizationResult> {
     const projection = await projectBatch(manifest, source);
     const normalizerVersion = normalizerVersionFor(manifest);
+    const timeout = normalizationStatementTimeout(
+      statementTimeoutMs,
+      deadlineAtMs,
+    );
     return await this.sql.begin(async (tx) => {
+      if (timeout !== undefined) {
+        await tx.unsafe("select set_config('statement_timeout', $1, true)", [
+          `${Math.max(1, Math.floor(timeout))}ms`,
+        ]);
+      }
       await tx.unsafe("set local role sherlock_normalizer");
       const sourceRecords = await tx.unsafe(
         `select id, record_index

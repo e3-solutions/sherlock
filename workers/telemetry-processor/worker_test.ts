@@ -1,14 +1,23 @@
 import {
   alternateLane,
+  CapacityCircuit,
+  capacityRetryMilliseconds,
   chooseLane,
+  chooseOverloadJobKind,
+  handoffOverlapConnectionBudget,
+  isCapacityError,
   loadConfig,
   retryDelaySeconds,
+  updateOverloadState,
+  workerConnectionBudget,
 } from "./main.ts";
+import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import {
   AFFECTED_SESSIONS_SQL,
   recordLocatorFromRow,
   reduceAffectedSessions,
 } from "./processor.ts";
+import railwayConfig from "../../railway.toml" with { type: "text" };
 
 function assert(
   condition: unknown,
@@ -22,11 +31,13 @@ Deno.test("configuration is bounded and secrets remain required", () => {
     SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
     SUPABASE_URL: "https://example.supabase.co",
     SUPABASE_SERVICE_ROLE_KEY: "test-secret",
-    SHERLOCK_WORKER_CONCURRENCY: "4",
-    SHERLOCK_WORKER_LIVE_RESERVED: "3",
   });
-  assert(config.concurrency === 4);
-  assert(config.liveReserved === 3);
+  assert(config.concurrency === 6);
+  assert(config.liveReserved === 5);
+  assert(config.normalizeReserved === 5);
+  assert(config.controlConnections === 4);
+  assert(config.processingConnections === 6);
+  assert(config.processingTimeoutMilliseconds === 90_000);
   let rejected = false;
   try {
     loadConfig({
@@ -55,6 +66,150 @@ Deno.test("configuration is bounded and secrets remain required", () => {
     }
     assert(invalid, `${concurrency}/${liveReserved} must be rejected`);
   }
+});
+
+Deno.test("connection pools and overload reservations stay within bounds", () => {
+  const config = loadConfig({
+    SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
+    SUPABASE_URL: "https://example.supabase.co",
+    SUPABASE_SERVICE_ROLE_KEY: "test-secret",
+  });
+  assert(workerConnectionBudget(config, "handoff_wait") === 1);
+  assert(workerConnectionBudget(config, "active") === 10);
+  assert(handoffOverlapConnectionBudget(config) === 11);
+  assert(config.controlConnections - 1 === 3);
+  for (
+    const invalid of [
+      { SHERLOCK_WORKER_CONTROL_CONNECTIONS: "1" },
+      { SHERLOCK_WORKER_PROCESSING_CONNECTIONS: "5" },
+      { SHERLOCK_WORKER_NORMALIZE_RESERVED: "6" },
+      {
+        SHERLOCK_WORKER_OVERLOAD_ENTER_SECONDS: "60",
+        SHERLOCK_WORKER_OVERLOAD_EXIT_SECONDS: "60",
+      },
+    ]
+  ) {
+    let rejected = false;
+    try {
+      loadConfig({
+        SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
+        SUPABASE_URL: "https://example.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY: "test-secret",
+        ...invalid,
+      });
+    } catch {
+      rejected = true;
+    }
+    assert(rejected, JSON.stringify(invalid));
+  }
+});
+
+Deno.test("Railway rebuilds only for the complete worker dependency closure", () => {
+  for (
+    const path of [
+      "/workers/telemetry-processor/**",
+      "/supabase/functions/sherlock-rollout-ingest/**",
+      "/supabase/functions/sherlock-activity-reducer/**",
+      "/packages/frame-evidence/**",
+      "/.dockerignore",
+      "/railway.toml",
+    ]
+  ) {
+    assert(railwayConfig.includes(`"${path}"`), `missing watch path ${path}`);
+  }
+  assert(railwayConfig.includes("drainingSeconds = 120"));
+  assert(railwayConfig.includes("overlapSeconds = 0"));
+});
+
+Deno.test("overload mode uses hysteresis and preserves one reduction lane", () => {
+  const thresholds = { overloadEnterSeconds: 120, overloadExitSeconds: 60 };
+  let state = { active: false, enterSamples: 0, exitSamples: 0 };
+  state = updateOverloadState(state, 130, thresholds);
+  assert(!state.active);
+  state = updateOverloadState(state, 125, thresholds);
+  assert(state.active);
+  state = updateOverloadState(state, 61, thresholds);
+  assert(state.active);
+  state = updateOverloadState(state, 60, thresholds);
+  assert(state.active);
+  state = updateOverloadState(state, null, thresholds);
+  assert(!state.active);
+  assert(chooseOverloadJobKind(4, 1, 5) === "normalize");
+  assert(chooseOverloadJobKind(5, 0, 5) === "reduce");
+  assert(chooseOverloadJobKind(5, 1, 5) === "normalize");
+});
+
+Deno.test("only pool capacity errors open the worker circuit", () => {
+  assert(isCapacityError(Object.assign(new Error("too many connections"), {
+    code: "53300",
+  })));
+  assert(isCapacityError(Object.assign(new Error("pool EMAX"), {
+    code: "XX000",
+  })));
+  assert(isCapacityError(Object.assign(new Error("session pool exhausted"), {
+    code: "EMAXCONNSESSION",
+  })));
+  assert(
+    !isCapacityError(Object.assign(new Error("serialization"), {
+      code: "40001",
+    })),
+  );
+  assert(
+    !isCapacityError(Object.assign(new Error("generic internal error"), {
+      code: "XX000",
+    })),
+  );
+  assert(capacityRetryMilliseconds(1, () => 0.5) === 30_000);
+  assert(capacityRetryMilliseconds(3, () => 0.5) === 120_000);
+});
+
+Deno.test("processing and control EMAX stay in one single-probe circuit", () => {
+  let now = 0;
+  const circuit = new CapacityCircuit(() => now, () => 0.5);
+  const processingError = Object.assign(new Error("job EMAX"), {
+    code: "XX000",
+  });
+  assert(
+    circuit.handle(processingError) === 30_000,
+    "processing capacity must be absorbed instead of rejecting the run loop",
+  );
+  assert(circuit.millisecondsUntilReady() === 30_000);
+  now += 30_000;
+  assert(circuit.isHalfOpen());
+  assert(circuit.beginProbe(), "the first half-open claim must be admitted");
+  assert(!circuit.beginProbe(), "a second half-open claim must be rejected");
+  assert(circuit.hasProbeInFlight());
+
+  const controlError = Object.assign(new Error("outer claim exhausted"), {
+    code: "EMAXCONNSESSION",
+  });
+  assert(
+    circuit.handle(controlError) === 60_000,
+    "control capacity must reopen the same circuit instead of rejecting",
+  );
+  assert(!circuit.isHalfOpen());
+  now += 60_000;
+  assert(circuit.beginProbe());
+  assert(!circuit.beginProbe());
+  now += 300_000;
+  assert(
+    circuit.hasProbeInFlight(),
+    "elapsed time alone must not admit work beside the probe",
+  );
+  assert(circuit.completeProbe());
+  assert(circuit.millisecondsUntilReady() === 0);
+});
+
+Deno.test("normalization rechecks its absolute deadline after projection", () => {
+  assert(normalizationStatementTimeout(5_000, 10_000, () => 8_000) === 2_000);
+  let rejected = false;
+  try {
+    normalizationStatementTimeout(5_000, 10_000, () => 10_001);
+  } catch (error) {
+    rejected = error instanceof Error && "code" in error &&
+      error.code === "processing_deadline_exceeded";
+  }
+  assert(rejected, "expired projection budget must prevent database work");
 });
 
 Deno.test("live capacity is reserved and backfill remains bounded", () => {

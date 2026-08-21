@@ -13,6 +13,7 @@ import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
 import { FlameDayCache } from "./src/server/flame-cache.js";
+import { FreshnessCache } from "./src/server/freshness-cache.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -54,6 +55,15 @@ async function loadTimeline({ signal }) {
   return await source.fetchDay({ signal });
 }
 
+async function loadFreshness({ signal }) {
+  if (!databaseVerified) {
+    const readiness = await source.readiness({ signal });
+    if (readiness.status !== "ok") throw new FlameSourceError(readiness.reason);
+    databaseVerified = true;
+  }
+  return await source.fetchFreshness({ signal });
+}
+
 const cache = source
   ? new FlameDayCache({
       load: loadTimeline,
@@ -61,6 +71,13 @@ const cache = source
     })
   : null;
 cache?.start();
+const freshnessCache = source
+  ? new FreshnessCache({
+      load: loadFreshness,
+      log: (event) => console.log(JSON.stringify(event)),
+    })
+  : null;
+freshnessCache?.start();
 const mcpSource = source && cache ? createCachedMcpSource({ cache, source }) : null;
 const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
 
@@ -192,6 +209,31 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (url.pathname === "/api/flame/freshness") {
+    if (!source) {
+      sendJson(response, 503, { error: "dashboard_not_configured" });
+      return;
+    }
+    const signal = requestAbortSignal(request, response);
+    try {
+      const result = await freshnessCache.read({
+        signal,
+        waitForRefresh: url.searchParams.get("refresh") === "wait",
+      });
+      sendJson(response, 200, result.payload, {
+        "X-Sherlock-Freshness-Cache": result.state,
+      });
+    } catch (error) {
+      const code = error instanceof FlameSourceError
+        ? error.code
+        : "flame_database_unavailable";
+      if (code !== "flame_request_aborted" || !signal.aborted) {
+        sendJson(response, 503, { error: code });
+      }
+    }
+    return;
+  }
+
   if (url.pathname === "/api/flame/interval") {
     if (!source) {
       sendJson(response, 503, { error: "dashboard_not_configured" });
@@ -271,6 +313,7 @@ async function shutdown(signal) {
   console.log(JSON.stringify({ event: "dashboard_shutdown", signal }));
   const drained = new Promise((resolve) => server.close(resolve));
   await cache?.close();
+  await freshnessCache?.close();
   await drained;
   await Promise.all([mcpProtocol?.close(), source?.close()]);
 }

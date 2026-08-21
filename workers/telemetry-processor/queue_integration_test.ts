@@ -16,6 +16,22 @@ function assert(
   if (!condition) throw new Error(message);
 }
 
+function explainPlanNodes(value: unknown): Record<string, unknown>[] {
+  const parsed = typeof value === "string" ? JSON.parse(value) : value;
+  const nodes: Record<string, unknown>[] = [];
+  const visit = (candidate: unknown) => {
+    if (Array.isArray(candidate)) {
+      for (const child of candidate) visit(child);
+    } else if (candidate !== null && typeof candidate === "object") {
+      const node = candidate as Record<string, unknown>;
+      if ("Node Type" in node) nodes.push(node);
+      for (const child of Object.values(node)) visit(child);
+    }
+  };
+  visit(parsed);
+  return nodes;
+}
+
 async function insertQueueBatch(
   sql: ReturnType<typeof postgres>,
   input: {
@@ -66,11 +82,39 @@ Deno.test({
   async fn() {
     const sql = postgres(databaseUrl!, { prepare: false, max: 4 });
     const queue = PostgresJobQueue.connect(databaseUrl!, 4);
+    const replacementQueue = PostgresJobQueue.connect(databaseUrl!, 4);
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
     const batchId = crypto.randomUUID();
     const sessionId = crypto.randomUUID();
     try {
+      const handoffKey = `queue-test-${workspaceId}`;
+      assert(await queue.tryAcquireHandoff(handoffKey));
+      assert(
+        !(await replacementQueue.tryAcquireHandoff(handoffKey)),
+        "a replacement must wait with one control session",
+      );
+      await queue.releaseHandoff();
+      assert(
+        await replacementQueue.tryAcquireHandoff(handoffKey),
+        "a replacement must acquire after the owner releases",
+      );
+      await replacementQueue.releaseHandoff();
+
+      const schedulerIndexes = await sql.unsafe(
+        `select indexname from pg_indexes
+          where schemaname = 'processing'
+            and indexname = any($1::text[])`,
+        [[
+          "telemetry_jobs_kind_claim_idx",
+          "telemetry_jobs_kind_expired_lease_idx",
+          "telemetry_jobs_live_normalize_age_idx",
+        ]],
+      );
+      assert(
+        schedulerIndexes.length === 3,
+        "scheduler claim indexes must be installed",
+      );
       await sql.begin(async (tx) => {
         await tx.unsafe(
           `insert into telemetry.workspaces (id, slug, name)
@@ -122,6 +166,99 @@ Deno.test({
            where job_kind = 'normalize' do nothing`,
         [workspaceId, batchId],
       );
+
+      // Exercise the real predecessor anti-join with enough immutable ranges
+      // that an accidental sequential scan is visible in the analyzed plan.
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_provider,
+           source_kind, source_stream_key, generation_key, generation_seq,
+           start_offset, end_offset, source_byte_count, source_sha256,
+           storage_path, storage_encoding, stored_byte_count, stored_sha256,
+           record_count, contract_version, first_occurred_at, last_occurred_at,
+           processing_class_hint
+         )
+         select gen_random_uuid(), $1, $2, 'queue-plan-collector', 'claude_code',
+                'transcript', 'queue-plan-stream', 'queue-plan-generation', 0,
+                offset_value, offset_value + 1, 1, repeat('f', 64),
+                'queue-plan/' || $1::text || '/' || offset_value || '.jsonl.gz',
+                'gzip', 1, repeat('0', 64), 1,
+                'sherlock.transcript-batch.v1', now(), now(), 'backfill'
+           from generate_series(0, 1999) offset_value`,
+        [workspaceId, personId],
+      );
+      await sql.unsafe(
+        `update processing.telemetry_jobs job
+            set available_at = case when batch.start_offset = 0
+              then now() - interval '2 minutes'
+              else now() - interval '1 minute' end
+           from telemetry.ingest_batches batch
+          where job.workspace_id = $1 and job.batch_id = batch.id
+            and batch.collector_key = 'queue-plan-collector'`,
+        [workspaceId],
+      );
+      const explained = await sql.unsafe(
+        `explain (analyze, buffers, format json)
+         select job.id
+           from processing.telemetry_jobs job
+           left join telemetry.ingest_batches batch
+             on job.job_kind = 'normalize'
+            and batch.workspace_id = job.workspace_id
+            and batch.id = job.batch_id
+          where job.workload_class = 'backfill'
+            and job.job_kind = 'normalize'
+            and job.attempt_count < job.attempt_limit
+            and job.status = 'queued' and job.available_at <= now()
+            and not exists (
+              select 1
+                from telemetry.ingest_batches predecessor
+                join processing.telemetry_jobs predecessor_job
+                  on predecessor_job.workspace_id = predecessor.workspace_id
+                 and predecessor_job.batch_id = predecessor.id
+                 and predecessor_job.job_kind = 'normalize'
+               where predecessor.workspace_id = batch.workspace_id
+                 and predecessor.collector_key = batch.collector_key
+                 and predecessor.source_kind = batch.source_kind
+                 and predecessor.source_stream_key = batch.source_stream_key
+                 and predecessor.generation_seq = batch.generation_seq
+                 and predecessor.generation_key = batch.generation_key
+                 and predecessor.start_offset < batch.start_offset
+                 and predecessor_job.status in ('queued', 'leased')
+            )
+          order by job.available_at, job.id
+          for update of job skip locked limit 1`,
+      );
+      const planNodes = explainPlanNodes(Object.values(explained[0])[0]);
+      assert(
+        planNodes.some((node) =>
+          node["Index Name"] === "ingest_batches_range_key"
+        ),
+        "predecessor lookup must use the immutable ingest range index",
+      );
+      assert(
+        !planNodes.some((node) =>
+          node["Node Type"] === "Seq Scan" &&
+          node["Relation Name"] === "ingest_batches"
+        ),
+        "predecessor lookup must not scan all immutable batches",
+      );
+      assert(
+        Math.max(...planNodes.map((node) => Number(node["Actual Rows"] ?? 0))) <
+          64,
+        "claim planning must inspect bounded candidate rows under backlog",
+      );
+      await sql.unsafe(
+        `delete from processing.telemetry_jobs job
+          using telemetry.ingest_batches batch
+          where job.workspace_id = $1 and job.batch_id = batch.id
+            and batch.collector_key = 'queue-plan-collector'`,
+        [workspaceId],
+      );
+      await sql.unsafe(
+        `delete from telemetry.ingest_batches
+          where workspace_id = $1 and collector_key = 'queue-plan-collector'`,
+        [workspaceId],
+      );
       const count = await sql.unsafe(
         `select count(*)::int as count
            from processing.telemetry_jobs
@@ -129,6 +266,16 @@ Deno.test({
         [workspaceId, batchId],
       );
       assert(Number(count[0].count) === 1, "duplicate enqueue must converge");
+      assert(
+        await queue.claim("live", "wrong-kind", 60, "reduce") === null,
+        "job-kind reservations must not consume normalization work",
+      );
+      const oldestLiveNormalize = await queue
+        .oldestLiveNormalizationAgeSeconds();
+      assert(
+        oldestLiveNormalize !== null && oldestLiveNormalize >= 0,
+        "overload age must observe queued live normalization",
+      );
 
       const [first, overlapping] = await Promise.all([
         queue.claim("live", "worker-a", 60),
@@ -426,7 +573,11 @@ Deno.test({
         "delete from telemetry.workspaces where id = $1",
         [workspaceId],
       ).catch(() => undefined);
-      await Promise.allSettled([queue.close(), sql.end()]);
+      await Promise.allSettled([
+        replacementQueue.close(),
+        queue.close(),
+        sql.end(),
+      ]);
     }
   },
 });

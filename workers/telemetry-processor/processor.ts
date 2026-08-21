@@ -1,4 +1,3 @@
-import postgres from "npm:postgres@3.4.7";
 import { PostgresActivityReducer } from "../../supabase/functions/sherlock-activity-reducer/postgres.ts";
 import { ACTIVITY_VERSION } from "../../supabase/functions/sherlock-activity-reducer/reducer.ts";
 import {
@@ -12,9 +11,14 @@ import { NORMALIZER_VERSION } from "../../supabase/functions/sherlock-rollout-in
 import { PostgresBatchNormalizer } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import { validateStoredBatch } from "../../supabase/functions/sherlock-rollout-ingest/service.ts";
 import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";
+import {
+  createPostgresPool,
+  remainingMilliseconds,
+  type ReservedSql,
+  type Sql,
+  withReservedConnection,
+} from "./database.ts";
 import type { NormalizationJob, ReductionJob, WorkloadClass } from "./queue.ts";
-
-type Sql = ReturnType<typeof postgres>;
 
 export const AFFECTED_SESSIONS_SQL = `
 select id::text as id
@@ -63,69 +67,76 @@ interface StoredBatch {
 }
 
 export class TelemetryProcessor {
-  private readonly loader: Sql;
-  private readonly normalizer: PostgresBatchNormalizer;
-  private readonly reducer: PostgresActivityReducer;
+  private readonly sql: Sql;
   private readonly frameProjector: PostgresFrameEvidenceProjector;
 
   constructor(
     databaseUrl: string,
     private readonly storage: SupabaseRawStorage,
+    maxConnections = 6,
   ) {
-    this.loader = postgres(databaseUrl, {
-      prepare: false,
-      max: 2,
-      idle_timeout: 20,
-    });
-    this.normalizer = PostgresBatchNormalizer.connect(databaseUrl);
-    this.reducer = PostgresActivityReducer.connect(databaseUrl);
-    this.frameProjector = PostgresFrameEvidenceProjector.connect(databaseUrl);
+    this.sql = createPostgresPool(databaseUrl, maxConnections);
+    this.frameProjector = new PostgresFrameEvidenceProjector(this.sql);
   }
 
   async close(): Promise<void> {
-    await Promise.all([
-      this.loader.end(),
-      this.normalizer.close(),
-      this.reducer.close(),
-      this.frameProjector.close(),
-    ]);
+    await this.sql.end({ timeout: 5 });
   }
 
-  async normalize(job: NormalizationJob): Promise<ReductionTarget[]> {
-    const batch = await this.loadBatch(job);
-    const stored = await this.storage.download(
-      batch.receipt.storage_path,
-      batch.receipt.stored_byte_count,
+  async normalize(
+    job: NormalizationJob,
+    maximumDurationMs = 90_000,
+  ): Promise<ReductionTarget[]> {
+    const deadlineAtMs = performance.now() + maximumDurationMs;
+    return await withReservedConnection(
+      this.sql,
+      deadlineAtMs,
+      async (connection) => {
+        const batch = await this.loadBatch(connection, job, deadlineAtMs);
+        const stored = await this.storage.download(
+          batch.receipt.storage_path,
+          batch.receipt.stored_byte_count,
+          remainingMilliseconds(deadlineAtMs),
+        );
+        const source = await validateStoredBatch(batch.manifest, stored);
+        remainingMilliseconds(deadlineAtMs);
+        const normalized = await new PostgresBatchNormalizer(connection)
+          .normalize(
+            batch.receipt,
+            batch.manifest,
+            source,
+            remainingMilliseconds(deadlineAtMs),
+            deadlineAtMs,
+          );
+        const affectedSessionIds = await this.resolveAffectedSessionIds(
+          connection,
+          job.workspace_id,
+          normalized.session_ids,
+          deadlineAtMs,
+        );
+        const targets: ReductionTarget[] = [];
+        for (const sessionId of affectedSessionIds) {
+          const targetEventId = await this.resolveSessionCutoff(
+            connection,
+            job.workspace_id,
+            sessionId,
+            normalized.normalizer_version,
+            deadlineAtMs,
+          );
+          if (targetEventId > 0n) {
+            targets.push({
+              workspace_id: job.workspace_id,
+              session_id: sessionId,
+              normalizer_version: normalized.normalizer_version,
+              activity_version: ACTIVITY_VERSION,
+              target_event_id: targetEventId,
+              workload_class: job.workload_class,
+            });
+          }
+        }
+        return targets;
+      },
     );
-    const source = await validateStoredBatch(batch.manifest, stored);
-    const normalized = await this.normalizer.normalize(
-      batch.receipt,
-      batch.manifest,
-      source,
-    );
-    const affectedSessionIds = await this.resolveAffectedSessionIds(
-      job.workspace_id,
-      normalized.session_ids,
-    );
-    const targets: ReductionTarget[] = [];
-    for (const sessionId of affectedSessionIds) {
-      const targetEventId = await this.resolveSessionCutoff(
-        job.workspace_id,
-        sessionId,
-        normalized.normalizer_version,
-      );
-      if (targetEventId > 0n) {
-        targets.push({
-          workspace_id: job.workspace_id,
-          session_id: sessionId,
-          normalizer_version: normalized.normalizer_version,
-          activity_version: ACTIVITY_VERSION,
-          target_event_id: targetEventId,
-          workload_class: job.workload_class,
-        });
-      }
-    }
-    return targets;
   }
 
   async reduce(
@@ -133,27 +144,28 @@ export class TelemetryProcessor {
     maximumDurationMs: number,
   ): Promise<ProcessingResult> {
     const deadlineAtMs = performance.now() + maximumDurationMs;
-    const reduced = await this.reducer.reduceSession({
-      workspaceId: job.workspace_id,
-      sessionId: job.session_id,
-      normalizerVersion: job.normalizer_version,
-      activityVersion: job.activity_version,
-      throughEventId: job.target_event_id,
-      eventPageSize: 1_000,
-      statementTimeoutMs: maximumDurationMs,
+    const reduced = await withReservedConnection(
+      this.sql,
       deadlineAtMs,
-    });
-    const remainingMilliseconds = Math.floor(deadlineAtMs - performance.now());
-    if (remainingMilliseconds <= 0) {
-      throw new Error(
-        "frame projection deadline exhausted after activity reduction",
-      );
-    }
+      (connection) =>
+        new PostgresActivityReducer(connection).reduceSession({
+          workspaceId: job.workspace_id,
+          sessionId: job.session_id,
+          normalizerVersion: job.normalizer_version,
+          activityVersion: job.activity_version,
+          throughEventId: job.target_event_id,
+          eventPageSize: 1_000,
+          statementTimeoutMs: maximumDurationMs,
+          deadlineAtMs,
+        }),
+    );
+    const remaining = remainingMilliseconds(deadlineAtMs);
     const projected = await this.frameProjector.projectSession({
       workspaceId: job.workspace_id,
       sessionId: job.session_id,
       requestGeneration: job.request_generation,
-      statementTimeoutMs: remainingMilliseconds,
+      statementTimeoutMs: remaining,
+      deadlineAtMs,
     });
     return {
       session_count: 1,
@@ -163,8 +175,13 @@ export class TelemetryProcessor {
     };
   }
 
-  private async loadBatch(job: NormalizationJob): Promise<StoredBatch> {
-    return await this.loader.begin(async (tx) => {
+  private async loadBatch(
+    sql: ReservedSql,
+    job: NormalizationJob,
+    deadlineAtMs: number,
+  ): Promise<StoredBatch> {
+    return await sql.begin(async (tx) => {
+      await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
       await tx.unsafe("set local role sherlock_normalizer");
       const batches = await tx.unsafe(
         `select id, workspace_id, person_id, collector_key, source_provider,
@@ -259,11 +276,14 @@ export class TelemetryProcessor {
   }
 
   private async resolveSessionCutoff(
+    sql: ReservedSql,
     workspaceId: string,
     sessionId: string,
     normalizerVersion: string,
+    deadlineAtMs: number,
   ): Promise<bigint> {
-    return await this.loader.begin(async (tx) => {
+    return await sql.begin(async (tx) => {
+      await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
       await tx.unsafe("set local role sherlock_normalizer");
       const rows = await tx.unsafe(
         `select coalesce(max(id), 0)::text as cutoff
@@ -277,11 +297,14 @@ export class TelemetryProcessor {
   }
 
   private async resolveAffectedSessionIds(
+    sql: ReservedSql,
     workspaceId: string,
     normalizedSessionIds: readonly string[],
+    deadlineAtMs: number,
   ): Promise<string[]> {
     if (normalizedSessionIds.length === 0) return [];
-    return await this.loader.begin(async (tx) => {
+    return await sql.begin(async (tx) => {
+      await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
       await tx.unsafe("set local role sherlock_normalizer");
       const rows = await tx.unsafe(
         AFFECTED_SESSIONS_SQL,
@@ -351,7 +374,11 @@ export class SupabaseRawStorage {
     private readonly timeoutMilliseconds = 30_000,
   ) {}
 
-  async download(path: string, expectedBytes: number): Promise<Uint8Array> {
+  async download(
+    path: string,
+    expectedBytes: number,
+    maximumDurationMs = this.timeoutMilliseconds,
+  ): Promise<Uint8Array> {
     const encoded = path.split("/").map(encodeURIComponent).join("/");
     const response = await fetch(
       `${this.supabaseUrl}/storage/v1/object/telemetry-raw/${encoded}`,
@@ -360,7 +387,9 @@ export class SupabaseRawStorage {
           Authorization: `Bearer ${this.serviceRoleKey}`,
           apikey: this.serviceRoleKey,
         },
-        signal: AbortSignal.timeout(this.timeoutMilliseconds),
+        signal: AbortSignal.timeout(
+          Math.max(1, Math.min(this.timeoutMilliseconds, maximumDurationMs)),
+        ),
       },
     );
     if (!response.ok) {
@@ -411,6 +440,15 @@ export class SupabaseRawStorage {
     }
     return result;
   }
+}
+
+async function setStatementTimeout(
+  sql: Sql,
+  milliseconds: number,
+): Promise<void> {
+  await sql.unsafe("select set_config('statement_timeout', $1, true)", [
+    `${Math.max(1, Math.floor(milliseconds))}ms`,
+  ]);
 }
 
 function nullableString(value: unknown): string | null {

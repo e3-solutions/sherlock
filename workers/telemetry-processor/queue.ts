@@ -1,4 +1,4 @@
-import postgres from "npm:postgres@3.4.7";
+import { createPostgresPool, type ReservedSql, type Sql } from "./database.ts";
 
 export type WorkloadClass = "live" | "backfill";
 export type JobKind = "normalize" | "reduce";
@@ -29,31 +29,57 @@ export interface ReductionJob extends BaseJob {
 export type TelemetryJob = NormalizationJob | ReductionJob;
 export type CompletionResult = "succeeded" | "requeued" | "fenced";
 
-type Sql = ReturnType<typeof postgres>;
-
 export class PostgresJobQueue {
+  private handoffConnection: ReservedSql | null = null;
+
   private constructor(private readonly sql: Sql) {}
 
   static connect(
     databaseUrl: string,
     maxConnections: number,
   ): PostgresJobQueue {
-    return new PostgresJobQueue(postgres(databaseUrl, {
-      prepare: false,
-      max: maxConnections,
-      idle_timeout: 20,
-      connect_timeout: 10,
-    }));
+    return new PostgresJobQueue(
+      createPostgresPool(databaseUrl, maxConnections),
+    );
   }
 
   async close(): Promise<void> {
-    await this.sql.end();
+    await this.releaseHandoff();
+    await this.sql.end({ timeout: 5 });
+  }
+
+  async tryAcquireHandoff(lockKey: string): Promise<boolean> {
+    if (this.handoffConnection !== null) return true;
+    const connection = await this.sql.reserve();
+    try {
+      const rows = await connection.unsafe(
+        "select pg_try_advisory_lock(hashtextextended($1, 0)) as acquired",
+        [lockKey],
+      );
+      if (rows[0]?.acquired !== true) return false;
+      this.handoffConnection = connection;
+      return true;
+    } finally {
+      if (this.handoffConnection !== connection) connection.release();
+    }
+  }
+
+  async releaseHandoff(): Promise<void> {
+    const connection = this.handoffConnection;
+    if (connection === null) return;
+    this.handoffConnection = null;
+    try {
+      await connection.unsafe("select pg_advisory_unlock_all()");
+    } finally {
+      connection.release();
+    }
   }
 
   async claim(
     workloadClass: WorkloadClass,
     owner: string,
     leaseSeconds: number,
+    jobKind: JobKind | null = null,
   ): Promise<TelemetryJob | null> {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
@@ -66,6 +92,7 @@ export class PostgresJobQueue {
               and batch.workspace_id = j.workspace_id
               and batch.id = j.batch_id
             where j.workload_class = $1
+              and ($4::text is null or j.job_kind = $4)
               and j.attempt_count < j.attempt_limit
               and (
                 (j.status = 'queued' and j.available_at <= now()) or
@@ -113,9 +140,27 @@ export class PostgresJobQueue {
                   j.request_generation::text as request_generation,
                   j.workload_class, j.attempt_count, j.attempt_limit,
                   j.lease_token::text as lease_token`,
-        [workloadClass, owner, leaseSeconds],
+        [workloadClass, owner, leaseSeconds, jobKind],
       );
       return rows.length === 0 ? null : jobFromRow(rows[0]);
+    });
+  }
+
+  async oldestLiveNormalizationAgeSeconds(): Promise<number | null> {
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_processor");
+      const rows = await tx.unsafe(
+        `select extract(epoch from now() - min(created_at))::float8 as age_seconds
+           from processing.telemetry_jobs
+          where workload_class = 'live' and job_kind = 'normalize'
+            and attempt_count < attempt_limit
+            and (
+              (status = 'queued' and available_at <= now()) or
+              (status = 'leased' and lease_expires_at <= now())
+            )`,
+      );
+      const value = rows[0]?.age_seconds;
+      return value === null || value === undefined ? null : Number(value);
     });
   }
 

@@ -1,4 +1,5 @@
 import postgres from "npm:postgres@3.4.7";
+import { ProcessingDeadlineError, reserveBefore } from "./database.ts";
 import {
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
@@ -59,7 +60,28 @@ export interface FrameProjectionOptions {
   sessionId: string;
   requestGeneration: bigint;
   statementTimeoutMs?: number;
+  deadlineAtMs?: number;
+  monotonicNow?: () => number;
   now?: Date;
+}
+
+export function frameStatementTimeout(
+  options: Pick<
+    FrameProjectionOptions,
+    "statementTimeoutMs" | "deadlineAtMs" | "monotonicNow"
+  >,
+): number {
+  const configured = Math.max(
+    1,
+    Math.floor(options.statementTimeoutMs ?? DEFAULT_FRAME_LOCK_TIMEOUT_MS),
+  );
+  if (options.deadlineAtMs === undefined) return configured;
+  const remaining = Math.floor(
+    options.deadlineAtMs -
+      (options.monotonicNow?.() ?? performance.now()),
+  );
+  if (remaining <= 0) throw new ProcessingDeadlineError();
+  return Math.min(configured, remaining);
 }
 
 export interface FrameProjectionResult {
@@ -286,16 +308,15 @@ export class PostgresFrameEvidenceProjector {
       options.sessionId,
       FRAME_VERSION,
     ]);
-    const connection = await this.sql.reserve();
+    const connection = options.deadlineAtMs === undefined
+      ? await this.sql.reserve()
+      : await reserveBefore(this.sql, options.deadlineAtMs);
     let lockAcquired = false;
     let sessionTimeoutSet = false;
     try {
-      const lockTimeoutMs = Math.max(
-        1,
-        Math.floor(
-          options.statementTimeoutMs ?? DEFAULT_FRAME_LOCK_TIMEOUT_MS,
-        ),
-      );
+      // Pool acquisition consumes the same absolute budget. Recompute only
+      // after reserve so its wait cannot be added to a stale statement timeout.
+      const lockTimeoutMs = frameStatementTimeout(options);
       await connection.unsafe(FRAME_LOCK_TIMEOUT_SQL, [
         `${lockTimeoutMs}ms`,
       ]);
@@ -304,20 +325,24 @@ export class PostgresFrameEvidenceProjector {
       lockAcquired = true;
       await connection.unsafe(FRAME_RESET_TIMEOUT_SQL);
       sessionTimeoutSet = false;
+      await connection.unsafe(FRAME_LOCK_TIMEOUT_SQL, [
+        `${frameStatementTimeout(options)}ms`,
+      ]);
+      sessionTimeoutSet = true;
       await connection.unsafe(FRAME_BEGIN_SQL);
       let transactionOpen = true;
       try {
         const tx = connection;
+        const refreshTransactionTimeout = async () => {
+          await tx.unsafe(
+            "select set_config('statement_timeout', $1, true)",
+            [`${frameStatementTimeout(options)}ms`],
+          );
+        };
         const result = await (async () => {
-          if (options.statementTimeoutMs !== undefined) {
-            await tx.unsafe(
-              "select set_config('statement_timeout', $1, true)",
-              [
-                `${Math.max(1, Math.floor(options.statementTimeoutMs))}ms`,
-              ],
-            );
-          }
+          await refreshTransactionTimeout();
           await tx.unsafe("set local role sherlock_frame_projector");
+          await refreshTransactionTimeout();
           const sessions = await tx.unsafe(
             `select person_id::text person_id,
                 to_char(date_trunc('milliseconds', started_at)
@@ -333,6 +358,7 @@ export class PostgresFrameEvidenceProjector {
           }
           const sessionStartedAt = dateString(sessions[0].started_at);
           const sessionUpdatedAt = String(sessions[0].session_updated_at);
+          await refreshTransactionTimeout();
           const coordinates = await tx.unsafe(FRAME_SOURCE_COORDINATES_SQL, [
             options.workspaceId,
             options.sessionId,
@@ -353,6 +379,7 @@ export class PostgresFrameEvidenceProjector {
           const sourceEventCount = BigInt(
             String(coordinates[0].source_event_count),
           );
+          await refreshTransactionTimeout();
           const rows = await tx.unsafe(FRAME_SOURCE_EVENTS_SQL, [
             options.workspaceId,
             options.sessionId,
@@ -369,6 +396,7 @@ export class PostgresFrameEvidenceProjector {
             coveredFrom,
             coveredThrough,
           );
+          await refreshTransactionTimeout();
           const previousRows = await tx.unsafe(PREVIOUS_SQL, [
             options.workspaceId,
             options.sessionId,
@@ -384,6 +412,7 @@ export class PostgresFrameEvidenceProjector {
             sessionStartedAt,
             sessionUpdatedAt,
           );
+          await refreshTransactionTimeout();
           const exact = await tx.unsafe(
             `select id::text id from analytics.frame_projection_receipts
           where workspace_id = $1 and session_id = $2 and frame_version = $3
@@ -411,6 +440,7 @@ export class PostgresFrameEvidenceProjector {
               receipt_id: null,
             };
           }
+          await refreshTransactionTimeout();
           const receipts = await tx.unsafe(
             `insert into analytics.frame_projection_receipts (
            workspace_id, session_id, person_id, frame_version,
@@ -459,6 +489,7 @@ export class PostgresFrameEvidenceProjector {
             // postgres.js supports Query fragments in its runtime values
             // builder, but its object-helper type excludes those fragments.
             for (const batch of revisionInsertBatches(inserts)) {
+              await refreshTransactionTimeout();
               await tx`insert into analytics.frame_evidence_revisions ${
                 tx(batch as never, ...REVISION_COLUMNS)
               }`;
@@ -473,6 +504,7 @@ export class PostgresFrameEvidenceProjector {
             receipt_id: receiptId,
           };
         })();
+        await refreshTransactionTimeout();
         await connection.unsafe(FRAME_COMMIT_SQL);
         transactionOpen = false;
         return result;

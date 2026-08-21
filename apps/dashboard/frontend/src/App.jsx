@@ -5,10 +5,16 @@ import FlameGraph, {
   DEFAULT_PERSON_RANK,
   PERSON_RANK_OPTIONS,
 } from "./FlameGraph.jsx";
-import { adaptFlamePayload, BUCKET_MS } from "./flame-data.js";
+import {
+  adaptFlameFreshness,
+  adaptFlamePayload,
+  BUCKET_MS,
+  mergeFlameFreshness,
+} from "./flame-data.js";
 
 const REFRESH_OFFSET_MS = 90 * 1000;
 const RETRY_MS = 60 * 1000;
+const FRESHNESS_POLL_MS = 60 * 1000;
 
 function nextRefreshDelay(now) {
   const boundary = Math.floor(now / BUCKET_MS) * BUCKET_MS;
@@ -46,11 +52,15 @@ export default function App() {
   const [data, setData] = useState(null);
   const [state, setState] = useState("loading");
   const [message, setMessage] = useState("");
+  const [freshnessState, setFreshnessState] = useState("loading");
   const [clock, setClock] = useState(() => Date.now());
   const [rankBy, setRankBy] = useState(DEFAULT_PERSON_RANK);
   const lastGoodRef = useRef(null);
   const timerRef = useRef(null);
   const requestRef = useRef(null);
+  const freshnessRef = useRef(null);
+  const freshnessTimerRef = useRef(null);
+  const freshnessRequestRef = useRef(null);
   const mountedRef = useRef(false);
 
   const load = useCallback(async ({ refresh = "" } = {}) => {
@@ -70,9 +80,18 @@ export default function App() {
         throw new Error(`Flame request failed with HTTP ${response.status}`);
       }
 
-      const nextData = adaptFlamePayload(await response.json());
+      const timeline = adaptFlamePayload(await response.json());
       if (!mountedRef.current || controller.signal.aborted) return;
 
+      let nextData = timeline;
+      if (freshnessRef.current) {
+        try {
+          nextData = mergeFlameFreshness(timeline, freshnessRef.current);
+        } catch {
+          freshnessRef.current = null;
+          setFreshnessState("stale");
+        }
+      }
       lastGoodRef.current = nextData;
       setData(nextData);
       setMessage("");
@@ -102,15 +121,54 @@ export default function App() {
     }
   }, []);
 
+  const loadFreshness = useCallback(async () => {
+    window.clearTimeout(freshnessTimerRef.current);
+    freshnessRequestRef.current?.abort();
+    const controller = new AbortController();
+    freshnessRequestRef.current = controller;
+    try {
+      const response = await fetch("/api/flame/freshness?refresh=wait", {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Freshness request failed with HTTP ${response.status}`);
+      }
+      const freshness = adaptFlameFreshness(await response.json());
+      if (!mountedRef.current || controller.signal.aborted) return;
+      if (!lastGoodRef.current) {
+        freshnessRef.current = freshness;
+        setFreshnessState(freshness.delayed ? "delayed" : "ready");
+        return;
+      }
+      const nextData = mergeFlameFreshness(lastGoodRef.current, freshness);
+      freshnessRef.current = freshness;
+      lastGoodRef.current = nextData;
+      setData(nextData);
+      setFreshnessState(freshness.delayed ? "delayed" : "ready");
+    } catch {
+      if (mountedRef.current && !controller.signal.aborted) setFreshnessState("stale");
+    } finally {
+      if (freshnessRequestRef.current === controller) freshnessRequestRef.current = null;
+      if (mountedRef.current) {
+        freshnessTimerRef.current = window.setTimeout(loadFreshness, FRESHNESS_POLL_MS);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     mountedRef.current = true;
     load();
+    freshnessTimerRef.current = window.setTimeout(loadFreshness, 1000);
     return () => {
       mountedRef.current = false;
       window.clearTimeout(timerRef.current);
       requestRef.current?.abort();
+      window.clearTimeout(freshnessTimerRef.current);
+      freshnessRequestRef.current?.abort();
     };
-  }, [load]);
+  }, [load, loadFreshness]);
 
   useEffect(() => {
     const ageTimer = window.setInterval(() => setClock(Date.now()), 60 * 1000);
@@ -140,10 +198,18 @@ export default function App() {
 
   const freshness = timelineFreshness(data, clock);
   const refreshProblem = state === "stale" || freshness.delayed;
+  const liveProblem = freshnessState === "delayed" || freshnessState === "stale";
 
   return (
     <>
       <PortalHeader rankBy={rankBy} onRankChange={setRankBy} />
+      {liveProblem && (
+        <p className="refresh-warning" role="status">
+          {freshnessState === "delayed"
+            ? "Live telemetry is delayed. Recent activity may arrive late."
+            : "Live telemetry freshness is unavailable. Showing the last successful data."}
+        </p>
+      )}
       {refreshProblem && (
         <span className="visually-hidden" role="status">
           {state === "stale" ? "Timeline refresh failed." : "Timeline update delayed."}
@@ -152,7 +218,7 @@ export default function App() {
       <FlameGraph
         data={data}
         rankBy={rankBy}
-        stale={state === "stale" || state === "delayed"}
+        stale={state === "stale" || state === "delayed" || liveProblem}
         onRefresh={() => load({ refresh: "force" })}
         timelineMeta={(
           <p

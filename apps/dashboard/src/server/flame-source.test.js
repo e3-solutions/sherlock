@@ -7,6 +7,7 @@ import {
   CLAUDE_NORMALIZER_VERSION,
   DEFAULT_WORK_DETAIL_LIMIT,
   FRAME_VERSION,
+  FRESHNESS_SQL,
   FLAME_SQL,
   INTERVAL_PROMPTS_SQL,
   INTERVAL_PROMPT_LIMIT,
@@ -30,6 +31,7 @@ import {
   UNKEYED_PROMPT_MATCH_SECONDS,
   FlameSourceError,
   buildFlamePayload,
+  buildFreshnessPayload,
   decodeWorkCursor,
   decodeSnapshotToken,
   encodeWorkCursor,
@@ -60,6 +62,76 @@ function rowsFor(personId, overrides = {}) {
 }
 
 describe("Sherlock Flame payload", () => {
+  it("maps the live user-visible freshness aggregate without exposing private queue rows", () => {
+    const payload = buildFreshnessPayload([{
+      read_at: "2026-08-17T12:10:00.000Z",
+      raw_watermark: "2026-08-17T12:09:00.000Z",
+      canonical_watermark: "2026-08-17T12:08:00.000Z",
+      oldest_pending_normalize: "2026-08-17T12:00:00.000Z",
+      pending_normalize_count: "3",
+      person_id: "ada",
+      latest_canonical_activity: "2026-08-17T12:07:00.000Z",
+    }], 500);
+
+    expect(payload).toEqual({
+      read: "2026-08-17T12:10:00.000Z",
+      rawWatermark: "2026-08-17T12:09:00.000Z",
+      canonicalWatermark: "2026-08-17T12:08:00.000Z",
+      oldestPendingNormalize: "2026-08-17T12:00:00.000Z",
+      pendingNormalize: 3,
+      delayed: true,
+      people: [{ id: "ada", lastActivity: "2026-08-17T12:07:00.000Z" }],
+    });
+    expect(FRESHNESS_SQL).toContain("analytics.read_dashboard_freshness");
+    expect(FRESHNESS_SQL).not.toContain("processing.telemetry_jobs");
+  });
+
+  it("rejects inconsistent or duplicate freshness roster rows", () => {
+    const row = {
+      read_at: READ,
+      raw_watermark: null,
+      canonical_watermark: null,
+      oldest_pending_normalize: null,
+      pending_normalize_count: 0,
+      person_id: "ada",
+      latest_canonical_activity: null,
+    };
+    expect(() => buildFreshnessPayload([{ ...row }, { ...row }], 500))
+      .toThrow(FlameSourceError);
+    expect(() => buildFreshnessPayload([{ ...row, pending_normalize_count: 1 }], 500))
+      .toThrow(FlameSourceError);
+  });
+
+  it("fetches freshness through the narrow reader function in a bounded transaction", async () => {
+    const row = {
+      read_at: READ,
+      raw_watermark: null,
+      canonical_watermark: null,
+      oldest_pending_normalize: null,
+      pending_normalize_count: 0,
+      person_id: null,
+      latest_canonical_activity: null,
+    };
+    const unsafe = vi.fn().mockResolvedValue([row]);
+    const source = Object.create(DirectFlameSource.prototype);
+    Object.assign(source, {
+      workspaceId: "00000000-0000-4000-8000-000000000001",
+      expectedEmailDomain: "e3group.ai",
+      maxPeople: 500,
+      transaction: (callback, options) => {
+        expect(options.statementTimeoutMs).toBe(10_000);
+        return callback({ unsafe, array: (values) => ({ values }) });
+      },
+    });
+
+    await expect(source.fetchFreshness()).resolves.toMatchObject({ people: [] });
+    expect(unsafe).toHaveBeenCalledWith(FRESHNESS_SQL, [
+      source.workspaceId,
+      source.expectedEmailDomain,
+      { values: NORMALIZER_VERSIONS },
+      500,
+    ]);
+  });
   it("preserves the full roster, exact buckets, roles, prompts, and partial receipt", () => {
     const ada = rowsFor("ada", {
       0: {
