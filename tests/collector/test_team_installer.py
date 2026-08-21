@@ -24,6 +24,14 @@ from pathlib import Path
 
 capture = Path(os.environ["SHERLOCK_FAKE_CAPTURE"])
 
+if os.environ.get("SHERLOCK_FAKE_REQUIRE_CODEX_ARGV0") == "1":
+    if Path(sys.argv[0]).name != "codex":
+        print(
+            f"expected launcher name codex, got {Path(sys.argv[0]).name}",
+            file=sys.stderr,
+        )
+        raise SystemExit(64)
+
 def record(value):
     with capture.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -243,6 +251,71 @@ class TeamInstallerTests(unittest.TestCase):
                     call.get("argv", [])[:2] == ["plugin", "install"]
                     for call in calls
                 )
+            )
+
+    def test_unified_command_preserves_multicall_codex_launcher_name(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex-home"
+            claude_home = root / "claude-home"
+            sherlock_home = root / "sherlock-home"
+            vp_bin = root / "vp"
+            codex_bin = root / "codex"
+            fake_claude = root / "fake-claude"
+            capture = root / "calls.jsonl"
+            vp_bin.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
+            vp_bin.chmod(0o755)
+            codex_bin.symlink_to(vp_bin)
+            fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CODEX_BIN": str(codex_bin),
+                    "CODEX_HOME": str(codex_home),
+                    "CLAUDE_BIN": str(fake_claude),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "SHERLOCK_HOME": str(sherlock_home),
+                    "PYTHON_BIN": sys.executable,
+                    "SHERLOCK_FAKE_CAPTURE": str(capture),
+                    "SHERLOCK_FAKE_REQUIRE_CODEX_ARGV0": "1",
+                    "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(UNIFIED_INSTALLER),
+                    "install",
+                    "--name",
+                    "VP User",
+                    "--github",
+                    "vp-user",
+                    "--email",
+                    "vp-user@e3group.ai",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn(
+                "Sherlock is installed for Codex and Claude Code",
+                completed.stdout,
+            )
+            calls = [json.loads(line) for line in capture.read_text().splitlines()]
+            self.assertTrue(
+                any(
+                    call.get("argv", [])[:3] == ["plugin", "marketplace", "add"]
+                    for call in calls
+                )
+            )
+            self.assertTrue(
+                any(call.get("batchWrite") is not None for call in calls)
             )
 
     def test_unified_command_rejects_unapproved_domain_without_mutation(self):

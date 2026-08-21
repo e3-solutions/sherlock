@@ -51,7 +51,8 @@ def is_sherlock_marketplace(root: Path) -> bool:
 
 def main() -> int:
     args = arguments()
-    codex_bin = args.codex_bin.expanduser().resolve()
+    # Preserve the launcher name for multicall binaries such as VP's codex symlink.
+    codex_bin = args.codex_bin.expanduser().absolute()
     repo_root = args.repo_root.expanduser().resolve()
     raw = run_codex(codex_bin, "plugin", "marketplace", "list", "--json")
     try:

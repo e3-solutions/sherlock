@@ -149,7 +149,8 @@ def trust_key_path(key: str) -> str:
 
 def main() -> int:
     args = arguments()
-    codex_bin = args.codex_bin.expanduser().resolve()
+    # Preserve the launcher name for multicall binaries such as VP's codex symlink.
+    codex_bin = args.codex_bin.expanduser().absolute()
     codex_home = args.codex_home.expanduser().resolve()
     cwd = args.cwd.expanduser().resolve()
     if not codex_bin.is_file() or not os.access(codex_bin, os.X_OK):
