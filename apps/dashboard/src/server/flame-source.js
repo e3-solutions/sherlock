@@ -15,6 +15,8 @@ export const NORMALIZER_VERSIONS = Object.freeze([
 export const DATABASE_ROLE = "sherlock_reader";
 const DEFAULT_STATEMENT_TIMEOUT_MS = 20_000;
 const TIMELINE_STATEMENT_TIMEOUT_MS = 30_000;
+const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
+export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
 const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
 const WORK_CURSOR_VERSION = "v1";
@@ -119,6 +121,13 @@ select pe.id::text as person_id,
    and split_part(pe.email, '@', 3) = ''
  order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
+`;
+
+export const FRESHNESS_SQL = `
+select read_at, raw_watermark, canonical_watermark,
+       oldest_pending_normalize, pending_normalize_count,
+       person_id::text, latest_canonical_activity
+  from analytics.read_dashboard_freshness($1, $2, $3, $4)
 `;
 
 function promptsCte({
@@ -1458,6 +1467,66 @@ export function buildFlamePayload({
   };
 }
 
+export function buildFreshnessPayload(rows, maxPeople) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > maxPeople) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+  const first = rows[0];
+  const read = asDate(first.read_at);
+  const optionalDate = (value) => value === null || value === undefined
+    ? null
+    : asDate(value);
+  const globals = {
+    raw: optionalDate(first.raw_watermark),
+    canonical: optionalDate(first.canonical_watermark),
+    oldestPending: optionalDate(first.oldest_pending_normalize),
+    pending: count(first.pending_normalize_count),
+  };
+  if ((globals.pending === 0) !== (globals.oldestPending === null) ||
+      [globals.raw, globals.canonical, globals.oldestPending]
+        .some((value) => value !== null && value > read)) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+
+  const ids = new Set();
+  const people = [];
+  for (const row of rows) {
+    const rowRead = asDate(row.read_at);
+    const rowPending = count(row.pending_normalize_count);
+    const same = rowRead.getTime() === read.getTime() &&
+      optionalDate(row.raw_watermark)?.getTime() === globals.raw?.getTime() &&
+      optionalDate(row.canonical_watermark)?.getTime() === globals.canonical?.getTime() &&
+      optionalDate(row.oldest_pending_normalize)?.getTime() === globals.oldestPending?.getTime() &&
+      rowPending === globals.pending;
+    if (!same) throw new FlameSourceError("flame_database_result_invalid");
+    if (row.person_id === null || row.person_id === undefined) {
+      if (rows.length !== 1) throw new FlameSourceError("flame_database_result_invalid");
+      continue;
+    }
+    const id = String(row.person_id);
+    if (ids.has(id)) throw new FlameSourceError("flame_database_result_invalid");
+    ids.add(id);
+    const latest = optionalDate(row.latest_canonical_activity);
+    if (latest !== null && latest > read) {
+      throw new FlameSourceError("flame_database_result_invalid");
+    }
+    people.push({ id, lastActivity: latest?.toISOString() ?? null });
+  }
+
+  const pendingAgeMs = globals.oldestPending === null
+    ? 0
+    : read.getTime() - globals.oldestPending.getTime();
+  return {
+    read: read.toISOString(),
+    rawWatermark: globals.raw?.toISOString() ?? null,
+    canonicalWatermark: globals.canonical?.toISOString() ?? null,
+    oldestPendingNormalize: globals.oldestPending?.toISOString() ?? null,
+    pendingNormalize: globals.pending,
+    delayed: globals.pending > 0 && pendingAgeMs >= FRESHNESS_DELAY_MS,
+    people,
+  };
+}
+
 export class DirectFlameSource {
   constructor({
     databaseUrl,
@@ -1591,6 +1660,21 @@ export class DirectFlameSource {
         frameVersion,
       });
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
+  }
+
+  async fetchFreshness({ signal } = {}) {
+    return await this.transaction(async (tx) => {
+      const rows = await runQuery(tx, FRESHNESS_SQL, [
+        this.workspaceId,
+        this.expectedEmailDomain,
+        tx.array(NORMALIZER_VERSIONS),
+        this.maxPeople,
+      ], signal);
+      if (rows.length > this.maxPeople) {
+        throw new FlameSourceError("flame_database_roster_too_large");
+      }
+      return buildFreshnessPayload(rows, this.maxPeople);
+    }, { signal, statementTimeoutMs: FRESHNESS_STATEMENT_TIMEOUT_MS });
   }
 
   async fetchInterval({ personId, start, snapshot, signal, now }) {

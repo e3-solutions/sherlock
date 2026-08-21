@@ -31,3 +31,33 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..9ca9f08b18c2f7e5efd881b71d73fbc8
 +    const canceller = this.canceller
 +    this.canceller = null
 +    return canceller(this)
+diff --git a/cf/src/connection.js b/cf/src/connection.js
+--- a/cf/src/connection.js
++++ b/cf/src/connection.js
+@@ -16,0 +17,3 @@ export default Connection
++export function reconnectDelay(closedAt, delay, now = performance.now()) {
++  return Math.max(0, closedAt ? closedAt + delay - now : 0)
++}
+@@ -355 +358 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
+-    setTimeout(connect, closedDate ? closedDate + delay - performance.now() : 0)
++    setTimeout(connect, reconnectDelay(closedDate, delay))
+diff --git a/cjs/src/connection.js b/cjs/src/connection.js
+--- a/cjs/src/connection.js
++++ b/cjs/src/connection.js
+@@ -14,0 +15,3 @@ module.exports = Connection
++function reconnectDelay(closedAt, delay, now = performance.now()) {
++  return Math.max(0, closedAt ? closedAt + delay - now : 0)
++}
+@@ -353 +356 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
+-    setTimeout(connect, closedDate ? closedDate + delay - performance.now() : 0)
++    setTimeout(connect, reconnectDelay(closedDate, delay))
+diff --git a/src/connection.js b/src/connection.js
+--- a/src/connection.js
++++ b/src/connection.js
+@@ -14,0 +15,3 @@ export default Connection
++export function reconnectDelay(closedAt, delay, now = performance.now()) {
++  return Math.max(0, closedAt ? closedAt + delay - now : 0)
++}
+@@ -353 +356 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
+-    setTimeout(connect, closedDate ? closedDate + delay - performance.now() : 0)
++    setTimeout(connect, reconnectDelay(closedDate, delay))

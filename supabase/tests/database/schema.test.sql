@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(120);
+select plan(130);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -44,6 +44,99 @@ select ok(
   'frame activation uses only its exact workspace and version identity'
 );
 select has_table('processing', 'telemetry_jobs', 'durable telemetry queue exists');
+select has_function(
+  'analytics', 'read_dashboard_freshness', array['uuid', 'text', 'text[]', 'integer'],
+  'dashboard freshness has an aggregate-only database contract'
+);
+select ok(
+  has_function_privilege(
+    'sherlock_reader',
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)',
+    'execute'
+  ),
+  'only the dashboard reader receives the freshness aggregate'
+);
+select ok(
+  not has_function_privilege(
+    'anon', 'analytics.read_dashboard_freshness(uuid,text,text[],integer)', 'execute'
+  ) and not has_function_privilege(
+    'authenticated', 'analytics.read_dashboard_freshness(uuid,text,text[],integer)', 'execute'
+  ) and not has_function_privilege(
+    'service_role', 'analytics.read_dashboard_freshness(uuid,text,text[],integer)', 'execute'
+  ) and not has_function_privilege(
+    'sherlock_processor',
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)',
+    'execute'
+  ),
+  'public and operational roles cannot execute dashboard freshness'
+);
+select is(
+  (select count(*) from analytics.read_dashboard_freshness(
+    '00000000-0000-0000-0000-000000000001', 'example.com', array['v1'], 500
+  )),
+  0::bigint,
+  'freshness rejects an unapproved identity domain without revealing facts'
+);
+select is(
+  (select count(*) from analytics.read_dashboard_freshness(
+    '00000000-0000-0000-0000-000000000001', 'e3group.ai', array['v1'], 1001
+  )),
+  0::bigint,
+  'freshness rejects an over-broad roster bound'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+     where schemaname = 'processing'
+       and indexname = 'telemetry_jobs_dashboard_pending_normalize_idx'
+       and indexdef like '%workload_class = ''live''%'
+       and indexdef like '%status = ANY (ARRAY[''queued''::text, ''leased''::text])%'
+  ),
+  'pending freshness uses a narrow partial live-normalize index'
+);
+select ok(
+  regexp_count(
+    pg_get_functiondef(
+      'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+    ),
+    'workload_class[[:space:]]*=[[:space:]]*''live''',
+    1,
+    'i'
+  ) = 1
+  and regexp_count(
+    pg_get_functiondef(
+      'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+    ),
+    'join[[:space:]]+roster[[:space:]]+r[[:space:]]+on[[:space:]]+r.person_id[[:space:]]*=[[:space:]]*b.person_id',
+    1,
+    'i'
+  ) = 1
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'interval[[:space:]]+''30 minutes'''
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'order by[[:space:]]+b.committed_at[[:space:]]+desc,[[:space:]]*b.id[[:space:]]+desc[[:space:]]+limit[[:space:]]+1'
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'pending_freshness[[:space:]]+as[[:space:]]+materialized'
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'from[[:space:]]+roster[[:space:]]+r[[:space:]]+cross[[:space:]]+join[[:space:]]+lateral',
+  'freshness watermarks and pending metrics use only the visible live roster'
+);
+select ok(
+  to_regclass('processing.telemetry_jobs_kind_claim_idx') is not null,
+  'kind-filtered queued claims have a bounded scheduler index'
+);
+select ok(
+  to_regclass('processing.telemetry_jobs_kind_expired_lease_idx') is not null,
+  'kind-filtered expired leases have a bounded recovery index'
+);
+select ok(
+  to_regclass('processing.telemetry_jobs_live_normalize_age_idx') is not null,
+  'live normalization overload sampling has a bounded partial index'
+);
 select has_column(
   'analytics', 'frame_projection_receipts', 'request_generation',
   'projection receipts preserve queue generation'
@@ -952,7 +1045,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 120,
+  'assertion_count', 130,
   'tables', 11,
   'private_bucket', 'telemetry-raw'
 ) as verification;

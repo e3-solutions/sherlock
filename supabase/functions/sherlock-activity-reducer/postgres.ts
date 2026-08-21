@@ -7,6 +7,14 @@ import {
 
 type Sql = ReturnType<typeof postgres>;
 type TransactionSql = postgres.TransactionSql;
+export interface ReducerTransactionRunner {
+  <T>(callback: (tx: TransactionSql) => Promise<T>): Promise<T>;
+}
+
+function pooledTransactionRunner(sql: Sql): ReducerTransactionRunner {
+  return <T>(callback: (tx: TransactionSql) => Promise<T>) =>
+    sql.begin(callback) as Promise<T>;
+}
 
 export interface ReduceSessionOptions {
   workspaceId: string;
@@ -114,6 +122,9 @@ export class PostgresActivityReducer {
   constructor(
     private readonly sql: Sql,
     private readonly hooks: ActivityReducerHooks = {},
+    private readonly transactionRunner: ReducerTransactionRunner =
+      pooledTransactionRunner(sql),
+    private readonly ownsSql = true,
   ) {}
 
   static connect(
@@ -126,8 +137,16 @@ export class PostgresActivityReducer {
     );
   }
 
+  static fromReservedConnection(
+    sql: Sql,
+    transactionRunner: ReducerTransactionRunner,
+    hooks: ActivityReducerHooks = {},
+  ): PostgresActivityReducer {
+    return new PostgresActivityReducer(sql, hooks, transactionRunner, false);
+  }
+
   async close(): Promise<void> {
-    await this.sql.end();
+    if (this.ownsSql) await this.sql.end();
   }
 
   async resolveWorkspaceCutoff(
@@ -135,7 +154,7 @@ export class PostgresActivityReducer {
     normalizerVersion: string,
     statementTimeoutMs?: number,
   ): Promise<bigint> {
-    return await this.sql.begin(async (tx) => {
+    return await this.transactionRunner(async (tx) => {
       await setStatementTimeout(tx, statementTimeoutMs);
       await tx.unsafe("set local role sherlock_reducer");
       const rows = await tx.unsafe(
@@ -157,7 +176,7 @@ export class PostgresActivityReducer {
     limit: number;
     statementTimeoutMs?: number;
   }): Promise<string[]> {
-    return await this.sql.begin(async (tx) => {
+    return await this.transactionRunner(async (tx) => {
       await setStatementTimeout(tx, options.statementTimeoutMs);
       await tx.unsafe("set local role sherlock_reducer");
       const rows = await tx.unsafe(
@@ -221,7 +240,7 @@ export class PostgresActivityReducer {
       const candidates = reduceActivity(options.sessionId, events);
       remainingStatementTimeout(options);
       try {
-        return await this.sql.begin(async (tx) => {
+        return await this.transactionRunner(async (tx) => {
           await setStatementTimeout(tx, remainingStatementTimeout(options));
           await tx.unsafe("set local role sherlock_reducer");
           await setStatementTimeout(tx, remainingStatementTimeout(options));
@@ -352,7 +371,7 @@ export class PostgresActivityReducer {
     sessionId: string,
     statementTimeoutMs?: number,
   ): Promise<{ personId: string }> {
-    return await this.sql.begin(async (tx) => {
+    return await this.transactionRunner(async (tx) => {
       await setStatementTimeout(tx, statementTimeoutMs);
       await tx.unsafe("set local role sherlock_reducer");
       const rows = await tx.unsafe(
@@ -384,7 +403,7 @@ export class PostgresActivityReducer {
           options.maxEventCount!,
         );
       }
-      const page = await this.sql.begin(async (tx) => {
+      const page = await this.transactionRunner(async (tx) => {
         await setStatementTimeout(tx, remainingStatementTimeout(options));
         await tx.unsafe("set local role sherlock_reducer");
         return await tx.unsafe(

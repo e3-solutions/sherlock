@@ -1224,7 +1224,7 @@ export default function FlameGraph({
             peak={peak}
             promptPeak={promptPeak}
             chartWidth={width}
-            readMs={data.readMs}
+            readMs={data.recencyReadMs ?? data.readMs}
             windowMinutes={windowMinutes}
             selectedIndex={selectedPerson?.id === person.id ? selectedPoint?.index : undefined}
             onSelect={selectInterval}

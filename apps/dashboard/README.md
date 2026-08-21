@@ -172,6 +172,36 @@ expires; health then reports `timeline_expired` until a refresh succeeds.
 Cross-restart outage survival would require a separate durable publication and
 immutable publication-time session facts.
 
+## Live freshness receipt
+
+`GET /api/flame/freshness` serves a separate aggregate-only receipt containing
+the visible roster's raw ingest watermark, the latest canonical dashboard event
+watermark, its oldest/pending live normalization summary, and each roster
+person's latest canonical activity. Backfill, smoke-canary, and out-of-domain
+jobs cannot trigger the live-delay warning. The server refreshes this small
+receipt every two minutes; browsers
+poll the cache once per minute with `refresh=wait`, retain the last good result,
+and update only activity-recency status. The 144 immutable timeline buckets and
+their ten-minute refresh cadence do not change.
+
+The freshness activity scan is bounded to the 30-minute recency horizon. When a
+person has no activity in that horizon, the browser preserves any older timestamp
+from the last-good 24-hour timeline rather than regressing it to null. Failed
+database refreshes have a hard one-minute cooldown shared by scheduled and
+request-driven refreshes.
+
+The browser displays a global warning when the oldest pending normalization is
+at least five minutes old, or when the receipt cannot be refreshed. Operators
+can deterministically compare `canonicalWatermark` and `read`, then confirm the
+matching person's `lastActivity`, without treating a delayed pipeline as proof
+that everyone is inactive. Freshness failure does not affect `/healthz` and
+cannot restart an otherwise healthy dashboard process.
+
+The database function is `SECURITY DEFINER` with an empty search path because it
+must summarize the private processing queue. Execute is revoked from public,
+API, service, and worker roles and granted only to `sherlock_reader`; its result
+contains no job IDs, leases, errors, raw payloads, hashes, or storage paths.
+
 ## Environment
 
 SUPABASE_DB_URL, SHERLOCK_WORKSPACE_ID, and SHERLOCK_DASHBOARD_EMAIL_DOMAIN are

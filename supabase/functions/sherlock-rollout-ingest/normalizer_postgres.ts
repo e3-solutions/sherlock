@@ -17,6 +17,31 @@ import type { NormalizationResult } from "./service.ts";
 
 type Sql = ReturnType<typeof postgres>;
 type TransactionSql = postgres.TransactionSql;
+export interface NormalizerTransactionRunner {
+  <T>(callback: (tx: TransactionSql) => Promise<T>): Promise<T>;
+}
+
+function pooledTransactionRunner(sql: Sql): NormalizerTransactionRunner {
+  return <T>(callback: (tx: TransactionSql) => Promise<T>) =>
+    sql.begin(callback) as Promise<T>;
+}
+
+export function normalizationStatementTimeout(
+  statementTimeoutMs?: number,
+  deadlineAtMs?: number,
+  now = () => performance.now(),
+): number | undefined {
+  if (deadlineAtMs === undefined) return statementTimeoutMs;
+  const remaining = Math.floor(deadlineAtMs - now());
+  if (remaining <= 0) {
+    const error = new Error("normalization deadline exceeded");
+    Object.assign(error, { code: "processing_deadline_exceeded" });
+    throw error;
+  }
+  return statementTimeoutMs === undefined
+    ? remaining
+    : Math.min(statementTimeoutMs, remaining);
+}
 
 const EVENT_COLUMNS = [
   "workspace_id",
@@ -67,26 +92,52 @@ const EVENT_COLUMNS = [
 ] as const;
 
 export class PostgresBatchNormalizer implements BatchNormalizer {
-  constructor(private readonly sql: Sql) {}
+  constructor(
+    private readonly sql: Sql,
+    private readonly transactionRunner: NormalizerTransactionRunner =
+      pooledTransactionRunner(sql),
+    private readonly ownsSql = true,
+  ) {}
 
   static connect(databaseUrl: string): PostgresBatchNormalizer {
-    return new PostgresBatchNormalizer(
-      postgres(databaseUrl, { prepare: false, max: 2, idle_timeout: 20 }),
-    );
+    const sql = postgres(databaseUrl, {
+      prepare: false,
+      max: 2,
+      idle_timeout: 20,
+    });
+    return new PostgresBatchNormalizer(sql);
+  }
+
+  static fromReservedConnection(
+    sql: Sql,
+    transactionRunner: NormalizerTransactionRunner,
+  ): PostgresBatchNormalizer {
+    return new PostgresBatchNormalizer(sql, transactionRunner, false);
   }
 
   async close(): Promise<void> {
-    await this.sql.end();
+    if (this.ownsSql) await this.sql.end();
   }
 
   async normalize(
     receipt: CommittedReceipt,
     manifest: BatchManifest,
     source: Uint8Array,
+    statementTimeoutMs?: number,
+    deadlineAtMs?: number,
   ): Promise<NormalizationResult> {
     const projection = await projectBatch(manifest, source);
     const normalizerVersion = normalizerVersionFor(manifest);
-    return await this.sql.begin(async (tx) => {
+    const timeout = normalizationStatementTimeout(
+      statementTimeoutMs,
+      deadlineAtMs,
+    );
+    return await this.transactionRunner(async (tx) => {
+      if (timeout !== undefined) {
+        await tx.unsafe("select set_config('statement_timeout', $1, true)", [
+          `${Math.max(1, Math.floor(timeout))}ms`,
+        ]);
+      }
       await tx.unsafe("set local role sherlock_normalizer");
       const sourceRecords = await tx.unsafe(
         `select id, record_index
