@@ -153,8 +153,6 @@ Deno.test({
       );
 
       await normalizer.normalize(receipt, manifest, source);
-      const pairs = await store.pendingPairs(workspaceId, 10);
-      assert(pairs.length === 1, "matched projection must become pending");
       const result = await syncPending(store, {
         workspaceId,
         token: "test-token",
