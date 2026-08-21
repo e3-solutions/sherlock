@@ -21,8 +21,8 @@ stops without writing collector state if neither CLI is usable. It copies only
 the client plugin marketplace to
 `$HOME/.sherlock/marketplace` by default, so removing the temporary checkout
 does not break either installation. It then reuses the provider-specific
-installers below, including Codex hook trust and Claude Code's 24-hour
-transcript backfill. Its final summary shows what was installed and skipped.
+installers below, including Codex hook trust and each provider's 24-hour
+session backfill. Its final summary shows what was installed and skipped.
 Start a new session in every installed agent so its hooks load.
 
 Use the same work email on every machine that should be linked to you. If an
@@ -42,7 +42,11 @@ cd sherlock
   --email "<work email>"
 ```
 
-After installation, start a new Codex task so the hooks load.
+The installer queues Codex rollout files modified during the preceding 24
+hours and reports whether that bounded pass completed. Reinstalling is
+idempotent, and later `SessionStart` hooks continue the backfill while
+prioritizing the current task. After installation, start a new Codex task so
+the hooks load.
 
 ## Install only for Claude Code
 

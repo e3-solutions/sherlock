@@ -18,8 +18,11 @@ from .drain import Drain
 from .discovery import (
     CLAUDE_BACKFILL_MAX_BYTES,
     CLAUDE_BACKFILL_MAX_FILES,
+    CODEX_BACKFILL_MAX_BYTES,
+    CODEX_BACKFILL_MAX_FILES,
     DEFAULT_LOOKBACK_SECONDS,
     discover_claude_transcripts,
+    discover_rollouts,
 )
 from .hook import capture_and_spawn_drain, run_hook
 from .http import HttpTransport
@@ -96,26 +99,36 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
     if args.command == "backfill":
-        if args.provider != "claude_code" or args.lookback_seconds < 1:
-            print("backfill requires claude_code and a positive lookback", file=sys.stderr)
+        if args.lookback_seconds < 1:
+            print("backfill requires a positive lookback", file=sys.stderr)
             return 2
-        discovery = discover_claude_transcripts(
-            source_home,
-            lookback_seconds=args.lookback_seconds,
+        is_claude = args.provider == "claude_code"
+        discovery = (
+            discover_claude_transcripts(
+                source_home,
+                lookback_seconds=args.lookback_seconds,
+            )
+            if is_claude
+            else discover_rollouts(
+                source_home,
+                lookback_seconds=args.lookback_seconds,
+                scan_recent_files=True,
+            )
         )
         outcome = capture_and_spawn_drain(
             RolloutCapturer(
                 state_root,
                 spool,
-                source_provider="claude_code",
-                source_kind="transcript",
-                state_name="claude-transcript",
-                capture_unterminated_tail=False,
+                source_provider=args.provider,
+                source_kind="transcript" if is_claude else "rollout",
+                state_name="claude-transcript" if is_claude else "rollout",
+                capture_unterminated_tail=not is_claude,
                 allowed_root=(
                     source_home / "projects"
-                    if not (source_home / "projects").is_symlink()
+                    if is_claude
+                    and not (source_home / "projects").is_symlink()
                     and (source_home / "projects").is_dir()
-                    else None
+                    else source_home if not is_claude else None
                 ),
             ),
             discovery.paths,
@@ -123,10 +136,10 @@ def main(argv: list[str] | None = None) -> int:
                 sys.executable,
                 "-m",
                 "sherlock_collector.cli",
-                "--claude-home",
+                "--claude-home" if is_claude else "--codex-home",
                 str(source_home),
                 "--provider",
-                "claude_code",
+                args.provider,
                 "--state-root",
                 str(state_root),
                 *(["--config", str(args.config)] if args.config else []),
@@ -137,8 +150,16 @@ def main(argv: list[str] | None = None) -> int:
             source_snapshots=discovery.source_snapshots,
             drain_environment=environment,
             best_effort=True,
-            max_files=CLAUDE_BACKFILL_MAX_FILES,
-            max_sync_bytes=CLAUDE_BACKFILL_MAX_BYTES,
+            max_files=(
+                CLAUDE_BACKFILL_MAX_FILES
+                if is_claude
+                else CODEX_BACKFILL_MAX_FILES
+            ),
+            max_sync_bytes=(
+                CLAUDE_BACKFILL_MAX_BYTES
+                if is_claude
+                else CODEX_BACKFILL_MAX_BYTES
+            ),
             backlog_workload_class="backfill",
         )
         partial = bool(
