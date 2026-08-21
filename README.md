@@ -7,20 +7,23 @@ immutable telemetry backend.
 
 ## Install for Codex and Claude Code
 
-You need macOS or Linux, Git, Python 3, and both the Codex and Claude Code
-CLIs. Run this one command with the same team identity for both providers:
+You need macOS or Linux, Git, Python 3, and at least one of the Codex or Claude
+Code CLIs. Run this one command with the same team identity for every available
+provider:
 
 ```sh
 workdir="$(mktemp -d)" && git clone --depth 1 --single-branch --branch main https://github.com/e3-solutions/sherlock.git "$workdir/sherlock" && "$workdir/sherlock/sherlock" install --name "<full name>" --github "<GitHub username>" --email "<work email>" && rm -rf "$workdir"
 ```
 
-The command checks that both agent CLIs are available before changing either
-installation. It copies only the client plugin marketplace to
+The command detects both agent CLIs before changing either installation. It
+installs every usable provider, reports unavailable providers as skipped, and
+stops without writing collector state if neither CLI is usable. It copies only
+the client plugin marketplace to
 `$HOME/.sherlock/marketplace` by default, so removing the temporary checkout
 does not break either installation. It then reuses the provider-specific
 installers below, including Codex hook trust and Claude Code's 24-hour
-transcript backfill. Start new Codex and Claude Code sessions after it completes
-so both sets of hooks load.
+transcript backfill. Its final summary shows what was installed and skipped.
+Start a new session in every installed agent so its hooks load.
 
 Use the same work email on every machine that should be linked to you. If an
 agent is installing Sherlock for someone else, it must ask for all three values

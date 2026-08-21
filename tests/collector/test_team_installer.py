@@ -201,10 +201,8 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertIn(
-                "Sherlock is installed for Codex and Claude Code",
-                completed.stdout,
-            )
+            self.assertIn("Codex: installed", completed.stdout)
+            self.assertIn("Claude Code: installed", completed.stdout)
             for config in (
                 codex_home / "sherlock" / "collector.json",
                 claude_home / "sherlock" / "collector.json",
@@ -303,10 +301,8 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertIn(
-                "Sherlock is installed for Codex and Claude Code",
-                completed.stdout,
-            )
+            self.assertIn("Codex: installed", completed.stdout)
+            self.assertIn("Claude Code: installed", completed.stdout)
             calls = [json.loads(line) for line in capture.read_text().splitlines()]
             self.assertTrue(
                 any(
@@ -558,10 +554,12 @@ class TeamInstallerTests(unittest.TestCase):
                     self.assertIn("work domain", completed.stderr)
                     self.assertFalse(provider_home.exists())
 
-    def test_unified_command_preflights_both_agents_before_installing(self):
+    def test_unified_command_installs_codex_when_claude_is_missing(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             codex_home = root / "codex"
+            claude_home = root / "claude"
+            sherlock_home = root / "sherlock-home"
             fake_codex = root / "fake-codex"
             fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
             fake_codex.chmod(0o755)
@@ -571,9 +569,11 @@ class TeamInstallerTests(unittest.TestCase):
                     "CODEX_BIN": str(fake_codex),
                     "CODEX_HOME": str(codex_home),
                     "CLAUDE_BIN": str(root / "missing-claude"),
-                    "CLAUDE_CONFIG_DIR": str(root / "claude"),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "SHERLOCK_HOME": str(sherlock_home),
                     "PYTHON_BIN": sys.executable,
                     "SHERLOCK_FAKE_CAPTURE": str(root / "calls.jsonl"),
+                    "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
                 }
             )
 
@@ -596,14 +596,21 @@ class TeamInstallerTests(unittest.TestCase):
                 text=True,
             )
 
-            self.assertEqual(completed.returncode, 1)
-            self.assertIn("CLAUDE_BIN is not executable", completed.stderr)
-            self.assertFalse((codex_home / "sherlock").exists())
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((codex_home / "sherlock" / "collector.json").is_file())
+            self.assertFalse((claude_home / "sherlock").exists())
+            self.assertIn("Codex: installed", completed.stdout)
+            self.assertIn(
+                "Claude Code: skipped - configured CLAUDE_BIN is not executable",
+                completed.stdout,
+            )
 
-    def test_unified_command_rejects_unusable_agent_before_installing(self):
+    def test_unified_command_installs_codex_when_claude_is_unusable(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             codex_home = root / "codex"
+            claude_home = root / "claude"
+            sherlock_home = root / "sherlock-home"
             fake_codex = root / "fake-codex"
             fake_claude = root / "not-claude"
             fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
@@ -616,9 +623,11 @@ class TeamInstallerTests(unittest.TestCase):
                     "CODEX_BIN": str(fake_codex),
                     "CODEX_HOME": str(codex_home),
                     "CLAUDE_BIN": str(fake_claude),
-                    "CLAUDE_CONFIG_DIR": str(root / "claude"),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "SHERLOCK_HOME": str(sherlock_home),
                     "PYTHON_BIN": sys.executable,
                     "SHERLOCK_FAKE_CAPTURE": str(root / "calls.jsonl"),
+                    "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
                 }
             )
 
@@ -641,9 +650,117 @@ class TeamInstallerTests(unittest.TestCase):
                 text=True,
             )
 
-            self.assertEqual(completed.returncode, 1)
-            self.assertIn("Claude Code CLI is not usable", completed.stderr)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((codex_home / "sherlock" / "collector.json").is_file())
+            self.assertFalse((claude_home / "sherlock").exists())
+            self.assertIn("Codex: installed", completed.stdout)
+            self.assertIn(
+                "Claude Code: skipped - configured Claude Code CLI is not usable",
+                completed.stdout,
+            )
+
+    def test_unified_command_installs_claude_when_codex_is_missing(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            claude_home = root / "claude"
+            sherlock_home = root / "sherlock-home"
+            fake_claude = root / "fake-claude"
+            capture = root / "calls.jsonl"
+            fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CODEX_BIN": str(root / "missing-codex"),
+                    "CODEX_HOME": str(codex_home),
+                    "CLAUDE_BIN": str(fake_claude),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "SHERLOCK_HOME": str(sherlock_home),
+                    "PYTHON_BIN": sys.executable,
+                    "SHERLOCK_FAKE_CAPTURE": str(capture),
+                    "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(UNIFIED_INSTALLER),
+                    "install",
+                    "--name",
+                    "Claude User",
+                    "--github",
+                    "claude-user",
+                    "--email",
+                    "claude-user@sixtyfour.ai",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertFalse((codex_home / "sherlock").exists())
+            self.assertTrue((claude_home / "sherlock" / "collector.json").is_file())
+            self.assertIn(
+                "Codex: skipped - configured CODEX_BIN is not executable",
+                completed.stdout,
+            )
+            self.assertIn("Claude Code: installed", completed.stdout)
+            calls = [json.loads(line)["argv"] for line in capture.read_text().splitlines()]
+            self.assertFalse(any(call[:2] == ["plugin", "add"] for call in calls))
+            self.assertTrue(any(call[:2] == ["plugin", "install"] for call in calls))
+
+    def test_unified_command_fails_without_mutation_when_no_agent_is_usable(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            claude_home = root / "claude"
+            sherlock_home = root / "sherlock-home"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CODEX_BIN": str(root / "missing-codex"),
+                    "CODEX_HOME": str(codex_home),
+                    "CLAUDE_BIN": str(root / "missing-claude"),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "SHERLOCK_HOME": str(sherlock_home),
+                    "PYTHON_BIN": sys.executable,
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(UNIFIED_INSTALLER),
+                    "install",
+                    "--name",
+                    "No Agent User",
+                    "--github",
+                    "no-agent-user",
+                    "--email",
+                    "no-agent-user@sixtyfour.ai",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn(
+                "No usable Codex or Claude Code CLI was found; nothing was installed",
+                completed.stderr,
+            )
+            self.assertIn("Codex: skipped", completed.stderr)
+            self.assertIn("Claude Code: skipped", completed.stderr)
+            self.assertFalse(codex_home.exists())
+            self.assertFalse(claude_home.exists())
+            self.assertFalse(sherlock_home.exists())
 
     def test_one_command_installs_and_trusts_only_sherlock_hooks(self):
         with TemporaryDirectory() as temporary:
