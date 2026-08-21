@@ -75,7 +75,7 @@ jobs:
         run: |
           deno test supabase/functions/sherlock-rollout-ingest
           deno test supabase/functions/sherlock-activity-reducer
-          deno test workers/telemetry-processor
+          deno test --allow-read=railway.toml workers/telemetry-processor
 
       - name: Verify dashboard
         working-directory: apps/dashboard

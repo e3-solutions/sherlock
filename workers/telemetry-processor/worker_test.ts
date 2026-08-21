@@ -17,7 +17,9 @@ import {
   recordLocatorFromRow,
   reduceAffectedSessions,
 } from "./processor.ts";
-import railwayConfig from "../../railway.toml" with { type: "text" };
+const railwayConfig = await Deno.readTextFile(
+  new URL("../../railway.toml", import.meta.url),
+);
 
 function assert(
   condition: unknown,
