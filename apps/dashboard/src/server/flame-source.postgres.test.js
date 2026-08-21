@@ -145,7 +145,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
          `insert into telemetry.sessions (
            id, workspace_id, person_id, collector_key, native_session_id,
            actor_role, role_version, started_at
-         ) values ($1, $2, $3, 'fixture', $1::text, 'primary', 'fixture.v1', $4)`,
+         ) values ($1::uuid, $2, $3, 'fixture', $1::uuid::text,
+                   'primary', 'fixture.v1', $4)`,
         [sessionId, workspaceId, personId, bucketStart.toISOString()],
       );
       await sql.unsafe(
