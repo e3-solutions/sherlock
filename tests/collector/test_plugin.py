@@ -695,6 +695,9 @@ class HookCompanionTests(unittest.TestCase):
 
         self.assertEqual(set(hooks), CODEX_HOOK_EVENTS)
         self.assertTrue(set(hooks).issubset(HOOK_EVENTS))
+        for event_name, entries in hooks.items():
+            command = entries[0]["hooks"][0]
+            self.assertNotIn("async", command, event_name)
         for event_name in (
             "PostToolUse",
             "PostCompact",
@@ -702,7 +705,6 @@ class HookCompanionTests(unittest.TestCase):
             "SubagentStop",
         ):
             command = hooks[event_name][0]["hooks"][0]
-            self.assertIs(command["async"], True)
             self.assertEqual(command["timeout"], 30)
 
     def test_configured_hook_commands_are_fail_open(self):
