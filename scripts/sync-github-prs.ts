@@ -502,37 +502,24 @@ export class PostgresLookupStore implements LookupStore {
           lookup.candidates.length,
         ],
       );
-      if (lookup.candidates.length > 0) {
+      for (const candidate of lookup.candidates) {
         await connection.unsafe(
           `insert into github.commit_pull_candidates (
              workspace_id, attempt_id, github_repository_id,
              github_pull_request_id, pull_request_number, state,
              pull_request_created_at, pull_request_closed_at,
              pull_request_merged_at
-           )
-           select $1, $2, item.github_repository_id,
-                  item.github_pull_request_id, item.pull_request_number,
-                  item.state, item.pull_request_created_at,
-                  item.pull_request_closed_at, item.pull_request_merged_at
-             from jsonb_to_recordset($3::jsonb) as item (
-               github_repository_id bigint, github_pull_request_id bigint,
-               pull_request_number integer, state text,
-               pull_request_created_at timestamptz,
-               pull_request_closed_at timestamptz,
-               pull_request_merged_at timestamptz
-             )`,
+           ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [
             workspaceId,
             attempt[0].id,
-            JSON.stringify(lookup.candidates.map((candidate) => ({
-              github_repository_id: candidate.githubRepositoryId,
-              github_pull_request_id: candidate.githubPullRequestId,
-              pull_request_number: candidate.pullRequestNumber,
-              state: candidate.state,
-              pull_request_created_at: candidate.pullRequestCreatedAt,
-              pull_request_closed_at: candidate.pullRequestClosedAt,
-              pull_request_merged_at: candidate.pullRequestMergedAt,
-            }))),
+            candidate.githubRepositoryId,
+            candidate.githubPullRequestId,
+            candidate.pullRequestNumber,
+            candidate.state,
+            candidate.pullRequestCreatedAt,
+            candidate.pullRequestClosedAt,
+            candidate.pullRequestMergedAt,
           ],
         );
       }
