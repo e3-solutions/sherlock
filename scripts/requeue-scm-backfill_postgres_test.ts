@@ -78,15 +78,16 @@ Deno.test({
          ) values ($1, $2, 'sherlock.github-scm.v1', 'no_match')`,
         [workspaceId, projectedRecord!.id],
       );
-      await sql.unsafe(
-        `insert into processing.telemetry_jobs (
-           workspace_id, job_kind, batch_id, workload_class, status,
-           completed_at
-         ) values
-           ($1, 'normalize', $2, 'live', 'succeeded', now()),
-           ($1, 'normalize', $3, 'live', 'succeeded', now())`,
+      const completedJobs = await sql.unsafe(
+        `update processing.telemetry_jobs
+            set status = 'succeeded', completed_at = now()
+          where workspace_id = $1
+            and job_kind = 'normalize'
+            and (batch_id = $2 or batch_id = $3)
+        returning id`,
         [workspaceId, missingBatchId, projectedBatchId],
       );
+      assert(completedJobs.length === 2, "ingest must create normalize jobs");
 
       assert(await requeueScmBackfill(databaseUrl!, workspaceId, 10) === 1);
       const jobs = await sql.unsafe(
