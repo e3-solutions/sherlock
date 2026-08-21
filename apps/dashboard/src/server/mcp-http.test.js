@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { Readable } from "node:stream";
 
-import { MCP_TOKEN_MIN_LENGTH, createMcpHttpRoute } from "./mcp-http.js";
+import {
+  MAX_MCP_BODY_BYTES,
+  MCP_TOKEN_MIN_LENGTH,
+  createMcpHttpRoute,
+} from "./mcp-http.js";
 
 const TOKEN = "s".repeat(MCP_TOKEN_MIN_LENGTH);
 
@@ -80,5 +85,63 @@ describe("Bonaparte MCP HTTP route", () => {
     expect(response.status).toBe(503);
     expect(JSON.parse(response.body)).toEqual({ error: "mcp_unavailable" });
     expect(response.body).not.toContain("database secret");
+  });
+
+  it("accepts the exact declared boundary and rejects one byte more before protocol", async () => {
+    const protocolHandler = vi.fn();
+    const route = createMcpHttpRoute({ protocolHandler, token: TOKEN });
+    const accepted = responseRecorder();
+    await route({
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-length": String(MAX_MCP_BODY_BYTES),
+      },
+    }, accepted);
+    expect(protocolHandler).toHaveBeenCalledTimes(1);
+
+    const rejected = responseRecorder();
+    await route({
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-length": String(MAX_MCP_BODY_BYTES + 1),
+      },
+    }, rejected);
+    expect(protocolHandler).toHaveBeenCalledTimes(1);
+    expect(rejected.status).toBe(413);
+    expect(JSON.parse(rejected.body)).toEqual({ error: "mcp_body_too_large" });
+  });
+
+  it("buffers chunked requests and never invokes protocol after overflow", async () => {
+    const protocolHandler = vi.fn();
+    const route = createMcpHttpRoute({ protocolHandler, token: TOKEN });
+    const request = Readable.from([
+      Buffer.alloc(MAX_MCP_BODY_BYTES),
+      Buffer.alloc(1),
+    ]);
+    request.headers = { authorization: `Bearer ${TOKEN}` };
+    const response = responseRecorder();
+
+    await route(request, response);
+
+    expect(protocolHandler).not.toHaveBeenCalled();
+    expect(response.status).toBe(413);
+    expect(JSON.parse(response.body)).toEqual({ error: "mcp_body_too_large" });
+  });
+
+  it("passes an exact-boundary chunked body only after buffering it", async () => {
+    const seen = [];
+    const protocolHandler = vi.fn(async (request) => {
+      for await (const chunk of request) seen.push(chunk);
+    });
+    const route = createMcpHttpRoute({ protocolHandler, token: TOKEN });
+    const request = Readable.from([Buffer.alloc(MAX_MCP_BODY_BYTES)]);
+    request.method = "POST";
+    request.url = "/mcp";
+    request.headers = { authorization: `Bearer ${TOKEN}` };
+
+    await route(request, responseRecorder());
+
+    expect(protocolHandler).toHaveBeenCalledTimes(1);
+    expect(Buffer.concat(seen)).toHaveLength(MAX_MCP_BODY_BYTES);
   });
 });

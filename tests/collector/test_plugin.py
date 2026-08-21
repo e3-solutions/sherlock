@@ -35,12 +35,31 @@ SOURCE = ROOT / "packages" / "telemetry-collector" / "src"
 LAUNCHER = ROOT / "plugins" / "sherlock" / "scripts" / "run_hook.py"
 INSTALLER = ROOT / "plugins" / "sherlock" / "scripts" / "install.py"
 HOOKS = ROOT / "plugins" / "sherlock" / "hooks" / "hooks.json"
+ANALYSIS_SKILL = (
+    ROOT / "plugins" / "sherlock" / "skills" / "sherlock-analysis" / "SKILL.md"
+)
 IDENTITY_CONFIG = {
     "name": "Test User",
     "github_id": "test-user",
     "email": "test@example.com",
     "installation_id": "00000000-0000-4000-8000-000000000001",
 }
+
+
+class CodexAnalysisSkillTests(unittest.TestCase):
+    def test_manual_analysis_skill_requires_complete_snapshot_bound_workflow(self):
+        skill = ANALYSIS_SKILL.read_text(encoding="utf-8")
+        self.assertIn("explicitly invokes", skill)
+        self.assertIn("Follow every `nextCursor` until it is null", skill)
+        self.assertIn("discard that traversal and restart", skill)
+        self.assertIn("untrusted user-authored text", skill)
+        self.assertIn("native file, search, history, and test tools", skill)
+        self.assertIn("exactly once", skill)
+        self.assertIn("Submit an empty array", skill)
+        self.assertIn("never select, rank, or silently truncate", skill)
+        self.assertIn("fixes the high-water mark", skill)
+        self.assertIn("does not persist approval", skill)
+        self.assertIn("does not verify submitter or reviewer identity", skill)
 
 
 def create_threads_database(path: Path, rows: list[dict[str, object]]) -> None:

@@ -45,7 +45,10 @@ describe("cached MCP usage evidence", () => {
   it("preserves the cached snapshot and advances after a missing key", () => {
     const day = payload([person(1), person(3)], "v1.cached-snapshot");
 
-    const page = pageCachedUsageEvidence(day, encodeUsageCursor(person(2).id));
+    const page = pageCachedUsageEvidence(
+      day,
+      encodeUsageCursor(day.snapshot, person(2).id),
+    );
 
     expect(page.snapshot).toBe("v1.cached-snapshot");
     expect(page.read).toBe(day.read);
@@ -55,7 +58,10 @@ describe("cached MCP usage evidence", () => {
   it("returns a successful empty page after the final cached person", () => {
     const day = payload([person(1)]);
 
-    const page = pageCachedUsageEvidence(day, encodeUsageCursor(person(2).id));
+    const page = pageCachedUsageEvidence(
+      day,
+      encodeUsageCursor(day.snapshot, person(2).id),
+    );
 
     expect(page.people).toEqual([]);
     expect(page.nextCursor).toBeNull();
@@ -63,10 +69,25 @@ describe("cached MCP usage evidence", () => {
   });
 
   it("rejects malformed cursors and duplicate cached people", () => {
-    expect(decodeUsageCursor(encodeUsageCursor(person(1).id))).toBe(person(1).id);
+    expect(decodeUsageCursor(encodeUsageCursor("v1.snapshot", person(1).id))).toEqual({
+      snapshotSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      afterPersonId: person(1).id,
+    });
     expect(() => decodeUsageCursor("u1.not+base64")).toThrow(FlameSourceError);
     expect(() => pageCachedUsageEvidence(payload([person(1), person(1)])))
       .toThrow(FlameSourceError);
+  });
+
+  it("expires a traversal when the cached snapshot refreshes", () => {
+    const first = pageCachedUsageEvidence(payload(
+      Array.from({ length: 21 }, (_, index) => person(index + 1)),
+      "v1.first",
+    ));
+
+    expect(() => pageCachedUsageEvidence(
+      payload([person(21)], "v1.second"),
+      first.nextCursor,
+    )).toThrowError(new FlameSourceError("flame_usage_snapshot_expired"));
   });
 
   it("reads usage only from the timeline cache and delegates prompt evidence", async () => {

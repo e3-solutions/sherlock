@@ -110,6 +110,11 @@ describe("Sherlock Flame payload", () => {
       state: "partial",
       reason: "event_presence_not_continuous_attention",
     });
+    expect(payload.normalizerVersions).toEqual([
+      NORMALIZER_VERSION,
+      CLAUDE_NORMALIZER_VERSION,
+    ]);
+    expect(payload.frameVersion).toBeNull();
     expect(decodeSnapshotToken(payload.snapshot)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
@@ -482,6 +487,8 @@ describe("Sherlock Flame payload", () => {
         "e3group.ai",
       ]);
     }
+    expect(payload.normalizerVersions).toEqual(NORMALIZER_VERSIONS);
+    expect(payload.frameVersion).toBe(frameProjectionActive === true ? FRAME_VERSION : null);
     expect(payload.snapshot).toMatch(new RegExp(`^${expectedTokenVersion}\\.`));
     expect(decodeSnapshotToken(payload.snapshot)).toEqual(expectedSnapshot);
   });
