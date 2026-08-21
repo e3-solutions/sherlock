@@ -892,10 +892,14 @@ describe("FlameGraph", () => {
     const firstResponse = deferred();
     const data = modelWithCacheableFrames();
     const firstStart = new Date(data.people[0].buckets[0].startMs).toISOString();
-    vi.mocked(fetch).mockImplementation((url, options) => {
+    vi.mocked(fetch).mockImplementation(async (url, options) => {
       const request = new URL(url, "http://dashboard.test");
       if (request.searchParams.get("start") === firstStart) {
-        return firstResponse.promise.then(() => defaultFetch(url, options));
+        await firstResponse.promise;
+        const response = await defaultFetch(url, options);
+        const payload = await response.json();
+        payload.prompts[0].content = "stale frame A marker";
+        return { ...response, json: () => Promise.resolve(payload) };
       }
       return defaultFetch(url, options);
     });
@@ -912,8 +916,8 @@ describe("FlameGraph", () => {
     expect(await screen.findByText("3 human prompts")).toBeInTheDocument();
     firstResponse.resolve();
     await act(() => Promise.resolve());
-    expect(screen.getByRole("complementary", { name: "Ada Lovelace" }))
-      .toHaveTextContent(/12:10 AM.*12:20 AM/);
+    expect(screen.queryByText("stale frame A marker")).not.toBeInTheDocument();
+    expect(wrapper.closest(".flame-lane")).toHaveAttribute("data-selected-index", "1");
   });
 
   it("restarts an aborted pending load when the same frame is immediately reopened", async () => {
