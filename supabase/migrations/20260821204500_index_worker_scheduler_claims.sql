@@ -1,17 +1,17 @@
 -- Keep overload-mode normalize/reduce claims bounded without changing queue
 -- facts or scheduling semantics. The existing workload/FIFO index remains for
 -- unfiltered claims.
-create index concurrently if not exists telemetry_jobs_kind_claim_idx
+create index if not exists telemetry_jobs_kind_claim_idx
   on processing.telemetry_jobs (
     workload_class, job_kind, available_at, id
   ) where status = 'queued';
 
-create index concurrently if not exists telemetry_jobs_kind_expired_lease_idx
+create index if not exists telemetry_jobs_kind_expired_lease_idx
   on processing.telemetry_jobs (
     workload_class, job_kind, lease_expires_at, id
   ) where status = 'leased';
 
-create index concurrently if not exists telemetry_jobs_live_normalize_age_idx
+create index if not exists telemetry_jobs_live_normalize_age_idx
   on processing.telemetry_jobs (created_at, id)
   where workload_class = 'live' and job_kind = 'normalize'
     and status in ('queued', 'leased');

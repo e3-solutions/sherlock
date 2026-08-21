@@ -158,7 +158,7 @@ grant execute on function analytics.read_dashboard_freshness(uuid, text, text[],
 
 -- Support the narrow live pending-normalize scan. Raw per-person watermarks use
 -- the existing ingest_batches_person_committed_idx.
-create index concurrently telemetry_jobs_dashboard_pending_normalize_idx
+create index if not exists telemetry_jobs_dashboard_pending_normalize_idx
   on processing.telemetry_jobs (workspace_id, id)
   include (batch_id)
   where job_kind = 'normalize'
