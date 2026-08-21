@@ -814,6 +814,38 @@ class HookIntegrationTests(unittest.TestCase):
         )
         return codex_home, rollout
 
+    def test_exact_launcher_returns_valid_success_when_runtime_is_missing(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            launcher = (
+                codex_home
+                / "plugins"
+                / "cache"
+                / "marketplace"
+                / "sherlock"
+                / "v1"
+                / "scripts"
+                / "run_hook.py"
+            )
+            launcher.parent.mkdir(parents=True)
+            launcher.write_bytes(LAUNCHER.read_bytes())
+            environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+            environment.pop("SHERLOCK_COLLECTOR_SOURCE", None)
+
+            completed = subprocess.run(
+                [sys.executable, str(launcher), "Stop"],
+                input="{}",
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, '{"continue":true}\n')
+            self.assertEqual(completed.stderr, "")
+
     def test_exact_launcher_returns_quickly_when_network_is_down(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -853,9 +885,7 @@ class HookIntegrationTests(unittest.TestCase):
             elapsed = time.monotonic() - started
 
             self.assertLess(elapsed, 1.0)
-            outcome = json.loads(completed.stdout)
-            self.assertEqual(outcome["discovered"], 1)
-            self.assertEqual(outcome["enqueued"], 1)
+            self.assertEqual(completed.stdout, '{"continue":true}\n')
             state_root = codex_home / "sherlock" / "telemetry"
             self.assertTrue((state_root / "rollout-state.json").is_file())
             self.assertEqual(
@@ -1010,6 +1040,7 @@ class HookIntegrationTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, '{"continue":true}\n')
             self.assertIn("Sherlock telemetry capture failed", completed.stderr)
 
     def test_later_eligible_hook_starts_recovery_drain_without_new_bytes(self):
