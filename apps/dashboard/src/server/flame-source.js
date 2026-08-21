@@ -21,7 +21,7 @@ const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
 const PG_SNAPSHOT_PATTERN = /^\d+:\d+:(?:\d+(?:,\d+)*)?$/;
-const UUID_PATTERN = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const UNKEYED_PROMPT_MATCH_SECONDS = 2;
 export const UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS = 100;
 export const ASSISTANT_REPRESENTATION_MATCH_SECONDS = 3;
@@ -1271,11 +1271,9 @@ function parseWorkLimit(value) {
 }
 
 function validateIntervalIdentity(personId, startAt, prefix) {
-  if (typeof personId !== "string" || !UUID_PATTERN.test(personId) ||
-      startAt.getTime() % BUCKET_MS !== 0) {
+  if (!UUID_PATTERN.test(personId) || startAt.getTime() % BUCKET_MS !== 0) {
     throw new FlameSourceError(`flame_${prefix}_request_invalid`);
   }
-  return personId.toLowerCase();
 }
 
 function requestStart(value, prefix) {
@@ -1603,7 +1601,7 @@ export class DirectFlameSource {
   async fetchInterval({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "interval");
     const snapshotReceipt = requestSnapshot(snapshot, "interval");
-    personId = validateIntervalIdentity(personId, startAt, "interval");
+    validateIntervalIdentity(personId, startAt, "interval");
 
     return await this.transaction(async (tx) => {
       const databaseRead = asDate((await runQuery(
@@ -1685,12 +1683,11 @@ export class DirectFlameSource {
   }) {
     const startAt = requestStart(start, "work");
     const snapshotReceipt = requestSnapshot(snapshot, "work");
-    personId = validateIntervalIdentity(personId, startAt, "work");
-    if (typeof sessionId !== "string" || !UUID_PATTERN.test(sessionId) ||
+    validateIntervalIdentity(personId, startAt, "work");
+    if (!UUID_PATTERN.test(sessionId) ||
         !["agent", "subagent", "unclassified"].includes(role)) {
       throw new FlameSourceError("flame_work_request_invalid");
     }
-    sessionId = sessionId.toLowerCase();
     const decodedCursor = decodeWorkCursor(cursor);
     const pageSize = parseWorkLimit(limit);
 
@@ -1807,7 +1804,7 @@ export class DirectFlameSource {
   async fetchPromptEvidence({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "prompt");
     const snapshotReceipt = requestSnapshot(snapshot, "prompt");
-    personId = validateIntervalIdentity(personId, startAt, "prompt");
+    validateIntervalIdentity(personId, startAt, "prompt");
 
     return await this.transaction(async (tx) => {
       const databaseRead = asDate((await runQuery(

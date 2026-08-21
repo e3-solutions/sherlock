@@ -111,15 +111,14 @@ database pool headroom. Multiple replicas are safe because claims use row
 locks and every completion/retry is fenced by the active lease token.
 
 `SUPABASE_DB_URL` must use the dedicated `sherlock_worker_login`, not the
-`postgres` owner. The login has `NOINHERIT` and can assume only six roles:
-`sherlock_reader`, `sherlock_processor`, `sherlock_normalizer`,
-`sherlock_reducer`, `sherlock_frame_projector`, and
-`sherlock_bottleneck_writer`; each transaction
-explicitly selects the narrow role it needs. The projector may append receipts
-and revisions but cannot update or delete them or activate a version. Set or
-rotate its password out of band and store it only as a sealed Railway variable.
-Prefer Supabase's session pooler on port 5432 so Railway does not depend on the
-direct database host's IPv6-only DNS record. Store a current Supabase secret key in
+`postgres` owner. The login has `NOINHERIT` and can assume only
+`sherlock_processor`, `sherlock_normalizer`, `sherlock_reducer`, and
+`sherlock_frame_projector`; each transaction explicitly selects the narrow
+role it needs. The projector may append receipts and revisions but cannot
+update or delete them or activate a version. Set or rotate its password out of
+band and store it only as a sealed Railway variable. Prefer
+Supabase's session pooler on port 5432 so Railway does not depend on the direct
+database host's IPv6-only DNS record. Store a current Supabase secret key in
 `SUPABASE_SERVICE_ROLE_KEY`; the variable name is retained for compatibility,
 but a legacy service-role JWT is not required.
 

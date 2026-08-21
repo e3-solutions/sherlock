@@ -2,12 +2,9 @@
 
 The dashboard serves the CodeActivity Flame experience from Sherlock's canonical
 private telemetry schemas. It is a single workspace-scoped service: every query
-uses SHERLOCK_WORKSPACE_ID and requires the service's approved
-SHERLOCK_DASHBOARD_EMAIL_DOMAIN. Telemetry reads use a small connection pool
-whose repeatable-read, read-only transactions assume `sherlock_reader`.
-Candidate receipts use a separate pool and the narrower
-`sherlock_bottleneck_writer` product role; that role has no telemetry,
-analytics, or processing privileges.
+uses SHERLOCK_WORKSPACE_ID, requires the service's approved
+SHERLOCK_DASHBOARD_EMAIL_DOMAIN, and uses one small connection pool whose
+transactions are repeatable-read, read-only, and pinned to `sherlock_reader`.
 
 The browser and MCP clients never receive database credentials. The page and
 all browser APIs are public and unauthenticated, including lazy interval and
@@ -18,21 +15,6 @@ interval and work-detail endpoints return only canonical normalized evidence
 for one person and one ten-minute bucket. Message content is limited to
 `telemetry.events.content_excerpt`; the dashboard never reads full raw Storage
 objects.
-
-The authenticated MCP endpoint exposes four tools: two evidence reads, one
-atomic complete-batch candidate submission, and one fixed-high-water candidate
-listing. Sherlock never performs candidate analysis or persists review
-decisions. Candidate free text is bounded and structurally validated but
-remains untrusted, potentially sensitive, and not semantically sanitized.
-Requests are capped at 2,097,152 body bytes before MCP parsing. Submission alone
-is process-locally limited to 10 attempts per workspace per rolling 60 seconds;
-evidence and listing calls are unaffected and the limiter resets on restart.
-
-Apply the product migration before deploying this runtime. Then verify exact
-four-tool discovery before distributing the manual plugin skill and client
-configuration. See the [current MCP contract](../../docs/bonaparte-mcp.md) for
-Codex and Claude HTTP configuration via environment/secret indirection, the v2
-usage provenance migration, and rollout order. No bearer is bundled here.
 
 ## Data contract
 
@@ -192,10 +174,8 @@ immutable publication-time session facts.
 
 ## Environment
 
-SUPABASE_DB_URL, SHERLOCK_WORKSPACE_ID, SHERLOCK_DASHBOARD_EMAIL_DOMAIN,
-SHERLOCK_MCP_TOKEN, and SHERLOCK_MCP_CURSOR_SECRET are required for a healthy
-service. The two MCP secrets must be distinct and at least 32 characters. The
-email domain must be exactly `e3group.ai` or `sixtyfour.ai`; it
+SUPABASE_DB_URL, SHERLOCK_WORKSPACE_ID, and SHERLOCK_DASHBOARD_EMAIL_DOMAIN are
+required. The email domain must be exactly `e3group.ai` or `sixtyfour.ai`; it
 filters every roster, detail, and MCP evidence read for that one-workspace
 service. SUPABASE_DB_URL reuses
 the existing Sherlock worker login contract, which can assume
@@ -205,57 +185,11 @@ the additive frame-projection migration or when stopping new v2 token minting.
 
 ## Bonaparte MCP
 
-`/mcp` is a stateless Streamable HTTP endpoint exposing exactly four tools:
-`list_usage_evidence`, `list_prompt_evidence`, `submit_candidate_batch`, and
-`list_bottleneck_candidates`. The current schemas, manual Codex/Claude client
-configuration, bounds, and rollout order are documented in the
-[current v2 contract](../../docs/bonaparte-mcp.md).
-
-Set `SHERLOCK_MCP_TOKEN` to a random bearer of at least 32 characters. Set
-`SHERLOCK_MCP_CURSOR_SECRET` to a different random server-only secret of at
-least 32 characters. Clients receive only the bearer; the cursor secret remains
-inside the dashboard process and authenticates workspace/version/high-water
-cursor state. Browser-origin requests are rejected. Declared and chunked MCP
-request bodies are capped at 2,097,152 bytes before protocol handling.
-
-Usage cursors bind one exact cached v2 snapshot and expire when it refreshes.
-Candidate-list cursors bind one authenticated workspace high-water mark, so
-later inserts cannot enter that traversal; an optional receipt `submissionId`
-is also authenticated into the cursor and restricts the traversal to that
-batch. The first two tools return bounded
-observed evidence. `submit_candidate_batch` atomically persists one
-agent-declared-complete ordered batch of zero to 50 structurally validated
-untrusted claims, and
-`list_bottleneck_candidates` deterministically reads those immutable product
-facts. The completeness literal is itself an untrusted agent declaration about
-the conversationally recorded method, not a server-verified claim of exhaustive
-prompt coverage. Submission is process-locally limited to 10 attempts per workspace per
-rolling 60 seconds; evidence and list calls are unaffected.
-
-Tool results expose the same full JSON payload in MCP text content and
-`structuredContent`, preserving compatibility with both text-only and typed
-structured-output clients.
-
-The dashboard performs no semantic analysis, ranking, inference, clustering,
-identity verification, or review-decision persistence. Prompt excerpts and
-candidate free text remain untrusted and potentially sensitive. Product
-readiness verifies the migrated schema, exact NOLOGIN role, worker membership,
-table-wide SELECT plus non-grantable INSERT only on the nine report-input and
-seven candidate-input columns, immutable posture, permanent relations with
-exact bigint identity sequences, and source-schema revocations. Identity,
-generated truth, and creation-time columns are not client-insertable. MCP
-protocol discovery is gated on that product boundary. `/healthz`
-remains unavailable until both product readiness and timeline-cache readiness
-pass; the timeline cache does not gate MCP discovery.
-
-Supabase PostgreSQL 17 also records one non-assumable platform administration
-edge from `postgres`, granted by `supabase_admin`. Readiness accepts only its
-exact `ADMIN true`, `INHERIT false`, `SET false` posture;
-`sherlock_worker_login` remains the only `SET`-capable runtime member. Any other
-inbound writer membership or option change fails readiness.
-Successful product-readiness receipts are cached for at most 30 seconds and
-unavailable receipts for at most one second; an expired entry blocks on one
-coalesced refresh rather than serving stale readiness.
+`/mcp` is a bearer-authenticated stateless Streamable HTTP endpoint. Its four
+tools, exact schemas, private product-table boundary, agent workflow, and
+default-off candidate-write rollout are documented in the
+[authoritative MCP contract](../../docs/bonaparte-mcp.md). Browser-origin
+requests are rejected and request bodies are capped at 2 MiB before parsing.
 
 ## Local verification
 

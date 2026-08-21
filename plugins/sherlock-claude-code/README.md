@@ -85,22 +85,3 @@ audit and retry. They are currently retained until that state is removed.
 Hook and plugin behavior follows Anthropic's official
 [hooks](https://code.claude.com/docs/en/hooks) and
 [plugins](https://code.claude.com/docs/en/plugins) specifications.
-
-## Manual Sherlock analysis
-
-This plugin also includes `/sherlock-analysis` with
-`disable-model-invocation: true`. The skill must be invoked manually. It
-exhausts one snapshot-bound usage traversal, applies a deterministic bounded
-prompt-inspection policy, inspects local code with Claude Code's native tools,
-submits exactly one agent-declared-complete candidate batch for that recorded
-bounded local method (including empty), and presents a fixed-high-water
-traversal for conversational review. It does not imply exhaustive prompt
-analysis.
-
-Installation does not configure MCP or bundle a bearer. Configure the remote
-HTTP endpoint manually in a local or user-managed MCP configuration using
-environment-expanded URL and authorization header values, following the
-[current MCP contract](../../docs/bonaparte-mcp.md). Sherlock does not verify
-submitter/reviewer identity or persist review decisions. Stored free text is
-bounded untrusted potentially sensitive content and is not semantically
-sanitized.

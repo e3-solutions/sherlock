@@ -1,11 +1,5 @@
 # Bonaparte MCP v1 contract
 
-> Historical contract: `bonaparte.usage-evidence.v1` is superseded by
-> `bonaparte.usage-evidence.v2` and is explicitly not backward compatible
-> because v2 replaces the false single-projection provenance field with the
-> canonical evidence contract, ordered normalizer versions, and nullable frame
-> version. See [the current MCP contract](bonaparte-mcp.md).
-
 Bonaparte MCP v1 is a read-only evidence API. It exposes canonical usage facts
 and a small prompt sample; it does not analyze, score, rank, or write anything.
 

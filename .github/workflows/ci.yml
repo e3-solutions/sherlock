@@ -102,12 +102,6 @@ jobs:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
         run: pnpm test:postgres
 
-      - name: Re-prove schema cleanup after dashboard integration tests
-        run: supabase test db --local supabase/tests/database/schema.test.sql
-
-      - name: Re-prove bottleneck cleanup after dashboard integration tests
-        run: supabase test db --local supabase/tests/database/bottleneck_reports.test.sql
-
       - name: Run activity reducer database integration test
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres

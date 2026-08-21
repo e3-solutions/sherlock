@@ -1,274 +1,232 @@
-import { readFileSync } from "node:fs";
-import path from "node:path";
-
 import { describe, expect, it, vi } from "vitest";
 
-import { FlameSourceError } from "./flame-source.js";
-import {
-  createSubmitRateLimiter,
-  createBonaparteMcpProtocol,
-  registerBonaparteTools,
-} from "./mcp-server.js";
+import { BottleneckSourceError } from "./bottleneck-source.js";
+import { FlameSourceError, NORMALIZER_VERSIONS } from "./flame-source.js";
+import { createBonaparteMcpProtocol, registerBonaparteTools } from "./mcp-server.js";
 
-const START = "2026-08-18T03:30:00.000Z";
+const START = "2026-08-20T00:00:00.000Z";
+const END = "2026-08-21T00:00:00.000Z";
+const READ = "2026-08-21T00:00:01.000Z";
+const REPOSITORY = "https://github.com/example/repository";
+const REVISION = "a".repeat(40);
 
 function payload() {
   return {
     start: START,
-    read: "2026-08-19T03:30:08.000Z",
+    read: READ,
     snapshot: "v1.snapshot",
-    normalizerVersions: [
-      "sherlock.codex-rollout.v1",
-      "sherlock.claude-code-transcript.v1",
-    ],
+    normalizerVersions: NORMALIZER_VERSIONS,
     frameVersion: null,
     nextCursor: null,
-    coverage: {
-      evidence: "observed_events",
-      state: "partial",
-      reason: "event_presence_not_continuous_attention",
-    },
     people: [],
   };
 }
 
-function registeredTools(source) {
-  const tools = new Map();
-  const server = {
-    registerTool: vi.fn((name, config, handler) => tools.set(name, { config, handler })),
+function method(overrides = {}) {
+  return {
+    usageEvidence: {
+      schemaVersion: "bonaparte.usage-evidence.v2",
+      snapshotToken: "v1.snapshot",
+      window: { startInclusive: START, endExclusive: END, readAt: READ },
+      provenance: {
+        evidenceContract: "sherlock.canonical-events.v1",
+        normalizerVersions: [...NORMALIZER_VERSIONS],
+        frameVersion: null,
+        backwardCompatible: false,
+        supersedes: "bonaparte.usage-evidence.v1",
+      },
+    },
+    promptInspection: {
+      policy: "first_n_prompt_buckets_in_usage_order",
+      limit: 1000,
+      availablePromptBucketCount: 2,
+      eligiblePromptBucketCount: 2,
+      inspectedPromptBucketCount: 2,
+    },
+    repository: {
+      identifier: REPOSITORY,
+      revision: REVISION,
+      workingTreeState: "clean",
+    },
+    completeness: "agent_declared_complete",
+    ...overrides,
   };
-  registerBonaparteTools(server, source);
+}
+
+function candidate(index = 0, overrides = {}) {
+  return {
+    candidateKey: `candidate-${index}`,
+    title: `Candidate ${index}`,
+    claim: "A bounded unverified client claim.",
+    evidence: [{
+      type: "code_reference",
+      repository: REPOSITORY,
+      revision: REVISION,
+      path: "src/example.js",
+      lineStart: 1,
+      lineEnd: 2,
+      trust: "unverified_client_claim",
+    }],
+    ...overrides,
+  };
+}
+
+function request(candidates = [candidate()]) {
+  return {
+    submissionId: "11111111-1111-4111-8111-111111111111",
+    method: method(),
+    candidates,
+  };
+}
+
+function registeredTools(evidence = {}, candidateSource = {}) {
+  const tools = new Map();
+  registerBonaparteTools({
+    registerTool: (name, config, handler) => tools.set(name, { config, handler }),
+  }, evidence, candidateSource);
   return tools;
 }
 
 describe("Bonaparte MCP tools", () => {
-  it("documents one coherent current four-tool v2 contract", () => {
-    const readme = readFileSync(path.resolve(process.cwd(), "README.md"), "utf8");
-    expect(readme).toContain("exposing exactly four tools");
-    expect(readme).toContain("current v2 contract");
-    expect(readme).toContain("SHERLOCK_MCP_CURSOR_SECRET");
-    expect(readme).not.toContain("two versioned read-only tools");
-  });
-
-  it("registers exactly four versioned typed tools with honest annotations", () => {
-    const tools = registeredTools({ fetchUsageEvidence: vi.fn() });
-
+  it("registers exactly the four accepted typed tools", () => {
+    const tools = registeredTools();
     expect([...tools.keys()]).toEqual([
       "list_usage_evidence",
       "list_prompt_evidence",
       "submit_candidate_batch",
-      "list_bottleneck_candidates",
+      "get_candidate_batch",
     ]);
-    for (const [name, { config }] of tools) {
-      expect(config.inputSchema).toBeDefined();
-      expect(config.outputSchema).toBeDefined();
-      expect(config.annotations).toMatchObject({
-        readOnlyHint: name !== "submit_candidate_batch",
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: false,
-      });
-    }
-    expect(tools.get("list_prompt_evidence").config.description)
-      .toContain("untrusted evidence");
-    expect(tools.get("submit_candidate_batch").config).toMatchObject({
-      title: expect.stringContaining("agent-declared"),
-      description: expect.stringContaining("explicit bounded local analysis scope"),
-    });
-    expect(tools.get("submit_candidate_batch").config.description)
-      .toContain("does not verify completeness");
+    expect(tools.get("submit_candidate_batch").config.annotations.readOnlyHint).toBe(false);
+    expect(tools.get("get_candidate_batch").config.annotations.readOnlyHint).toBe(true);
   });
 
-  it("rejects lone surrogates in every persisted string before submission", () => {
-    const source = { submitCandidateBatch: vi.fn() };
-    const submitSchema = registeredTools(source)
-      .get("submit_candidate_batch").config.inputSchema;
-    const candidate = {
-      candidateKey: "unicode",
-      title: "valid-😀",
-      claim: "valid-😀",
+  it("accepts the method, code-reference, and 50-candidate boundaries", () => {
+    const schema = registeredTools().get("submit_candidate_batch").config.inputSchema;
+    expect(schema.safeParse(request([])).success).toBe(true);
+    expect(schema.safeParse(request(Array.from({ length: 50 }, (_, index) =>
+      candidate(index)))).success).toBe(true);
+    expect(schema.safeParse(request(Array.from({ length: 51 }, (_, index) =>
+      candidate(index)))).success).toBe(false);
+    expect(schema.safeParse({
+      ...request([]),
+      method: method({
+        promptInspection: {
+          policy: "first_n_prompt_buckets_in_usage_order",
+          limit: 0,
+          availablePromptBucketCount: 0,
+          eligiblePromptBucketCount: 0,
+          inspectedPromptBucketCount: 0,
+        },
+      }),
+    }).success).toBe(true);
+
+    expect(schema.safeParse({
+      ...request(),
+      method: method({
+        repository: { identifier: REPOSITORY, revision: REVISION.toUpperCase(), workingTreeState: "clean" },
+      }),
+    }).success).toBe(false);
+    expect(schema.safeParse({
+      ...request(),
+      method: method({
+        repository: { identifier: REPOSITORY, revision: "b".repeat(64), workingTreeState: "dirty" },
+      }),
+      candidates: [candidate(0, {
+        evidence: [{
+          ...candidate().evidence[0], revision: "b".repeat(64),
+        }],
+      })],
+    }).success).toBe(true);
+  });
+
+  it("rejects unsafe paths, missing code evidence, mismatched repositories, and invalid counts", () => {
+    const schema = registeredTools().get("submit_candidate_batch").config.inputSchema;
+    for (const path of [
+      "/absolute.js", "C:/absolute.js", "../escape.js", "src/../escape.js",
+      "src\\file.js", "a\0b",
+    ]) {
+      expect(schema.safeParse(request([candidate(0, {
+        evidence: [{ ...candidate().evidence[0], path }],
+      })])).success).toBe(false);
+    }
+    expect(schema.safeParse(request([candidate(0, {
       evidence: [{
         type: "usage_summary",
-        personId: "11111111-1111-4111-8111-111111111111",
+        personId: "22222222-2222-4222-8222-222222222222",
+        trust: "unverified_client_claim",
       }],
-    };
-    const request = {
-      submissionId: "11111111-1111-4111-8111-111111111111",
-      analysisScope: {
-        usageSnapshotToken: "valid-😀",
-        window: {
-          startInclusive: "2026-08-20T00:00:00.000Z",
-          endExclusive: "2026-08-21T00:00:00.000Z",
-          readAt: "2026-08-21T00:00:01.000Z",
-        },
-        completeness: "agent_declared_complete",
-      },
-      candidates: [candidate],
-    };
-
-    expect(submitSchema.safeParse(request).success).toBe(true);
-    for (const malformed of ["\ud800", "\udc00"]) {
-      for (const invalidRequest of [
-        {
-          ...request,
-          analysisScope: { ...request.analysisScope, usageSnapshotToken: malformed },
-        },
-        { ...request, candidates: [{ ...candidate, title: malformed }] },
-        { ...request, candidates: [{ ...candidate, claim: malformed }] },
-      ]) {
-        expect(submitSchema.safeParse(invalidRequest).success).toBe(false);
-      }
+    })])).success).toBe(false);
+    expect(schema.safeParse(request([candidate(0, {
+      evidence: [{ ...candidate().evidence[0], repository: "another" }],
+    })])).success).toBe(false);
+    for (const promptInspection of [
+      { ...method().promptInspection, limit: 1001 },
+      { ...method().promptInspection, eligiblePromptBucketCount: 1 },
+      { ...method().promptInspection, inspectedPromptBucketCount: 1 },
+      { ...method().promptInspection, inspectedPromptBucketCount: 3 },
+    ]) {
+      expect(schema.safeParse({
+        ...request(), method: method({ promptInspection }),
+      }).success).toBe(false);
     }
-    expect(source.submitCandidateBatch).not.toHaveBeenCalled();
   });
 
-  it("returns full JSON text alongside structured content for compatible clients", async () => {
-    const source = { fetchUsageEvidence: vi.fn().mockResolvedValue(payload()) };
-    const tools = registeredTools(source);
-
+  it("returns v2 provenance as text and structured content", async () => {
+    const tools = registeredTools({ fetchUsageEvidence: vi.fn().mockResolvedValue(payload()) });
     const result = await tools.get("list_usage_evidence").handler({});
-
-    expect(result.isError).toBeUndefined();
-    expect(result.structuredContent.schemaVersion).toBe("bonaparte.usage-evidence.v2");
     expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
-  });
-
-  it("keeps a full candidate page available to text-only clients", async () => {
-    const page = {
-      schemaVersion: "bonaparte.bottleneck-candidates.v1",
-      candidates: Array.from({ length: 20 }, (_, index) => ({
-        candidateKey: `candidate-${index}`,
-        claim: "sensitive".repeat(500),
-      })),
-      nextCursor: null,
-    };
-    const source = {
-      listBottleneckCandidates: vi.fn().mockResolvedValue(page),
-    };
-    const result = await registeredTools(source)
-      .get("list_bottleneck_candidates").handler({});
-
-    expect(result.structuredContent).toBe(page);
-    expect(JSON.parse(result.content[0].text)).toEqual(page);
-  });
-
-  it("enforces an exact process-local submit window without limiting reads", async () => {
-    let now = 1_000;
-    const source = {
-      workspaceKey: "workspace-a",
-      submitCandidateBatch: vi.fn().mockResolvedValue({
-        schemaVersion: "bonaparte.bottleneck-report-receipt.v1",
-        reportId: "1",
-        submissionId: "11111111-1111-4111-8111-111111111111",
-        requestSha256: "a".repeat(64),
-        candidateCount: 0,
-        attributionMode: "workspace_shared_bearer",
-        trust: "untrusted_agent_generated_claim",
-        createdAt: "2026-08-21T00:00:00.000Z",
-      }),
-      listBottleneckCandidates: vi.fn().mockResolvedValue({
-        schemaVersion: "bonaparte.bottleneck-candidates.v1",
-        candidates: [],
-        nextCursor: null,
-      }),
-    };
-    const tools = new Map();
-    registerBonaparteTools({
-      registerTool: (name, config, handler) => tools.set(name, { config, handler }),
-    }, source, {
-      submitRateLimiter: createSubmitRateLimiter({ now: () => now }),
-    });
-    const request = {
-      submissionId: "11111111-1111-4111-8111-111111111111",
-      analysisScope: {
-        usageSnapshotToken: "snapshot",
-        window: {
-          startInclusive: "2026-08-20T00:00:00.000Z",
-          endExclusive: "2026-08-21T00:00:00.000Z",
-          readAt: "2026-08-21T00:00:01.000Z",
-        },
-        completeness: "agent_declared_complete",
-      },
-      candidates: [],
-    };
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      expect((await tools.get("submit_candidate_batch").handler(request)).isError)
-        .toBeUndefined();
-    }
-    expect(JSON.parse((await tools.get("submit_candidate_batch").handler(request))
-      .content[0].text).error.code).toBe("rate_limited");
-    const listSubmissionId = "22222222-2222-4222-8222-222222222222";
-    expect((await tools.get("list_bottleneck_candidates").handler({
-      submissionId: listSubmissionId,
-    })).isError)
-      .toBeUndefined();
-    expect(source.listBottleneckCandidates).toHaveBeenCalledWith({
-      submissionId: listSubmissionId,
-      signal: undefined,
-    });
-    now += 60_000;
-    expect((await tools.get("submit_candidate_batch").handler(request)).isError)
-      .toBeUndefined();
-  });
-
-  it("isolates submit attempts by workspace key", () => {
-    const limiter = createSubmitRateLimiter({ now: () => 1_000 });
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      expect(limiter.attempt("workspace-a")).toBe(true);
-    }
-    expect(limiter.attempt("workspace-a")).toBe(false);
-    expect(limiter.attempt("workspace-b")).toBe(true);
-  });
-
-  it("returns actionable structured tool errors without leaking internals", async () => {
-    const source = {
-      fetchUsageEvidence: vi.fn().mockRejectedValue(new Error("database secret")),
-    };
-    const tools = registeredTools(source);
-
-    const result = await tools.get("list_usage_evidence").handler({});
-    const error = JSON.parse(result.content[0].text);
-
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent).toBeUndefined();
-    expect(error).toEqual({
-      error: {
-        code: "unavailable",
-        message: "Usage evidence is temporarily unavailable.",
-        retryable: true,
-        recovery: "Retry this tool later.",
+    expect(result.structuredContent).toMatchObject({
+      schemaVersion: "bonaparte.usage-evidence.v2",
+      provenance: {
+        evidenceContract: "sherlock.canonical-events.v1",
+        normalizerVersions: [...NORMALIZER_VERSIONS],
+        backwardCompatible: false,
       },
     });
-    expect(JSON.stringify(result)).not.toContain("database secret");
   });
 
-  it("tells agents how to recover from an expired snapshot", async () => {
-    const source = {
-      fetchPromptEvidence: vi.fn().mockRejectedValue(
-        new FlameSourceError("flame_prompt_snapshot_expired"),
-      ),
-    };
-    const tools = registeredTools(source);
-
-    const result = await tools.get("list_prompt_evidence").handler({
-      personId: "11111111-1111-4111-8111-111111111111",
-      bucketStart: "2026-08-18T03:50:00.000Z",
+  it("maps source failures to safe errors without leaking details", async () => {
+    const tools = registeredTools({
+      fetchPromptEvidence: vi.fn()
+        .mockRejectedValueOnce(new FlameSourceError("flame_prompt_snapshot_expired"))
+        .mockRejectedValueOnce(new FlameSourceError("flame_prompt_request_not_found")),
+    }, {
+      getCandidateBatch: vi.fn()
+        .mockRejectedValueOnce(new BottleneckSourceError("not_found"))
+        .mockRejectedValueOnce(new Error("postgresql://secret")),
+    });
+    const prompt = await tools.get("list_prompt_evidence").handler({
       snapshotToken: "v1.snapshot",
+      personId: "11111111-1111-4111-8111-111111111111",
+      bucketStart: START,
+    });
+    expect(JSON.parse(prompt.content[0].text).error.code).toBe("snapshot_expired");
+    const promptMissing = await tools.get("list_prompt_evidence").handler({
+      snapshotToken: "v1.snapshot",
+      personId: "11111111-1111-4111-8111-111111111111",
+      bucketStart: START,
+    });
+    expect(JSON.parse(promptMissing.content[0].text).error).toMatchObject({
+      code: "not_found",
+      recovery: expect.stringContaining("select an exact returned person and prompt-bearing bucket"),
     });
 
-    expect(JSON.parse(result.content[0].text)).toEqual({
-      error: {
-        code: "snapshot_expired",
-        message: "The evidence snapshot has expired.",
-        retryable: false,
-        recovery: "Restart with list_usage_evidence to obtain a new snapshotToken.",
-      },
+    const missing = await tools.get("get_candidate_batch").handler({
+      submissionId: request().submissionId,
     });
+    const unavailable = await tools.get("get_candidate_batch").handler({
+      submissionId: request().submissionId,
+    });
+    expect(JSON.parse(missing.content[0].text).error).toMatchObject({
+      code: "not_found",
+      recovery: expect.stringContaining("receipt submissionId and workspace"),
+    });
+    expect(JSON.parse(unavailable.content[0].text).error.code).toBe("unavailable");
+    expect(JSON.stringify(unavailable)).not.toContain("postgresql://secret");
   });
 
-  it("builds and closes the official stateless Streamable HTTP handler", async () => {
-    const protocol = createBonaparteMcpProtocol({ fetchUsageEvidence: vi.fn() });
-
+  it("builds and cleanly closes the stateless protocol", async () => {
+    const protocol = createBonaparteMcpProtocol({}, {});
     expect(protocol.handler).toBeTypeOf("function");
     await expect(protocol.close()).resolves.toBeUndefined();
   });

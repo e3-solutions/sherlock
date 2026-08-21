@@ -73,46 +73,6 @@ describe("cached MCP usage evidence", () => {
     expect(traversedIds).toEqual(expectedIds);
   });
 
-  it("pages the exact Zod UUID set canonically without mutating cached people", () => {
-    const acceptedIds = [
-      "00000000-0000-0000-0000-000000000000",
-      ...Array.from({ length: 18 }, (_, index) =>
-        `018f22e2-79b0-7cc3-98c4-${String(index + 1).padStart(12, "0")}`
-      ),
-      "018f22e2-79b0-8cc3-98c4-dc0c0c07398f",
-      "ffffffff-ffff-ffff-ffff-ffffffffffff",
-    ];
-    const cachedPeople = acceptedIds.map((id) => ({ id: id.toUpperCase() })).reverse();
-    const day = payload(cachedPeople, "v1.uuid-variants");
-    const first = pageCachedUsageEvidence(day);
-    const second = pageCachedUsageEvidence(day, first.nextCursor);
-    const expectedIds = [...acceptedIds].sort();
-
-    expect([...first.people, ...second.people].map(({ id }) => id)).toEqual(expectedIds);
-    expect(first.people).toHaveLength(MCP_USAGE_PAGE_LIMIT);
-    expect(second.people).toHaveLength(1);
-    expect(second.nextCursor).toBeNull();
-    expect(decodeUsageCursor(first.nextCursor).afterPersonId).toBe(expectedIds[19]);
-    expect(cachedPeople.every(({ id }) => id === id.toUpperCase())).toBe(true);
-    for (const id of [acceptedIds[0], acceptedIds[1], acceptedIds[19], acceptedIds[20]]) {
-      expect(decodeUsageCursor(encodeUsageCursor(day.snapshot, id.toUpperCase())))
-        .toMatchObject({ afterPersonId: id });
-    }
-
-    expect(() => pageCachedUsageEvidence(payload([
-      { id: acceptedIds[1] },
-      { id: acceptedIds[1].toUpperCase() },
-    ]))).toThrow(FlameSourceError);
-    for (const id of [
-      "018f22e2-79b0-0cc3-98c4-dc0c0c07398f",
-      "018f22e2-79b0-9cc3-98c4-dc0c0c07398f",
-      "018f22e2-79b0-7cc3-78c4-dc0c0c07398f",
-    ]) {
-      expect(() => pageCachedUsageEvidence(payload([{ id }]))).toThrow(FlameSourceError);
-      expect(() => encodeUsageCursor(day.snapshot, id)).toThrow(FlameSourceError);
-    }
-  });
-
   it("preserves the cached snapshot and advances after a missing key", () => {
     const day = payload([person(1), person(3)], "v1.cached-snapshot");
 
