@@ -167,8 +167,8 @@ Deno.test({
         [workspaceId, batchId],
       );
 
-      // Exercise the real predecessor anti-join with enough immutable ranges
-      // that an accidental sequential scan is visible in the analyzed plan.
+      // Exercise stream-order planning with enough immutable ranges that a
+      // correlated predecessor probe becomes visible in the analyzed plan.
       await sql.unsafe(
         `insert into telemetry.ingest_batches (
            id, workspace_id, person_id, collector_key, source_provider,
@@ -188,64 +188,137 @@ Deno.test({
         [workspaceId, personId],
       );
       await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_provider,
+           source_kind, source_stream_key, generation_key, generation_seq,
+           start_offset, end_offset, source_byte_count, source_sha256,
+           storage_path, storage_encoding, stored_byte_count, stored_sha256,
+           record_count, contract_version, first_occurred_at, last_occurred_at,
+           processing_class_hint
+         ) values (
+           gen_random_uuid(), $1, $2, 'queue-plan-collector', 'claude_code',
+           'transcript', 'queue-plan-stream', 'queue-plan-generation', 0,
+           0, 2, 1, repeat('f', 64),
+           'queue-plan/' || ($1::uuid)::text || '/same-offset.jsonl.gz',
+           'gzip', 1, repeat('0', 64), 1,
+           'sherlock.transcript-batch.v1', now(), now(), 'backfill'
+         )`,
+        [workspaceId, personId],
+      );
+      await sql.unsafe(
         `update processing.telemetry_jobs job
             set available_at = case when batch.start_offset = 0
-              then now() - interval '2 minutes'
-              else now() - interval '1 minute' end
+                  then now() - interval '2 minutes'
+                  else now() - interval '1 minute' end,
+                status = case when batch.start_offset = 0
+                  then 'leased' else job.status end,
+                attempt_count = case when batch.start_offset = 0
+                  then 1 else job.attempt_count end,
+                lease_token = case when batch.start_offset = 0
+                  then gen_random_uuid() else job.lease_token end,
+                lease_owner = case when batch.start_offset = 0
+                  then 'expired-plan-test' else job.lease_owner end,
+                lease_started_at = case when batch.start_offset = 0
+                  then now() - interval '2 minutes' else job.lease_started_at end,
+                lease_expires_at = case when batch.start_offset = 0
+                  then now() - interval '1 minute' else job.lease_expires_at end
            from telemetry.ingest_batches batch
           where job.workspace_id = $1 and job.batch_id = batch.id
             and batch.collector_key = 'queue-plan-collector'`,
         [workspaceId],
       );
+      const eligibleOffsets = await sql.unsafe(
+        `with pending_normalize as (
+           select pending_job.id,
+                  min(pending_batch.start_offset) over (
+                    partition by pending_batch.workspace_id,
+                                 pending_batch.collector_key,
+                                 pending_batch.source_kind,
+                                 pending_batch.source_stream_key,
+                                 pending_batch.generation_seq,
+                                 pending_batch.generation_key
+                  ) as earliest_start
+             from processing.telemetry_jobs pending_job
+             join telemetry.ingest_batches pending_batch
+               on pending_batch.workspace_id = pending_job.workspace_id
+              and pending_batch.id = pending_job.batch_id
+            where pending_job.job_kind = 'normalize'
+              and pending_job.status in ('queued', 'leased')
+         )
+         select count(*)::int as count,
+                count(distinct batch.start_offset)::int as offsets,
+                count(*) filter (where job.status = 'leased')::int as leased
+           from processing.telemetry_jobs job
+           join telemetry.ingest_batches batch
+             on batch.workspace_id = job.workspace_id and batch.id = job.batch_id
+           join pending_normalize pending on pending.id = job.id
+          where job.workspace_id = $1
+            and job.workload_class = 'backfill'
+            and job.job_kind = 'normalize'
+            and job.attempt_count < job.attempt_limit
+            and (
+              (job.status = 'queued' and job.available_at <= now()) or
+              (job.status = 'leased' and job.lease_expires_at <= now())
+            )
+            and batch.start_offset = pending.earliest_start`,
+        [workspaceId],
+      );
+      assert(
+        Number(eligibleOffsets[0].count) === 2 &&
+          Number(eligibleOffsets[0].offsets) === 1 &&
+          Number(eligibleOffsets[0].leased) === 2,
+        "same-offset expired leases must remain concurrently eligible",
+      );
       const explained = await sql.unsafe(
         `explain (analyze, buffers, format json)
+         with pending_normalize as (
+           select pending_job.id,
+                  min(pending_batch.start_offset) over (
+                    partition by pending_batch.workspace_id,
+                                 pending_batch.collector_key,
+                                 pending_batch.source_kind,
+                                 pending_batch.source_stream_key,
+                                 pending_batch.generation_seq,
+                                 pending_batch.generation_key
+                  ) as earliest_start
+             from processing.telemetry_jobs pending_job
+             join telemetry.ingest_batches pending_batch
+               on pending_batch.workspace_id = pending_job.workspace_id
+              and pending_batch.id = pending_job.batch_id
+            where pending_job.job_kind = 'normalize'
+              and pending_job.status in ('queued', 'leased')
+         )
          select job.id
            from processing.telemetry_jobs job
            left join telemetry.ingest_batches batch
              on job.job_kind = 'normalize'
             and batch.workspace_id = job.workspace_id
             and batch.id = job.batch_id
+           left join pending_normalize pending on pending.id = job.id
           where job.workload_class = 'backfill'
             and job.job_kind = 'normalize'
             and job.attempt_count < job.attempt_limit
-            and job.status = 'queued' and job.available_at <= now()
-            and not exists (
-              select 1
-                from telemetry.ingest_batches predecessor
-                join processing.telemetry_jobs predecessor_job
-                  on predecessor_job.workspace_id = predecessor.workspace_id
-                 and predecessor_job.batch_id = predecessor.id
-                 and predecessor_job.job_kind = 'normalize'
-               where predecessor.workspace_id = batch.workspace_id
-                 and predecessor.collector_key = batch.collector_key
-                 and predecessor.source_kind = batch.source_kind
-                 and predecessor.source_stream_key = batch.source_stream_key
-                 and predecessor.generation_seq = batch.generation_seq
-                 and predecessor.generation_key = batch.generation_key
-                 and predecessor.start_offset < batch.start_offset
-                 and predecessor_job.status in ('queued', 'leased')
+            and (
+              (job.status = 'queued' and job.available_at <= now()) or
+              (job.status = 'leased' and job.lease_expires_at <= now())
             )
-          order by job.available_at, job.id
+            and (batch.id is null or batch.start_offset = pending.earliest_start)
+          order by case when job.status = 'queued' then job.available_at
+                        else job.lease_expires_at end,
+                   job.id
           for update of job skip locked limit 1`,
       );
       const planNodes = explainPlanNodes(Object.values(explained[0])[0]);
       assert(
-        !planNodes.some((node) =>
-          node["Node Type"] === "Seq Scan" &&
-          ["ingest_batches", "telemetry_jobs"].includes(
-            String(node["Relation Name"]),
-          )
-        ),
-        "claim planning must not scan immutable batches or queue history",
+        planNodes.some((node) => node["Node Type"] === "WindowAgg"),
+        "claim planning must rank pending stream offsets once",
       );
-      const examinedRows = (node: Record<string, unknown>) =>
-        Number(node["Actual Rows"] ?? 0) +
-        Number(node["Rows Removed by Filter"] ?? 0) +
-        Number(node["Rows Removed by Join Filter"] ?? 0) +
-        Number(node["Rows Removed by Index Recheck"] ?? 0);
       assert(
-        Math.max(...planNodes.map(examinedRows)) < 64,
-        "claim planning must use bounded indexed access under backlog",
+        !planNodes.some((node) =>
+          node["Index Name"] === "telemetry_jobs_batch_key" &&
+          Number(node["Actual Loops"] ?? 0) > 64
+        ),
+        "claim planning must not probe queue state once per earlier range",
       );
       await sql.unsafe(
         `delete from processing.telemetry_jobs job

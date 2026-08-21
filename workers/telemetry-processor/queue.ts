@@ -124,13 +124,31 @@ export class PostgresJobQueue {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
-        `with candidate as (
+        `with pending_normalize as (
+           select pending_job.id,
+                  min(pending_batch.start_offset) over (
+                    partition by pending_batch.workspace_id,
+                                 pending_batch.collector_key,
+                                 pending_batch.source_kind,
+                                 pending_batch.source_stream_key,
+                                 pending_batch.generation_seq,
+                                 pending_batch.generation_key
+                  ) as earliest_start
+             from processing.telemetry_jobs pending_job
+             join telemetry.ingest_batches pending_batch
+               on pending_batch.workspace_id = pending_job.workspace_id
+              and pending_batch.id = pending_job.batch_id
+            where pending_job.job_kind = 'normalize'
+              and pending_job.status in ('queued', 'leased')
+         ), candidate as (
            select j.id
              from processing.telemetry_jobs j
              left join telemetry.ingest_batches batch
                on j.job_kind = 'normalize'
               and batch.workspace_id = j.workspace_id
               and batch.id = j.batch_id
+             left join pending_normalize pending
+               on pending.id = j.id
             where j.workload_class = $1
               and ($4::text is null or j.job_kind = $4)
               and j.attempt_count < j.attempt_limit
@@ -139,22 +157,8 @@ export class PostgresJobQueue {
                 (j.status = 'leased' and j.lease_expires_at <= now())
               )
               and (
-                j.job_kind <> 'normalize' or not exists (
-                  select 1
-                    from telemetry.ingest_batches predecessor
-                    join processing.telemetry_jobs predecessor_job
-                      on predecessor_job.workspace_id = predecessor.workspace_id
-                     and predecessor_job.batch_id = predecessor.id
-                     and predecessor_job.job_kind = 'normalize'
-                   where predecessor.workspace_id = batch.workspace_id
-                     and predecessor.collector_key = batch.collector_key
-                     and predecessor.source_kind = batch.source_kind
-                     and predecessor.source_stream_key = batch.source_stream_key
-                     and predecessor.generation_seq = batch.generation_seq
-                     and predecessor.generation_key = batch.generation_key
-                     and predecessor.start_offset < batch.start_offset
-                     and predecessor_job.status in ('queued', 'leased')
-                )
+                j.job_kind <> 'normalize' or batch.id is null
+                or batch.start_offset = pending.earliest_start
               )
             order by case when j.status = 'queued' then j.available_at
                           else j.lease_expires_at end,

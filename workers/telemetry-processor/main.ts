@@ -16,6 +16,7 @@ const OVERLOAD_SAMPLE_COUNT = 2;
 const CAPACITY_RETRY_BASE_MILLISECONDS = 30_000;
 const CAPACITY_RETRY_MAX_MILLISECONDS = 120_000;
 const HANDOFF_POLL_MILLISECONDS = 1_000;
+export const MAX_ADMISSIONS_PER_PASS = 1;
 
 export interface WorkerConfig {
   databaseUrl: string;
@@ -182,6 +183,21 @@ export function chooseOverloadJobKind(
   if (activeNormalize < normalizeReserved) return "normalize";
   if (activeReduce < 1) return "reduce";
   return "normalize";
+}
+
+export function admissionAvailable(
+  admissions: number,
+  active: number,
+  concurrency: number,
+): boolean {
+  return admissions < MAX_ADMISSIONS_PER_PASS && active < concurrency;
+}
+
+export function maintenanceSampleDue(
+  now: number,
+  lastSampleAt: number,
+): boolean {
+  return now - lastSampleAt >= OVERLOAD_SAMPLE_MILLISECONDS;
 }
 
 export function isCapacityError(error: unknown): boolean {
@@ -392,12 +408,12 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       const halfOpen = capacityCircuit.isHalfOpen();
       let claimedAny = false;
       try {
-        if (Date.now() - lastReaperAt >= OVERLOAD_SAMPLE_MILLISECONDS) {
+        if (maintenanceSampleDue(Date.now(), lastReaperAt)) {
           const terminalized = await queue.terminalizeExpired();
           if (terminalized > 0) log("expired_jobs_failed", { terminalized });
           lastReaperAt = Date.now();
         }
-        if (Date.now() - lastOverloadSampleAt >= OVERLOAD_SAMPLE_MILLISECONDS) {
+        if (maintenanceSampleDue(Date.now(), lastOverloadSampleAt)) {
           const age = await queue.oldestLiveNormalizationAgeSeconds();
           const previous = overload.active;
           overload = updateOverloadState(overload, age, config);
@@ -413,11 +429,16 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
           }
           lastOverloadSampleAt = Date.now();
         }
-        while (!stopping && active.size < config.concurrency) {
+        let admissions = 0;
+        while (
+          !stopping &&
+          admissionAvailable(admissions, active.size, config.concurrency)
+        ) {
           const job = overload.active
             ? await claimOverloadJob(queue, active, config)
             : await claimNormalJob(queue, active, config);
           if (!job) break;
+          admissions += 1;
           claimedAny = true;
           const task = runJob(
             queue,

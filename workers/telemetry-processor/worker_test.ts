@@ -1,4 +1,5 @@
 import {
+  admissionAvailable,
   alternateLane,
   CapacityCircuit,
   capacityRetryMilliseconds,
@@ -8,6 +9,7 @@ import {
   handoffOverlapConnectionBudget,
   isCapacityError,
   loadConfig,
+  maintenanceSampleDue,
   retryDelaySeconds,
   updateOverloadState,
   workerConnectionBudget,
@@ -259,6 +261,34 @@ Deno.test("overload mode uses hysteresis and preserves one reduction lane", () =
   assert(chooseOverloadJobKind(4, 1, 5) === "normalize");
   assert(chooseOverloadJobKind(5, 0, 5) === "reduce");
   assert(chooseOverloadJobKind(5, 1, 5) === "normalize");
+});
+
+Deno.test("slow claims cannot starve overload maintenance", () => {
+  const thresholds = { overloadEnterSeconds: 120, overloadExitSeconds: 60 };
+  let overload = { active: false, enterSamples: 0, exitSamples: 0 };
+  let now = 10_000;
+  let lastSampleAt = 0;
+  let samples = 0;
+  let claims = 0;
+  for (let pass = 0; pass < 10 && !overload.active; pass += 1) {
+    if (maintenanceSampleDue(now, lastSampleAt)) {
+      overload = updateOverloadState(overload, 130, thresholds);
+      lastSampleAt = now;
+      samples += 1;
+    }
+    let admissions = 0;
+    // A claim takes four seconds while each prior job finishes, so active
+    // capacity never fills. The pass limit must still return to maintenance.
+    while (admissionAvailable(admissions, 0, 6)) {
+      admissions += 1;
+      claims += 1;
+      now += 4_000;
+    }
+    assert(admissions === 1);
+  }
+  assert(overload.active);
+  assert(samples === 2);
+  assert(claims === 4);
 });
 
 Deno.test("only pool capacity errors open the worker circuit", () => {
