@@ -56,6 +56,7 @@ Deno.test({
     const unrelatedPersonId = crypto.randomUUID();
     const unrelatedBatchId = crypto.randomUUID();
     const now = new Date("2026-08-20T20:00:00.000Z");
+    const windowStart = new Date(now.getTime() - 26 * 60 * 60 * 1000);
     try {
       await sql.unsafe(
         `insert into telemetry.workspaces (id, slug, name)
@@ -338,6 +339,7 @@ Deno.test({
           proveAndActivateFrameProjection(sql, {
             workspaceId,
             activate: false,
+            windowStart,
           }),
         "target-workspace normalization backlog must block activation",
         "normalization or reduction jobs",
@@ -376,7 +378,7 @@ Deno.test({
       await proveAndActivateFrameProjection(sql, {
         workspaceId,
         activate: false,
-        windowStart: new Date("2026-08-19T18:00:00Z"),
+        windowStart,
       });
       const oldReceipts = await sql.unsafe(
         `select count(*)::int count
@@ -411,6 +413,7 @@ Deno.test({
           proveAndActivateFrameProjection(sql, {
             workspaceId,
             activate: true,
+            windowStart,
           }),
         "session metadata changes must make activation proof fail",
       );
@@ -428,6 +431,7 @@ Deno.test({
       await proveAndActivateFrameProjection(sql, {
         workspaceId,
         activate: false,
+        windowStart,
       });
 
       await sql.unsafe(
@@ -452,6 +456,7 @@ Deno.test({
           proveAndActivateFrameProjection(sql, {
             workspaceId,
             activate: true,
+            windowStart,
           }),
         "a committed lower-id source event must make activation proof fail",
       );
@@ -475,6 +480,7 @@ Deno.test({
       await proveAndActivateFrameProjection(sql, {
         workspaceId,
         activate: true,
+        windowStart,
       });
       const activations = await sql.unsafe(
         `select count(*)::int count
