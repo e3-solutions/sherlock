@@ -208,7 +208,11 @@ def _capture_hook(
             ),
         )
         if provider == "claude_code"
-        else discover_rollouts(home, hook_payload=payload)
+        else discover_rollouts(
+            home,
+            hook_payload=payload,
+            scan_recent_files=event_name == "SessionStart",
+        )
     )
     environment = os.environ.copy()
     if drain_environment:
@@ -278,7 +282,7 @@ def _capture_hook(
                 if provider == "claude_code"
                 and not (home / "projects").is_symlink()
                 and (home / "projects").is_dir()
-                else None
+                else home if provider == "codex" else None
             ),
         ),
         discovery.paths,
@@ -291,7 +295,7 @@ def _capture_hook(
         priority_count=discovery.priority_count,
         backlog_workload_class=(
             "backfill"
-            if provider == "claude_code" and event_name == "SessionStart"
+            if event_name == "SessionStart"
             else None
         ),
     )

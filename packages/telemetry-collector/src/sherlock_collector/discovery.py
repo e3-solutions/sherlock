@@ -18,6 +18,8 @@ DEFAULT_DATABASE_LIMIT = 8
 DEFAULT_ROWS_PER_DATABASE = 128
 CLAUDE_IDENTITY_SCAN_BYTES = 256 * 1024
 CLAUDE_IDENTITY_SCAN_RECORDS = 64
+CODEX_BACKFILL_MAX_FILES = 4096
+CODEX_BACKFILL_MAX_BYTES = 512 * 1024 * 1024
 CLAUDE_BACKFILL_MAX_FILES = 4096
 CLAUDE_BACKFILL_MAX_BYTES = 512 * 1024 * 1024
 
@@ -41,6 +43,14 @@ class _ClaudeCandidate:
     path: Path
     native_id: str
     parent_id: str | None
+    snapshot: SourceSnapshot
+
+
+@dataclass(frozen=True)
+class _CodexCandidate:
+    mtime_ns: int
+    path: Path
+    native_id: str | None
     snapshot: SourceSnapshot
 
 
@@ -140,6 +150,7 @@ def discover_rollouts(
     hook_payload: Mapping[str, object] | None = None,
     lookback_seconds: int = DEFAULT_LOOKBACK_SECONDS,
     rows_per_database: int = DEFAULT_ROWS_PER_DATABASE,
+    scan_recent_files: bool = False,
 ) -> DiscoveryResult:
     home = Path(codex_home or default_codex_home()).expanduser().resolve()
     cutoff_ms = int(time.time() * 1000) - max(1, lookback_seconds) * 1000
@@ -149,6 +160,9 @@ def discover_rollouts(
     payload = hook_payload or {}
     payload_session = payload.get("session_id")
     payload_agent = payload.get("agent_id")
+    source_snapshots: dict[str, SourceSnapshot] = {}
+    invalid_count = 0
+    selected_bytes = 0
     for key, native_id in (
         ("rollout_path", payload_session),
         ("transcript_path", payload_session),
@@ -187,6 +201,26 @@ def discover_rollouts(
             previous = discovered.get(path)
             if previous is None or updated > previous[0]:
                 discovered[path] = (updated, session_id)
+    if scan_recent_files:
+        cutoff_ns = cutoff_ms * 1_000_000
+        try:
+            candidates, invalid_count = _recent_codex_candidates(home, cutoff_ns)
+        except OSError as error:
+            errors.append(f"sessions discovery: {error}")
+            candidates = []
+        for candidate in candidates:
+            previous = discovered.get(candidate.path)
+            native_id = (
+                previous[1]
+                if previous is not None and previous[1] is not None
+                else candidate.native_id
+            )
+            discovered[candidate.path] = (
+                max(candidate.mtime_ns // 1_000_000, previous[0] if previous else 0),
+                native_id,
+            )
+            source_snapshots[str(candidate.path)] = candidate.snapshot
+            selected_bytes += candidate.snapshot.end_offset
     ordered = sorted(
         discovered,
         key=lambda item: (discovered[item][0], str(item)),
@@ -204,6 +238,9 @@ def discover_rollouts(
         native_session_ids=native_ids,
         priority_count=len(set(payload_paths)),
         errors=tuple(errors),
+        invalid_count=invalid_count,
+        selected_bytes=selected_bytes,
+        source_snapshots=source_snapshots,
     )
 
 
@@ -278,6 +315,67 @@ def discover_claude_transcripts(
         selected_bytes=selected_bytes,
         source_snapshots=source_snapshots,
     )
+
+
+def _recent_codex_candidates(
+    codex_home: Path,
+    cutoff_ns: int,
+) -> tuple[list[_CodexCandidate], int]:
+    candidates: list[_CodexCandidate] = []
+    invalid_count = 0
+    for root in (codex_home / "sessions", codex_home / "archived_sessions"):
+        if not root.exists():
+            continue
+        if root.is_symlink() or not root.is_dir():
+            invalid_count += 1
+            continue
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        if (
+                            not entry.is_file(follow_symlinks=False)
+                            or not entry.name.startswith("rollout-")
+                            or not entry.name.endswith(".jsonl")
+                        ):
+                            continue
+                        try:
+                            path = Path(entry.path)
+                            with open_regular_under_root(root, path) as handle:
+                                details = os.fstat(handle.fileno())
+                                if details.st_mtime_ns < cutoff_ns:
+                                    continue
+                                prefix_length, prefix_sha256 = source_prefix(
+                                    handle,
+                                    details.st_size,
+                                )
+                        except (OSError, ValueError):
+                            invalid_count += 1
+                            continue
+                        native_id = _native_session_id(path.stem[-36:])
+                        candidates.append(
+                            _CodexCandidate(
+                                mtime_ns=details.st_mtime_ns,
+                                path=path,
+                                native_id=native_id,
+                                snapshot=SourceSnapshot(
+                                    device=details.st_dev,
+                                    inode=details.st_ino,
+                                    end_offset=details.st_size,
+                                    prefix_length=prefix_length,
+                                    prefix_sha256=prefix_sha256,
+                                ),
+                            )
+                        )
+            except OSError:
+                invalid_count += 1
+    candidates.sort(key=lambda item: (-item.mtime_ns, str(item.path)))
+    return candidates, invalid_count
 
 
 def _recent_claude_candidates(
