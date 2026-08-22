@@ -171,7 +171,7 @@ export class PostgresJobQueue {
                   ) as oldest_ready_live_created_at`
       : "";
     const workloadPredicate = liveNormalizationFrontier
-      ? "pending.oldest_ready_live_created_at is not null"
+      ? "$1::text = 'live' and pending.oldest_ready_live_created_at is not null"
       : "j.workload_class = $1";
     const liveDemandOrder = liveNormalizationFrontier
       ? "pending.oldest_ready_live_created_at,"
