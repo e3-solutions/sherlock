@@ -121,6 +121,61 @@ export class PostgresJobQueue {
     leaseSeconds: number,
     jobKind: JobKind | null = null,
   ): Promise<TelemetryJob | null> {
+    return await this.claimMatching(
+      workloadClass,
+      owner,
+      leaseSeconds,
+      jobKind,
+      false,
+    );
+  }
+
+  async claimLiveNormalizationFrontier(
+    owner: string,
+    leaseSeconds: number,
+  ): Promise<TelemetryJob | null> {
+    return await this.claimMatching(
+      "live",
+      owner,
+      leaseSeconds,
+      "normalize",
+      true,
+    );
+  }
+
+  private async claimMatching(
+    workloadClass: WorkloadClass,
+    owner: string,
+    leaseSeconds: number,
+    jobKind: JobKind | null,
+    liveNormalizationFrontier: boolean,
+  ): Promise<TelemetryJob | null> {
+    const liveDemandProjection = liveNormalizationFrontier
+      ? `,
+                  min(pending_job.created_at) filter (
+                    where pending_job.workload_class = 'live'
+                      and pending_job.attempt_count < pending_job.attempt_limit
+                      and (
+                        (pending_job.status = 'queued'
+                          and pending_job.available_at <= now()) or
+                        (pending_job.status = 'leased'
+                          and pending_job.lease_expires_at <= now())
+                      )
+                  ) over (
+                    partition by pending_batch.workspace_id,
+                                 pending_batch.collector_key,
+                                 pending_batch.source_kind,
+                                 pending_batch.source_stream_key,
+                                 pending_batch.generation_seq,
+                                 pending_batch.generation_key
+                  ) as oldest_ready_live_created_at`
+      : "";
+    const workloadPredicate = liveNormalizationFrontier
+      ? "$1::text = 'live' and pending.oldest_ready_live_created_at is not null"
+      : "j.workload_class = $1";
+    const liveDemandOrder = liveNormalizationFrontier
+      ? "pending.oldest_ready_live_created_at,"
+      : "";
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
@@ -133,7 +188,7 @@ export class PostgresJobQueue {
                                  pending_batch.source_stream_key,
                                  pending_batch.generation_seq,
                                  pending_batch.generation_key
-                  ) as earliest_start
+                  ) as earliest_start${liveDemandProjection}
              from processing.telemetry_jobs pending_job
              join telemetry.ingest_batches pending_batch
                on pending_batch.workspace_id = pending_job.workspace_id
@@ -149,7 +204,7 @@ export class PostgresJobQueue {
               and batch.id = j.batch_id
              left join pending_normalize pending
                on pending.id = j.id
-            where j.workload_class = $1
+            where ${workloadPredicate}
               and ($4::text is null or j.job_kind = $4)
               and j.attempt_count < j.attempt_limit
               and (
@@ -160,7 +215,8 @@ export class PostgresJobQueue {
                 j.job_kind <> 'normalize' or batch.id is null
                 or batch.start_offset = pending.earliest_start
               )
-            order by case when j.status = 'queued' then j.available_at
+            order by ${liveDemandOrder}
+                     case when j.status = 'queued' then j.available_at
                           else j.lease_expires_at end,
                      j.id
             for update of j skip locked
