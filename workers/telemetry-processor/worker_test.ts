@@ -5,6 +5,7 @@ import {
   capacityRetryMilliseconds,
   chooseLane,
   chooseOverloadJobKind,
+  claimOverloadJob,
   enqueueReductionTargets,
   handoffOverlapConnectionBudget,
   isCapacityError,
@@ -12,6 +13,7 @@ import {
   maintenanceSampleDue,
   retryDelaySeconds,
   updateOverloadState,
+  type WorkerConfig,
   workerConnectionBudget,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
@@ -261,6 +263,45 @@ Deno.test("overload mode uses hysteresis and preserves one reduction lane", () =
   assert(chooseOverloadJobKind(4, 1, 5) === "normalize");
   assert(chooseOverloadJobKind(5, 0, 5) === "reduce");
   assert(chooseOverloadJobKind(5, 1, 5) === "normalize");
+});
+
+Deno.test("overload normalization claims only a live-demand stream frontier", async () => {
+  const calls: string[] = [];
+  const prerequisite = {
+    id: 1n,
+    workspace_id: "00000000-0000-4000-8000-000000000999",
+    job_kind: "normalize" as const,
+    batch_id: "00000000-0000-4000-8000-000000000001",
+    workload_class: "backfill" as const,
+    attempt_count: 1,
+    attempt_limit: 5,
+    lease_token: "00000000-0000-4000-8000-000000000002",
+  };
+  const queue = {
+    claimLiveNormalizationFrontier(owner: string, leaseSeconds: number) {
+      calls.push(`frontier:${owner}:${leaseSeconds}`);
+      return Promise.resolve(prerequisite);
+    },
+    claim() {
+      calls.push("ordinary");
+      return Promise.resolve(null);
+    },
+  };
+  const claimed = await claimOverloadJob(
+    queue as never,
+    new Map(),
+    {
+      workerId: "worker-a",
+      leaseSeconds: 120,
+      normalizeReserved: 5,
+    } as WorkerConfig,
+  );
+  assert(claimed === prerequisite);
+  assert(calls.join(",") === "frontier:worker-a:120");
+  assert(
+    claimed.workload_class === "backfill",
+    "claiming a prerequisite must not rewrite its audited workload class",
+  );
 });
 
 Deno.test("slow claims cannot starve overload maintenance", () => {

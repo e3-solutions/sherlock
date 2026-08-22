@@ -520,7 +520,7 @@ async function claimNormalJob(
     : null;
 }
 
-async function claimOverloadJob(
+export async function claimOverloadJob(
   queue: PostgresJobQueue,
   active: Map<Promise<void>, Pick<TelemetryJob, "job_kind" | "workload_class">>,
   config: WorkerConfig,
@@ -534,19 +534,21 @@ async function claimOverloadJob(
     activeReduce,
     config.normalizeReserved,
   );
-  const preferredJob = await queue.claim(
-    "live",
-    config.workerId,
-    config.leaseSeconds,
-    preferred,
-  );
+  const claim = (jobKind: JobKind): Promise<TelemetryJob | null> =>
+    jobKind === "normalize"
+      ? queue.claimLiveNormalizationFrontier(
+        config.workerId,
+        config.leaseSeconds,
+      )
+      : queue.claim(
+        "live",
+        config.workerId,
+        config.leaseSeconds,
+        "reduce",
+      );
+  const preferredJob = await claim(preferred);
   if (preferredJob) return preferredJob;
-  return await queue.claim(
-    "live",
-    config.workerId,
-    config.leaseSeconds,
-    preferred === "normalize" ? "reduce" : "normalize",
-  );
+  return await claim(preferred === "normalize" ? "reduce" : "normalize");
 }
 
 async function waitForWork(

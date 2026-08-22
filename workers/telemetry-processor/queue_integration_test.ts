@@ -42,6 +42,7 @@ async function insertQueueBatch(
     streamKey: string;
     generationKey: string;
     startOffset: number;
+    workloadClass?: "live" | "backfill";
   },
 ): Promise<void> {
   await sql.unsafe(
@@ -55,7 +56,7 @@ async function insertQueueBatch(
      ) values (
        $1, $2, $3, 'queue-collector', $4, $5, $6, $7, 0,
        $8::bigint, $8::bigint + 1, 1, $9, $10, 'gzip', 1, $11, 1,
-       'sherlock.rollout-batch.v1', now(), now(), 'backfill'
+       'sherlock.rollout-batch.v1', now(), now(), $12
      )`,
     [
       input.id,
@@ -69,8 +70,55 @@ async function insertQueueBatch(
       "d".repeat(64),
       `queue-tests/${input.id}.jsonl.gz`,
       "e".repeat(64),
+      input.workloadClass ?? "backfill",
     ],
   );
+}
+
+async function insertQueueFixture(
+  sql: ReturnType<typeof postgres>,
+  label: string,
+): Promise<{ workspaceId: string; personId: string }> {
+  const workspaceId = crypto.randomUUID();
+  const personId = crypto.randomUUID();
+  await sql.unsafe(
+    `insert into telemetry.workspaces (id, slug, name)
+     values ($1, $2, 'Queue mixed-lane integration test')`,
+    [workspaceId, `${label}-${workspaceId}`],
+  );
+  await sql.unsafe(
+    `insert into telemetry.people (id, workspace_id, identity_key, email)
+     values ($1, $2, $3, $4)`,
+    [
+      personId,
+      workspaceId,
+      `${label}-person`,
+      `${label}-${workspaceId}@example.com`,
+    ],
+  );
+  return { workspaceId, personId };
+}
+
+async function deleteQueueFixture(
+  sql: ReturnType<typeof postgres>,
+  workspaceId: string,
+): Promise<void> {
+  await sql.unsafe(
+    "delete from processing.telemetry_jobs where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
+    "delete from telemetry.ingest_batches where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
+    "delete from telemetry.people where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
+    "delete from telemetry.workspaces where id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
 }
 
 Deno.test({
@@ -750,6 +798,390 @@ Deno.test({
         queue.close(),
         sql.end(),
       ]);
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "live normalization claims replay an ordered backfill prerequisite without borrowing unrelated backfill",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 4 });
+    const queue = PostgresJobQueue.connect(databaseUrl!, 4);
+    const competingQueue = PostgresJobQueue.connect(databaseUrl!, 2);
+    const { workspaceId, personId } = await insertQueueFixture(
+      sql,
+      "mixed-lane",
+    );
+    const prerequisiteId = crypto.randomUUID();
+    const firstLiveId = crypto.randomUUID();
+    const secondLiveId = crypto.randomUUID();
+    const independentLiveId = crypto.randomUUID();
+    const unrelatedBackfillId = crypto.randomUUID();
+    const futurePrerequisiteId = crypto.randomUUID();
+    const futureLiveId = crypto.randomUUID();
+    try {
+      await insertQueueBatch(sql, {
+        id: prerequisiteId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "mixed-stream",
+        generationKey: "mixed-generation",
+        startOffset: 0,
+        workloadClass: "backfill",
+      });
+      await insertQueueBatch(sql, {
+        id: firstLiveId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "mixed-stream",
+        generationKey: "mixed-generation",
+        startOffset: 1,
+        workloadClass: "live",
+      });
+      await insertQueueBatch(sql, {
+        id: secondLiveId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "mixed-stream",
+        generationKey: "mixed-generation",
+        startOffset: 2,
+        workloadClass: "live",
+      });
+      await insertQueueBatch(sql, {
+        id: independentLiveId,
+        workspaceId,
+        personId,
+        sourceKind: "rollout",
+        streamKey: "independent-live-stream",
+        generationKey: "independent-live-generation",
+        startOffset: 0,
+        workloadClass: "live",
+      });
+      await insertQueueBatch(sql, {
+        id: unrelatedBackfillId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "unrelated-backfill-stream",
+        generationKey: "unrelated-backfill-generation",
+        startOffset: 0,
+        workloadClass: "backfill",
+      });
+      await insertQueueBatch(sql, {
+        id: futurePrerequisiteId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "future-live-stream",
+        generationKey: "future-live-generation",
+        startOffset: 0,
+        workloadClass: "backfill",
+      });
+      await insertQueueBatch(sql, {
+        id: futureLiveId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "future-live-stream",
+        generationKey: "future-live-generation",
+        startOffset: 1,
+        workloadClass: "live",
+      });
+      await sql.unsafe(
+        `update processing.telemetry_jobs
+            set available_at = case
+              when batch_id = $1 then now() - interval '10 minutes'
+              when batch_id = $2 then now() - interval '4 minutes'
+              when batch_id = $3 then now() + interval '1 hour'
+              else now() - interval '5 minutes' end,
+                created_at = case
+                  when batch_id = $2 then now() - interval '6 minutes'
+                  when batch_id = $4 then now() - interval '5 minutes'
+                  else created_at end
+          where workspace_id = $5`,
+        [
+          unrelatedBackfillId,
+          independentLiveId,
+          futureLiveId,
+          firstLiveId,
+          workspaceId,
+        ],
+      );
+
+      const independentLive = await queue.claimLiveNormalizationFrontier(
+        "live-frontier-a",
+        60,
+      );
+      assert(
+        independentLive?.job_kind === "normalize" &&
+          independentLive.batch_id === independentLiveId &&
+          independentLive.workload_class === "live",
+        "the oldest ready live demand must win across stream frontiers",
+      );
+      assert(await queue.complete(independentLive) === "succeeded");
+
+      const prerequisite = await competingQueue
+        .claimLiveNormalizationFrontier("live-frontier-b", 60);
+      assert(
+        prerequisite?.job_kind === "normalize" &&
+          prerequisite.batch_id === prerequisiteId,
+        "live demand must pull its own earliest unfinished stream range",
+      );
+      assert(
+        prerequisite.workload_class === "backfill",
+        "dependency scheduling must preserve the prerequisite's stored workload class",
+      );
+
+      assert(
+        await queue.retry(
+          prerequisite,
+          60,
+          "test_prerequisite_retry",
+          "ordered replay remains ahead of live descendants",
+        ),
+      );
+      assert(
+        await competingQueue.claimLiveNormalizationFrontier(
+          "live-frontier-retry-blocked",
+          60,
+        ) === null,
+        "a delayed prerequisite retry must continue to block its live descendants",
+      );
+      await sql.unsafe(
+        `update processing.telemetry_jobs set available_at = now()
+          where workspace_id = $1 and batch_id = $2`,
+        [workspaceId, prerequisiteId],
+      );
+      const replayed = await competingQueue.claimLiveNormalizationFrontier(
+        "live-frontier-replay",
+        60,
+      );
+      assert(
+        replayed?.job_kind === "normalize" &&
+          replayed.batch_id === prerequisiteId &&
+          replayed.workload_class === "backfill",
+        "replay must reclaim the same auditable prerequisite before live work",
+      );
+      assert(
+        await queue.complete(prerequisite) === "fenced",
+        "a replayed prerequisite must fence its superseded lease token",
+      );
+      assert(await competingQueue.complete(replayed) === "succeeded");
+
+      const firstLive = await queue.claimLiveNormalizationFrontier(
+        "live-frontier-first",
+        60,
+      );
+      assert(
+        firstLive?.job_kind === "normalize" &&
+          firstLive.batch_id === firstLiveId &&
+          firstLive.workload_class === "live",
+        "the first live descendant must follow the completed prerequisite",
+      );
+      assert(
+        await competingQueue.claimLiveNormalizationFrontier(
+          "live-frontier-overlap",
+          60,
+        ) === null,
+        "same-stream live normalization must remain serialized across owners",
+      );
+      assert(await queue.complete(firstLive) === "succeeded");
+
+      const secondLive = await competingQueue.claimLiveNormalizationFrontier(
+        "live-frontier-second",
+        60,
+      );
+      assert(
+        secondLive?.job_kind === "normalize" &&
+          secondLive.batch_id === secondLiveId &&
+          secondLive.workload_class === "live",
+        "live descendants must drain in immutable source-offset order",
+      );
+      assert(await competingQueue.complete(secondLive) === "succeeded");
+      assert(
+        await queue.claimLiveNormalizationFrontier("live-frontier-done", 60) ===
+          null,
+        "a ready prerequisite must not be borrowed for delayed live demand",
+      );
+
+      const states = await sql.unsafe(
+        `select job.batch_id::text as batch_id, job.status,
+                job.workload_class, batch.processing_class_hint
+           from processing.telemetry_jobs job
+           join telemetry.ingest_batches batch
+             on batch.workspace_id = job.workspace_id
+            and batch.id = job.batch_id
+          where job.workspace_id = $1`,
+        [workspaceId],
+      );
+      const byBatch = new Map(
+        states.map((row) => [String(row.batch_id), row]),
+      );
+      assert(
+        byBatch.get(unrelatedBackfillId)?.status === "queued",
+        "live capacity must not borrow an unrelated backfill partition",
+      );
+      assert(
+        byBatch.get(futurePrerequisiteId)?.status === "queued" &&
+          byBatch.get(futureLiveId)?.status === "queued",
+        "delayed live demand and its prerequisite must remain untouched",
+      );
+      assert(
+        byBatch.get(prerequisiteId)?.workload_class === "backfill" &&
+          byBatch.get(prerequisiteId)?.processing_class_hint === "backfill",
+        "claiming a dependency must not rewrite raw or queue classification facts",
+      );
+    } finally {
+      await deleteQueueFixture(sql, workspaceId);
+      await Promise.allSettled([
+        competingQueue.close(),
+        queue.close(),
+        sql.end(),
+      ]);
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "concurrent live-frontier owners drain a bounded mixed-lane backlog without duplication or reordering",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 8 });
+    const queue = PostgresJobQueue.connect(databaseUrl!, 8);
+    const { workspaceId, personId } = await insertQueueFixture(
+      sql,
+      "mixed-load",
+    );
+    const streamCount = 12;
+    const rangesPerStream = 4;
+    const batchFacts = new Map<string, { stream: number; offset: number }>();
+    const unrelatedBackfillId = crypto.randomUUID();
+    try {
+      const inserts: Promise<void>[] = [];
+      for (let stream = 0; stream < streamCount; stream += 1) {
+        for (let offset = 0; offset < rangesPerStream; offset += 1) {
+          const id = crypto.randomUUID();
+          batchFacts.set(id, { stream, offset });
+          inserts.push(insertQueueBatch(sql, {
+            id,
+            workspaceId,
+            personId,
+            sourceKind: "transcript",
+            streamKey: `mixed-load-stream-${stream}`,
+            generationKey: `mixed-load-generation-${stream}`,
+            startOffset: offset,
+            workloadClass: offset === 0 ? "backfill" : "live",
+          }));
+        }
+      }
+      inserts.push(insertQueueBatch(sql, {
+        id: unrelatedBackfillId,
+        workspaceId,
+        personId,
+        sourceKind: "transcript",
+        streamKey: "mixed-load-unrelated",
+        generationKey: "mixed-load-unrelated-generation",
+        startOffset: 0,
+        workloadClass: "backfill",
+      }));
+      await Promise.all(inserts);
+      await sql.unsafe(
+        `update processing.telemetry_jobs
+            set available_at = now() - interval '5 minutes'
+          where workspace_id = $1`,
+        [workspaceId],
+      );
+
+      const nextOffset = new Map<number, number>();
+      const claimedIds = new Set<bigint>();
+      let completed = 0;
+      for (let round = 0; round < 64; round += 1) {
+        const claims = (await Promise.all(
+          Array.from(
+            { length: 5 },
+            (_, owner) =>
+              queue.claimLiveNormalizationFrontier(
+                `mixed-load-owner-${owner}`,
+                60,
+              ),
+          ),
+        )).filter((job) => job !== null);
+        if (claims.length === 0) break;
+
+        const streamsInRound = new Set<number>();
+        for (const job of claims) {
+          assert(job.job_kind === "normalize");
+          const fact = batchFacts.get(job.batch_id);
+          assert(
+            fact !== undefined,
+            "live owners must not claim unrelated backfill",
+          );
+          assert(
+            !claimedIds.has(job.id),
+            "no durable queue job may be owned twice during a drain",
+          );
+          assert(
+            !streamsInRound.has(fact.stream),
+            "concurrent owners must not overlap within a stream",
+          );
+          assert(
+            fact.offset === (nextOffset.get(fact.stream) ?? 0),
+            "each stream must drain in source-offset order",
+          );
+          assert(
+            job.workload_class === (fact.offset === 0 ? "backfill" : "live"),
+            "dependency claims must retain every job's original workload class",
+          );
+          streamsInRound.add(fact.stream);
+          claimedIds.add(job.id);
+          nextOffset.set(fact.stream, fact.offset + 1);
+        }
+        const completions = await Promise.all(
+          claims.map((job) => queue.complete(job)),
+        );
+        assert(
+          completions.every((result) => result === "succeeded"),
+          "every active mixed-load lease must complete exactly once",
+        );
+        completed += completions.length;
+      }
+
+      assert(
+        completed === streamCount * rangesPerStream,
+        "all live-demand partitions, including their prerequisites, must drain",
+      );
+      assert(
+        [...nextOffset.values()].every((offset) =>
+          offset === rangesPerStream
+        ) && nextOffset.size === streamCount,
+        "every stream must reach its complete ordered frontier",
+      );
+      const remaining = await sql.unsafe(
+        `select batch_id::text as batch_id, workload_class, status
+           from processing.telemetry_jobs
+          where workspace_id = $1 and status <> 'succeeded'`,
+        [workspaceId],
+      );
+      assert(
+        remaining.length === 1 &&
+          remaining[0].batch_id === unrelatedBackfillId &&
+          remaining[0].workload_class === "backfill" &&
+          remaining[0].status === "queued",
+        "the bounded drain must leave only unrelated backfill untouched",
+      );
+    } finally {
+      await deleteQueueFixture(sql, workspaceId);
+      await Promise.allSettled([queue.close(), sql.end()]);
     }
   },
 });
