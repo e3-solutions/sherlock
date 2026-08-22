@@ -33,6 +33,29 @@ const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
 const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;
 const DEFAULT_TOOLTIP_SIZE = { width: 224, height: 136 };
+const FRAME_EVIDENCE_CACHE_LIMIT = 3;
+
+function frameEvidenceCacheKey(snapshot, personId, startMs) {
+  return JSON.stringify([snapshot, personId, startMs]);
+}
+
+function readFrameEvidence(cache, key) {
+  const evidence = cache.get(key);
+  if (!evidence) return undefined;
+  cache.delete(key);
+  cache.set(key, evidence);
+  return evidence;
+}
+
+function emptyIntervalEvidence(key = null, state = "idle") {
+  return {
+    key,
+    state,
+    work: [],
+    prompts: [],
+    workIncomplete: false,
+  };
+}
 
 export const PERSON_RANK_OPTIONS = [
   { value: "roster", label: "Name" },
@@ -908,12 +931,11 @@ export default function FlameGraph({
   const [showAdditionalWork, setShowAdditionalWork] = useState(false);
   const [intervalRevision, setIntervalRevision] = useState(0);
   const [workRevision, setWorkRevision] = useState(0);
-  const [intervalEvidence, setIntervalEvidence] = useState({
-    state: "idle", work: [], prompts: [], workIncomplete: false,
-  });
+  const [intervalEvidence, setIntervalEvidence] = useState(emptyIntervalEvidence);
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], nextCursor: null,
   });
+  const intervalEvidenceCache = useMemo(() => new Map(), [data.snapshot, stale]);
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
   const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
   const promptPeak = data.people.reduce(
@@ -941,6 +963,15 @@ export default function FlameGraph({
   const selectionKey = selectedPerson && selectedPoint
     ? `${selectedPerson.id}:${selectedPoint.startMs}`
     : null;
+  const selectionEvidenceKey = selectedPerson && selectedPoint
+    ? frameEvidenceCacheKey(data.snapshot, selectedPerson.id, selectedPoint.startMs)
+    : null;
+  const visibleIntervalEvidence = intervalEvidence.key === selectionEvidenceKey
+    ? intervalEvidence
+    : emptyIntervalEvidence(
+        selectionEvidenceKey,
+        selectedPoint?.activity === 0 && selectedPoint?.prompts === 0 ? "ready" : "loading",
+      );
 
   const beginCloseDetail = useCallback(() => {
     if (!selection || detailClosingRef.current) return;
@@ -984,16 +1015,23 @@ export default function FlameGraph({
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint) {
-      setIntervalEvidence({
-        state: "idle", work: [], prompts: [], workIncomplete: false,
-      });
+      setIntervalEvidence(emptyIntervalEvidence());
       return undefined;
     }
 
+    const evidenceKey = frameEvidenceCacheKey(
+      data.snapshot,
+      selectedPerson.id,
+      selectedPoint.startMs,
+    );
+    if (selectedPoint.activity === 0 && selectedPoint.prompts === 0) {
+      return undefined;
+    }
+    if (!stale && intervalEvidenceCache.has(evidenceKey)) {
+      return undefined;
+    }
     const controller = new AbortController();
-    setIntervalEvidence({
-      state: "loading", work: [], prompts: [], workIncomplete: false,
-    });
+    setIntervalEvidence(emptyIntervalEvidence(evidenceKey, "loading"));
     const query = new URLSearchParams({
       personId: selectedPerson.id,
       start: new Date(selectedPoint.startMs).toISOString(),
@@ -1019,22 +1057,37 @@ export default function FlameGraph({
         if (evidence.work.length > selectedPoint.activity) {
           throw new Error("Work evidence count does not match the timeline snapshot");
         }
-        setIntervalEvidence({
+        const readyEvidence = {
+          key: evidenceKey,
           state: "ready",
           ...evidence,
           workIncomplete: evidence.work.length < selectedPoint.activity,
-        });
+        };
+        if (!stale && !readyEvidence.workIncomplete) {
+          intervalEvidenceCache.delete(evidenceKey);
+          intervalEvidenceCache.set(evidenceKey, readyEvidence);
+          if (intervalEvidenceCache.size > FRAME_EVIDENCE_CACHE_LIMIT) {
+            intervalEvidenceCache.delete(intervalEvidenceCache.keys().next().value);
+          }
+        }
+        setIntervalEvidence(readyEvidence);
       })
       .catch((error) => {
         if (!controller.signal.aborted) {
           setIntervalEvidence({
-            state: "error", work: [], prompts: [], workIncomplete: false,
+            ...emptyIntervalEvidence(evidenceKey, "error"),
             reason: evidenceFailureReason(error),
           });
         }
       });
     return () => controller.abort();
-  }, [data.snapshot, intervalRevision, selectedPerson?.id, selectedPoint?.startMs]);
+  }, [
+    data.snapshot,
+    intervalEvidenceCache,
+    intervalRevision,
+    selectedPerson?.id,
+    selectedPoint?.startMs,
+  ]);
 
   useEffect(() => {
     if (!selectedPerson || !selectedPoint || drawerView.screen !== "work") {
@@ -1096,10 +1149,20 @@ export default function FlameGraph({
   ]);
 
   const selectInterval = (person, point) => {
+    const evidenceKey = frameEvidenceCacheKey(data.snapshot, person.id, point.startMs);
+    const cached = stale ? undefined : readFrameEvidence(intervalEvidenceCache, evidenceKey);
     detailClosingRef.current = false;
     setDetailClosing(false);
     setShowAdditionalWork(false);
     setDrawerView({ screen: "overview" });
+    if (cached) {
+      setIntervalEvidence(cached);
+    } else if (selectionEvidenceKey !== evidenceKey) {
+      setIntervalEvidence(emptyIntervalEvidence(
+        evidenceKey,
+        point.activity === 0 && point.prompts === 0 ? "ready" : "loading",
+      ));
+    }
     setSelection({ personId: person.id, startMs: point.startMs });
   };
 
@@ -1240,7 +1303,7 @@ export default function FlameGraph({
           className={`flame-detail${detailClosing ? " flame-detail--closing" : ""}`}
           aria-busy={drawerView.screen === "work"
             ? workEvidence.state === "loading" || workEvidence.loadingMore === true
-            : intervalEvidence.state === "loading"}
+            : visibleIntervalEvidence.state === "loading"}
           aria-labelledby={drawerView.screen === "work"
             ? `flame-work-${drawerView.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`
             : `flame-detail-${selectedPerson.id.replace(/[^a-zA-Z0-9_-]/g, "")}`}
@@ -1264,7 +1327,7 @@ export default function FlameGraph({
               key={`${selectedPerson.id}:${selectedPoint.startMs}`}
               person={selectedPerson}
               point={selectedPoint}
-              evidence={intervalEvidence}
+              evidence={visibleIntervalEvidence}
               stale={stale}
               closing={detailClosing}
               onClose={beginCloseDetail}
