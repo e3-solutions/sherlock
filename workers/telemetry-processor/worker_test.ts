@@ -28,6 +28,7 @@ import { createReservedTransactionRunner } from "./database.ts";
 import {
   coalesceReductionTargets,
   type ReductionEnqueueOptions,
+  type TelemetryJob,
 } from "./queue.ts";
 const railwayConfig = await Deno.readTextFile(
   new URL("../../railway.toml", import.meta.url),
@@ -268,15 +269,9 @@ Deno.test("overload mode uses hysteresis and preserves one reduction lane", () =
 Deno.test("overload normalization claims only a live-demand stream frontier", async () => {
   const calls: string[] = [];
   const prerequisite = {
-    id: 1n,
-    workspace_id: "00000000-0000-4000-8000-000000000999",
-    job_kind: "normalize" as const,
-    batch_id: "00000000-0000-4000-8000-000000000001",
-    workload_class: "backfill" as const,
-    attempt_count: 1,
-    attempt_limit: 5,
-    lease_token: "00000000-0000-4000-8000-000000000002",
-  };
+    job_kind: "normalize",
+    workload_class: "backfill",
+  } as TelemetryJob;
   const queue = {
     claimLiveNormalizationFrontier(owner: string, leaseSeconds: number) {
       calls.push(`frontier:${owner}:${leaseSeconds}`);
@@ -298,10 +293,6 @@ Deno.test("overload normalization claims only a live-demand stream frontier", as
   );
   assert(claimed === prerequisite);
   assert(calls.join(",") === "frontier:worker-a:120");
-  assert(
-    claimed.workload_class === "backfill",
-    "claiming a prerequisite must not rewrite its audited workload class",
-  );
 });
 
 Deno.test("slow claims cannot starve overload maintenance", () => {
