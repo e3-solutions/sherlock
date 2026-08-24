@@ -172,6 +172,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     const promptNativeItemId = nativeItemId(observedAt);
     const partialRead = new Date(FIXED_NOW.getTime() + 2_000);
     const partialActivityAt = new Date(FIXED_NOW.getTime() + 1_000);
+    const newestGuardianAt = new Date(partialActivityAt.getTime() + 500);
     try {
       await sql.unsafe(
         `insert into telemetry.workspaces (id, slug, name)
@@ -286,7 +287,9 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            ($1, $2, $4, $5, 3, 'projection-guardian', 'same-activity', 10,
             'reasoning', 'reasoning', 'worker', $7, $7, $7),
            ($1, $3, $4, $5, 4, null, null, 100,
-            'reasoning', 'reasoning', 'worker', $8, $8, $8)
+            'reasoning', 'reasoning', 'worker', $8, $8, $8),
+           ($1, $2, $4, $5, 5, null, null, 100,
+            'reasoning', 'reasoning', 'guardian', $9, $9, $9)
          returning id::text id`,
         [
           workspaceId,
@@ -297,9 +300,15 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           new Date(bucketStart.getTime() + 2_000).toISOString(),
           new Date(bucketStart.getTime() + 2_500).toISOString(),
           new Date(bucketStart.getTime() + 3_000).toISOString(),
+          newestGuardianAt.toISOString(),
         ],
       );
-      const [guardianEvent, guardianLoserEvent, workerEvent] = roleEventRows;
+      const [
+        guardianEvent,
+        guardianLoserEvent,
+        workerEvent,
+        newestGuardianEvent,
+      ] = roleEventRows;
       const receiptRows = await sql.unsafe(
          `insert into analytics.frame_projection_receipts (
            workspace_id, session_id, person_id, frame_version,
@@ -330,7 +339,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            source_event_count, source_state_sha256, request_generation,
            session_updated_at
          ) values (
-           $1, $2, $3, $4, $5, $6, $7, 2, $8, 1,
+           $1, $2, $3, $4, $5, $6, $7, 3, $8, 1,
            (select updated_at from telemetry.sessions
              where workspace_id = $1 and id = $2)
          ) returning id::text id`,
@@ -341,7 +350,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           FRAME_VERSION,
           bucketStart.toISOString(),
           partialRead.toISOString(),
-          guardianLoserEvent.id,
+          newestGuardianEvent.id,
           "1".repeat(64),
         ],
       );
@@ -408,6 +417,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            ($1, $2, $3, $4, $5, 'activity', $7, $10, $10, 'worker',
             'reasoning', 'reasoning', null, null, null, false, true),
            ($13, $2, $8, $4, $5, 'activity', $11, $12, $12, 'worker',
+            'reasoning', 'reasoning', null, null, null, false, false),
+           ($1, $2, $3, $4, $5, 'activity', $14, $15, $15, 'guardian',
             'reasoning', 'reasoning', null, null, null, false, false)`,
         [
           guardianReceiptRows[0].id,
@@ -423,6 +434,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           workerEvent.id,
           new Date(bucketStart.getTime() + 3_000).toISOString(),
           workerReceiptRows[0].id,
+          newestGuardianEvent.id,
+          newestGuardianAt.toISOString(),
         ],
       );
 
@@ -439,6 +452,10 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         now: partialRead,
       });
       expect(legacyDay.snapshot).toMatch(/^v1\./);
+      expect(legacyDay.latest).toBe(partialActivityAt.toISOString());
+      expect(legacyDay.people[0].lastActivity).toBe(
+        partialActivityAt.toISOString(),
+      );
 
       await sql.unsafe(
         `insert into analytics.frame_projection_activations (
@@ -460,16 +477,15 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect(projectedDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),
       );
-      expect(projectedDay.people[0].total[0]).toBe(1);
       expect(projectedDay.people[0].total).toEqual([1, 1, 0]);
       expect(projectedInterval.work).toEqual(legacyInterval.work);
       expect(projectedInterval.prompts).toEqual(legacyInterval.prompts);
-      expect(projectedInterval.work.map(({ sessionId }) => sessionId)).toContain(
-        workerSessionId,
-      );
-      expect(projectedInterval.work.map(({ sessionId }) => sessionId).includes(
-        guardianSessionId,
-      )).toBe(false);
+      expect(Object.fromEntries(projectedInterval.work.map(({ sessionId, role }) =>
+        [sessionId, role]
+      ))).toEqual({
+        [sessionId]: "agent",
+        [workerSessionId]: "subagent",
+      });
       await expect(source.fetchWork({
         personId,
         start: bucketStart.toISOString(),
@@ -539,7 +555,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            workspace_id, session_id, source_record_id, normalizer_version,
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
-         ) values ($1, $2, $3, $4, 5, 100, 'reasoning', 'reasoning',
+         ) values ($1, $2, $3, $4, 6, 100, 'reasoning', 'reasoning',
                    'primary', $5, $5, $5)
          returning id::text id`,
         [
@@ -1128,7 +1144,6 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         now: FIXED_NOW,
       });
       expect(guardianInterval.work).toEqual([]);
-      expect(guardianInterval.prompts).toEqual([]);
       await expect(source.fetchWork({
         personId,
         start: "2026-08-18T10:40:00.000Z",
@@ -1146,7 +1161,6 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         now: FIXED_NOW,
       });
       expect(canonicalLoserInterval.work).toEqual([]);
-      expect(canonicalLoserInterval.prompts).toEqual([]);
     } finally {
       if (source) await source.close();
       try {

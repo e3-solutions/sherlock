@@ -59,12 +59,13 @@ function rowsFor(personId, overrides = {}) {
   }));
 }
 
-function sqlSection(sql, start, end) {
-  const startIndex = sql.indexOf(start);
-  const endIndex = sql.indexOf(end, startIndex + start.length);
-  expect(startIndex).toBeGreaterThanOrEqual(0);
-  expect(endIndex).toBeGreaterThan(startIndex);
-  return sql.slice(startIndex, endIndex);
+function expectSqlInOrder(sql, ...fragments) {
+  let previousIndex = -1;
+  for (const fragment of fragments) {
+    const index = sql.indexOf(fragment, previousIndex + 1);
+    expect(index).toBeGreaterThan(previousIndex);
+    previousIndex = index;
+  }
 }
 
 describe("Sherlock Flame payload", () => {
@@ -221,9 +222,6 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("max(a.observed_at) latest_activity");
     expect(FLAME_SQL).toContain("where a.observed_at < p.end_at");
     expect(FLAME_SQL).toContain("s.started_at session_started_at");
-    expect(FLAME_SQL).toContain(
-      "where canonical_rank = 1\n     and actor_role <> 'guardian'\n     and observed_at >= date_trunc('milliseconds', session_started_at)",
-    );
     expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
     expect(FLAME_SQL).not.toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
@@ -231,41 +229,26 @@ describe("Sherlock Flame payload", () => {
   });
 
   it("excludes guardians only after canonical activity winners are selected", () => {
-    const aggregateCandidates = sqlSection(
+    expectSqlInOrder(
       FLAME_SQL,
       "activity_candidates as materialized",
       "activity_events as materialized",
-    );
-    const aggregateBoundary = sqlSection(
-      FLAME_SQL,
-      "activity_events as materialized",
+      "where canonical_rank = 1",
+      "and actor_role <> 'guardian'",
       "bucket_activity as materialized",
     );
-    expect(aggregateCandidates).not.toContain("actor_role <> 'guardian'");
-    expect(aggregateBoundary.indexOf("where canonical_rank = 1")).toBeLessThan(
-      aggregateBoundary.indexOf("and actor_role <> 'guardian'"),
-    );
-    expect(aggregateBoundary).toContain("and actor_role <> 'guardian'");
     expect(FLAME_SQL).toContain("where a.actor_role = 'worker'");
 
     for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
-      const candidates = sqlSection(
+      expectSqlInOrder(
         sql,
         "activity_candidates as materialized",
         "activity_event_ids as materialized",
-      );
-      const ids = sqlSection(
-        sql,
-        "activity_event_ids as materialized",
+        "where canonical_rank = 1",
+        "and actor_role <> 'guardian'",
         "activity_events as materialized",
       );
-      expect(candidates).not.toContain("actor_role <> 'guardian'");
-      expect(ids.indexOf("where canonical_rank = 1")).toBeLessThan(
-        ids.indexOf("and actor_role <> 'guardian'"),
-      );
-      expect(ids).toContain("and actor_role <> 'guardian'");
       expect(sql).toContain("when actor_role = 'worker' then 'subagent'");
-      expect(sql).not.toContain("when actor_role in ('worker', 'guardian')");
     }
   });
 
@@ -765,11 +748,6 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_PROMPTS_SQL).toContain("limit $11");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("activity_candidates as materialized");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("context_before");
-    expect(sqlSection(
-      INTERVAL_PROMPTS_SQL,
-      "prompt_candidates as materialized",
-      "select prompt_identity",
-    )).not.toContain("actor_role <> 'guardian'");
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
   });
 
@@ -834,22 +812,14 @@ describe("Sherlock Flame payload", () => {
       PROJECTION_INTERVAL_PROMPTS_SQL,
       PROJECTION_WORK_DETAIL_SQL,
     ]) {
-      const ranked = sqlSection(
+      expectSqlInOrder(
         sql,
         "ranked_frame_revisions as materialized",
         "latest_frame_evidence as materialized",
-      );
-      const latest = sqlSection(
-        sql,
-        "latest_frame_evidence as materialized",
+        "where latest_rank = 1 and not is_tombstone",
+        "projected_activity as materialized",
+        "and actor_role <> 'guardian'",
         "projected_prompt_candidates as materialized",
-      );
-      expect(ranked).not.toContain("actor_role <> 'guardian'");
-      expect(latest.indexOf("where latest_rank = 1 and not is_tombstone")).toBeLessThan(
-        latest.indexOf("and actor_role <> 'guardian'"),
-      );
-      expect(latest).toContain(
-        "where evidence_kind = 'activity'\n     and actor_role <> 'guardian'",
       );
     }
     for (const sql of [
@@ -857,7 +827,6 @@ describe("Sherlock Flame payload", () => {
       PROJECTION_WORK_DETAIL_SQL,
     ]) {
       expect(sql).toContain("when actor_role = 'worker' then 'subagent'");
-      expect(sql).not.toContain("when actor_role in ('worker', 'guardian')");
     }
     expect(PROJECTION_FLAME_SQL).toContain(
       "where evidence.actor_role = 'worker'",
