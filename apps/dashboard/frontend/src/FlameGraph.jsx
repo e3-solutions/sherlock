@@ -616,7 +616,7 @@ function WorkDetail({
               </ol>
             )}
           </section>
-          {evidence.nextCursor && (
+          {evidence.nextCursor && !evidence.moreError && (
             <button
               type="button"
               className="flame-detail__more flame-detail__more--session"
@@ -627,9 +627,16 @@ function WorkDetail({
             </button>
           )}
           {evidence.moreError && (
-            <p className="flame-detail__more-error flame-detail__more-error--session" role="alert">
-              More session evidence could not be loaded. Try again.
-            </p>
+            <div className="flame-detail__more-error flame-detail__more-error--session" role="alert">
+              <p>{evidenceErrorCopy("session", evidence.moreError)}</p>
+              <button
+                type="button"
+                className="flame-detail__more"
+                onClick={needsTimelineRefresh(evidence.moreError) ? onRefresh : onLoadMore}
+              >
+                {needsTimelineRefresh(evidence.moreError) ? "Refresh timeline" : "Retry"}
+              </button>
+            </div>
           )}
           <EvidenceLimits />
         </div>
@@ -1131,7 +1138,8 @@ export default function FlameGraph({
   };
 
   const refreshWorkTimeline = () => {
-    if (workEvidence.reason?.endsWith("_request_not_found")) backToOverview();
+    const reason = workEvidence.reason || workEvidence.moreError;
+    if (reason?.endsWith("_request_not_found")) backToOverview();
     if (onRefresh) onRefresh();
     else setWorkRevision((revision) => revision + 1);
   };
@@ -1155,7 +1163,7 @@ export default function FlameGraph({
       const response = await fetch(`/api/flame/work?${query}`, {
         headers: { Accept: "application/json" }, cache: "no-store", signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`Work request failed with HTTP ${response.status}`);
+      if (!response.ok) throw await apiFailure(response, `flame_work_http_${response.status}`);
       const page = adaptWorkEvidence(await response.json(), {
         personId: selectedPerson.id,
         startMs: selectedPoint.startMs,
@@ -1177,9 +1185,13 @@ export default function FlameGraph({
         loadingMore: false,
         moreError: false,
       }));
-    } catch {
+    } catch (error) {
       if (!controller.signal.aborted) {
-        setWorkEvidence((current) => ({ ...current, loadingMore: false, moreError: true }));
+        setWorkEvidence((current) => ({
+          ...current,
+          loadingMore: false,
+          moreError: evidenceFailureReason(error),
+        }));
       }
     }
   };

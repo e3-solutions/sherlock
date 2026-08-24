@@ -11,7 +11,6 @@ import {
   INTERVAL_PROMPTS_SQL,
   INTERVAL_PROMPT_LIMIT,
   INTERVAL_WORK_SQL,
-  INTERVAL_WORK_LIMIT,
   MAX_WORK_DETAIL_LIMIT,
   MCP_PROMPT_EVIDENCE_LIMIT,
   NORMALIZER_VERSION,
@@ -310,9 +309,13 @@ describe("Sherlock Flame payload", () => {
     expect(payload.people[0].activeSeconds).toBe(86_400);
   });
 
-  it("excludes stable smoke identities from the complete roster", () => {
+  it("excludes stable smoke identities from roster and direct evidence paths", () => {
     expect(PEOPLE_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
     expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
+    expect(WORK_DETAIL_SQL).toContain("pe.github_id is distinct from 'sherlock-smoke'");
+    expect(PROJECTION_WORK_DETAIL_SQL).toContain(
+      "evidence_person.github_id is distinct from 'sherlock-smoke'",
+    );
   });
 
   it("requires one approved dashboard email domain", () => {
@@ -757,6 +760,18 @@ describe("Sherlock Flame payload", () => {
     expect(PROJECTION_WORK_DETAIL_SQL.indexOf("limit $12")).toBeLessThan(
       PROJECTION_WORK_DETAIL_SQL.indexOf("left join telemetry.events source"),
     );
+    const detailRevisionScope = PROJECTION_WORK_DETAIL_SQL.indexOf(
+      "and revision.session_id = p.session_id",
+    );
+    expect(detailRevisionScope).toBeGreaterThan(
+      PROJECTION_WORK_DETAIL_SQL.indexOf("ranked_frame_revisions as materialized"),
+    );
+    expect(detailRevisionScope).toBeLessThan(
+      PROJECTION_WORK_DETAIL_SQL.indexOf("), latest_frame_evidence as materialized"),
+    );
+    expect(PROJECTION_INTERVAL_WORK_SQL).not.toContain(
+      "revision.session_id = p.session_id",
+    );
     expect(PROJECTION_FLAME_SQL).toContain(
       "and observed_at >= p.start_at and observed_at < p.read_at",
     );
@@ -997,7 +1012,6 @@ describe("Sherlock Flame payload", () => {
     }];
     const unsafe = vi.fn()
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-      .mockResolvedValueOnce([header])
       .mockResolvedValueOnce(items);
     source.transaction = (callback) => callback({
       unsafe,
@@ -1014,11 +1028,9 @@ describe("Sherlock Flame payload", () => {
       limit: "1",
     });
 
-    expect(unsafe.mock.calls).toHaveLength(3);
-    expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
-    expect(unsafe.mock.calls[1][1].at(-1)).toBe(INTERVAL_WORK_LIMIT + 1);
-    expect(unsafe.mock.calls[2][0]).toBe(WORK_DETAIL_SQL);
-    expect(unsafe.mock.calls[2][1].at(-1)).toBe(2);
+    expect(unsafe.mock.calls).toHaveLength(2);
+    expect(unsafe.mock.calls[1][0]).toBe(WORK_DETAIL_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(2);
     expect(detail.items).toEqual([expect.objectContaining({
       id: "41",
       role: "user",
@@ -1034,6 +1046,65 @@ describe("Sherlock Flame payload", () => {
       workId: `${sessionId}:agent`,
       eventCount: 2,
     });
+  });
+
+  it("returns detail metadata when the selected conversation page is empty", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([{
+        session_id: sessionId,
+        semantic_role: "unclassified",
+        first_at: new Date("2026-08-16T12:00:00.000Z"),
+        last_at: new Date("2026-08-16T12:00:03.000Z"),
+        event_count: 3,
+        summary: null,
+        id: null,
+        observed_at: null,
+        observed_at_microseconds: null,
+        message_role: null,
+        content_byte_size: null,
+        content_excerpt: null,
+      }]);
+    source.transaction = (callback) => callback({
+      unsafe,
+      array: (values) => values,
+    });
+    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+    const detail = await source.fetchWork({
+      personId,
+      start: START.toISOString(),
+      sessionId,
+      role: "unclassified",
+      snapshot,
+    });
+
+    expect(unsafe).toHaveBeenCalledTimes(2);
+    expect(unsafe.mock.calls[1][0]).toBe(WORK_DETAIL_SQL);
+    expect(detail).toMatchObject({
+      workId: `${sessionId}:unclassified`,
+      sessionId,
+      role: "unclassified",
+      eventCount: 3,
+      items: [],
+      nextCursor: null,
+    });
+
+    unsafe.mockReset()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([]);
+    await expect(source.fetchWork({
+      personId,
+      start: START.toISOString(),
+      sessionId,
+      role: "unclassified",
+      snapshot,
+    })).rejects.toMatchObject({ code: "flame_work_request_not_found" });
+    expect(unsafe).toHaveBeenCalledTimes(2);
   });
 
   it("round-trips work cursors and enforces page bounds", async () => {

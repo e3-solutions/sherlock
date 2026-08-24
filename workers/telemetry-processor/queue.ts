@@ -29,6 +29,15 @@ export interface ReductionJob extends BaseJob {
 export type TelemetryJob = NormalizationJob | ReductionJob;
 export type CompletionResult = "succeeded" | "requeued" | "fenced";
 
+export interface ReductionEnqueue {
+  workspaceId: string;
+  sessionId: string;
+  normalizerVersion: string;
+  activityVersion: string;
+  targetEventId: bigint;
+  workloadClass: WorkloadClass;
+}
+
 type Sql = ReturnType<typeof postgres>;
 
 export class PostgresJobQueue {
@@ -119,27 +128,38 @@ export class PostgresJobQueue {
     });
   }
 
-  async enqueueReduction(options: {
-    workspaceId: string;
-    sessionId: string;
-    normalizerVersion: string;
-    activityVersion: string;
-    targetEventId: bigint;
-    workloadClass: WorkloadClass;
-  }): Promise<void> {
-    if (options.targetEventId <= 0n) return;
+  async enqueueReduction(options: ReductionEnqueue): Promise<void> {
+    await this.enqueueReductions([options]);
+  }
+
+  async enqueueReductions(options: readonly ReductionEnqueue[]): Promise<void> {
+    const requests = coalesceReductionEnqueues(options);
+    if (requests.length === 0) return;
     await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       await tx.unsafe(
-        `insert into processing.telemetry_jobs (
+        `with requested as (
+           select *
+             from unnest(
+               $1::uuid[], $2::uuid[], $3::text[], $4::text[],
+               $5::bigint[], $6::text[]
+             ) as request(
+               workspace_id, session_id, normalizer_version,
+               activity_version, target_event_id, workload_class
+             )
+         )
+         insert into processing.telemetry_jobs (
            workspace_id, job_kind, session_id, normalizer_version,
            activity_version, target_event_id, request_generation,
            workload_class, available_at
-         ) values (
-           $1, 'reduce', $2, $3, $4, $5, 1, $6,
-           now() + case when $6 = 'live' then interval '100 milliseconds'
+         ) select
+           workspace_id, 'reduce', session_id, normalizer_version,
+           activity_version, target_event_id, 1, workload_class,
+           now() + case when workload_class = 'live'
+                          then interval '100 milliseconds'
                         else interval '2 seconds' end
-         ) on conflict (
+           from requested
+         on conflict (
            workspace_id, session_id, normalizer_version, activity_version
          ) where job_kind = 'reduce' do update set
            target_event_id = greatest(
@@ -176,12 +196,12 @@ export class PostgresJobQueue {
            end,
            updated_at = now()`,
         [
-          options.workspaceId,
-          options.sessionId,
-          options.normalizerVersion,
-          options.activityVersion,
-          options.targetEventId.toString(),
-          options.workloadClass,
+          requests.map((request) => request.workspaceId),
+          requests.map((request) => request.sessionId),
+          requests.map((request) => request.normalizerVersion),
+          requests.map((request) => request.activityVersion),
+          requests.map((request) => request.targetEventId.toString()),
+          requests.map((request) => request.workloadClass),
         ],
       );
     });
@@ -321,6 +341,45 @@ export class PostgresJobQueue {
       return (await tx.unsafe(query, parameters as never[])).length === 1;
     });
   }
+}
+
+function coalesceReductionEnqueues(
+  options: readonly ReductionEnqueue[],
+): ReductionEnqueue[] {
+  const requests = new Map<string, ReductionEnqueue>();
+  for (const option of options) {
+    if (option.targetEventId <= 0n) continue;
+    const key = [
+      option.workspaceId,
+      option.sessionId,
+      option.normalizerVersion,
+      option.activityVersion,
+    ].join("\0");
+    const current = requests.get(key);
+    if (!current) {
+      requests.set(key, { ...option });
+      continue;
+    }
+    requests.set(key, {
+      ...current,
+      targetEventId: option.targetEventId > current.targetEventId
+        ? option.targetEventId
+        : current.targetEventId,
+      workloadClass: option.workloadClass === "live"
+        ? "live"
+        : current.workloadClass,
+    });
+  }
+  return [...requests.values()].sort((left, right) =>
+    compareText(left.workspaceId, right.workspaceId) ||
+    compareText(left.sessionId, right.sessionId) ||
+    compareText(left.normalizerVersion, right.normalizerVersion) ||
+    compareText(left.activityVersion, right.activityVersion)
+  );
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function jobFromRow(row: Record<string, unknown>): TelemetryJob {

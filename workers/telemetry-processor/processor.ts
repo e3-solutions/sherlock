@@ -16,12 +16,23 @@ import type { NormalizationJob, ReductionJob, WorkloadClass } from "./queue.ts";
 
 type Sql = ReturnType<typeof postgres>;
 
-export const AFFECTED_SESSIONS_SQL = `
-select id::text as id
-  from telemetry.sessions
- where workspace_id = $1
-   and (id = any($2::uuid[]) or parent_session_id = any($2::uuid[]))
- order by id
+export const AFFECTED_SESSION_CUTOFFS_SQL = `
+with affected_sessions as (
+  select id
+    from telemetry.sessions
+   where workspace_id = $1
+     and (id = any($2::uuid[]) or parent_session_id = any($2::uuid[]))
+)
+select affected_sessions.id::text as session_id,
+       max(events.id)::text as target_event_id
+  from affected_sessions
+  join telemetry.events events
+    on events.workspace_id = $1
+   and events.session_id = affected_sessions.id
+   and events.normalizer_version = $3
+ group by affected_sessions.id
+having max(events.id) > 0
+ order by affected_sessions.id
 `;
 
 export interface ProcessingResult {
@@ -38,6 +49,11 @@ export interface ReductionTarget {
   activity_version: string;
   target_event_id: bigint;
   workload_class: WorkloadClass;
+}
+
+export interface SessionCutoffRow {
+  session_id: string;
+  target_event_id: bigint;
 }
 
 export interface TargetedReducer {
@@ -103,29 +119,21 @@ export class TelemetryProcessor {
       batch.manifest,
       source,
     );
-    const affectedSessionIds = await this.resolveAffectedSessionIds(
-      job.workspace_id,
-      normalized.session_ids,
+    return await resolveReductionTargets(
+      {
+        workspaceId: job.workspace_id,
+        normalizedSessionIds: normalized.session_ids,
+        normalizerVersion: normalized.normalizer_version,
+        activityVersion: ACTIVITY_VERSION,
+        workloadClass: job.workload_class,
+      },
+      (normalizedSessionIds) =>
+        this.resolveAffectedSessionCutoffs(
+          job.workspace_id,
+          normalizedSessionIds,
+          normalized.normalizer_version,
+        ),
     );
-    const targets: ReductionTarget[] = [];
-    for (const sessionId of affectedSessionIds) {
-      const targetEventId = await this.resolveSessionCutoff(
-        job.workspace_id,
-        sessionId,
-        normalized.normalizer_version,
-      );
-      if (targetEventId > 0n) {
-        targets.push({
-          workspace_id: job.workspace_id,
-          session_id: sessionId,
-          normalizer_version: normalized.normalizer_version,
-          activity_version: ACTIVITY_VERSION,
-          target_event_id: targetEventId,
-          workload_class: job.workload_class,
-        });
-      }
-    }
-    return targets;
   }
 
   async reduce(
@@ -258,38 +266,64 @@ export class TelemetryProcessor {
     });
   }
 
-  private async resolveSessionCutoff(
-    workspaceId: string,
-    sessionId: string,
-    normalizerVersion: string,
-  ): Promise<bigint> {
-    return await this.loader.begin(async (tx) => {
-      await tx.unsafe("set local role sherlock_normalizer");
-      const rows = await tx.unsafe(
-        `select coalesce(max(id), 0)::text as cutoff
-           from telemetry.events
-          where workspace_id = $1 and session_id = $2
-            and normalizer_version = $3`,
-        [workspaceId, sessionId, normalizerVersion],
-      );
-      return BigInt(String(rows[0].cutoff));
-    });
-  }
-
-  private async resolveAffectedSessionIds(
+  private async resolveAffectedSessionCutoffs(
     workspaceId: string,
     normalizedSessionIds: readonly string[],
-  ): Promise<string[]> {
-    if (normalizedSessionIds.length === 0) return [];
+    normalizerVersion: string,
+  ): Promise<SessionCutoffRow[]> {
     return await this.loader.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_normalizer");
       const rows = await tx.unsafe(
-        AFFECTED_SESSIONS_SQL,
-        [workspaceId, normalizedSessionIds],
+        AFFECTED_SESSION_CUTOFFS_SQL,
+        [workspaceId, normalizedSessionIds, normalizerVersion],
       );
-      return rows.map((row) => String(row.id));
+      return rows.map((row) => ({
+        session_id: String(row.session_id),
+        target_event_id: BigInt(String(row.target_event_id)),
+      }));
     });
   }
+}
+
+export async function resolveReductionTargets(
+  options: {
+    workspaceId: string;
+    normalizedSessionIds: readonly string[];
+    normalizerVersion: string;
+    activityVersion: string;
+    workloadClass: WorkloadClass;
+  },
+  resolveCutoffs: (
+    normalizedSessionIds: readonly string[],
+  ) => Promise<readonly SessionCutoffRow[]>,
+): Promise<ReductionTarget[]> {
+  const normalizedSessionIds = [...new Set(options.normalizedSessionIds)]
+    .sort();
+  if (normalizedSessionIds.length === 0) return [];
+
+  const greatestCutoffBySession = new Map<string, bigint>();
+  for (const row of await resolveCutoffs(normalizedSessionIds)) {
+    if (row.target_event_id <= 0n) continue;
+    const current = greatestCutoffBySession.get(row.session_id) ?? 0n;
+    greatestCutoffBySession.set(
+      row.session_id,
+      row.target_event_id > current ? row.target_event_id : current,
+    );
+  }
+  return [...greatestCutoffBySession.entries()]
+    .sort(([left], [right]) => compareText(left, right))
+    .map(([sessionId, targetEventId]) => ({
+      workspace_id: options.workspaceId,
+      session_id: sessionId,
+      normalizer_version: options.normalizerVersion,
+      activity_version: options.activityVersion,
+      target_event_id: targetEventId,
+      workload_class: options.workloadClass,
+    }));
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 export async function reduceAffectedSessions(

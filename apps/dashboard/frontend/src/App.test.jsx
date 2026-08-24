@@ -1,8 +1,9 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { adaptMock } = vi.hoisted(() => ({
+const { adaptMock, flameGraphRenderMock } = vi.hoisted(() => ({
   adaptMock: vi.fn(),
+  flameGraphRenderMock: vi.fn(),
 }));
 
 vi.mock("./flame-data.js", () => ({
@@ -11,13 +12,16 @@ vi.mock("./flame-data.js", () => ({
 }));
 
 vi.mock("./FlameGraph.jsx", () => ({
-  default: ({ data, rankBy, stale, onRefresh, timelineMeta }) => (
-    <div data-testid="flame-graph" data-rank-by={rankBy} data-stale={String(stale)}>
-      {timelineMeta}
-      {data.marker}
-      <button type="button" onClick={onRefresh}>Refresh timeline</button>
-    </div>
-  ),
+  default: ({ data, rankBy, stale, onRefresh, timelineMeta }) => {
+    flameGraphRenderMock();
+    return (
+      <div data-testid="flame-graph" data-rank-by={rankBy} data-stale={String(stale)}>
+        {timelineMeta}
+        {data.marker}
+        <button type="button" onClick={onRefresh}>Refresh timeline</button>
+      </div>
+    );
+  },
   PERSON_RANK_OPTIONS: [
     { value: "roster", label: "Name" },
     { value: "active-time", label: "Active time" },
@@ -62,6 +66,7 @@ describe("App", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-14T12:03:00Z"));
     adaptMock.mockReturnValue(model);
+    flameGraphRenderMock.mockClear();
   });
 
   afterEach(() => {
@@ -274,13 +279,14 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("updates the visible read age without refetching", async () => {
+  it("updates the visible read age without refetching or rerendering the graph", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response());
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     await settle();
     expect(screen.getByText(/read 1m ago/)).toBeInTheDocument();
+    const graphRenders = flameGraphRenderMock.mock.calls.length;
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(60 * 1000);
@@ -288,6 +294,7 @@ describe("App", () => {
 
     expect(screen.getByText(/read 2m ago/)).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(flameGraphRenderMock).toHaveBeenCalledTimes(graphRenders);
   });
 
   it("aborts an in-flight request on unmount", () => {

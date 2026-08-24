@@ -253,9 +253,9 @@ async function runJob(
   }
 }
 
-async function normalizeAndEnqueue(
-  queue: PostgresJobQueue,
-  processor: TelemetryProcessor,
+export async function normalizeAndEnqueue(
+  queue: Pick<PostgresJobQueue, "enqueueReductions">,
+  processor: Pick<TelemetryProcessor, "normalize">,
   job: Extract<TelemetryJob, { job_kind: "normalize" }>,
 ): Promise<{
   session_count: number;
@@ -264,16 +264,16 @@ async function normalizeAndEnqueue(
   tombstone_count: number;
 }> {
   const targets = await processor.normalize(job);
-  for (const target of targets) {
-    await queue.enqueueReduction({
+  await queue.enqueueReductions(
+    targets.map((target) => ({
       workspaceId: target.workspace_id,
       sessionId: target.session_id,
       normalizerVersion: target.normalizer_version,
       activityVersion: target.activity_version,
       targetEventId: target.target_event_id,
       workloadClass: target.workload_class,
-    });
-  }
+    })),
+  );
   return {
     session_count: targets.length,
     candidate_count: 0,

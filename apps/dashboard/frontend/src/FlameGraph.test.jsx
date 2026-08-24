@@ -981,6 +981,144 @@ describe("FlameGraph", () => {
     expect(screen.queryByRole("button", { name: "Load more session evidence" })).not.toBeInTheDocument();
   });
 
+  it("retains loaded turns and retries a transient later-page failure with the same cursor", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    let laterPageAttempts = 0;
+    vi.mocked(fetch).mockImplementation((url, options) => {
+      const request = new URL(url, "http://dashboard.test");
+      if (request.pathname !== "/api/flame/work") return defaultFetch(url, options);
+      const start = request.searchParams.get("start");
+      const personId = request.searchParams.get("personId");
+      const snapshot = request.searchParams.get("snapshot");
+      const sessionId = request.searchParams.get("sessionId");
+      const role = request.searchParams.get("role");
+      const cursor = request.searchParams.get("cursor");
+      if (cursor) {
+        laterPageAttempts += 1;
+        if (laterPageAttempts === 1) {
+          return Promise.resolve({
+            ok: false,
+            status: 503,
+            json: () => Promise.resolve({ error: "flame_database_unavailable" }),
+          });
+        }
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          personId, start, snapshot, workId: `${sessionId}:${role}`, sessionId, role,
+          firstAt: start,
+          lastAt: new Date(Date.parse(start) + 2000).toISOString(),
+          eventCount: 2,
+          items: cursor ? [{
+            id: "event-later",
+            at: new Date(Date.parse(start) + 2000).toISOString(),
+            role: "assistant",
+            content: "Recovered later turn",
+            truncated: false,
+          }] : [{
+            id: "event-first",
+            at: start,
+            role: "user",
+            content: "First exact prompt",
+            truncated: false,
+          }],
+          nextCursor: cursor ? null : "retry-this-cursor",
+        }),
+      });
+    });
+
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: /First exact prompt/ }));
+    await screen.findByText("Conversation");
+    fireEvent.click(screen.getByRole("button", { name: "Load more session evidence" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Session evidence is temporarily unavailable. Try again.",
+    );
+    expect(screen.getByText("First exact prompt")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Load more session evidence" }))
+      .not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByText("Recovered later turn")).toBeInTheDocument();
+    expect(screen.getByText("First exact prompt")).toBeInTheDocument();
+    const laterPageUrls = vi.mocked(fetch).mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes("cursor="));
+    expect(laterPageUrls).toHaveLength(2);
+    expect(laterPageUrls.every((url) => url.includes("cursor=retry-this-cursor"))).toBe(true);
+  });
+
+  it("retains loaded turns and offers timeline refresh for an expired later page", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation((url, options) => {
+      const request = new URL(url, "http://dashboard.test");
+      if (request.pathname !== "/api/flame/work") return defaultFetch(url, options);
+      const start = request.searchParams.get("start");
+      const personId = request.searchParams.get("personId");
+      const snapshot = request.searchParams.get("snapshot");
+      const sessionId = request.searchParams.get("sessionId");
+      const role = request.searchParams.get("role");
+      if (request.searchParams.has("cursor")) {
+        return Promise.resolve({
+          ok: false,
+          status: 410,
+          json: () => Promise.resolve({ error: "flame_work_snapshot_expired" }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          personId, start, snapshot, workId: `${sessionId}:${role}`, sessionId, role,
+          firstAt: start,
+          lastAt: new Date(Date.parse(start) + 2000).toISOString(),
+          eventCount: 2,
+          items: [{
+            id: "event-first",
+            at: start,
+            role: "user",
+            content: "First exact prompt",
+            truncated: false,
+          }],
+          nextCursor: "expired-cursor",
+        }),
+      });
+    });
+    const onRefresh = vi.fn();
+    const { container } = render(
+      <FlameGraph data={model()} chartWidth={1008} onRefresh={onRefresh} />,
+    );
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: /First exact prompt/ }));
+    await screen.findByText("Conversation");
+    fireEvent.click(screen.getByRole("button", { name: "Load more session evidence" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "This timeline snapshot has expired. Refresh the timeline to load session evidence.",
+    );
+    expect(screen.getByText("First exact prompt")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh timeline" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes("cursor=")))
+      .toHaveLength(1);
+  });
+
   it("exposes stale state without replacing the last-good graph", () => {
     const { container } = render(<FlameGraph data={model()} chartWidth={1008} stale />);
 

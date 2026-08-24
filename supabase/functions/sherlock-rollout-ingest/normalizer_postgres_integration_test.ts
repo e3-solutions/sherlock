@@ -3,12 +3,15 @@ import { PostgresActivityReducer } from "../sherlock-activity-reducer/postgres.t
 import { CLAUDE_NORMALIZER_VERSION } from "./normalizer.ts";
 import {
   type BatchManifest,
+  type CollectorIdentity,
   type CommittedReceipt,
   CONTRACT_VERSION,
+  IngestError,
   RECEIPT_VERSION,
   sha256Hex,
 } from "./contract.ts";
 import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
+import { PostgresBatchRepository } from "./postgres.ts";
 
 const permission = await Deno.permissions.query({
   name: "env",
@@ -575,6 +578,82 @@ async function assertParentLink(
 }
 
 Deno.test({
+  name: "Postgres person attribution skips identical physical updates",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 2 });
+    const repository = PostgresBatchRepository.connect(databaseUrl!);
+    const workspaceId = crypto.randomUUID();
+    const grant = {
+      workspace_id: workspaceId,
+      collector_key_prefix: "identity-integration",
+    };
+    const identity: CollectorIdentity = {
+      name: "Identity Test",
+      github_id: "identity-test",
+      email: "identity-test@example.com",
+      installation_id: crypto.randomUUID(),
+    };
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Identity integration test')`,
+        [workspaceId, `identity-${workspaceId}`],
+      );
+
+      const first = await repository.resolveAttribution(grant, identity);
+      const beforeReplay = await sql.unsafe(
+        `select xmin::text as xmin, display_name, github_id
+           from telemetry.people
+          where workspace_id = $1 and id = $2`,
+        [workspaceId, first.person_id],
+      );
+      const replay = await repository.resolveAttribution(grant, identity);
+      const afterReplay = await sql.unsafe(
+        `select xmin::text as xmin, display_name, github_id
+           from telemetry.people
+          where workspace_id = $1 and id = $2`,
+        [workspaceId, first.person_id],
+      );
+      assert(replay.person_id === first.person_id);
+      assert(
+        afterReplay[0].xmin === beforeReplay[0].xmin,
+        "identical person attribution must not create a new row version",
+      );
+
+      const changed = await repository.resolveAttribution(grant, {
+        ...identity,
+        name: "Changed Identity Test",
+        github_id: "changed-identity-test",
+      });
+      const afterChange = await sql.unsafe(
+        `select xmin::text as xmin, display_name, github_id
+           from telemetry.people
+          where workspace_id = $1 and id = $2`,
+        [workspaceId, first.person_id],
+      );
+      assert(changed.person_id === first.person_id);
+      assert(
+        afterChange[0].xmin !== afterReplay[0].xmin &&
+          afterChange[0].display_name === "Changed Identity Test" &&
+          afterChange[0].github_id === "changed-identity-test",
+        "changed person metadata must create an auditable row version",
+      );
+    } finally {
+      await sql.unsafe("delete from telemetry.people where workspace_id = $1", [
+        workspaceId,
+      ]).catch(() => undefined);
+      await sql.unsafe("delete from telemetry.workspaces where id = $1", [
+        workspaceId,
+      ]).catch(() => undefined);
+      await Promise.allSettled([repository.close(), sql.end()]);
+    }
+  },
+});
+
+Deno.test({
   name:
     "Postgres normalizer repairs parent-first, child-first, replayed, and concurrent session trees",
   ignore: !databaseUrl,
@@ -659,14 +738,45 @@ Deno.test({
         "child-first-child",
         "child-first-parent",
       );
+      const beforeReplay = await sql.unsafe(
+        `select xmin::text as xmin, updated_at::text as updated_at
+           from telemetry.sessions
+          where workspace_id = $1 and id = $2`,
+        [workspaceId, childSessionId],
+      );
       assert(
         await normalize(firstNormalizer, childFirstChild) === childSessionId,
         "child replay must preserve its session id",
+      );
+      const afterReplay = await sql.unsafe(
+        `select xmin::text as xmin, updated_at::text as updated_at
+           from telemetry.sessions
+          where workspace_id = $1 and id = $2`,
+        [workspaceId, childSessionId],
+      );
+      assert(
+        afterReplay[0].xmin === beforeReplay[0].xmin &&
+          afterReplay[0].updated_at === beforeReplay[0].updated_at,
+        "identical session replay must preserve xmin and updated_at",
       );
       assert(
         await normalize(firstNormalizer, childFirstParent) === parentSessionId,
         "parent replay must preserve its session id",
       );
+
+      const wrongPersonReplay = await seedBatch(sql, {
+        workspaceId,
+        personId: otherPersonId,
+        collectorKey,
+        nativeSessionId: "child-first-child",
+      });
+      try {
+        await normalize(firstNormalizer, wrongPersonReplay);
+        assert(false, "wrong-person session replay must conflict");
+      } catch (error) {
+        assert(error instanceof IngestError);
+        assert(error.code === "session_attribution_conflict");
+      }
 
       const concurrentChild = await seedBatch(sql, {
         workspaceId,

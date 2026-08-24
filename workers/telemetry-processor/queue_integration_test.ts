@@ -405,6 +405,104 @@ Deno.test({
       assert(newest?.job_kind === "reduce");
       assert(newest.target_event_id === 30n);
       assert(await queue.complete(newest) === "succeeded");
+
+      await queue.enqueueReductions([{
+        workspaceId,
+        sessionId,
+        normalizerVersion: "test.normalizer.v1",
+        activityVersion: "test.activity.v1",
+        targetEventId: 30n,
+        workloadClass: "backfill",
+      }]);
+      const resetSucceeded = await sql.unsafe(
+        `select status, attempt_count, completed_at,
+                request_generation::text as request_generation,
+                workload_class
+           from processing.telemetry_jobs
+          where workspace_id = $1 and session_id = $2`,
+        [workspaceId, sessionId],
+      );
+      assert(resetSucceeded[0].status === "queued");
+      assert(Number(resetSucceeded[0].attempt_count) === 0);
+      assert(resetSucceeded[0].completed_at === null);
+      assert(resetSucceeded[0].request_generation === "5");
+      assert(
+        resetSucceeded[0].workload_class === "live",
+        "a prior live request must not be demoted",
+      );
+      await sql.unsafe(
+        `update processing.telemetry_jobs set available_at = now()
+          where workspace_id = $1 and session_id = $2`,
+        [workspaceId, sessionId],
+      );
+      const failedReduction = await queue.claim("live", "worker-failure", 60);
+      assert(failedReduction?.job_kind === "reduce");
+      assert(await queue.fail(failedReduction, "test_failure", "test failure"));
+      await queue.enqueueReductions([{
+        workspaceId,
+        sessionId,
+        normalizerVersion: "test.normalizer.v1",
+        activityVersion: "test.activity.v1",
+        targetEventId: 30n,
+        workloadClass: "backfill",
+      }]);
+      const resetFailed = await sql.unsafe(
+        `select status, attempt_count, requeue_count, completed_at,
+                request_generation::text as request_generation
+           from processing.telemetry_jobs
+          where workspace_id = $1 and session_id = $2`,
+        [workspaceId, sessionId],
+      );
+      assert(resetFailed[0].status === "queued");
+      assert(Number(resetFailed[0].attempt_count) === 0);
+      assert(Number(resetFailed[0].requeue_count) === 1);
+      assert(resetFailed[0].completed_at === null);
+      assert(resetFailed[0].request_generation === "6");
+
+      const bulkSessions = await sql.unsafe(
+        `insert into telemetry.sessions (
+           workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         )
+         select $1, $2, 'queue-collector', 'queue-bulk-' || ordinal::text,
+                'primary', 'test.v1', now()
+           from generate_series(1, 75) ordinal
+        returning id::text as id`,
+        [workspaceId, personId],
+      );
+      const bulkRequests = bulkSessions.map((row, index) => ({
+        workspaceId,
+        sessionId: String(row.id),
+        normalizerVersion: "test.normalizer.v1",
+        activityVersion: "test.activity.v1",
+        targetEventId: BigInt(index + 1),
+        workloadClass: "backfill" as const,
+      }));
+      await queue.enqueueReductions([
+        ...bulkRequests.reverse(),
+        {
+          ...bulkRequests[0],
+          targetEventId: 1_000n,
+          workloadClass: "live",
+        },
+      ]);
+      const bulkState = await sql.unsafe(
+        `select count(*)::int as count,
+                min(request_generation)::text as minimum_generation,
+                max(request_generation)::text as maximum_generation,
+                max(target_event_id)::text as maximum_target,
+                count(*) filter (where workload_class = 'live')::int as live_count
+           from processing.telemetry_jobs
+          where workspace_id = $1
+            and session_id = any($2::uuid[])
+            and job_kind = 'reduce'`,
+        [workspaceId, bulkSessions.map((row) => String(row.id))],
+      );
+      assert(Number(bulkState[0].count) === 75);
+      assert(bulkState[0].minimum_generation === "1");
+      assert(bulkState[0].maximum_generation === "1");
+      assert(bulkState[0].maximum_target === "1000");
+      assert(Number(bulkState[0].live_count) === 1);
     } finally {
       await sql.unsafe(
         "delete from processing.telemetry_jobs where workspace_id = $1",

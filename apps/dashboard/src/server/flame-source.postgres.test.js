@@ -155,7 +155,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     }
   }, 30_000);
 
-  it("activates a snapshot-stable projection with exact legacy parity", async () => {
+  it("activates a snapshot-stable projection with parity and blocks direct smoke detail", async () => {
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
     const sessionId = crypto.randomUUID();
@@ -348,6 +348,26 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect(projectedDay.people[0].total[0]).toBe(1);
       expect(projectedInterval.work).toEqual(legacyInterval.work);
       expect(projectedInterval.prompts).toEqual(legacyInterval.prompts);
+
+      await sql.unsafe(
+        "update telemetry.people set github_id = 'sherlock-smoke' where workspace_id = $1 and id = $2",
+        [workspaceId, personId],
+      );
+      for (const snapshot of [legacyDay.snapshot, projectedDay.snapshot]) {
+        await expect(source.fetchWork({
+          personId,
+          start: bucketStart.toISOString(),
+          sessionId,
+          role: "agent",
+          snapshot,
+          now: partialRead,
+        })).rejects.toMatchObject({ code: "flame_work_request_not_found" });
+      }
+      await sql.unsafe(
+        "update telemetry.people set github_id = null where workspace_id = $1 and id = $2",
+        [workspaceId, personId],
+      );
+
       const projectedSnapshot = decodeSnapshotToken(projectedDay.snapshot);
       const planRows = await sql.begin(async (tx) => {
         await tx.unsafe("set local role sherlock_reader");
