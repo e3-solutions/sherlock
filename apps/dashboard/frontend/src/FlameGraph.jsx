@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useId,
@@ -688,7 +689,7 @@ function PersonRail({ person, headingId, readMs, windowMinutes }) {
   );
 }
 
-function PersonLane({
+const PersonLane = memo(function PersonLane({
   person,
   peak,
   promptPeak,
@@ -863,7 +864,7 @@ function PersonLane({
       </div>
     </section>
   );
-}
+});
 
 export function getAvailableChartWidth(scrollportClientWidth, railWidth) {
   return Math.max(1, scrollportClientWidth - railWidth);
@@ -1102,13 +1103,13 @@ export default function FlameGraph({
     workRevision,
   ]);
 
-  const selectInterval = (person, point) => {
+  const selectInterval = useCallback((person, point) => {
     detailClosingRef.current = false;
     setDetailClosing(false);
     setShowAdditionalWork(false);
     setDrawerView({ screen: "overview" });
     setSelection({ personId: person.id, startMs: point.startMs });
-  };
+  }, []);
 
   const deactivateTooltip = useCallback((personId) => {
     setActiveTooltipPersonId((activePersonId) => (
