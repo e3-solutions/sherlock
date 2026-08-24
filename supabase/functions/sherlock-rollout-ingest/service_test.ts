@@ -299,7 +299,7 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
   }
 });
 
-Deno.test("Deno 2 typed-array base64 decoding preserves padding rules", () => {
+Deno.test("base64 decoding preserves padding rules across runtimes", () => {
   for (const encoded of ["dGVzdA==", "dGVzdA", " dGVz\ndA== "]) {
     assert(new TextDecoder().decode(decodeBase64Bytes(encoded)) === "test");
   }

@@ -330,7 +330,21 @@ export function parseCollectorIdentity(value: unknown): CollectorIdentity {
 }
 
 export function decodeBase64Bytes(value: string): Uint8Array {
-  return Uint8Array.fromBase64(value);
+  const typedArray = Uint8Array as Uint8ArrayConstructor & {
+    fromBase64?: (encoded: string) => Uint8Array;
+  };
+  if (typeof typedArray.fromBase64 === "function") {
+    return typedArray.fromBase64(value);
+  }
+
+  try {
+    return Uint8Array.from(
+      atob(value),
+      (character) => character.charCodeAt(0),
+    );
+  } catch {
+    throw new SyntaxError("Invalid base64 string");
+  }
 }
 
 function decodeBase64(value: unknown): Uint8Array {
