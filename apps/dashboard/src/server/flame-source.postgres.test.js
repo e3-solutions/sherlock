@@ -539,7 +539,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            workspace_id, session_id, source_record_id, normalizer_version,
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
-         ) values ($1, $2, $3, $4, 2, 100, 'reasoning', 'reasoning',
+         ) values ($1, $2, $3, $4, 5, 100, 'reasoning', 'reasoning',
                    'primary', $5, $5, $5)
          returning id::text id`,
         [
