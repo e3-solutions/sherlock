@@ -4,13 +4,62 @@ import {
   BUCKET_COUNT,
   BUCKET_MS,
   FlameDataError,
+  adaptFlameFreshness,
   adaptFlamePayload,
   adaptIntervalEvidence,
   adaptWorkEvidence,
   createTimeAxisTicks,
   getGlobalPeak,
   getPersonActivityStatus,
+  mergeFlameFreshness,
 } from "./flame-data.js";
+
+describe("dashboard freshness", () => {
+  const receipt = {
+    read: "2026-03-09T08:04:00.000Z",
+    rawWatermark: "2026-03-09T08:03:00.000Z",
+    canonicalWatermark: "2026-03-09T08:02:00.000Z",
+    oldestPendingNormalize: "2026-03-09T07:58:00.000Z",
+    pendingNormalize: 2,
+    delayed: true,
+    people: [{ id: "person-1", lastActivity: "2026-03-09T08:03:00.000Z" }],
+  };
+
+  it("updates per-person recency without changing the heavy aggregate", () => {
+    const timeline = adaptFlamePayload(payload());
+    const merged = mergeFlameFreshness(timeline, adaptFlameFreshness(receipt));
+
+    expect(merged.people[0].lastActivityMs).toBe(Date.parse(receipt.people[0].lastActivity));
+    expect(merged.people[0].buckets).toBe(timeline.people[0].buckets);
+    expect(merged.recencyReadMs).toBe(Date.parse(receipt.read));
+  });
+
+  it("preserves an older heavy-timeline timestamp when the 30-minute receipt is null", () => {
+    const older = "2026-03-09T06:30:00.000Z";
+    const timeline = adaptFlamePayload(payload({
+      people: [person({ lastActivity: older })],
+    }));
+    const merged = mergeFlameFreshness(timeline, adaptFlameFreshness({
+      ...receipt,
+      people: [{ id: "person-1", lastActivity: null }],
+    }));
+
+    expect(merged.people[0].lastActivityMs).toBe(Date.parse(older));
+  });
+
+  it("rejects duplicate, missing, and internally inconsistent roster receipts", () => {
+    expect(() => adaptFlameFreshness({
+      ...receipt,
+      people: [...receipt.people, ...receipt.people],
+    })).toThrow(FlameDataError);
+    expect(() => mergeFlameFreshness(adaptFlamePayload(payload()), adaptFlameFreshness({
+      ...receipt,
+      people: [],
+    }))).toThrow(FlameDataError);
+    expect(() => adaptFlameFreshness({ ...receipt, pendingNormalize: 0 }))
+      .toThrow(FlameDataError);
+  });
+});
 
 function buckets() {
   return Array.from({ length: BUCKET_COUNT }, () => [0, 0, 0, 0]);

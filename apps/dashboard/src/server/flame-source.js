@@ -15,6 +15,8 @@ export const NORMALIZER_VERSIONS = Object.freeze([
 export const DATABASE_ROLE = "sherlock_reader";
 const DEFAULT_STATEMENT_TIMEOUT_MS = 20_000;
 const TIMELINE_STATEMENT_TIMEOUT_MS = 30_000;
+const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
+export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
 const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
 const WORK_CURSOR_VERSION = "v1";
@@ -105,6 +107,7 @@ activity_candidates as materialized (
   select person_id, session_id, actor_role, observed_at
     from activity_candidates
    where canonical_rank = 1
+     and actor_role <> 'guardian'
      and observed_at >= date_trunc('milliseconds', session_started_at)
 )`;
 }
@@ -119,6 +122,13 @@ select pe.id::text as person_id,
    and split_part(pe.email, '@', 3) = ''
  order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
+`;
+
+export const FRESHNESS_SQL = `
+select read_at, raw_watermark, canonical_watermark,
+       oldest_pending_normalize, pending_normalize_count,
+       person_id::text, latest_canonical_activity
+  from analytics.read_dashboard_freshness($1, $2, $3, $4)
 `;
 
 function promptsCte({
@@ -362,7 +372,7 @@ with p as materialized (
   select a.person_id,
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint agent,
-         count(distinct a.session_id) filter (where a.actor_role in ('worker', 'guardian'))::bigint subagent,
+         count(distinct a.session_id) filter (where a.actor_role = 'worker')::bigint subagent,
          count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other
     from activity_events a cross join p
    where a.observed_at < p.end_at
@@ -373,7 +383,7 @@ with p as materialized (
            where a.actor_role = 'primary' and a.observed_at < p.end_at
          )::bigint day_agent,
          count(distinct a.session_id) filter (
-           where a.actor_role in ('worker', 'guardian') and a.observed_at < p.end_at
+           where a.actor_role = 'worker' and a.observed_at < p.end_at
          )::bigint day_subagent,
          count(distinct a.session_id) filter (
            where a.actor_role = 'unknown' and a.observed_at < p.end_at
@@ -560,6 +570,7 @@ activity_candidates as materialized (
          activity_candidates.observed_at
     from activity_candidates cross join p
    where canonical_rank = 1
+     and actor_role <> 'guardian'
      and observed_at >= date_trunc('milliseconds', session_started_at)
      and observed_at >= p.bucket_start - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
      and observed_at < p.bucket_end + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
@@ -722,7 +733,7 @@ with p as materialized (
      and e.session_id in (select session_id from relevant_activity_sessions)`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from canonical_activity_events candidate cross join p
    where candidate.person_id = p.person_id
@@ -784,7 +795,7 @@ with p as materialized (
      and e.session_id = p.session_id`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from canonical_activity_events candidate cross join p
    where candidate.person_id = p.person_id
@@ -881,6 +892,7 @@ ranked_frame_revisions as materialized (
   select latest_frame_evidence.*
    from latest_frame_evidence cross join p
    where evidence_kind = 'activity'
+     and actor_role <> 'guardian'
      and observed_at >= p.start_at and observed_at < ${activityEnd}
 ), projected_prompt_candidates as materialized (
   select latest_frame_evidence.*,
@@ -922,7 +934,7 @@ with p as materialized (
   select evidence.person_id,
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
-         count(distinct evidence.session_id) filter (where evidence.actor_role in ('worker', 'guardian'))::bigint subagent,
+         count(distinct evidence.session_id) filter (where evidence.actor_role = 'worker')::bigint subagent,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other
     from projected_activity evidence cross join p
    where evidence.observed_at < p.end_at
@@ -933,7 +945,7 @@ with p as materialized (
            where evidence.actor_role = 'primary' and evidence.observed_at < p.end_at
          )::bigint day_agent,
          count(distinct evidence.session_id) filter (
-           where evidence.actor_role in ('worker', 'guardian')
+           where evidence.actor_role = 'worker'
              and evidence.observed_at < p.end_at
          )::bigint day_subagent,
          count(distinct evidence.session_id) filter (
@@ -988,7 +1000,7 @@ with p as materialized (
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from projected_activity evidence
 ), grouped as materialized (
@@ -1056,7 +1068,7 @@ with p as materialized (
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from projected_activity evidence
 ), header as materialized (
@@ -1465,6 +1477,66 @@ export function buildFlamePayload({
   };
 }
 
+export function buildFreshnessPayload(rows, maxPeople) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > maxPeople) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+  const first = rows[0];
+  const read = asDate(first.read_at);
+  const optionalDate = (value) => value === null || value === undefined
+    ? null
+    : asDate(value);
+  const globals = {
+    raw: optionalDate(first.raw_watermark),
+    canonical: optionalDate(first.canonical_watermark),
+    oldestPending: optionalDate(first.oldest_pending_normalize),
+    pending: count(first.pending_normalize_count),
+  };
+  if ((globals.pending === 0) !== (globals.oldestPending === null) ||
+      [globals.raw, globals.canonical, globals.oldestPending]
+        .some((value) => value !== null && value > read)) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+
+  const ids = new Set();
+  const people = [];
+  for (const row of rows) {
+    const rowRead = asDate(row.read_at);
+    const rowPending = count(row.pending_normalize_count);
+    const same = rowRead.getTime() === read.getTime() &&
+      optionalDate(row.raw_watermark)?.getTime() === globals.raw?.getTime() &&
+      optionalDate(row.canonical_watermark)?.getTime() === globals.canonical?.getTime() &&
+      optionalDate(row.oldest_pending_normalize)?.getTime() === globals.oldestPending?.getTime() &&
+      rowPending === globals.pending;
+    if (!same) throw new FlameSourceError("flame_database_result_invalid");
+    if (row.person_id === null || row.person_id === undefined) {
+      if (rows.length !== 1) throw new FlameSourceError("flame_database_result_invalid");
+      continue;
+    }
+    const id = String(row.person_id);
+    if (ids.has(id)) throw new FlameSourceError("flame_database_result_invalid");
+    ids.add(id);
+    const latest = optionalDate(row.latest_canonical_activity);
+    if (latest !== null && latest > read) {
+      throw new FlameSourceError("flame_database_result_invalid");
+    }
+    people.push({ id, lastActivity: latest?.toISOString() ?? null });
+  }
+
+  const pendingAgeMs = globals.oldestPending === null
+    ? 0
+    : read.getTime() - globals.oldestPending.getTime();
+  return {
+    read: read.toISOString(),
+    rawWatermark: globals.raw?.toISOString() ?? null,
+    canonicalWatermark: globals.canonical?.toISOString() ?? null,
+    oldestPendingNormalize: globals.oldestPending?.toISOString() ?? null,
+    pendingNormalize: globals.pending,
+    delayed: globals.pending > 0 && pendingAgeMs >= FRESHNESS_DELAY_MS,
+    people,
+  };
+}
+
 export class DirectFlameSource {
   constructor({
     databaseUrl,
@@ -1598,6 +1670,21 @@ export class DirectFlameSource {
         frameVersion,
       });
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
+  }
+
+  async fetchFreshness({ signal } = {}) {
+    return await this.transaction(async (tx) => {
+      const rows = await runQuery(tx, FRESHNESS_SQL, [
+        this.workspaceId,
+        this.expectedEmailDomain,
+        tx.array(NORMALIZER_VERSIONS),
+        this.maxPeople,
+      ], signal);
+      if (rows.length > this.maxPeople) {
+        throw new FlameSourceError("flame_database_roster_too_large");
+      }
+      return buildFreshnessPayload(rows, this.maxPeople);
+    }, { signal, statementTimeoutMs: FRESHNESS_STATEMENT_TIMEOUT_MS });
   }
 
   async fetchInterval({ personId, start, snapshot, signal, now }) {
