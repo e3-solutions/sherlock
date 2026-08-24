@@ -107,6 +107,7 @@ activity_candidates as materialized (
   select person_id, session_id, actor_role, observed_at
     from activity_candidates
    where canonical_rank = 1
+     and actor_role <> 'guardian'
      and observed_at >= date_trunc('milliseconds', session_started_at)
 )`;
 }
@@ -371,7 +372,7 @@ with p as materialized (
   select a.person_id,
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint agent,
-         count(distinct a.session_id) filter (where a.actor_role in ('worker', 'guardian'))::bigint subagent,
+         count(distinct a.session_id) filter (where a.actor_role = 'worker')::bigint subagent,
          count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other
     from activity_events a cross join p
    where a.observed_at < p.end_at
@@ -382,7 +383,7 @@ with p as materialized (
            where a.actor_role = 'primary' and a.observed_at < p.end_at
          )::bigint day_agent,
          count(distinct a.session_id) filter (
-           where a.actor_role in ('worker', 'guardian') and a.observed_at < p.end_at
+           where a.actor_role = 'worker' and a.observed_at < p.end_at
          )::bigint day_subagent,
          count(distinct a.session_id) filter (
            where a.actor_role = 'unknown' and a.observed_at < p.end_at
@@ -568,6 +569,7 @@ activity_candidates as materialized (
          activity_candidates.observed_at
     from activity_candidates cross join p
    where canonical_rank = 1
+     and actor_role <> 'guardian'
      and observed_at >= date_trunc('milliseconds', session_started_at)
      and observed_at >= p.bucket_start - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
      and observed_at < p.bucket_end + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
@@ -730,7 +732,7 @@ with p as materialized (
      and e.session_id in (select session_id from relevant_activity_sessions)`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from canonical_activity_events candidate cross join p
    where candidate.person_id = p.person_id
@@ -792,7 +794,7 @@ with p as materialized (
      and e.session_id = p.session_id`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from canonical_activity_events candidate cross join p
    where candidate.person_id = p.person_id
@@ -886,6 +888,7 @@ ranked_frame_revisions as materialized (
   select latest_frame_evidence.*
    from latest_frame_evidence cross join p
    where evidence_kind = 'activity'
+     and actor_role <> 'guardian'
      and observed_at >= p.start_at and observed_at < ${activityEnd}
 ), projected_prompt_candidates as materialized (
   select latest_frame_evidence.*,
@@ -927,7 +930,7 @@ with p as materialized (
   select evidence.person_id,
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
-         count(distinct evidence.session_id) filter (where evidence.actor_role in ('worker', 'guardian'))::bigint subagent,
+         count(distinct evidence.session_id) filter (where evidence.actor_role = 'worker')::bigint subagent,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other
     from projected_activity evidence cross join p
    where evidence.observed_at < p.end_at
@@ -938,7 +941,7 @@ with p as materialized (
            where evidence.actor_role = 'primary' and evidence.observed_at < p.end_at
          )::bigint day_agent,
          count(distinct evidence.session_id) filter (
-           where evidence.actor_role in ('worker', 'guardian')
+           where evidence.actor_role = 'worker'
              and evidence.observed_at < p.end_at
          )::bigint day_subagent,
          count(distinct evidence.session_id) filter (
@@ -993,7 +996,7 @@ with p as materialized (
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from projected_activity evidence
 ), grouped as materialized (
@@ -1058,7 +1061,7 @@ with p as materialized (
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from projected_activity evidence
 ), header as materialized (

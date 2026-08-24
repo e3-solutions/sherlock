@@ -42,8 +42,11 @@ objects.
   evidence must be at or after its owning Sherlock session's millisecond-aligned
   start. Copied pre-start source facts remain immutable in telemetry, but they do
   not make the later session active in an earlier dashboard bucket.
-- primary is Agent; worker and guardian are Subagent; unknown is Unclassified;
-  automation is excluded. When a v1 event is `unknown` but its Sherlock session
+- primary is Agent; worker is Subagent; unknown is Unclassified; explicit
+  guardian and automation roles are excluded from dashboard product work views.
+  Guardian telemetry remains immutable and auditable in the source and projected
+  evidence stores; only the dashboard view omits it. When a v1 event is `unknown`
+  but its Sherlock session
   has a resolved parent, the dashboard presents it as Subagent: parent topology
   is resolved source-backed session evidence that it is child work even when an
   older Codex payload encoded `source.subagent` as a string the v1 normalizer did
@@ -141,8 +144,8 @@ objects.
   144-bucket timeline as a single view. The graph never shrinks to a different
   preview window while the full aggregate is loading. People can be ranked in
   the browser by active time, peak observed sessions in one bucket, canonical
-  prompt count, or distinct subagent sessions. Ranking creates a product view
-  over the adapted payload; it does not mutate the roster or source telemetry.
+  prompt count, or distinct worker Subagent sessions. Ranking creates a product
+  view over the adapted payload; it does not mutate the roster or source telemetry.
   Active time is selected by default, and Name restores the source roster order.
 
 ## Initial-load cache
