@@ -357,8 +357,7 @@ class CollectorDrainTests(unittest.TestCase):
             transport.items.append(item)
             if not enqueued:
                 enqueued = True
-                next_manifest, stored = batch("stream-b")
-                self.spool.enqueue(next_manifest, stored)
+                self.enqueue("stream-b")
             return receipt(item.manifest)
 
         transport.upload = upload
@@ -378,8 +377,7 @@ class CollectorDrainTests(unittest.TestCase):
                 uploaded_streams.append(item.manifest.source_stream_key)
                 next_wave = len(uploaded_streams)
                 if next_wave < wave_count:
-                    manifest, stored = batch(f"stream-wave-{next_wave}")
-                    self.spool.enqueue(manifest, stored)
+                    self.enqueue(f"stream-wave-{next_wave}")
                 return receipt(item.manifest)
 
         result = Drain(self.spool, ChainedTransport()).run()
@@ -446,9 +444,8 @@ class CollectorDrainTests(unittest.TestCase):
         manifests = []
         start = 0
         for _ in range(128):
-            manifest, stored = batch("stream-linear", start)
+            manifest, _ = self.enqueue("stream-linear", start)
             manifests.append(manifest)
-            self.spool.enqueue(manifest, stored)
             start = manifest.end_offset
 
         transport = SuccessTransport()

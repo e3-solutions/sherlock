@@ -49,36 +49,26 @@ describe("timeline representation negotiation", () => {
     )).toEqual({ bytes: identity, encoding: null });
   });
 
-  it("describes the exact encoded byte representation sent by the route", () => {
-    const selected = selectJsonRepresentation(representations, "gzip");
-
-    expect(flameRepresentationHeaders(selected, "stale")).toEqual({
-      "Content-Encoding": "gzip",
-      "Content-Length": gzip.byteLength,
+  it.each([
+    ["gzip", "stale", gzip, { "Content-Encoding": "gzip" }],
+    ["gzip;q=0", "hit", identity, {}],
+  ])("describes exact %s bytes and negotiation headers", (acceptEncoding, cache, bytes, encoding) => {
+    const selected = selectJsonRepresentation(representations, acceptEncoding);
+    expect(flameRepresentationHeaders(selected, cache)).toEqual({
+      ...encoding,
+      "Content-Length": bytes.byteLength,
       "Content-Type": "application/json; charset=utf-8",
       Vary: "Accept-Encoding",
-      "X-Sherlock-Timeline-Cache": "stale",
-    });
-  });
-
-  it("omits Content-Encoding for identity while retaining content negotiation headers", () => {
-    const selected = selectJsonRepresentation(representations, "gzip;q=0");
-
-    expect(flameRepresentationHeaders(selected, "hit")).toEqual({
-      "Content-Length": identity.byteLength,
-      "Content-Type": "application/json; charset=utf-8",
-      Vary: "Accept-Encoding",
-      "X-Sherlock-Timeline-Cache": "hit",
+      "X-Sherlock-Timeline-Cache": cache,
     });
   });
 });
 
 describe("static asset MIME types", () => {
-  it("serves PNG assets as image/png", () => {
-    expect(mimeTypeForPath("/assets/bonaparte-logo.ABC123.PNG")).toBe("image/png");
-  });
-
-  it("keeps unknown static assets binary", () => {
-    expect(mimeTypeForPath("/assets/data.bin")).toBe("application/octet-stream");
+  it.each([
+    ["/assets/bonaparte-logo.ABC123.PNG", "image/png"],
+    ["/assets/data.bin", "application/octet-stream"],
+  ])("serves %s as %s", (path, mime) => {
+    expect(mimeTypeForPath(path)).toBe(mime);
   });
 });

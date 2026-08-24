@@ -13,10 +13,45 @@ interface MockRun {
   verify?: (request: RequestInfo | URL, init?: RequestInit) => void;
 }
 
-async function withConflictFetch(
-  run: MockRun,
-  action: () => Promise<void>,
-): Promise<void> {
+const bytes = new Uint8Array([1, 2, 3, 4]);
+const storage = new SupabaseImmutableStorage(
+  "https://example.supabase.co",
+  "key",
+);
+
+function streamedResponse(
+  chunks: Uint8Array[],
+  contentLength?: string,
+): Response {
+  return new Response(ReadableStream.from(chunks), {
+    status: 206,
+    headers: contentLength ? { "Content-Length": contentLength } : undefined,
+  });
+}
+
+function cancellableResponse(
+  chunk: Uint8Array,
+  contentLength?: string,
+): { response: Response; wasCancelled: () => boolean } {
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return {
+    response: new Response(body, {
+      status: contentLength ? 206 : 200,
+      headers: contentLength ? { "Content-Length": contentLength } : undefined,
+    }),
+    wasCancelled: () => cancelled,
+  };
+}
+
+async function ensureWithConflict(run: MockRun): Promise<void> {
   const originalFetch = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = ((request: RequestInfo | URL, init?: RequestInit) => {
@@ -30,7 +65,7 @@ async function withConflictFetch(
     return Promise.resolve(run.get());
   }) as typeof fetch;
   try {
-    await action();
+    await storage.ensure("path/object.gz", bytes, await sha256Hex(bytes));
     assert(calls === 2, "expected one upload and one verification request");
   } finally {
     globalThis.fetch = originalFetch;
@@ -40,106 +75,56 @@ async function withConflictFetch(
 async function expectError(
   code: string,
   run: MockRun,
-  bytes = new Uint8Array([1, 2, 3, 4]),
 ): Promise<void> {
-  const storage = new SupabaseImmutableStorage(
-    "https://example.supabase.co",
-    "key",
-  );
-  await withConflictFetch(run, async () => {
-    try {
-      await storage.ensure("path/object.gz", bytes, await sha256Hex(bytes));
-      assert(false, `${code} should be thrown`);
-    } catch (error) {
-      assert(error instanceof IngestError);
-      assert(error.code === code, `received ${error.code}`);
-    }
-  });
+  try {
+    await ensureWithConflict(run);
+    assert(false, `${code} should be thrown`);
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === code, `received ${error.code}`);
+  }
 }
 
 Deno.test("409 verification accepts exact streamed bytes without Content-Length", async () => {
-  const bytes = new Uint8Array([1, 2, 3, 4]);
-  const hash = await sha256Hex(bytes);
-  const storage = new SupabaseImmutableStorage(
-    "https://example.supabase.co",
-    "key",
-  );
-  await withConflictFetch({
-    get: () =>
-      new Response(
-        ReadableStream.from([
-          bytes.subarray(0, 1),
-          bytes.subarray(1),
-        ]),
-        { status: 206 },
-      ),
+  await ensureWithConflict({
+    get: () => streamedResponse([bytes.subarray(0, 1), bytes.subarray(1)]),
     verify: (_request, init) => {
       assert(new Headers(init?.headers).get("range") === "bytes=0-4");
     },
-  }, () => storage.ensure("path/object.gz", bytes, hash));
+  });
 });
 
 Deno.test("409 verification does not trust a lying Content-Length", async () => {
   await expectError("storage_integrity_conflict", {
-    get: () =>
-      new Response(ReadableStream.from([new Uint8Array([1, 2, 3])]), {
-        status: 206,
-        headers: { "Content-Length": "4" },
-      }),
+    get: () => streamedResponse([new Uint8Array([1, 2, 3])], "4"),
   });
 });
 
 Deno.test("409 verification rejects declared length mismatch early", async () => {
-  let cancelled = false;
+  const stream = cancellableResponse(new Uint8Array([1, 2, 3]), "3");
   await expectError("storage_integrity_conflict", {
-    get: () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          pull(controller) {
-            controller.enqueue(new Uint8Array([1, 2, 3]));
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }),
-        {
-          status: 206,
-          headers: { "Content-Length": "3" },
-        },
-      ),
+    get: () => stream.response,
   });
-  assert(cancelled, "declared mismatch should cancel the response stream");
+  assert(
+    stream.wasCancelled(),
+    "declared mismatch should cancel the response stream",
+  );
 });
 
 Deno.test("409 verification cancels an oversized response chunk", async () => {
-  let cancelled = false;
+  const stream = cancellableResponse(new Uint8Array(1024 * 1024));
   await expectError("storage_integrity_conflict", {
-    get: () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          pull(controller) {
-            controller.enqueue(new Uint8Array(1024 * 1024));
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }),
-        { status: 200 },
-      ),
+    get: () => stream.response,
   });
   assert(
-    cancelled,
+    stream.wasCancelled(),
     "long response should be cancelled after the first extra byte",
   );
 });
 
 Deno.test("409 verification rejects same-length different bytes", async () => {
   await expectError("storage_integrity_conflict", {
-    get: () =>
-      new Response(ReadableStream.from([new Uint8Array([4, 3, 2, 1])]), {
-        status: 206,
-        headers: { "Content-Length": "4" },
-      }),
+    get: () => streamedResponse([new Uint8Array([4, 3, 2, 1])], "4"),
   });
 });
 

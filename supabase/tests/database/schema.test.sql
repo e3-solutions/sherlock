@@ -690,29 +690,6 @@ select ok(
   'multiple null emails remain valid in one workspace'
 );
 
-create temporary table identity_constraint_results (
-  test_name text primary key,
-  passed boolean not null
-);
-
-do $$
-begin
-  begin
-    insert into telemetry.people (workspace_id, identity_key, email) values (
-      '00000000-0000-0000-0000-000000000001',
-      'duplicate-shared-email',
-      'shared@example.com'
-    );
-    insert into identity_constraint_results values ('duplicate email', false);
-  exception when unique_violation then
-    insert into identity_constraint_results values ('duplicate email', true);
-  end;
-end
-$$;
-
-select ok(passed, 'a duplicate nonnull email in one workspace is rejected')
-from identity_constraint_results where test_name = 'duplicate email';
-
 insert into telemetry.sessions (
   id, workspace_id, person_id, collector_key, native_session_id,
   actor_role, role_version, started_at
@@ -841,6 +818,16 @@ create temporary table constraint_results (
 do $$
 begin
   begin
+    insert into telemetry.people (workspace_id, identity_key, email) values (
+      '00000000-0000-0000-0000-000000000001',
+      'duplicate-shared-email', 'shared@example.com'
+    );
+    insert into constraint_results values ('duplicate email', false);
+  exception when unique_violation then
+    insert into constraint_results values ('duplicate email', true);
+  end;
+
+  begin
     insert into telemetry.ingest_batches (
       workspace_id, person_id, collector_key, source_kind, source_stream_key,
       generation_key, generation_seq, start_offset, end_offset,
@@ -914,6 +901,8 @@ begin
 end
 $$;
 
+select ok(passed, 'a duplicate nonnull email in one workspace is rejected')
+from constraint_results where test_name = 'duplicate email';
 select ok(passed, 'cross-workspace person attribution is rejected')
 from constraint_results where test_name = 'tenant mismatch';
 select ok(passed, 'invalid byte ranges are rejected')
@@ -1017,7 +1006,6 @@ begin
       select 1 from cron.job
       where jobname = 'sherlock-activity-reducer-every-minute' and active
     ) and
-    (select bool_and(passed) from identity_constraint_results) and
     (select bool_and(passed) from constraint_results)
   ) then
     raise exception 'Sherlock schema verification failed';
