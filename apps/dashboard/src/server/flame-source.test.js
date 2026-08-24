@@ -59,6 +59,14 @@ function rowsFor(personId, overrides = {}) {
   }));
 }
 
+function sqlSection(sql, start, end) {
+  const startIndex = sql.indexOf(start);
+  const endIndex = sql.indexOf(end, startIndex + start.length);
+  expect(startIndex).toBeGreaterThanOrEqual(0);
+  expect(endIndex).toBeGreaterThan(startIndex);
+  return sql.slice(startIndex, endIndex);
+}
+
 describe("Sherlock Flame payload", () => {
   it("preserves the full roster, exact buckets, roles, prompts, and partial receipt", () => {
     const ada = rowsFor("ada", {
@@ -214,12 +222,51 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("where a.observed_at < p.end_at");
     expect(FLAME_SQL).toContain("s.started_at session_started_at");
     expect(FLAME_SQL).toContain(
-      "where canonical_rank = 1\n     and observed_at >= date_trunc('milliseconds', session_started_at)",
+      "where canonical_rank = 1\n     and actor_role <> 'guardian'\n     and observed_at >= date_trunc('milliseconds', session_started_at)",
     );
     expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
     expect(FLAME_SQL).not.toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
     expect(FLAME_SQL).not.toContain("content_excerpt");
+  });
+
+  it("excludes guardians only after canonical activity winners are selected", () => {
+    const aggregateCandidates = sqlSection(
+      FLAME_SQL,
+      "activity_candidates as materialized",
+      "activity_events as materialized",
+    );
+    const aggregateBoundary = sqlSection(
+      FLAME_SQL,
+      "activity_events as materialized",
+      "bucket_activity as materialized",
+    );
+    expect(aggregateCandidates).not.toContain("actor_role <> 'guardian'");
+    expect(aggregateBoundary.indexOf("where canonical_rank = 1")).toBeLessThan(
+      aggregateBoundary.indexOf("and actor_role <> 'guardian'"),
+    );
+    expect(aggregateBoundary).toContain("and actor_role <> 'guardian'");
+    expect(FLAME_SQL).toContain("where a.actor_role = 'worker'");
+
+    for (const sql of [INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
+      const candidates = sqlSection(
+        sql,
+        "activity_candidates as materialized",
+        "activity_event_ids as materialized",
+      );
+      const ids = sqlSection(
+        sql,
+        "activity_event_ids as materialized",
+        "activity_events as materialized",
+      );
+      expect(candidates).not.toContain("actor_role <> 'guardian'");
+      expect(ids.indexOf("where canonical_rank = 1")).toBeLessThan(
+        ids.indexOf("and actor_role <> 'guardian'"),
+      );
+      expect(ids).toContain("and actor_role <> 'guardian'");
+      expect(sql).toContain("when actor_role = 'worker' then 'subagent'");
+      expect(sql).not.toContain("when actor_role in ('worker', 'guardian')");
+    }
   });
 
   it("reads supported provider projections without canonicalizing across versions", () => {
@@ -718,6 +765,11 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_PROMPTS_SQL).toContain("limit $11");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("activity_candidates as materialized");
     expect(INTERVAL_PROMPTS_SQL).not.toContain("context_before");
+    expect(sqlSection(
+      INTERVAL_PROMPTS_SQL,
+      "prompt_candidates as materialized",
+      "select prompt_identity",
+    )).not.toContain("actor_role <> 'guardian'");
     expect(MCP_PROMPT_EVIDENCE_LIMIT).toBe(5);
   });
 
@@ -773,6 +825,43 @@ describe("Sherlock Flame payload", () => {
       "latest_frame_evidence.anchor_observed_at,",
     );
     expect(PROJECTION_INTERVAL_WORK_SQL).not.toContain("p.read_at");
+  });
+
+  it("excludes projected guardians after latest-revision selection", () => {
+    for (const sql of [
+      PROJECTION_FLAME_SQL,
+      PROJECTION_INTERVAL_WORK_SQL,
+      PROJECTION_INTERVAL_PROMPTS_SQL,
+      PROJECTION_WORK_DETAIL_SQL,
+    ]) {
+      const ranked = sqlSection(
+        sql,
+        "ranked_frame_revisions as materialized",
+        "latest_frame_evidence as materialized",
+      );
+      const latest = sqlSection(
+        sql,
+        "latest_frame_evidence as materialized",
+        "projected_prompt_candidates as materialized",
+      );
+      expect(ranked).not.toContain("actor_role <> 'guardian'");
+      expect(latest.indexOf("where latest_rank = 1 and not is_tombstone")).toBeLessThan(
+        latest.indexOf("and actor_role <> 'guardian'"),
+      );
+      expect(latest).toContain(
+        "where evidence_kind = 'activity'\n     and actor_role <> 'guardian'",
+      );
+    }
+    for (const sql of [
+      PROJECTION_INTERVAL_WORK_SQL,
+      PROJECTION_WORK_DETAIL_SQL,
+    ]) {
+      expect(sql).toContain("when actor_role = 'worker' then 'subagent'");
+      expect(sql).not.toContain("when actor_role in ('worker', 'guardian')");
+    }
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "where evidence.actor_role = 'worker'",
+    );
   });
 
   it("bridges only mutually unique immutable-stream representations in work evidence", () => {
