@@ -135,13 +135,15 @@ objects.
   provider normalizers. A current canonical raw timeline emits a `v3` token
   pinned to Codex v2 and Claude v1, so later lazy reads cannot mix classifier
   versions. Once an owner
-  activates the exact immutable `frame-evidence-v3` version for the workspace,
+  activates the exact immutable `frame-evidence-v4` version for the workspace,
   a projection-backed timeline emits `v2` tokens containing that version and
   every lazy evidence read stays on the matching append-only projection. While
-  v3 is backfilling and immutable frame v2 is already active, the timeline
+  v4 is projecting and immutable frame v2 is already active, the timeline
   continues to serve frame v2 in full. It never combines frame v2 facts with
-  Codex v2 rows; the owner activates frame v3 only after current-version
-  normalization coverage and exact frame receipts are proven. A
+  Codex events directly. Frame v4 chooses Codex v1 for sessions before the
+  recorded workspace cutover and v2 for later sessions; old missing-v2 batches
+  therefore cannot block activation. The owner activates v4 only after the
+  selected-version coverage and exact receipts are proven. A
   projected-read failure is surfaced; it never silently falls back to raw work
   evidence. Existing v1 tokens remain usable through their normal expiry.
 - Projection-backed timeline reads touch only the indexed analytics receipts

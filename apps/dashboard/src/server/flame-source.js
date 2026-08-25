@@ -5,10 +5,11 @@ export const BUCKET_MS = 10 * 60 * 1000;
 // Keep this immutable reader contract aligned with the worker's frame version.
 // The dashboard Docker build context is apps/dashboard, so it cannot import the
 // repository-level worker module at runtime.
-export const FRAME_VERSION = "frame-evidence-v3";
+export const FRAME_VERSION = "frame-evidence-v4";
 // Prompt classification moved into Codex normalization v2. During the v3
 // backfill, continue serving work from the already-active immutable v2
-// projection so interval clicks never regress to raw activity scans.
+// projection so interval clicks never regress to raw activity scans. Frame v4
+// selects Codex v1/v2 per immutable workspace cutover and session start.
 export const COMPATIBLE_WORK_FRAME_VERSION = "frame-evidence-v2";
 export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
@@ -21,6 +22,11 @@ export const NORMALIZER_VERSIONS = Object.freeze([
 ]);
 export const LEGACY_NORMALIZER_VERSIONS = Object.freeze([
   LEGACY_CODEX_NORMALIZER_VERSION,
+  CLAUDE_NORMALIZER_VERSION,
+]);
+export const FRESHNESS_NORMALIZER_VERSIONS = Object.freeze([
+  LEGACY_CODEX_NORMALIZER_VERSION,
+  NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
 export const DATABASE_ROLE = "sherlock_reader";
@@ -1801,7 +1807,7 @@ export class DirectFlameSource {
       const rows = await runQuery(tx, FRESHNESS_SQL, [
         this.workspaceId,
         this.expectedEmailDomain,
-        tx.array(NORMALIZER_VERSIONS),
+        tx.array(FRESHNESS_NORMALIZER_VERSIONS),
         this.maxPeople,
       ], signal);
       if (rows.length > this.maxPeople) {

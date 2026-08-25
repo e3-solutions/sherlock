@@ -59,8 +59,8 @@ Deno.test({
     const proofWindowStart = new Date("2026-08-20T19:58:00.000Z");
     try {
       await sql.unsafe(
-        `insert into telemetry.workspaces (id, slug, name)
-         values ($1, $2, 'Frame projector test')`,
+        `insert into telemetry.workspaces (id, slug, name, created_at)
+         values ($1, $2, 'Frame projector test', '2026-08-20T19:00:00Z')`,
         [workspaceId, `frame-projector-${workspaceId}`],
       );
       await sql.unsafe(
@@ -100,8 +100,8 @@ Deno.test({
         ],
       );
       await sql.unsafe(
-        `insert into telemetry.workspaces (id, slug, name)
-         values ($1, $2, 'Unrelated frame projector test')`,
+        `insert into telemetry.workspaces (id, slug, name, created_at)
+         values ($1, $2, 'Unrelated frame projector test', '2026-08-20T19:00:00Z')`,
         [
           unrelatedWorkspaceId,
           `unrelated-frame-projector-${unrelatedWorkspaceId}`,
@@ -281,12 +281,14 @@ Deno.test({
           workspaceId,
           sessionId,
           requestGeneration: 1n,
+          statementTimeoutMs: 5_000,
           now,
         }),
         projector.projectSession({
           workspaceId,
           sessionId,
           requestGeneration: 1n,
+          statementTimeoutMs: 5_000,
           now,
         }),
       ]);
@@ -407,6 +409,7 @@ Deno.test({
         workspaceId,
         sessionId,
         requestGeneration: 2n,
+        statementTimeoutMs: 5_000,
         now,
       });
       assert(
@@ -460,6 +463,7 @@ Deno.test({
         workspaceId,
         sessionId,
         requestGeneration: 3n,
+        statementTimeoutMs: 5_000,
         now,
       });
       assert(corrected.receipt_id !== null && corrected.inserted_count > 0);
@@ -495,16 +499,16 @@ Deno.test({
       );
       assert(
         receipts[0].through_event_id === earlierTimestampEventId.toString(),
-        "projection must resolve the all-normalizer cutoff itself",
+        "projection must resolve the selected-provider cutoff itself",
       );
       assert(
         receipts.every((receipt) =>
           receipt.through_event_id === receipts[0].through_event_id
         ),
       );
-      assert(receipts[0].source_event_count === "4");
-      assert(receipts[1].source_event_count === "4");
-      assert(receipts[2].source_event_count === "5");
+      assert(receipts[0].source_event_count === "3");
+      assert(receipts[1].source_event_count === "3");
+      assert(receipts[2].source_event_count === "4");
       assert(receipts.every((receipt) => receipt.session_updated_at !== null));
       assert(
         receipts[1].session_updated_at === "2026-08-20T20:00:01.123456Z",
@@ -544,6 +548,7 @@ Deno.test({
             workspaceId,
             sessionId,
             requestGeneration: 4n,
+            statementTimeoutMs: 5_000,
             now,
           }),
         "future evidence must fail closed until its timestamp is corrected",

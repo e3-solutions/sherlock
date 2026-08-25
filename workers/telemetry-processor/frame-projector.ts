@@ -1,7 +1,9 @@
 import postgres from "npm:postgres@3.4.7";
 import { ProcessingDeadlineError, reserveBefore } from "./database.ts";
 import {
-  FRAME_NORMALIZER_VERSIONS,
+  FRAME_CLAUDE_NORMALIZER_VERSION,
+  FRAME_CODEX_NORMALIZER_VERSION,
+  FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
   FRAME_WINDOW_HOURS,
@@ -147,6 +149,47 @@ interface PromptSource extends SourceEvent {
   prompt_observed_at: string;
 }
 
+export function frameSourceCutoverJoinSql(
+  sessionAlias: string,
+  batchAlias: string,
+  cutoverAlias: string,
+): string {
+  return `left join analytics.normalizer_cutovers ${cutoverAlias}
+    on ${cutoverAlias}.workspace_id = ${sessionAlias}.workspace_id
+   and ${cutoverAlias}.source_provider = ${batchAlias}.source_provider
+   and ${cutoverAlias}.to_normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'`;
+}
+
+export function frameSourceNormalizerPredicateSql(
+  eventAlias: string,
+  sessionAlias: string,
+  batchAlias: string,
+  cutoverAlias: string,
+): string {
+  return `(
+    ${batchAlias}.source_provider = 'claude_code'
+    and ${eventAlias}.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
+    or ${batchAlias}.source_provider = 'codex'
+    and (
+      (${cutoverAlias}.cutover_at is null
+       or ${sessionAlias}.started_at >= ${cutoverAlias}.cutover_at)
+      and ${eventAlias}.normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
+      or ${sessionAlias}.started_at < ${cutoverAlias}.cutover_at
+      and (
+        ${eventAlias}.normalizer_version = '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}'
+        or ${eventAlias}.normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
+        and not exists (
+          select 1 from telemetry.events legacy
+           where legacy.workspace_id = ${eventAlias}.workspace_id
+             and legacy.source_record_id = ${eventAlias}.source_record_id
+             and legacy.normalizer_version = '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}'
+             and not legacy.is_replay
+        )
+      )
+    )
+  )`;
+}
+
 export const FRAME_SOURCE_EVENTS_SQL = `
 select e.id::text id, s.person_id::text person_id, e.session_id::text session_id,
        e.normalizer_version, e.canonical_scope_key, e.logical_event_key,
@@ -187,9 +230,10 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
     on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
   join telemetry.ingest_batches ib
     on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
+  ${frameSourceCutoverJoinSql("s", "ib", "cutover")}
  where e.workspace_id = $1 and e.session_id = $2
-   and e.normalizer_version = any($3::text[])
-   and e.id <= $4 and not e.is_replay
+   and ${frameSourceNormalizerPredicateSql("e", "s", "ib", "cutover")}
+   and e.id <= $3 and not e.is_replay
    and (
      (
        e.actor_role <> 'automation'
@@ -205,11 +249,11 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
        and coalesce(
          ${nativeItemTimestampSql("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-       ) >= $5::timestamptz - make_interval(secs => $7)
+       ) >= $4::timestamptz - make_interval(secs => $6)
        and coalesce(
          ${nativeItemTimestampSql("e.native_item_id")},
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-       ) < $6::timestamptz + make_interval(secs => $7)
+       ) < $5::timestamptz + make_interval(secs => $6)
      ) or (
        e.event_kind = 'message' and e.message_origin = 'human'
        and e.message_role = 'user' and e.content_sha256 is not null
@@ -217,13 +261,13 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
        and e.actor_role = 'primary'
        and (
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-           >= $5::timestamptz - interval '2 seconds'
+           >= $4::timestamptz - interval '2 seconds'
          and coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-           < $6::timestamptz + interval '2 seconds'
+           < $5::timestamptz + interval '2 seconds'
          or ${nativeItemTimestampSql("e.native_item_id")}
-           >= $5::timestamptz - interval '2 seconds'
+           >= $4::timestamptz - interval '2 seconds'
          and ${nativeItemTimestampSql("e.native_item_id")}
-           < $6::timestamptz + interval '2 seconds'
+           < $5::timestamptz + interval '2 seconds'
        )
      )
    )
@@ -248,17 +292,24 @@ select distinct on (evidence_kind, source_event_id)
 `;
 
 export const FRAME_SOURCE_COORDINATES_SQL = `
-select max(id)::text through_event_id, count(*)::text source_event_count,
-       max(id) filter (where
-         coalesce(occurred_at, observed_at, server_received_at)
-           >= $4::timestamptz + make_interval(secs => $5)
-         or ${nativeItemTimestampSql("native_item_id")}
-           >= $4::timestamptz + make_interval(secs => $5)
+select max(e.id)::text through_event_id, count(*)::text source_event_count,
+       max(e.id) filter (where
+         coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+           >= $3::timestamptz + make_interval(secs => $4)
+         or ${nativeItemTimestampSql("e.native_item_id")}
+           >= $3::timestamptz + make_interval(secs => $4)
        )::text future_event_id
-  from telemetry.events
- where workspace_id = $1 and session_id = $2
-   and normalizer_version = any($3::text[])
-   and not is_replay
+  from telemetry.events e
+  join telemetry.sessions s
+    on s.workspace_id = e.workspace_id and s.id = e.session_id
+  join telemetry.native_records nr
+    on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
+  join telemetry.ingest_batches ib
+    on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
+  ${frameSourceCutoverJoinSql("s", "ib", "cutover")}
+ where e.workspace_id = $1 and e.session_id = $2
+   and ${frameSourceNormalizerPredicateSql("e", "s", "ib", "cutover")}
+   and not e.is_replay
 `;
 
 const REVISION_COLUMNS = [
@@ -362,7 +413,6 @@ export class PostgresFrameEvidenceProjector {
           const coordinates = await tx.unsafe(FRAME_SOURCE_COORDINATES_SQL, [
             options.workspaceId,
             options.sessionId,
-            tx.array([...FRAME_NORMALIZER_VERSIONS]),
             coveredThrough.toISOString(),
             FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
           ]);
@@ -383,7 +433,6 @@ export class PostgresFrameEvidenceProjector {
           const rows = await tx.unsafe(FRAME_SOURCE_EVENTS_SQL, [
             options.workspaceId,
             options.sessionId,
-            tx.array([...FRAME_NORMALIZER_VERSIONS]),
             throughEventId?.toString() ?? null,
             coveredFrom.toISOString(),
             coveredThrough.toISOString(),
