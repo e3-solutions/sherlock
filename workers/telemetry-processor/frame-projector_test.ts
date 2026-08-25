@@ -56,6 +56,7 @@ function sourceEvent(overrides: Partial<SourceEvent> = {}): SourceEvent {
     content_sha256: "a".repeat(64),
     content_byte_size: 12,
     has_content_excerpt: true,
+    native_prompt_content_candidate: true,
     error_code: null,
     source_batch_id: "batch-1",
     source_record_index: 0,
@@ -146,8 +147,111 @@ Deno.test("canonical rank preserves PostgreSQL timestamp microseconds", () => {
   assert(activity[0].observed_at.endsWith(".000100Z"));
 });
 
+Deno.test("native human user messages are prompts without a user_message envelope", () => {
+  const nativeOnly = sourceEvent({
+    event_subtype: "message",
+    source_priority: 50,
+    native_item_id: "msg_01a01f0a-da00-7000-8000-000000000001",
+    source_native_type: "response_item",
+    source_native_payload_type: "message",
+  });
+  const prompts = canonicalEvidence(
+    [nativeOnly],
+    "2026-08-20T11:59:00.000000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  ).filter((row) => row.evidence_kind === "prompt");
+
+  assert(prompts.length === 1);
+  assert(prompts[0].source_event_id === nativeOnly.id);
+  assert(
+    prompts[0].prompt_identity ===
+      "native:msg_01a01f0a-da00-7000-8000-000000000001",
+  );
+  const activity = canonicalEvidence(
+    [nativeOnly],
+    "2026-08-20T11:59:00.000000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  ).find((row) => row.evidence_kind === "activity");
+  assert(activity?.is_summary_candidate === true);
+});
+
+Deno.test("native machine context is not projected as a prompt", () => {
+  const internalContext = sourceEvent({
+    event_subtype: "message",
+    source_priority: 50,
+    native_item_id: "msg_01a01f0a-da00-7000-8000-000000000003",
+    source_native_type: "response_item",
+    source_native_payload_type: "message",
+    native_prompt_content_candidate: false,
+  });
+  const prompts = canonicalEvidence(
+    [internalContext],
+    "2026-08-20T11:59:00.000000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  ).filter((row) => row.evidence_kind === "prompt");
+
+  assert(prompts.length === 0);
+  const activity = canonicalEvidence(
+    [internalContext],
+    "2026-08-20T11:59:00.000000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  ).find((row) => row.evidence_kind === "activity");
+  assert(activity?.is_summary_candidate === false);
+});
+
+Deno.test("native parent-agent runtime context does not title worker sessions", () => {
+  const workerMessage = sourceEvent({
+    event_subtype: "message",
+    stored_actor_role: "worker",
+    actor_role: "worker",
+    message_origin: "parent_agent",
+    native_item_id: "msg_01a01f0a-da00-7000-8000-000000000002",
+    source_native_type: "response_item",
+    source_native_payload_type: "message",
+  });
+  const activity = canonicalEvidence(
+    [workerMessage],
+    "2026-08-20T11:59:00.000000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  ).find((row) => row.evidence_kind === "activity");
+
+  assert(activity?.is_summary_candidate === false);
+});
+
+Deno.test("native and envelope copies remain one canonical prompt", () => {
+  const native = sourceEvent({
+    id: 10n,
+    event_subtype: "message",
+    source_priority: 50,
+    native_item_id: "msg_01a01f0a-da00-7000-8000-000000000001",
+    source_native_type: "response_item",
+    source_native_payload_type: "message",
+  });
+  const submitted = sourceEvent({ id: 11n });
+  const prompts = canonicalEvidence(
+    [native, submitted],
+    "2026-08-20T11:59:00.000000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  ).filter((row) => row.evidence_kind === "prompt");
+
+  assert(prompts.length === 1);
+  assert(
+    prompts[0].prompt_identity ===
+      "native:msg_01a01f0a-da00-7000-8000-000000000001",
+  );
+});
+
 Deno.test("projector reads only bounded source metadata and never copies content", () => {
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt is not null"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("native_prompt_content_candidate"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("<recommended_plugins>"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("<heartbeat>"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt,"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("storage_path"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("record_sha256"));

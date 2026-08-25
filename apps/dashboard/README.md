@@ -105,9 +105,11 @@ objects.
   only the stored database excerpt plus an explicit truncation flag. A work row exists only
   when the same canonical activity universe used by the aggregate contains
   visible evidence for that session and role. Its first/last timestamps are the
-  observed evidence window, not active duration. Its optional summary is the
-  first submitted `user_message` excerpt in the frame; response-only runtime
-  context is excluded and no title is synthesized. The drawer keeps Active Work
+  observed evidence window, not active duration. Its optional summary carries
+  the first source-backed request for that session across later frames in the
+  pinned trailing snapshot: a submitted human/parent-agent
+  `user_message` or a stable native human `response_item/message`. Native
+  parent-agent runtime context is excluded and no title is synthesized. The drawer keeps Active Work
   primary and exposes prompt excerpts through a compact, collapsed disclosure.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
@@ -129,12 +131,16 @@ objects.
   read-consistency boundary, not a durable pipeline publication cutoff: a later
   timeline refresh can correctly include newly normalized evidence.
 - Snapshot tokens remain source-explicit during the frame-projection rollout.
-  Legacy `v1` tokens always use the canonical raw-event queries. Once an owner
-  activates the exact immutable `frame-evidence-v1` version for the workspace,
+  Legacy `v1` tokens always use canonical raw-event queries. Once an owner
+  activates the exact immutable `frame-evidence-v2` version for the workspace,
   a projection-backed timeline emits `v2` tokens containing that version and
-  every lazy evidence read stays on the matching append-only projection. A v2
-  failure is surfaced; it never silently falls back to a different evidence
-  universe. Existing v1 tokens remain usable through their normal expiry.
+  every lazy evidence read stays on the matching append-only projection. While
+  v2 is backfilling and immutable v1 is already active, the corrected raw
+  timeline emits a v2 receipt pinned to v1 for unchanged activity/work reads;
+  prompt detail unions v1 prompt facts with only qualified native prompt rows
+  from the selected ten-minute bucket. A projected-read failure is surfaced;
+  it never silently falls back to raw work evidence. Existing v1 tokens remain
+  usable through their normal expiry.
 - Projection-backed timeline reads touch only the indexed analytics receipts
   and evidence revisions. Interval summaries, prompt excerpts, and conversation
   pages select bounded source event IDs first and then use primary-key joins to
