@@ -193,11 +193,13 @@ summary-eligibility, and prompt-identity facts without copying excerpts or raw
 payloads.
 
 `frame-evidence-v1` deliberately chooses one semantic winner across the
-projector's bounded session window, rather than changing that winner at each
-dashboard window boundary. This stabilizes duplicate identity over time; a
-malformed duplicate group split exactly across the legacy 24-hour boundary can
-therefore differ from the old window-local query and requires a new frame
-version if that policy changes.
+projector's bounded session window. `frame-evidence-v2` preserves that activity
+policy and adds stable native `response_item` / `message` human-user items as
+prompt evidence when a rollout omitted the separate `user_message` envelope.
+Both versions deduplicate by native prompt identity; v2 prefers an existing
+envelope-backed source when both representations are present. This stabilizes
+duplicate identity over time while keeping the semantic change versioned and
+auditable.
 
 Corrections append tombstones or replacement revisions; application roles
 cannot update or delete history. Reads select the latest revision visible in

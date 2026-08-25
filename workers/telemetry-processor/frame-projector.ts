@@ -14,6 +14,25 @@ const ADJACENT_PROMPT_MATCH_MS = 100;
 const ASSISTANT_REPRESENTATION_MATCH_MS = 3_000;
 const DEFAULT_FRAME_LOCK_TIMEOUT_MS = 60_000;
 const REVISION_INSERT_BATCH_SIZE = 3_000;
+export const INTERNAL_NATIVE_PROMPT_PREFIXES = Object.freeze([
+  "<recommended_plugins>",
+  "<in-app-browser-context",
+  "<app-context",
+  "<skills_instructions",
+  "<permissions instructions",
+  "<permissions_instructions>",
+  "<environment_context>",
+  "<collaboration_mode>",
+  "<apps_instructions>",
+  "<plugins_instructions>",
+  "<heartbeat>",
+  "<turn_aborted>",
+  "<automation",
+  "<skill>",
+  "# AGENTS.md instructions",
+  "# Bonaparte Implementation",
+  "The configured soft phase budget has expired.",
+]);
 
 export const FRAME_LOCK_TIMEOUT_SQL =
   "select set_config('statement_timeout', $1, false)";
@@ -41,6 +60,16 @@ export function nativeItemTimestampSql(column: string): string {
     ) / 1000.0)
     else null
   end`;
+}
+
+function nativePromptContentCandidateSql(column: string): string {
+  const prefixExclusions = INTERNAL_NATIVE_PROMPT_PREFIXES.map((prefix) =>
+    `left(btrim(${column}), ${prefix.length}) <> '${
+      prefix.replaceAll("'", "''")
+    }'`
+  ).join("\n       and ");
+  return `${column} is not null and btrim(${column}) <> ''
+       and ${prefixExclusions}`;
 }
 
 export function revisionInsertBatches<T>(values: readonly T[]): T[][] {
@@ -128,6 +157,7 @@ export interface SourceEvent {
   content_sha256: string | null;
   content_byte_size: number | null;
   has_content_excerpt: boolean;
+  native_prompt_content_candidate: boolean;
   error_code: string | null;
   source_batch_id: string;
   source_record_index: number;
@@ -171,6 +201,8 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
        e.native_item_id, e.turn_id, e.message_role, e.message_origin,
        e.content_sha256, e.content_byte_size,
        e.content_excerpt is not null has_content_excerpt,
+       (${nativePromptContentCandidateSql("e.content_excerpt")})
+         native_prompt_content_candidate,
        e.error_code,
        nr.batch_id::text source_batch_id, nr.record_index source_record_index,
        nr.source_start_offset::text source_start_offset,
@@ -580,10 +612,14 @@ function canonicalActivity(
     message_role: event.message_role,
     message_origin: event.message_origin,
     prompt_identity: null,
-    is_summary_candidate: event.event_subtype === "user_message" &&
+    is_summary_candidate: event.event_kind === "message" &&
       event.message_role === "user" &&
-      (event.message_origin === "human" ||
-        event.message_origin === "parent_agent") &&
+      (event.event_subtype === "user_message" &&
+          (event.message_origin === "human" ||
+            event.message_origin === "parent_agent") ||
+        event.event_subtype === "message" &&
+          event.message_origin === "human" &&
+          event.native_prompt_content_candidate) &&
       event.has_content_excerpt,
     is_tombstone: false,
   }));
@@ -602,23 +638,21 @@ function canonicalPrompts(
     (!event.canonical_scope_key || !event.logical_event_key) &&
     event.event_subtype === "user_message" && !adjacentSuppressed.has(event.id)
   );
-  const nativeCandidates = candidates.filter((event) =>
-    event.event_subtype === "message" && event.native_item_id !== null
-  );
+  const nativeCandidates = candidates.filter(isStableNativePrompt);
   const pairs = mutuallyUniquePromptPairs(unkeyedSubmitted, nativeCandidates);
   const sources: PromptSource[] = [];
   for (const event of canonical) {
     if (!event.canonical_scope_key || !event.logical_event_key) continue;
     const group = groups.get(semanticKey(event)) ?? [event];
-    const keyedNativeItemId = group.map((row) =>
-      row.event_subtype === "message" ? row.native_item_id : null
-    ).filter((value): value is string =>
-      value !== null
+    const keyedNativeItemId = group.filter(isStableNativePrompt).map((row) =>
+      row.native_item_id
     ).sort().at(-1) ?? null;
     const hasSubmitted = group.some((row) =>
       row.event_subtype === "user_message"
     );
-    if (!hasSubmitted) continue;
+    // A stable native user item is direct submission evidence even when Codex
+    // omits the separate `user_message` envelope from the rollout.
+    if (!hasSubmitted && !keyedNativeItemId) continue;
     sources.push({
       ...event,
       prompt_identity: keyedNativeItemId
@@ -644,7 +678,29 @@ function canonicalPrompts(
         : paired?.activity_observed_at ?? event.source_observed_at,
     });
   }
-  return sources.filter((event) =>
+  const canonicalByIdentity = new Map<string, PromptSource>();
+  for (const source of sources) {
+    if (!canonicalByIdentity.has(source.prompt_identity)) {
+      canonicalByIdentity.set(source.prompt_identity, source);
+    }
+  }
+  for (
+    const event of [...nativeCandidates].sort((left, right) =>
+      compareBigint(left.id, right.id)
+    )
+  ) {
+    if (event.canonical_scope_key && event.logical_event_key) continue;
+    const promptIdentity = `native:${event.native_item_id}`;
+    if (canonicalByIdentity.has(promptIdentity)) continue;
+    canonicalByIdentity.set(promptIdentity, {
+      ...event,
+      prompt_identity: promptIdentity,
+      prompt_observed_at: nativeItemObservedAt(event.native_item_id) ??
+        event.source_observed_at,
+    });
+  }
+  const canonicalSources = [...canonicalByIdentity.values()];
+  return canonicalSources.filter((event) =>
     inWindow(event.prompt_observed_at, coveredFrom, coveredThrough)
   ).map((event) => ({
     evidence_kind: "prompt",
@@ -688,6 +744,15 @@ function isPromptCandidate(event: SourceEvent): boolean {
     event.message_role === "user" && event.content_sha256 !== null &&
     (event.content_byte_size ?? 0) > 0 && event.error_code === null &&
     event.stored_actor_role === "primary";
+}
+
+function isStableNativePrompt(
+  event: SourceEvent,
+): event is SourceEvent & { native_item_id: string } {
+  return event.event_subtype === "message" && event.native_item_id !== null &&
+    event.source_native_type === "response_item" &&
+    event.source_native_payload_type === "message" &&
+    event.native_prompt_content_candidate;
 }
 
 function canonicalSemanticRows(events: readonly SourceEvent[]): SourceEvent[] {
@@ -1047,6 +1112,7 @@ async function fingerprintSourceState(
       event.content_sha256,
       event.content_byte_size,
       event.has_content_excerpt,
+      event.native_prompt_content_candidate,
       event.error_code,
       event.source_batch_id,
       event.source_record_index,
@@ -1134,6 +1200,9 @@ function sourceEventFromRow(row: Record<string, unknown>): SourceEvent {
       ? null
       : Number(row.content_byte_size),
     has_content_excerpt: Boolean(row.has_content_excerpt),
+    native_prompt_content_candidate: Boolean(
+      row.native_prompt_content_candidate,
+    ),
     error_code: nullableString(row.error_code),
     source_batch_id: String(row.source_batch_id),
     source_record_index: Number(row.source_record_index),

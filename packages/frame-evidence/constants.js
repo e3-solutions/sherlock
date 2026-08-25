@@ -1,4 +1,4 @@
-export const FRAME_VERSION = "frame-evidence-v1";
+export const FRAME_VERSION = "frame-evidence-v2";
 
 export const FRAME_NORMALIZER_VERSIONS = Object.freeze([
   "sherlock.codex-rollout.v1",

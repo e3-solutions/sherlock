@@ -547,6 +547,10 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
             FRAME_VERSION,
             projectedSnapshot.snapshot,
             personId,
+            projectedDay.start,
+            new Date(
+              new Date(projectedDay.start).getTime() + 24 * 60 * 60 * 1000,
+            ).toISOString(),
             bucketStart.toISOString(),
             new Date(bucketStart.getTime() + BUCKET_MS).toISOString(),
             "e3group.ai",
