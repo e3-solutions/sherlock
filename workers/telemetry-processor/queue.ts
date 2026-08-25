@@ -1,4 +1,5 @@
-import postgres from "npm:postgres@3.4.7";
+import { createPostgresPool, type ReservedSql, type Sql } from "./database.ts";
+import type { CommitPair, LookupResult } from "./github-sync.ts";
 
 export type WorkloadClass = "live" | "backfill";
 export type JobKind = "normalize" | "reduce";
@@ -29,67 +30,263 @@ export interface ReductionJob extends BaseJob {
 export type TelemetryJob = NormalizationJob | ReductionJob;
 export type CompletionResult = "succeeded" | "requeued" | "fenced";
 
-type Sql = ReturnType<typeof postgres>;
+export interface ReductionEnqueueOptions {
+  workspaceId: string;
+  sessionId: string;
+  normalizerVersion: string;
+  activityVersion: string;
+  targetEventId: bigint;
+  workloadClass: WorkloadClass;
+}
+
+export function coalesceReductionTargets(
+  options: readonly ReductionEnqueueOptions[],
+): ReductionEnqueueOptions[] {
+  const targets = new Map<string, ReductionEnqueueOptions>();
+  for (const option of options) {
+    if (option.targetEventId <= 0n) continue;
+    const key = JSON.stringify([
+      option.workspaceId,
+      option.sessionId,
+      option.normalizerVersion,
+      option.activityVersion,
+    ]);
+    const existing = targets.get(key);
+    if (existing === undefined) {
+      targets.set(key, option);
+      continue;
+    }
+    targets.set(key, {
+      ...existing,
+      targetEventId: existing.targetEventId > option.targetEventId
+        ? existing.targetEventId
+        : option.targetEventId,
+      workloadClass: existing.workloadClass === "live" ||
+          option.workloadClass === "live"
+        ? "live"
+        : "backfill",
+    });
+  }
+  return [...targets.values()].sort((left, right) =>
+    compareText(left.workspaceId, right.workspaceId) ||
+    compareText(left.sessionId, right.sessionId) ||
+    compareText(left.normalizerVersion, right.normalizerVersion) ||
+    compareText(left.activityVersion, right.activityVersion)
+  );
+}
 
 export class PostgresJobQueue {
+  private handoffConnection: ReservedSql | null = null;
+
   private constructor(private readonly sql: Sql) {}
 
   static connect(
     databaseUrl: string,
     maxConnections: number,
   ): PostgresJobQueue {
-    return new PostgresJobQueue(postgres(databaseUrl, {
-      prepare: false,
-      max: maxConnections,
-      idle_timeout: 20,
-      connect_timeout: 10,
-    }));
+    return new PostgresJobQueue(
+      createPostgresPool(databaseUrl, maxConnections),
+    );
   }
 
   async close(): Promise<void> {
-    await this.sql.end();
+    await this.releaseHandoff();
+    await this.sql.end({ timeout: 5 });
+  }
+
+  async tryAcquireHandoff(lockKey: string): Promise<boolean> {
+    if (this.handoffConnection !== null) return true;
+    const connection = await this.sql.reserve();
+    try {
+      const rows = await connection.unsafe(
+        "select pg_try_advisory_lock(hashtextextended($1, 0)) as acquired",
+        [lockKey],
+      );
+      if (rows[0]?.acquired !== true) return false;
+      this.handoffConnection = connection;
+      return true;
+    } finally {
+      if (this.handoffConnection !== connection) connection.release();
+    }
+  }
+
+  async releaseHandoff(): Promise<void> {
+    const connection = this.handoffConnection;
+    if (connection === null) return;
+    this.handoffConnection = null;
+    try {
+      await connection.unsafe("select pg_advisory_unlock_all()");
+    } finally {
+      connection.release();
+    }
+  }
+
+  async pendingGithubCommitPairs(limit: number): Promise<CommitPair[]> {
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_processor");
+      const rows = await tx.unsafe(
+        `with observed as (
+           select workspace_id, repository_full_name, commit_sha,
+                  max(observed_at) observed_at
+             from telemetry.session_scm
+            where source_version = 'sherlock.github-scm.v1'
+              and observed_at >= now() - interval '26 hours'
+            group by workspace_id, repository_full_name, commit_sha
+         )
+         select observed.*
+           from observed
+           left join lateral (
+             select id, outcome, pull_request_terminal_at, created_at
+               from github.commit_pr_lookups
+              where workspace_id = observed.workspace_id
+                and source_version = 'sherlock.github-associated-pulls.v1'
+                and repository_full_name = observed.repository_full_name
+                and commit_sha = observed.commit_sha
+              order by id desc
+              limit 1
+           ) latest on true
+          where latest.id is null or (
+            latest.created_at < now() - interval '10 minutes' and not (
+              latest.outcome = 'matched' and
+              latest.pull_request_terminal_at is not null
+            )
+          )
+          order by (latest.id is not null), latest.id,
+                   observed.workspace_id, observed.repository_full_name,
+                   observed.commit_sha
+          limit $1`,
+        [limit],
+      );
+      return rows.map((row) => ({
+        workspaceId: String(row.workspace_id),
+        repositoryFullName: String(row.repository_full_name),
+        commitSha: String(row.commit_sha),
+      }));
+    });
+  }
+
+  async appendGithubLookup(result: LookupResult): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_processor");
+      await tx.unsafe(
+        `insert into github.commit_pr_lookups (
+           workspace_id, source_version, repository_full_name, commit_sha,
+           outcome, pull_request_number, pull_request_terminal_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1', $2, $3, $4, $5, $6)`,
+        [
+          result.workspaceId,
+          result.repositoryFullName,
+          result.commitSha,
+          result.outcome,
+          result.pullRequestNumber,
+          result.pullRequestTerminalAt,
+        ],
+      );
+    });
   }
 
   async claim(
     workloadClass: WorkloadClass,
     owner: string,
     leaseSeconds: number,
+    jobKind: JobKind | null = null,
   ): Promise<TelemetryJob | null> {
+    return await this.claimMatching(
+      workloadClass,
+      owner,
+      leaseSeconds,
+      jobKind,
+      false,
+    );
+  }
+
+  async claimLiveNormalizationFrontier(
+    owner: string,
+    leaseSeconds: number,
+  ): Promise<TelemetryJob | null> {
+    return await this.claimMatching(
+      "live",
+      owner,
+      leaseSeconds,
+      "normalize",
+      true,
+    );
+  }
+
+  private async claimMatching(
+    workloadClass: WorkloadClass,
+    owner: string,
+    leaseSeconds: number,
+    jobKind: JobKind | null,
+    liveNormalizationFrontier: boolean,
+  ): Promise<TelemetryJob | null> {
+    const liveDemandProjection = liveNormalizationFrontier
+      ? `,
+                  min(pending_job.created_at) filter (
+                    where pending_job.workload_class = 'live'
+                      and pending_job.attempt_count < pending_job.attempt_limit
+                      and (
+                        (pending_job.status = 'queued'
+                          and pending_job.available_at <= now()) or
+                        (pending_job.status = 'leased'
+                          and pending_job.lease_expires_at <= now())
+                      )
+                  ) over (
+                    partition by pending_batch.workspace_id,
+                                 pending_batch.collector_key,
+                                 pending_batch.source_kind,
+                                 pending_batch.source_stream_key,
+                                 pending_batch.generation_seq,
+                                 pending_batch.generation_key
+                  ) as oldest_ready_live_created_at`
+      : "";
+    const workloadPredicate = liveNormalizationFrontier
+      ? "$1::text = 'live' and pending.oldest_ready_live_created_at is not null"
+      : "j.workload_class = $1";
+    const liveDemandOrder = liveNormalizationFrontier
+      ? "pending.oldest_ready_live_created_at,"
+      : "";
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
-        `with candidate as (
+        `with pending_normalize as (
+           select pending_job.id,
+                  min(pending_batch.start_offset) over (
+                    partition by pending_batch.workspace_id,
+                                 pending_batch.collector_key,
+                                 pending_batch.source_kind,
+                                 pending_batch.source_stream_key,
+                                 pending_batch.generation_seq,
+                                 pending_batch.generation_key
+                  ) as earliest_start${liveDemandProjection}
+             from processing.telemetry_jobs pending_job
+             join telemetry.ingest_batches pending_batch
+               on pending_batch.workspace_id = pending_job.workspace_id
+              and pending_batch.id = pending_job.batch_id
+            where pending_job.job_kind = 'normalize'
+              and pending_job.status in ('queued', 'leased')
+         ), candidate as (
            select j.id
              from processing.telemetry_jobs j
              left join telemetry.ingest_batches batch
                on j.job_kind = 'normalize'
               and batch.workspace_id = j.workspace_id
               and batch.id = j.batch_id
-            where j.workload_class = $1
+             left join pending_normalize pending
+               on pending.id = j.id
+            where ${workloadPredicate}
+              and ($4::text is null or j.job_kind = $4)
               and j.attempt_count < j.attempt_limit
               and (
                 (j.status = 'queued' and j.available_at <= now()) or
                 (j.status = 'leased' and j.lease_expires_at <= now())
               )
               and (
-                j.job_kind <> 'normalize' or not exists (
-                  select 1
-                    from telemetry.ingest_batches predecessor
-                    join processing.telemetry_jobs predecessor_job
-                      on predecessor_job.workspace_id = predecessor.workspace_id
-                     and predecessor_job.batch_id = predecessor.id
-                     and predecessor_job.job_kind = 'normalize'
-                   where predecessor.workspace_id = batch.workspace_id
-                     and predecessor.collector_key = batch.collector_key
-                     and predecessor.source_kind = batch.source_kind
-                     and predecessor.source_stream_key = batch.source_stream_key
-                     and predecessor.generation_seq = batch.generation_seq
-                     and predecessor.generation_key = batch.generation_key
-                     and predecessor.start_offset < batch.start_offset
-                     and predecessor_job.status in ('queued', 'leased')
-                )
+                j.job_kind <> 'normalize' or batch.id is null
+                or batch.start_offset = pending.earliest_start
               )
-            order by case when j.status = 'queued' then j.available_at
+            order by ${liveDemandOrder}
+                     case when j.status = 'queued' then j.available_at
                           else j.lease_expires_at end,
                      j.id
             for update of j skip locked
@@ -113,21 +310,39 @@ export class PostgresJobQueue {
                   j.request_generation::text as request_generation,
                   j.workload_class, j.attempt_count, j.attempt_limit,
                   j.lease_token::text as lease_token`,
-        [workloadClass, owner, leaseSeconds],
+        [workloadClass, owner, leaseSeconds, jobKind],
       );
       return rows.length === 0 ? null : jobFromRow(rows[0]);
     });
   }
 
-  async enqueueReduction(options: {
-    workspaceId: string;
-    sessionId: string;
-    normalizerVersion: string;
-    activityVersion: string;
-    targetEventId: bigint;
-    workloadClass: WorkloadClass;
-  }): Promise<void> {
-    if (options.targetEventId <= 0n) return;
+  async oldestLiveNormalizationAgeSeconds(): Promise<number | null> {
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_processor");
+      const rows = await tx.unsafe(
+        `select extract(epoch from now() - min(created_at))::float8 as age_seconds
+           from processing.telemetry_jobs
+          where workload_class = 'live' and job_kind = 'normalize'
+            and attempt_count < attempt_limit
+            and (
+              (status = 'queued' and available_at <= now()) or
+              (status = 'leased' and lease_expires_at <= now())
+            )`,
+      );
+      const value = rows[0]?.age_seconds;
+      return value === null || value === undefined ? null : Number(value);
+    });
+  }
+
+  async enqueueReduction(options: ReductionEnqueueOptions): Promise<void> {
+    await this.enqueueReductions([options]);
+  }
+
+  async enqueueReductions(
+    options: readonly ReductionEnqueueOptions[],
+  ): Promise<void> {
+    const targets = coalesceReductionTargets(options);
+    if (targets.length === 0) return;
     await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       await tx.unsafe(
@@ -135,11 +350,20 @@ export class PostgresJobQueue {
            workspace_id, job_kind, session_id, normalizer_version,
            activity_version, target_event_id, request_generation,
            workload_class, available_at
-         ) values (
-           $1, 'reduce', $2, $3, $4, $5, 1, $6,
-           now() + case when $6 = 'live' then interval '100 milliseconds'
-                        else interval '2 seconds' end
-         ) on conflict (
+         )
+         select target.workspace_id, 'reduce', target.session_id,
+                target.normalizer_version, target.activity_version,
+                target.target_event_id, 1, target.workload_class,
+                now() + case when target.workload_class = 'live'
+                  then interval '100 milliseconds' else interval '2 seconds' end
+           from unnest(
+             $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::bigint[],
+             $6::text[]
+           ) as target(
+             workspace_id, session_id, normalizer_version, activity_version,
+             target_event_id, workload_class
+           )
+         on conflict (
            workspace_id, session_id, normalizer_version, activity_version
          ) where job_kind = 'reduce' do update set
            target_event_id = greatest(
@@ -176,12 +400,12 @@ export class PostgresJobQueue {
            end,
            updated_at = now()`,
         [
-          options.workspaceId,
-          options.sessionId,
-          options.normalizerVersion,
-          options.activityVersion,
-          options.targetEventId.toString(),
-          options.workloadClass,
+          targets.map((target) => target.workspaceId),
+          targets.map((target) => target.sessionId),
+          targets.map((target) => target.normalizerVersion),
+          targets.map((target) => target.activityVersion),
+          targets.map((target) => target.targetEventId.toString()),
+          targets.map((target) => target.workloadClass),
         ],
       );
     });
@@ -321,6 +545,10 @@ export class PostgresJobQueue {
       return (await tx.unsafe(query, parameters as never[])).length === 1;
     });
   }
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function jobFromRow(row: Record<string, unknown>): TelemetryJob {

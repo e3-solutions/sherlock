@@ -1,23 +1,36 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { adaptMock } = vi.hoisted(() => ({
+const {
+  adaptMock,
+  adaptFreshnessMock,
+  flameGraphRenderMock,
+  mergeFreshnessMock,
+} = vi.hoisted(() => ({
   adaptMock: vi.fn(),
+  adaptFreshnessMock: vi.fn(),
+  flameGraphRenderMock: vi.fn(),
+  mergeFreshnessMock: vi.fn(),
 }));
 
 vi.mock("./flame-data.js", () => ({
   adaptFlamePayload: adaptMock,
+  adaptFlameFreshness: adaptFreshnessMock,
+  mergeFlameFreshness: mergeFreshnessMock,
   BUCKET_MS: 10 * 60 * 1000,
 }));
 
 vi.mock("./FlameGraph.jsx", () => ({
-  default: ({ data, rankBy, stale, onRefresh, timelineMeta }) => (
-    <div data-testid="flame-graph" data-rank-by={rankBy} data-stale={String(stale)}>
-      {timelineMeta}
-      {data.marker}
-      <button type="button" onClick={onRefresh}>Refresh timeline</button>
-    </div>
-  ),
+  default: ({ data, rankBy, stale, onRefresh, timelineMeta }) => {
+    flameGraphRenderMock();
+    return (
+      <div data-testid="flame-graph" data-rank-by={rankBy} data-stale={String(stale)}>
+        {timelineMeta}
+        {data.marker}
+        <button type="button" onClick={onRefresh}>Refresh timeline</button>
+      </div>
+    );
+  },
   PERSON_RANK_OPTIONS: [
     { value: "roster", label: "Name" },
     { value: "active-time", label: "Active time" },
@@ -41,6 +54,7 @@ const model = {
     reason: "event_presence_not_continuous_attention",
   },
 };
+const freshnessModel = { delayed: false, people: [], readMs: model.readMs };
 
 function response({ ok = true, status = 200, body = payload } = {}) {
   return {
@@ -57,11 +71,27 @@ async function settle() {
   });
 }
 
+function routedFetch(timelineResponses) {
+  const queue = [...timelineResponses];
+  return vi.fn((url) => Promise.resolve(
+    url.startsWith("/api/flame/freshness")
+      ? response({ body: { freshness: true } })
+      : (queue.shift() ?? response()),
+  ));
+}
+
+function timelineCalls(mock) {
+  return mock.mock.calls.filter(([url]) => !url.startsWith("/api/flame/freshness"));
+}
+
 describe("App", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-14T12:03:00Z"));
     adaptMock.mockReturnValue(model);
+    flameGraphRenderMock.mockClear();
+    adaptFreshnessMock.mockReturnValue(freshnessModel);
+    mergeFreshnessMock.mockImplementation((timeline) => timeline);
   });
 
   afterEach(() => {
@@ -91,6 +121,28 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("polls the lightweight receipt and shows pipeline delay globally", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response());
+    adaptFreshnessMock.mockReturnValue({ ...freshnessModel, delayed: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    await settle();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/flame/freshness?refresh=wait",
+      expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Live telemetry is delayed. Recent activity may arrive late.",
+    );
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "true");
+  });
+
   it("lets detail recovery request a fresh timeline snapshot", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response());
     vi.stubGlobal("fetch", fetchMock);
@@ -108,10 +160,11 @@ describe("App", () => {
   });
 
   it("preserves forced recovery intent after a failed forced refresh", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response())
-      .mockResolvedValueOnce(response({ ok: false, status: 503 }))
-      .mockResolvedValueOnce(response());
+    const fetchMock = routedFetch([
+      response(),
+      response({ ok: false, status: 503 }),
+      response(),
+    ]);
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
@@ -125,10 +178,10 @@ describe("App", () => {
     });
     await settle();
 
-    expect(fetchMock).toHaveBeenLastCalledWith(
+    expect(timelineCalls(fetchMock).at(-1)).toEqual([
       "/api/flame?refresh=force",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
+    ]);
   });
 
   it("places the ranking selector between recency and role legends", () => {
@@ -198,9 +251,10 @@ describe("App", () => {
   });
 
   it("retains the last-good graph and announces a failed refresh", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response())
-      .mockResolvedValueOnce(response({ ok: false, status: 503 }));
+    const fetchMock = routedFetch([
+      response(),
+      response({ ok: false, status: 503 }),
+    ]);
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
@@ -211,14 +265,30 @@ describe("App", () => {
     });
     await settle();
 
-    expect(fetchMock).toHaveBeenLastCalledWith(
+    expect(timelineCalls(fetchMock).at(-1)).toEqual([
       "/api/flame?refresh=wait",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
+    ]);
 
     expect(screen.getByText(/Refresh failed\. Through/)).toBeInTheDocument();
     expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "true");
     expect(screen.getByTestId("flame-graph")).toHaveTextContent("adapted timeline");
+  });
+
+  it("announces a delayed refresh immediately between minute ticks", async () => {
+    const fetchMock = routedFetch([response(), response()]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await settle();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextRefreshDelay(Date.now()));
+    });
+    await settle();
+
+    expect(timelineCalls(fetchMock)).toHaveLength(2);
+    expect(screen.getByText(/Update delayed\. Through/)).toBeInTheDocument();
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "true");
   });
 
   it("keeps partial coverage chrome out of the visible timeline", async () => {
@@ -250,10 +320,11 @@ describe("App", () => {
         startMs: Date.parse("2026-08-13T12:10:00.000Z"),
         readMs: Date.parse("2026-08-14T12:11:31.000Z"),
       });
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response())
-      .mockResolvedValueOnce(response({ ok: false, status: 503 }))
-      .mockResolvedValueOnce(response());
+    const fetchMock = routedFetch([
+      response(),
+      response({ ok: false, status: 503 }),
+      response(),
+    ]);
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
@@ -271,23 +342,29 @@ describe("App", () => {
 
     expect(screen.queryByText(/Refresh failed/)).not.toBeInTheDocument();
     expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-stale", "false");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(timelineCalls(fetchMock)).toHaveLength(3);
   });
 
-  it("updates the visible read age without refetching", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(response());
+  it("updates the visible read age without refetching or rerendering the graph", async () => {
+    const fetchMock = routedFetch([response()]);
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     await settle();
     expect(screen.getByText(/read 1m ago/)).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    await settle();
+    const graphRenders = flameGraphRenderMock.mock.calls.length;
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(60 * 1000);
+      await vi.advanceTimersByTimeAsync(59 * 1000);
     });
 
     expect(screen.getByText(/read 2m ago/)).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(timelineCalls(fetchMock)).toHaveLength(1);
+    expect(flameGraphRenderMock).toHaveBeenCalledTimes(graphRenders);
   });
 
   it("aborts an in-flight request on unmount", () => {

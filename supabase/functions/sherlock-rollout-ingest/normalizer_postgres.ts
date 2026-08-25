@@ -17,6 +17,31 @@ import type { NormalizationResult } from "./service.ts";
 
 type Sql = ReturnType<typeof postgres>;
 type TransactionSql = postgres.TransactionSql;
+export interface NormalizerTransactionRunner {
+  <T>(callback: (tx: TransactionSql) => Promise<T>): Promise<T>;
+}
+
+function pooledTransactionRunner(sql: Sql): NormalizerTransactionRunner {
+  return <T>(callback: (tx: TransactionSql) => Promise<T>) =>
+    sql.begin(callback) as Promise<T>;
+}
+
+export function normalizationStatementTimeout(
+  statementTimeoutMs?: number,
+  deadlineAtMs?: number,
+  now = () => performance.now(),
+): number | undefined {
+  if (deadlineAtMs === undefined) return statementTimeoutMs;
+  const remaining = Math.floor(deadlineAtMs - now());
+  if (remaining <= 0) {
+    const error = new Error("normalization deadline exceeded");
+    Object.assign(error, { code: "processing_deadline_exceeded" });
+    throw error;
+  }
+  return statementTimeoutMs === undefined
+    ? remaining
+    : Math.min(statementTimeoutMs, remaining);
+}
 
 const EVENT_COLUMNS = [
   "workspace_id",
@@ -67,26 +92,52 @@ const EVENT_COLUMNS = [
 ] as const;
 
 export class PostgresBatchNormalizer implements BatchNormalizer {
-  constructor(private readonly sql: Sql) {}
+  constructor(
+    private readonly sql: Sql,
+    private readonly transactionRunner: NormalizerTransactionRunner =
+      pooledTransactionRunner(sql),
+    private readonly ownsSql = true,
+  ) {}
 
   static connect(databaseUrl: string): PostgresBatchNormalizer {
-    return new PostgresBatchNormalizer(
-      postgres(databaseUrl, { prepare: false, max: 2, idle_timeout: 20 }),
-    );
+    const sql = postgres(databaseUrl, {
+      prepare: false,
+      max: 2,
+      idle_timeout: 20,
+    });
+    return new PostgresBatchNormalizer(sql);
+  }
+
+  static fromReservedConnection(
+    sql: Sql,
+    transactionRunner: NormalizerTransactionRunner,
+  ): PostgresBatchNormalizer {
+    return new PostgresBatchNormalizer(sql, transactionRunner, false);
   }
 
   async close(): Promise<void> {
-    await this.sql.end();
+    if (this.ownsSql) await this.sql.end();
   }
 
   async normalize(
     receipt: CommittedReceipt,
     manifest: BatchManifest,
     source: Uint8Array,
+    statementTimeoutMs?: number,
+    deadlineAtMs?: number,
   ): Promise<NormalizationResult> {
     const projection = await projectBatch(manifest, source);
     const normalizerVersion = normalizerVersionFor(manifest);
-    return await this.sql.begin(async (tx) => {
+    const timeout = normalizationStatementTimeout(
+      statementTimeoutMs,
+      deadlineAtMs,
+    );
+    return await this.transactionRunner(async (tx) => {
+      if (timeout !== undefined) {
+        await tx.unsafe("select set_config('statement_timeout', $1, true)", [
+          `${Math.max(1, Math.floor(timeout))}ms`,
+        ]);
+      }
       await tx.unsafe("set local role sherlock_normalizer");
       const sourceRecords = await tx.unsafe(
         `select id, record_index
@@ -349,6 +400,37 @@ async function upsertSession(
        started_at = least(telemetry.sessions.started_at, excluded.started_at),
        updated_at = now()
      where telemetry.sessions.person_id = excluded.person_id
+       and row(
+         telemetry.sessions.native_thread_id,
+         telemetry.sessions.parent_session_id,
+         telemetry.sessions.parent_native_session_id,
+         telemetry.sessions.actor_role,
+         telemetry.sessions.role_version,
+         telemetry.sessions.title,
+         telemetry.sessions.project_key,
+         telemetry.sessions.repo_remote,
+         telemetry.sessions.branch,
+         telemetry.sessions.cwd,
+         telemetry.sessions.model,
+         telemetry.sessions.started_at
+       ) is distinct from row(
+         coalesce(excluded.native_thread_id, telemetry.sessions.native_thread_id),
+         coalesce(excluded.parent_session_id, telemetry.sessions.parent_session_id),
+         coalesce(
+           excluded.parent_native_session_id,
+           telemetry.sessions.parent_native_session_id
+         ),
+         case when excluded.actor_role = 'unknown'
+           then telemetry.sessions.actor_role else excluded.actor_role end,
+         excluded.role_version,
+         coalesce(excluded.title, telemetry.sessions.title),
+         coalesce(excluded.project_key, telemetry.sessions.project_key),
+         coalesce(excluded.repo_remote, telemetry.sessions.repo_remote),
+         coalesce(excluded.branch, telemetry.sessions.branch),
+         coalesce(excluded.cwd, telemetry.sessions.cwd),
+         coalesce(excluded.model, telemetry.sessions.model),
+         least(telemetry.sessions.started_at, excluded.started_at)
+       )
      returning id, actor_role`,
     [
       crypto.randomUUID(),
@@ -370,7 +452,20 @@ async function upsertSession(
       session.started_at ?? receipt.committed_at,
     ],
   );
-  if (rows.length === 0) {
+  const resolvedRows = rows.length > 0 ? rows : await tx.unsafe(
+    `select id, actor_role
+         from telemetry.sessions
+        where workspace_id = $1 and collector_key = $2
+          and native_session_id = $3 and person_id = $4
+        limit 1`,
+    [
+      receipt.workspace_id,
+      receipt.collector_key,
+      session.native_session_id,
+      receipt.person_id,
+    ],
+  );
+  if (resolvedRows.length === 0) {
     throw new IngestError(
       "session_attribution_conflict",
       "the native session is already attributed to another person",
@@ -384,7 +479,7 @@ async function upsertSession(
         and parent_native_session_id = $5 and parent_session_id is null
         and id <> $1`,
     [
-      rows[0].id,
+      resolvedRows[0].id,
       receipt.workspace_id,
       receipt.collector_key,
       receipt.person_id,
@@ -392,7 +487,7 @@ async function upsertSession(
     ],
   );
   return {
-    id: String(rows[0].id),
-    actor_role: String(rows[0].actor_role) as ActorRole,
+    id: String(resolvedRows[0].id),
+    actor_role: String(resolvedRows[0].actor_role) as ActorRole,
   };
 }

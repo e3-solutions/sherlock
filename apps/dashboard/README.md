@@ -42,8 +42,11 @@ objects.
   evidence must be at or after its owning Sherlock session's millisecond-aligned
   start. Copied pre-start source facts remain immutable in telemetry, but they do
   not make the later session active in an earlier dashboard bucket.
-- primary is Agent; worker and guardian are Subagent; unknown is Unclassified;
-  automation is excluded. When a v1 event is `unknown` but its Sherlock session
+- primary is Agent; worker is Subagent; unknown is Unclassified; explicit
+  guardian and automation roles are excluded from dashboard product work views.
+  Guardian telemetry remains immutable and auditable in the source and projected
+  evidence stores; only the dashboard view omits it. When a v1 event is `unknown`
+  but its Sherlock session
   has a resolved parent, the dashboard presents it as Subagent: parent topology
   is resolved source-backed session evidence that it is child work even when an
   older Codex payload encoded `source.subagent` as a string the v1 normalizer did
@@ -141,8 +144,8 @@ objects.
   144-bucket timeline as a single view. The graph never shrinks to a different
   preview window while the full aggregate is loading. People can be ranked in
   the browser by active time, peak observed sessions in one bucket, canonical
-  prompt count, or distinct subagent sessions. Ranking creates a product view
-  over the adapted payload; it does not mutate the roster or source telemetry.
+  prompt count, or distinct worker Subagent sessions. Ranking creates a product
+  view over the adapted payload; it does not mutate the roster or source telemetry.
   Active time is selected by default, and Name restores the source roster order.
 
 ## Initial-load cache
@@ -171,6 +174,36 @@ An entry stops being serveable after 24 hours, before its lazy-detail snapshot
 expires; health then reports `timeline_expired` until a refresh succeeds.
 Cross-restart outage survival would require a separate durable publication and
 immutable publication-time session facts.
+
+## Live freshness receipt
+
+`GET /api/flame/freshness` serves a separate aggregate-only receipt containing
+the visible roster's raw ingest watermark, the latest canonical dashboard event
+watermark, its oldest/pending live normalization summary, and each roster
+person's latest canonical activity. Backfill, smoke-canary, and out-of-domain
+jobs cannot trigger the live-delay warning. The server refreshes this small
+receipt every two minutes; browsers
+poll the cache once per minute with `refresh=wait`, retain the last good result,
+and update only activity-recency status. The 144 immutable timeline buckets and
+their ten-minute refresh cadence do not change.
+
+The freshness activity scan is bounded to the 30-minute recency horizon. When a
+person has no activity in that horizon, the browser preserves any older timestamp
+from the last-good 24-hour timeline rather than regressing it to null. Failed
+database refreshes have a hard one-minute cooldown shared by scheduled and
+request-driven refreshes.
+
+The browser displays a global warning when the oldest pending normalization is
+at least five minutes old, or when the receipt cannot be refreshed. Operators
+can deterministically compare `canonicalWatermark` and `read`, then confirm the
+matching person's `lastActivity`, without treating a delayed pipeline as proof
+that everyone is inactive. Freshness failure does not affect `/healthz` and
+cannot restart an otherwise healthy dashboard process.
+
+The database function is `SECURITY DEFINER` with an empty search path because it
+must summarize the private processing queue. Execute is revoked from public,
+API, service, and worker roles and granted only to `sherlock_reader`; its result
+contains no job IDs, leases, errors, raw payloads, hashes, or storage paths.
 
 ## Environment
 

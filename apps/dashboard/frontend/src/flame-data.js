@@ -283,23 +283,97 @@ export function adaptFlamePayload(value) {
   };
 }
 
+/** Validates the lightweight aggregate-only freshness receipt. */
+export function adaptFlameFreshness(value) {
+  const payload = requireObject(value, "freshness");
+  const readMs = requireDate(payload.read, "freshness.read");
+  const rawWatermarkMs = requireDate(
+    payload.rawWatermark,
+    "freshness.rawWatermark",
+    true,
+  );
+  const canonicalWatermarkMs = requireDate(
+    payload.canonicalWatermark,
+    "freshness.canonicalWatermark",
+    true,
+  );
+  const oldestPendingNormalizeMs = requireDate(
+    payload.oldestPendingNormalize,
+    "freshness.oldestPendingNormalize",
+    true,
+  );
+  const pendingNormalize = requireCount(payload.pendingNormalize, "freshness.pendingNormalize");
+  const delayed = requireBoolean(payload.delayed, "freshness.delayed");
+  if ([rawWatermarkMs, canonicalWatermarkMs, oldestPendingNormalizeMs]
+    .some((timestamp) => timestamp !== null && timestamp > readMs)) {
+    fail("freshness", "watermarks at or before its read");
+  }
+  if ((pendingNormalize === 0) !== (oldestPendingNormalizeMs === null)) {
+    fail("freshness.oldestPendingNormalize", "present exactly when normalization is pending");
+  }
+  const computedDelayed = pendingNormalize > 0 &&
+    readMs - oldestPendingNormalizeMs >= 5 * 60 * 1000;
+  if (delayed !== computedDelayed) fail("freshness.delayed", "consistent with pending age");
+  if (!Array.isArray(payload.people)) fail("freshness.people", "an array");
+  const ids = new Set();
+  const people = payload.people.map((rawPerson, index) => {
+    const path = `freshness.people[${index}]`;
+    const person = requireObject(rawPerson, path);
+    const id = requireNonemptyString(person.id, `${path}.id`);
+    if (ids.has(id)) fail(`${path}.id`, "unique");
+    ids.add(id);
+    const lastActivityMs = requireDate(person.lastActivity, `${path}.lastActivity`, true);
+    if (lastActivityMs !== null && lastActivityMs > readMs) {
+      fail(`${path}.lastActivity`, "at or before freshness.read");
+    }
+    return { id, lastActivityMs };
+  });
+  return {
+    readMs,
+    rawWatermarkMs,
+    canonicalWatermarkMs,
+    oldestPendingNormalizeMs,
+    pendingNormalize,
+    delayed,
+    people,
+  };
+}
+
+/** Applies recency only; immutable 10-minute buckets and totals are untouched. */
+export function mergeFlameFreshness(data, freshness) {
+  const byId = new Map(freshness.people.map((person) => [person.id, person]));
+  if (byId.size !== data.people.length ||
+      data.people.some((person) => !byId.has(person.id))) {
+    fail("freshness.people", "the complete timeline roster");
+  }
+  return {
+    ...data,
+    recencyReadMs: Math.max(data.readMs, freshness.readMs),
+    freshness,
+    people: data.people.map((person) => {
+      const latest = byId.get(person.id).lastActivityMs;
+      return {
+        ...person,
+        lastActivityMs: latest === null
+          ? person.lastActivityMs
+          : Math.max(person.lastActivityMs ?? latest, latest),
+      };
+    }),
+  };
+}
+
 const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
 const CONVERSATION_ROLES = ["user", "assistant"];
 
 function requirePullRequest(value, path) {
   if (value === null || value === undefined) return null;
   const pullRequest = requireObject(value, path);
-  const repository = requireNonemptyString(pullRequest.repository, `${path}.repository`);
   const number = requirePositiveCount(pullRequest.number, `${path}.number`);
-  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) ||
-      repository.split("/").some((part) => part === "." || part === "..")) {
-    fail(`${path}.repository`, "a canonical GitHub owner/repository name");
-  }
   const url = requireNonemptyString(pullRequest.url, `${path}.url`);
-  if (url !== `https://github.com/${repository}/pull/${number}`) {
-    fail(`${path}.url`, "the canonical GitHub pull request URL");
+  if (!new RegExp(`^https://github\\.com/[^/]+/[^/]+/pull/${number}$`).test(url)) {
+    fail(`${path}.url`, "the matching GitHub pull request URL");
   }
-  return { repository, number, url };
+  return { number, url };
 }
 
 /** Validates the bounded, snapshot-pinned interval overview response. */

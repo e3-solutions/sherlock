@@ -97,7 +97,7 @@ export async function validateStoredBatch(
     const relativeStart = record.source_start_offset - manifest.start_offset;
     const relativeEnd = record.source_end_offset - manifest.start_offset;
     if (
-      (await sha256Hex(source.slice(relativeStart, relativeEnd))) !==
+      (await sha256Hex(source.subarray(relativeStart, relativeEnd))) !==
         record.record_sha256
     ) {
       throw new IngestError(
@@ -114,11 +114,7 @@ export async function decompressBounded(
   storedPayload: Uint8Array,
 ): Promise<Uint8Array> {
   try {
-    const bytes = storedPayload.buffer.slice(
-      storedPayload.byteOffset,
-      storedPayload.byteOffset + storedPayload.byteLength,
-    ) as ArrayBuffer;
-    const reader = new Blob([bytes])
+    const reader = new Blob([storedPayload as Uint8Array<ArrayBuffer>])
       .stream()
       .pipeThrough(new DecompressionStream("gzip"))
       .getReader();

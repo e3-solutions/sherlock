@@ -329,6 +329,24 @@ export function parseCollectorIdentity(value: unknown): CollectorIdentity {
   };
 }
 
+export function decodeBase64Bytes(value: string): Uint8Array {
+  const typedArray = Uint8Array as Uint8ArrayConstructor & {
+    fromBase64?: (encoded: string) => Uint8Array;
+  };
+  if (typeof typedArray.fromBase64 === "function") {
+    return typedArray.fromBase64(value);
+  }
+
+  try {
+    return Uint8Array.from(
+      atob(value),
+      (character) => character.charCodeAt(0),
+    );
+  } catch {
+    throw new SyntaxError("Invalid base64 string");
+  }
+}
+
 function decodeBase64(value: unknown): Uint8Array {
   if (typeof value !== "string" || value.length === 0) {
     throw new IngestError(
@@ -346,11 +364,7 @@ function decodeBase64(value: unknown): Uint8Array {
     );
   }
   try {
-    const binary = atob(value);
-    const bytes = Uint8Array.from(
-      binary,
-      (character) => character.charCodeAt(0),
-    );
+    const bytes = decodeBase64Bytes(value);
     if (bytes.byteLength > MAX_STORED_BYTES) {
       throw new IngestError(
         "payload_too_large",
@@ -704,11 +718,10 @@ export function validateManifest(manifest: BatchManifest): void {
 }
 
 export async function sha256Hex(value: Uint8Array): Promise<string> {
-  const bytes = value.buffer.slice(
-    value.byteOffset,
-    value.byteOffset + value.byteLength,
-  ) as ArrayBuffer;
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    value as Uint8Array<ArrayBuffer>,
+  );
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");

@@ -57,8 +57,12 @@ between page calls; every response declares the exact window and `readAt` it use
 }
 ```
 
-Session fields count distinct observed Sherlock execution sessions. They are not
-elapsed time, attention, uptime, productivity, or performance measurements.
+Session fields count distinct observed Sherlock execution sessions. In
+particular, `subagentSessionCount` counts distinct worker sessions and excludes
+guardian sessions. Guardian facts remain retained in immutable raw telemetry and
+auditable projection evidence; this MCP product view omits them. Session counts
+are not elapsed time, attention, uptime, productivity, or performance
+measurements.
 
 ## `list_prompt_evidence`
 

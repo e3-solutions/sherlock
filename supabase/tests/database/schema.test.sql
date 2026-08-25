@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(123);
+select plan(137);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -53,6 +53,99 @@ select ok(
   'frame activation uses only its exact workspace and version identity'
 );
 select has_table('processing', 'telemetry_jobs', 'durable telemetry queue exists');
+select has_function(
+  'analytics', 'read_dashboard_freshness', array['uuid', 'text', 'text[]', 'integer'],
+  'dashboard freshness has an aggregate-only database contract'
+);
+select ok(
+  has_function_privilege(
+    'sherlock_reader',
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)',
+    'execute'
+  ),
+  'only the dashboard reader receives the freshness aggregate'
+);
+select ok(
+  not has_function_privilege(
+    'anon', 'analytics.read_dashboard_freshness(uuid,text,text[],integer)', 'execute'
+  ) and not has_function_privilege(
+    'authenticated', 'analytics.read_dashboard_freshness(uuid,text,text[],integer)', 'execute'
+  ) and not has_function_privilege(
+    'service_role', 'analytics.read_dashboard_freshness(uuid,text,text[],integer)', 'execute'
+  ) and not has_function_privilege(
+    'sherlock_processor',
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)',
+    'execute'
+  ),
+  'public and operational roles cannot execute dashboard freshness'
+);
+select is(
+  (select count(*) from analytics.read_dashboard_freshness(
+    '00000000-0000-0000-0000-000000000001', 'example.com', array['v1'], 500
+  )),
+  0::bigint,
+  'freshness rejects an unapproved identity domain without revealing facts'
+);
+select is(
+  (select count(*) from analytics.read_dashboard_freshness(
+    '00000000-0000-0000-0000-000000000001', 'e3group.ai', array['v1'], 1001
+  )),
+  0::bigint,
+  'freshness rejects an over-broad roster bound'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+     where schemaname = 'processing'
+       and indexname = 'telemetry_jobs_dashboard_pending_normalize_idx'
+       and indexdef like '%workload_class = ''live''%'
+       and indexdef like '%status = ANY (ARRAY[''queued''::text, ''leased''::text])%'
+  ),
+  'pending freshness uses a narrow partial live-normalize index'
+);
+select ok(
+  regexp_count(
+    pg_get_functiondef(
+      'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+    ),
+    'workload_class[[:space:]]*=[[:space:]]*''live''',
+    1,
+    'i'
+  ) = 1
+  and regexp_count(
+    pg_get_functiondef(
+      'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+    ),
+    'join[[:space:]]+roster[[:space:]]+r[[:space:]]+on[[:space:]]+r.person_id[[:space:]]*=[[:space:]]*b.person_id',
+    1,
+    'i'
+  ) = 1
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'interval[[:space:]]+''30 minutes'''
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'order by[[:space:]]+b.committed_at[[:space:]]+desc,[[:space:]]*b.id[[:space:]]+desc[[:space:]]+limit[[:space:]]+1'
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'pending_freshness[[:space:]]+as[[:space:]]+materialized'
+  and pg_get_functiondef(
+    'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+  ) ~* 'from[[:space:]]+roster[[:space:]]+r[[:space:]]+cross[[:space:]]+join[[:space:]]+lateral',
+  'freshness watermarks and pending metrics use only the visible live roster'
+);
+select ok(
+  to_regclass('processing.telemetry_jobs_kind_claim_idx') is not null,
+  'kind-filtered queued claims have a bounded scheduler index'
+);
+select ok(
+  to_regclass('processing.telemetry_jobs_kind_expired_lease_idx') is not null,
+  'kind-filtered expired leases have a bounded recovery index'
+);
+select ok(
+  to_regclass('processing.telemetry_jobs_live_normalize_age_idx') is not null,
+  'live normalization overload sampling has a bounded partial index'
+);
 select has_column(
   'analytics', 'frame_projection_receipts', 'request_generation',
   'projection receipts preserve queue generation'
@@ -111,6 +204,18 @@ select ok(
       and indexdef like '%WHERE ((parent_session_id IS NULL) AND (parent_native_session_id IS NOT NULL))%'
   ),
   'unresolved session parents have a narrow partial lookup index'
+);
+select ok(
+  exists (
+    select 1
+    from pg_index i
+    where i.indexrelid = 'telemetry.people_workspace_email_key'::regclass
+      and i.indisunique
+      and i.indisvalid
+      and pg_get_indexdef(i.indexrelid) like '%(workspace_id, email)%'
+      and pg_get_expr(i.indpred, i.indrelid) = '(email IS NOT NULL)'
+  ),
+  'nonnull person email is unique within a workspace'
 );
 
 select ok(
@@ -655,6 +760,38 @@ insert into telemetry.people (id, workspace_id, identity_key) values
     'other-test-person'
   );
 
+insert into telemetry.people (id, workspace_id, identity_key, email) values
+  (
+    '00000000-0000-0000-0000-000000000103',
+    '00000000-0000-0000-0000-000000000001',
+    'shared-email-workspace-one',
+    'shared@example.com'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000104',
+    '00000000-0000-0000-0000-000000000002',
+    'shared-email-workspace-two',
+    'shared@example.com'
+  );
+
+select ok(
+  (
+    select count(*) = 2
+    from telemetry.people
+    where email = 'shared@example.com'
+  ),
+  'the same nonnull email remains valid in different workspaces'
+);
+select ok(
+  (
+    select count(*) = 2
+    from telemetry.people
+    where workspace_id = '00000000-0000-0000-0000-000000000001'
+      and email is null
+  ),
+  'multiple null emails remain valid in one workspace'
+);
+
 insert into telemetry.sessions (
   id, workspace_id, person_id, collector_key, native_session_id,
   actor_role, role_version, started_at
@@ -783,6 +920,16 @@ create temporary table constraint_results (
 do $$
 begin
   begin
+    insert into telemetry.people (workspace_id, identity_key, email) values (
+      '00000000-0000-0000-0000-000000000001',
+      'duplicate-shared-email', 'shared@example.com'
+    );
+    insert into constraint_results values ('duplicate email', false);
+  exception when unique_violation then
+    insert into constraint_results values ('duplicate email', true);
+  end;
+
+  begin
     insert into telemetry.ingest_batches (
       workspace_id, person_id, collector_key, source_kind, source_stream_key,
       generation_key, generation_seq, start_offset, end_offset,
@@ -856,6 +1003,8 @@ begin
 end
 $$;
 
+select ok(passed, 'a duplicate nonnull email in one workspace is rejected')
+from constraint_results where test_name = 'duplicate email';
 select ok(passed, 'cross-workspace person attribution is rejected')
 from constraint_results where test_name = 'tenant mismatch';
 select ok(passed, 'invalid byte ranges are rejected')
@@ -882,6 +1031,13 @@ begin
     to_regclass('telemetry.events') is not null and
     to_regclass('telemetry.session_scm') is not null and
     to_regclass('github.commit_pr_lookups') is not null and
+    exists (
+      select 1
+      from pg_index i
+      where i.indexrelid = 'telemetry.people_workspace_email_key'::regclass
+        and i.indisunique and i.indisvalid
+        and pg_get_expr(i.indpred, i.indrelid) = '(email IS NOT NULL)'
+    ) and
     to_regclass('analytics.activity_spans') is not null and
     to_regclass('processing.telemetry_jobs') is not null and
     (select count(*) = 5 from pg_roles where rolname in (
@@ -892,7 +1048,6 @@ begin
     pg_has_role('postgres', 'sherlock_normalizer', 'member') and
     pg_has_role('postgres', 'sherlock_reducer', 'member') and
     pg_has_role('postgres', 'sherlock_processor', 'member') and
-    pg_has_role('postgres', 'sherlock_github_sync', 'member') and
     exists (
       select 1 from storage.buckets
       where id = 'telemetry-raw' and public = false
@@ -936,9 +1091,9 @@ begin
     not has_table_privilege('sherlock_normalizer', 'telemetry.events', 'delete') and
     has_table_privilege('sherlock_normalizer', 'telemetry.session_scm', 'insert') and
     not has_table_privilege('sherlock_normalizer', 'telemetry.session_scm', 'update') and
-    has_table_privilege('sherlock_github_sync', 'telemetry.session_scm', 'select') and
-    has_table_privilege('sherlock_github_sync', 'github.commit_pr_lookups', 'insert') and
-    not has_table_privilege('sherlock_github_sync', 'github.commit_pr_lookups', 'update') and
+    has_table_privilege('sherlock_processor', 'telemetry.session_scm', 'select') and
+    has_table_privilege('sherlock_processor', 'github.commit_pr_lookups', 'insert') and
+    not has_table_privilege('sherlock_processor', 'github.commit_pr_lookups', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'delete') and
     has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'select') and
@@ -972,7 +1127,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 123,
+  'assertion_count', 137,
   'tables', 13,
   'private_bucket', 'telemetry-raw'
 ) as verification;

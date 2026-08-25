@@ -126,6 +126,52 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(len(result.native_session_ids), 1)
             self.assertEqual(result.errors, ())
 
+    def test_history_scan_discovers_recent_unindexed_and_archived_rollouts(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            session_id = "11111111-1111-4111-8111-111111111111"
+            archived_id = "22222222-2222-4222-8222-222222222222"
+            recent = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "08"
+                / "21"
+                / f"rollout-2026-08-21T00-00-00-{session_id}.jsonl"
+            )
+            archived = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-2026-08-21T00-00-00-{archived_id}.jsonl"
+            )
+            old = recent.with_name("rollout-old.jsonl")
+            for path in (recent, archived, old):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('{"type":"event"}\n', encoding="utf-8")
+            now_ns = time.time_ns()
+            os.utime(recent, ns=(now_ns - 2_000_000_000, now_ns - 2_000_000_000))
+            os.utime(archived, ns=(now_ns - 1_000_000_000, now_ns - 1_000_000_000))
+            os.utime(old, ns=(now_ns - 48 * 60 * 60 * 1_000_000_000,) * 2)
+
+            indexed_only = discover_rollouts(codex_home)
+            result = discover_rollouts(codex_home, scan_recent_files=True)
+
+            self.assertEqual(indexed_only.paths, ())
+            self.assertEqual(result.paths, (archived.resolve(), recent.resolve()))
+            self.assertEqual(
+                result.native_session_ids,
+                {
+                    str(archived.resolve()): archived_id,
+                    str(recent.resolve()): session_id,
+                },
+            )
+            self.assertEqual(set(result.source_snapshots), set(map(str, result.paths)))
+            self.assertEqual(
+                result.selected_bytes,
+                recent.stat().st_size + archived.stat().st_size,
+            )
+            self.assertEqual(result.invalid_count, 0)
+
     def test_hook_payload_path_is_available_before_sqlite_registration(self):
         with TemporaryDirectory() as temporary:
             codex_home = Path(temporary) / "codex"
@@ -768,6 +814,38 @@ class HookIntegrationTests(unittest.TestCase):
         )
         return codex_home, rollout
 
+    def test_exact_launcher_returns_valid_success_when_runtime_is_missing(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            launcher = (
+                codex_home
+                / "plugins"
+                / "cache"
+                / "marketplace"
+                / "sherlock"
+                / "v1"
+                / "scripts"
+                / "run_hook.py"
+            )
+            launcher.parent.mkdir(parents=True)
+            launcher.write_bytes(LAUNCHER.read_bytes())
+            environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+            environment.pop("SHERLOCK_COLLECTOR_SOURCE", None)
+
+            completed = subprocess.run(
+                [sys.executable, str(launcher), "Stop"],
+                input="{}",
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, '{"continue":true}\n')
+            self.assertEqual(completed.stderr, "")
+
     def test_exact_launcher_returns_quickly_when_network_is_down(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -807,15 +885,132 @@ class HookIntegrationTests(unittest.TestCase):
             elapsed = time.monotonic() - started
 
             self.assertLess(elapsed, 1.0)
-            outcome = json.loads(completed.stdout)
-            self.assertEqual(outcome["discovered"], 1)
-            self.assertEqual(outcome["enqueued"], 1)
+            self.assertEqual(completed.stdout, '{"continue":true}\n')
             state_root = codex_home / "sherlock" / "telemetry"
             self.assertTrue((state_root / "rollout-state.json").is_file())
             self.assertEqual(
                 len(list((state_root / "queue").glob("*/*.json"))),
                 1,
             )
+
+    def test_session_start_keeps_current_rollout_live_and_backfills_recent_one(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            current_id = "33333333-3333-4333-8333-333333333333"
+            recent_id = "44444444-4444-4444-8444-444444444444"
+            current = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "08"
+                / "21"
+                / f"rollout-2026-08-21T00-00-01-{current_id}.jsonl"
+            )
+            recent = current.with_name(
+                f"rollout-2026-08-21T00-00-00-{recent_id}.jsonl"
+            )
+            current.parent.mkdir(parents=True)
+            source = b'{"type":"event_msg"}\n'
+            current.write_bytes(source)
+            recent.write_bytes(source)
+            state_root = codex_home / "sherlock" / "telemetry"
+
+            with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+                result = run_hook(
+                    "SessionStart",
+                    {
+                        "session_id": current_id,
+                        "transcript_path": str(current),
+                    },
+                    codex_home=codex_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertEqual(result.discovered, 2)
+            self.assertEqual(result.enqueued, 2)
+            self.assertEqual(result.captured_bytes, len(source) * 2)
+            self.assertEqual(popen.call_count, 1)
+            pending = list((state_root / "queue" / "pending").glob("*.json"))
+            self.assertEqual(len(pending), 2)
+            items = {
+                item["manifest"]["observed_native_session_id"]: item
+                for path in pending
+                for item in [json.loads(path.read_text(encoding="utf-8"))]
+            }
+            self.assertNotIn("workload_class", items[current_id]["metadata"])
+            self.assertEqual(
+                items[recent_id]["metadata"]["workload_class"],
+                "backfill",
+            )
+
+    def test_manual_codex_backfill_is_idempotent(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            session_id = "44444444-4444-4444-8444-444444444444"
+            rollout = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "08"
+                / "21"
+                / f"rollout-2026-08-21T00-00-00-{session_id}.jsonl"
+            )
+            rollout.parent.mkdir(parents=True)
+            source = b'{"type":"event_msg"}\n'
+            rollout.write_bytes(source)
+            state_root = codex_home / "sherlock" / "telemetry"
+            command = [
+                sys.executable,
+                "-m",
+                "sherlock_collector.cli",
+                "--provider",
+                "codex",
+                "--codex-home",
+                str(codex_home),
+                "--state-root",
+                str(state_root),
+                "--config",
+                str(root / "missing-config.json"),
+                "backfill",
+                "--lookback-seconds",
+                str(24 * 60 * 60),
+            ]
+            environment = {**os.environ, "PYTHONPATH": str(SOURCE)}
+
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            repeated = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            first = json.loads(completed.stdout)
+            second = json.loads(repeated.stdout)
+            self.assertEqual(first["status"], "complete")
+            self.assertEqual(first["discovered"], 1)
+            self.assertEqual(first["enqueued"], 1)
+            self.assertEqual(first["captured_bytes"], len(source))
+            self.assertEqual(second["enqueued"], 0)
+            self.assertEqual(second["captured_bytes"], 0)
+            pending = list((state_root / "queue" / "pending").glob("*.json"))
+            self.assertEqual(len(pending), 1)
+            item = json.loads(pending[0].read_text(encoding="utf-8"))
+            self.assertEqual(item["metadata"]["workload_class"], "backfill")
+            self.assertEqual(item["manifest"]["source_provider"], "codex")
+            self.assertEqual(item["manifest"]["source_kind"], "rollout")
 
     def test_exact_launcher_is_fail_open_when_local_state_is_corrupt(self):
         with TemporaryDirectory() as temporary:
@@ -845,6 +1040,7 @@ class HookIntegrationTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, '{"continue":true}\n')
             self.assertIn("Sherlock telemetry capture failed", completed.stderr)
 
     def test_later_eligible_hook_starts_recovery_drain_without_new_bytes(self):

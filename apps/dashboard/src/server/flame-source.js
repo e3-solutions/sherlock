@@ -15,6 +15,8 @@ export const NORMALIZER_VERSIONS = Object.freeze([
 export const DATABASE_ROLE = "sherlock_reader";
 const DEFAULT_STATEMENT_TIMEOUT_MS = 20_000;
 const TIMELINE_STATEMENT_TIMEOUT_MS = 30_000;
+const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
+export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
 const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
 const WORK_CURSOR_VERSION = "v1";
@@ -105,6 +107,7 @@ activity_candidates as materialized (
   select person_id, session_id, actor_role, observed_at
     from activity_candidates
    where canonical_rank = 1
+     and actor_role <> 'guardian'
      and observed_at >= date_trunc('milliseconds', session_started_at)
 )`;
 }
@@ -119,6 +122,13 @@ select pe.id::text as person_id,
    and split_part(pe.email, '@', 3) = ''
  order by lower(coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key)), pe.id
  limit $2
+`;
+
+export const FRESHNESS_SQL = `
+select read_at, raw_watermark, canonical_watermark,
+       oldest_pending_normalize, pending_normalize_count,
+       person_id::text, latest_canonical_activity
+  from analytics.read_dashboard_freshness($1, $2, $3, $4)
 `;
 
 function promptsCte({
@@ -362,7 +372,7 @@ with p as materialized (
   select a.person_id,
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint agent,
-         count(distinct a.session_id) filter (where a.actor_role in ('worker', 'guardian'))::bigint subagent,
+         count(distinct a.session_id) filter (where a.actor_role = 'worker')::bigint subagent,
          count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other
     from activity_events a cross join p
    where a.observed_at < p.end_at
@@ -373,7 +383,7 @@ with p as materialized (
            where a.actor_role = 'primary' and a.observed_at < p.end_at
          )::bigint day_agent,
          count(distinct a.session_id) filter (
-           where a.actor_role in ('worker', 'guardian') and a.observed_at < p.end_at
+           where a.actor_role = 'worker' and a.observed_at < p.end_at
          )::bigint day_subagent,
          count(distinct a.session_id) filter (
            where a.actor_role = 'unknown' and a.observed_at < p.end_at
@@ -521,6 +531,7 @@ activity_candidates as materialized (
       on pe.workspace_id = s.workspace_id and pe.id = s.person_id
     cross join p
    where e.workspace_id = p.workspace_id
+     and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = p.expected_email_domain
      and split_part(pe.email, '@', 3) = ''
      and e.normalizer_version = any(p.normalizer_versions)
@@ -559,6 +570,7 @@ activity_candidates as materialized (
          activity_candidates.observed_at
     from activity_candidates cross join p
    where canonical_rank = 1
+     and actor_role <> 'guardian'
      and observed_at >= date_trunc('milliseconds', session_started_at)
      and observed_at >= p.bucket_start - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
      and observed_at < p.bucket_end + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
@@ -721,7 +733,7 @@ with p as materialized (
      and e.session_id in (select session_id from relevant_activity_sessions)`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from canonical_activity_events candidate cross join p
    where candidate.person_id = p.person_id
@@ -770,58 +782,46 @@ select prompt_identity, session_id::text session_id, observed_at,
  limit $11
 `;
 
-// Enrich work only when the snapshot's latest exact commit lookup has one PR.
 export const INTERVAL_PULL_REQUESTS_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::pg_snapshot snapshot,
          $3::timestamptz snapshot_read, $4::uuid[] session_ids
-), visible_scm as materialized (
-  select scm.session_id, scm.repository_full_name, scm.commit_sha, scm.observed_at
+), facts as (
+  select scm.session_id, scm.repository_full_name, scm.observed_at,
+         lookup.outcome, lookup.pull_request_number,
+         lookup.pull_request_terminal_at, lookup.created_at
     from telemetry.session_scm scm cross join p
+    left join lateral (
+      select result.outcome, result.pull_request_number,
+             result.pull_request_terminal_at, result.created_at
+        from github.commit_pr_lookups result
+       where result.workspace_id = scm.workspace_id
+         and result.repository_full_name = scm.repository_full_name
+         and result.commit_sha = scm.commit_sha
+         and result.source_version = 'sherlock.github-associated-pulls.v1'
+         and pg_visible_in_snapshot(result.xmin::text::xid8, p.snapshot)
+       order by result.id desc
+       limit 1
+    ) lookup on true
    where scm.workspace_id = p.workspace_id
      and scm.session_id = any(p.session_ids)
      and scm.source_version = 'sherlock.github-scm.v1'
      and pg_visible_in_snapshot(scm.xmin::text::xid8, p.snapshot)
-), visible_lookups as materialized (
-  select lookup.*,
-         row_number() over (
-           partition by lookup.repository_full_name, lookup.commit_sha
-           order by lookup.id desc
-         ) latest_rank
-    from github.commit_pr_lookups lookup
-    join (
-      select distinct repository_full_name, commit_sha from visible_scm
-    ) scm using (repository_full_name, commit_sha)
-    cross join p
-   where lookup.workspace_id = p.workspace_id
-     and lookup.source_version = 'sherlock.github-associated-pulls.v1'
-     and pg_visible_in_snapshot(lookup.xmin::text::xid8, p.snapshot)
-), exact_matches as materialized (
-  select distinct scm.session_id, lookup.repository_full_name,
-         lookup.pull_request_number
-    from visible_scm scm
-    join visible_lookups lookup
-      on lookup.repository_full_name = scm.repository_full_name
-     and lookup.commit_sha = scm.commit_sha
-     and lookup.latest_rank = 1
-     and lookup.outcome = 'matched'
-     and lookup.candidate_count = 1
-     and lookup.pull_request_number is not null
-    cross join p
-   where lookup.created_at >= p.snapshot_read - interval '15 minutes'
-     and scm.observed_at <= coalesce(
-           lookup.pull_request_terminal_at,
-           'infinity'::timestamptz
-         )
-), session_matches as materialized (
-  select exact_matches.*,
-         count(*) over (partition by session_id) match_count
-    from exact_matches
 )
-select session_id::text session_id, repository_full_name,
-       pull_request_number
-  from session_matches
- where match_count = 1
+select session_id::text, min(repository_full_name) repository_full_name,
+       min(pull_request_number) pull_request_number
+  from facts cross join p
+ group by session_id
+having bool_and(coalesce(
+    outcome = 'matched' and
+    (pull_request_terminal_at is not null or
+      created_at between p.snapshot_read - interval '15 minutes'
+                            and p.snapshot_read) and
+    observed_at <= coalesce(
+      pull_request_terminal_at, 'infinity'::timestamptz
+    ),
+    false
+  )) and count(distinct (repository_full_name, pull_request_number)) = 1
  order by session_id
 `;
 
@@ -838,7 +838,7 @@ with p as materialized (
      and e.session_id = p.session_id`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from canonical_activity_events candidate cross join p
    where candidate.person_id = p.person_id
@@ -888,6 +888,7 @@ select header.session_id::text session_id, header.semantic_role,
 function projectedEvidenceCte({
   snapshotVisible = false,
   personScoped = false,
+  sessionScoped = false,
   activityThroughReadAt = false,
 } = {}) {
   const visibility = snapshotVisible
@@ -908,9 +909,11 @@ ranked_frame_revisions as materialized (
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     and evidence_person.github_id is distinct from 'sherlock-smoke'
      and split_part(evidence_person.email, '@', 2) = p.expected_email_domain
      and split_part(evidence_person.email, '@', 3) = ''
      ${personScoped ? "and revision.person_id = p.person_id" : ""}
+     ${sessionScoped ? "and revision.session_id = p.session_id" : ""}
      and (
        revision.evidence_kind = 'activity'
        and revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
@@ -932,6 +935,7 @@ ranked_frame_revisions as materialized (
   select latest_frame_evidence.*
    from latest_frame_evidence cross join p
    where evidence_kind = 'activity'
+     and actor_role <> 'guardian'
      and observed_at >= p.start_at and observed_at < ${activityEnd}
 ), projected_prompt_candidates as materialized (
   select latest_frame_evidence.*,
@@ -973,7 +977,7 @@ with p as materialized (
   select evidence.person_id,
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
-         count(distinct evidence.session_id) filter (where evidence.actor_role in ('worker', 'guardian'))::bigint subagent,
+         count(distinct evidence.session_id) filter (where evidence.actor_role = 'worker')::bigint subagent,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other
     from projected_activity evidence cross join p
    where evidence.observed_at < p.end_at
@@ -984,7 +988,7 @@ with p as materialized (
            where evidence.actor_role = 'primary' and evidence.observed_at < p.end_at
          )::bigint day_agent,
          count(distinct evidence.session_id) filter (
-           where evidence.actor_role in ('worker', 'guardian')
+           where evidence.actor_role = 'worker'
              and evidence.observed_at < p.end_at
          )::bigint day_subagent,
          count(distinct evidence.session_id) filter (
@@ -1039,7 +1043,7 @@ with p as materialized (
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from projected_activity evidence
 ), grouped as materialized (
@@ -1101,10 +1105,13 @@ with p as materialized (
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  // Session identity is stable across revisions and matches the reader index.
+  // Actor role is revisioned, so role filtering must remain after latest-rank selection.
+  sessionScoped: true,
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
-              when actor_role in ('worker', 'guardian') then 'subagent'
+              when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
     from projected_activity evidence
 ), header as materialized (
@@ -1373,7 +1380,6 @@ function pullRequestFromRow(row) {
     throw new FlameSourceError("flame_database_result_invalid");
   }
   return {
-    repository,
     number,
     url: `https://github.com/${repository}/pull/${number}`,
   };
@@ -1529,6 +1535,66 @@ export function buildFlamePayload({
   };
 }
 
+export function buildFreshnessPayload(rows, maxPeople) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > maxPeople) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+  const first = rows[0];
+  const read = asDate(first.read_at);
+  const optionalDate = (value) => value === null || value === undefined
+    ? null
+    : asDate(value);
+  const globals = {
+    raw: optionalDate(first.raw_watermark),
+    canonical: optionalDate(first.canonical_watermark),
+    oldestPending: optionalDate(first.oldest_pending_normalize),
+    pending: count(first.pending_normalize_count),
+  };
+  if ((globals.pending === 0) !== (globals.oldestPending === null) ||
+      [globals.raw, globals.canonical, globals.oldestPending]
+        .some((value) => value !== null && value > read)) {
+    throw new FlameSourceError("flame_database_result_invalid");
+  }
+
+  const ids = new Set();
+  const people = [];
+  for (const row of rows) {
+    const rowRead = asDate(row.read_at);
+    const rowPending = count(row.pending_normalize_count);
+    const same = rowRead.getTime() === read.getTime() &&
+      optionalDate(row.raw_watermark)?.getTime() === globals.raw?.getTime() &&
+      optionalDate(row.canonical_watermark)?.getTime() === globals.canonical?.getTime() &&
+      optionalDate(row.oldest_pending_normalize)?.getTime() === globals.oldestPending?.getTime() &&
+      rowPending === globals.pending;
+    if (!same) throw new FlameSourceError("flame_database_result_invalid");
+    if (row.person_id === null || row.person_id === undefined) {
+      if (rows.length !== 1) throw new FlameSourceError("flame_database_result_invalid");
+      continue;
+    }
+    const id = String(row.person_id);
+    if (ids.has(id)) throw new FlameSourceError("flame_database_result_invalid");
+    ids.add(id);
+    const latest = optionalDate(row.latest_canonical_activity);
+    if (latest !== null && latest > read) {
+      throw new FlameSourceError("flame_database_result_invalid");
+    }
+    people.push({ id, lastActivity: latest?.toISOString() ?? null });
+  }
+
+  const pendingAgeMs = globals.oldestPending === null
+    ? 0
+    : read.getTime() - globals.oldestPending.getTime();
+  return {
+    read: read.toISOString(),
+    rawWatermark: globals.raw?.toISOString() ?? null,
+    canonicalWatermark: globals.canonical?.toISOString() ?? null,
+    oldestPendingNormalize: globals.oldestPending?.toISOString() ?? null,
+    pendingNormalize: globals.pending,
+    delayed: globals.pending > 0 && pendingAgeMs >= FRESHNESS_DELAY_MS,
+    people,
+  };
+}
+
 export class DirectFlameSource {
   constructor({
     databaseUrl,
@@ -1664,6 +1730,21 @@ export class DirectFlameSource {
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
   }
 
+  async fetchFreshness({ signal } = {}) {
+    return await this.transaction(async (tx) => {
+      const rows = await runQuery(tx, FRESHNESS_SQL, [
+        this.workspaceId,
+        this.expectedEmailDomain,
+        tx.array(NORMALIZER_VERSIONS),
+        this.maxPeople,
+      ], signal);
+      if (rows.length > this.maxPeople) {
+        throw new FlameSourceError("flame_database_roster_too_large");
+      }
+      return buildFreshnessPayload(rows, this.maxPeople);
+    }, { signal, statementTimeoutMs: FRESHNESS_STATEMENT_TIMEOUT_MS });
+  }
+
   async fetchInterval({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "interval");
     const snapshotReceipt = requestSnapshot(snapshot, "interval");
@@ -1788,39 +1869,6 @@ export class DirectFlameSource {
           throw new FlameSourceError("flame_work_cursor_invalid");
         }
       }
-      const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const workRows = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
-          this.workspaceId,
-          snapshotReceipt.frameVersion,
-          snapshotReceipt.snapshot,
-          personId,
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          this.expectedEmailDomain,
-          workLimit,
-        ], signal)
-        : await runQuery(tx, INTERVAL_WORK_SQL, [
-          this.workspaceId,
-          bounds.snapshotStart.toISOString(),
-          bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
-          snapshotReceipt.read.toISOString(),
-          snapshotReceipt.snapshot,
-          personId,
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          this.expectedEmailDomain,
-          workLimit,
-        ], signal);
-      if (workRows.length === workLimit) {
-        throw new FlameSourceError("flame_work_result_too_large");
-      }
-      const headerRow = workRows.find((row) =>
-        String(row.session_id) === sessionId && String(row.semantic_role) === role
-      );
-      if (!headerRow) throw new FlameSourceError("flame_work_request_not_found");
-      const header = workFromRow(headerRow);
       const cursorAtMicroseconds = decodedCursor?.atMicroseconds ??
         bucketStartMicroseconds.toString();
       const cursorId = decodedCursor?.id ?? "0";
@@ -1857,6 +1905,7 @@ export class DirectFlameSource {
           pageSize + 1,
         ], signal);
       if (resultRows.length === 0) throw new FlameSourceError("flame_work_request_not_found");
+      const header = workFromRow(resultRows[0]);
       const itemRows = resultRows.filter((row) => row.id !== null && row.id !== undefined);
       const hasMore = itemRows.length > pageSize;
       const pageRows = hasMore ? itemRows.slice(0, pageSize) : itemRows;

@@ -1,3 +1,5 @@
+import { gzipSync } from "node:zlib";
+
 import { BUCKET_MS, FlameSourceError } from "./flame-source.js";
 
 export const REFRESH_OFFSET_MS = 90 * 1000;
@@ -25,6 +27,17 @@ function payloadEnd(payload) {
     throw new FlameSourceError("flame_database_result_invalid");
   }
   return { end, read };
+}
+
+function cacheEntry(payload, end, read) {
+  const identity = Buffer.from(JSON.stringify(payload), "utf8");
+  return Object.freeze({
+    payload,
+    identity,
+    gzip: gzipSync(identity),
+    end,
+    read,
+  });
 }
 
 function abortError() {
@@ -111,6 +124,8 @@ export class FlameDayCache {
 
     return {
       payload: this.entry.payload,
+      identity: this.entry.identity,
+      gzip: this.entry.gzip,
       state: this.isFresh() ? "hit" : "stale",
     };
   }
@@ -145,12 +160,13 @@ export class FlameDayCache {
       .then(() => this.load({ signal: controller.signal }))
       .then((payload) => {
         const { end, read } = payloadEnd(payload);
-        const candidate = { payload, end, read };
-        if (!this.isFresh(candidate) || (this.entry && (
-          candidate.end < this.entry.end || candidate.read < this.entry.read
+        const metadata = { end, read };
+        if (!this.isFresh(metadata) || (this.entry && (
+          metadata.end < this.entry.end || metadata.read < this.entry.read
         ))) {
           throw new FlameSourceError("flame_database_result_stale");
         }
+        const candidate = cacheEntry(payload, end, read);
         this.entry = candidate;
         this.retryNotBefore = null;
         succeeded = true;

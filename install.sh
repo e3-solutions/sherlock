@@ -99,6 +99,30 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
   --github-id "$GITHUB_ID" \
   --email "$EMAIL"
 
+RUNTIME_ROOT="$CODEX_HOME/sherlock/runtime"
+if [ -n "${PYTHONPATH:-}" ]; then
+  COLLECTOR_PYTHONPATH="$RUNTIME_ROOT:$PYTHONPATH"
+else
+  COLLECTOR_PYTHONPATH="$RUNTIME_ROOT"
+fi
+if BACKFILL_RESULT=$(PYTHONPATH="$COLLECTOR_PYTHONPATH" "$PYTHON_BIN" \
+  -m sherlock_collector.cli \
+  --provider codex \
+  --codex-home "$CODEX_HOME" \
+  --state-root "$CODEX_HOME/sherlock/telemetry" \
+  --config "$CODEX_HOME/sherlock/collector.json" \
+  backfill --lookback-seconds 86400); then
+  echo "Codex 24-hour backfill: $BACKFILL_RESULT"
+  case "$BACKFILL_RESULT" in
+    *'"status": "complete"'*) ;;
+    *)
+      echo "Warning: Codex backfill was partial; later SessionStart hooks will resume it." >&2
+      ;;
+  esac
+else
+  echo "Warning: Codex backfill could not start; plugin installation will continue and SessionStart will retry it." >&2
+fi
+
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install_marketplace.py" \
   --codex-bin "$CODEX_BIN" \
   --repo-root "$MARKETPLACE_ROOT"
