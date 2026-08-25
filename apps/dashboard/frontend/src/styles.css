@@ -963,18 +963,27 @@ input { font: inherit; }
 }
 
 .flame-detail__pull-request {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  padding: 0 10px;
-  border-left: 1px solid var(--flame-rule);
-  color: var(--flame-muted);
+  align-self: center;
+  margin: 0 12px 0 4px;
+  padding: 5px 9px;
+  border: 1px solid var(--flame-rule);
+  border-radius: 999px;
+  background: var(--flame-surface-selected);
+  color: var(--flame-ink);
   font-size: 11px;
   font-weight: 600;
+  line-height: 1;
   text-decoration: none;
+  white-space: nowrap;
 }
 
 .flame-detail__pull-request:hover,
-.flame-detail__pull-request:focus-visible { color: var(--flame-ink); }
+.flame-detail__pull-request:focus-visible {
+  border-color: var(--flame-ink);
+  background: var(--flame-surface-selected);
+}
 
 .flame-detail__work-expander {
   width: 100%;
