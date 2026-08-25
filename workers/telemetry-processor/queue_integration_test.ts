@@ -8,6 +8,7 @@ const permission = await Deno.permissions.query({
 const databaseUrl = permission.state === "granted"
   ? Deno.env.get("SHERLOCK_TEST_DATABASE_URL")
   : null;
+type Sql = ReturnType<typeof postgres>;
 
 function assert(
   condition: unknown,
@@ -73,6 +74,37 @@ async function insertQueueBatch(
       input.workloadClass ?? "backfill",
     ],
   );
+}
+
+function job(
+  workspaceId: string,
+  sessionId: string,
+  targetEventId: bigint,
+  workloadClass: "live" | "backfill",
+) {
+  return {
+    workspaceId,
+    sessionId,
+    normalizerVersion: "test.normalizer.v1",
+    activityVersion: "test.activity.v1",
+    targetEventId,
+    workloadClass,
+  };
+}
+
+async function reductionState(
+  sql: Sql,
+  workspace: string,
+  session: string,
+) {
+  const [row] = await sql.unsafe(
+    `select status, attempt_count, requeue_count, completed_at,
+            request_generation::text as request_generation, workload_class
+       from processing.telemetry_jobs
+      where workspace_id = $1 and session_id = $2`,
+    [workspace, session],
+  );
+  return row;
 }
 
 async function insertQueueFixture(
@@ -612,22 +644,10 @@ Deno.test({
       }
       assert(rawMutationRejected, "worker role must not mutate raw facts");
 
-      await queue.enqueueReduction({
-        workspaceId,
-        sessionId,
-        normalizerVersion: "test.normalizer.v1",
-        activityVersion: "test.activity.v1",
-        targetEventId: 10n,
-        workloadClass: "backfill",
-      });
-      await queue.enqueueReduction({
-        workspaceId,
-        sessionId,
-        normalizerVersion: "test.normalizer.v1",
-        activityVersion: "test.activity.v1",
-        targetEventId: 20n,
-        workloadClass: "live",
-      });
+      await queue.enqueueReduction(
+        job(workspaceId, sessionId, 10n, "backfill"),
+      );
+      await queue.enqueueReduction(job(workspaceId, sessionId, 20n, "live"));
       await sql.unsafe(
         `update processing.telemetry_jobs set available_at = now()
           where workspace_id = $1 and session_id = $2`,
@@ -645,14 +665,7 @@ Deno.test({
       assert(reductions[0].workload_class === "live");
       const reduction = await queue.claim("live", "worker-reducer", 60);
       assert(reduction?.job_kind === "reduce");
-      await queue.enqueueReduction({
-        workspaceId,
-        sessionId,
-        normalizerVersion: "test.normalizer.v1",
-        activityVersion: "test.activity.v1",
-        targetEventId: 20n,
-        workloadClass: "live",
-      });
+      await queue.enqueueReduction(job(workspaceId, sessionId, 20n, "live"));
       assert(
         await queue.complete(reduction) === "requeued",
         "a same-cutoff late-visible event must survive an in-flight completion",
@@ -660,19 +673,42 @@ Deno.test({
       const sameCutoff = await queue.claim("live", "worker-reducer-2", 60);
       assert(sameCutoff?.job_kind === "reduce");
       assert(sameCutoff.target_event_id === 20n);
-      await queue.enqueueReduction({
-        workspaceId,
-        sessionId,
-        normalizerVersion: "test.normalizer.v1",
-        activityVersion: "test.activity.v1",
-        targetEventId: 30n,
-        workloadClass: "live",
-      });
+      await queue.enqueueReduction(job(workspaceId, sessionId, 30n, "live"));
       assert(await queue.complete(sameCutoff) === "requeued");
       const newest = await queue.claim("live", "worker-reducer-3", 60);
       assert(newest?.job_kind === "reduce");
       assert(newest.target_event_id === 30n);
       assert(await queue.complete(newest) === "succeeded");
+
+      await queue.enqueueReductions([
+        job(workspaceId, sessionId, 30n, "backfill"),
+      ]);
+      const resetSucceeded = await reductionState(sql, workspaceId, sessionId);
+      assert(resetSucceeded.status === "queued");
+      assert(Number(resetSucceeded.attempt_count) === 0);
+      assert(resetSucceeded.completed_at === null);
+      assert(resetSucceeded.request_generation === "5");
+      assert(
+        resetSucceeded.workload_class === "live",
+        "a prior live request must not be demoted",
+      );
+      await sql.unsafe(
+        `update processing.telemetry_jobs set available_at = now()
+          where workspace_id = $1 and session_id = $2`,
+        [workspaceId, sessionId],
+      );
+      const failedReduction = await queue.claim("live", "worker-failure", 60);
+      assert(failedReduction?.job_kind === "reduce");
+      assert(await queue.fail(failedReduction, "test_failure", "test failure"));
+      await queue.enqueueReductions([
+        job(workspaceId, sessionId, 30n, "backfill"),
+      ]);
+      const resetFailed = await reductionState(sql, workspaceId, sessionId);
+      assert(resetFailed.status === "queued");
+      assert(Number(resetFailed.attempt_count) === 0);
+      assert(Number(resetFailed.requeue_count) === 1);
+      assert(resetFailed.completed_at === null);
+      assert(resetFailed.request_generation === "6");
 
       const batchSessions = await sql.unsafe(
         `insert into telemetry.sessions (

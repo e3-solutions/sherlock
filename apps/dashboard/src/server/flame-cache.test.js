@@ -1,3 +1,5 @@
+import { gunzipSync } from "node:zlib";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -60,6 +62,10 @@ describe("FlameDayCache", () => {
     const stale = await cache.read({ waitForRefresh: true });
 
     expect(first.payload).toBe(stale.payload);
+    expect(first.identity).toBe(stale.identity);
+    expect(first.gzip).toBe(stale.gzip);
+    expect(first.identity).toEqual(Buffer.from(JSON.stringify(first.payload), "utf8"));
+    expect(gunzipSync(first.gzip)).toEqual(first.identity);
     expect(stale.state).toBe("stale");
     expect(load).toHaveBeenCalledTimes(2);
     expect(cache.readiness()).toEqual({ status: "ok", mode: "sherlock_cached_aggregate" });
@@ -134,11 +140,15 @@ describe("FlameDayCache", () => {
     const load = vi.fn().mockResolvedValueOnce(payload()).mockResolvedValueOnce(replacement);
     const cache = new FlameDayCache({ load, now: () => now });
 
-    await cache.read();
+    const initial = await cache.read();
     now = Date.parse("2026-08-19T12:11:31.000Z");
     const refreshed = await cache.read({ waitForRefresh: true });
 
-    expect(refreshed).toEqual({ payload: replacement, state: "hit" });
+    expect(refreshed).toMatchObject({ payload: replacement, state: "hit" });
+    expect(refreshed.identity).not.toBe(initial.identity);
+    expect(refreshed.gzip).not.toBe(initial.gzip);
+    expect(refreshed.identity).toEqual(Buffer.from(JSON.stringify(replacement), "utf8"));
+    expect(gunzipSync(refreshed.gzip)).toEqual(refreshed.identity);
     await cache.close();
   });
 
@@ -150,7 +160,7 @@ describe("FlameDayCache", () => {
       now: () => Date.parse("2026-08-19T12:00:30.000Z"),
     });
 
-    await expect(cache.read()).resolves.toEqual({ payload: empty, state: "hit" });
+    await expect(cache.read()).resolves.toMatchObject({ payload: empty, state: "hit" });
     expect(cache.readiness()).toEqual({ status: "ok", mode: "sherlock_cached_aggregate" });
     await cache.close();
   });

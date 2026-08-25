@@ -3,6 +3,7 @@ import {
   type BatchManifest,
   type CommittedReceipt,
   CONTRACT_VERSION,
+  decodeBase64Bytes,
   FRAGMENT_SOURCE_BYTES,
   IngestError,
   MAX_LOGICAL_RECORD_BYTES,
@@ -296,6 +297,46 @@ Deno.test("strict timestamp validation rejects impossible calendar dates", async
     assert(error instanceof IngestError);
     assert(error.status === 400);
   }
+});
+
+Deno.test("base64 decoding preserves padding rules across runtimes", () => {
+  for (const encoded of ["dGVzdA==", "dGVzdA", " dGVz\ndA== "]) {
+    assert(new TextDecoder().decode(decodeBase64Bytes(encoded)) === "test");
+  }
+  for (const encoded of ["dGVzdA=", "dGVzdA===", "A===", "!!!!"]) {
+    try {
+      decodeBase64Bytes(encoded);
+      assert(false, `${encoded} should be rejected`);
+    } catch (error) {
+      assert(error instanceof SyntaxError);
+    }
+  }
+});
+
+Deno.test("ingest base64 size gate runs before decoding", async () => {
+  const { manifest } = await fixture();
+  const maximumEncodedLength = Math.ceil(MAX_STORED_BYTES / 3) * 4;
+  try {
+    parseEnvelope({
+      collector: COLLECTOR,
+      manifest,
+      stored_payload_base64: "A".repeat(maximumEncodedLength + 1),
+    });
+    assert(false, "oversized encoded payload should fail");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "payload_too_large");
+    assert(error.status === 413);
+  }
+});
+
+Deno.test("SHA-256 hashes only a non-zero-offset Uint8Array view", async () => {
+  const backing = new Uint8Array([99, 1, 2, 3, 100]);
+  const view = backing.subarray(1, 4);
+  assert(
+    await sha256Hex(view) === await sha256Hex(new Uint8Array([1, 2, 3])),
+  );
+  assert(await sha256Hex(view) !== await sha256Hex(backing));
 });
 
 Deno.test("approved collector domains resolve to configured workspaces", () => {

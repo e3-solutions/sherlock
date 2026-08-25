@@ -1,5 +1,6 @@
 import {
   type BatchManifest,
+  decodeBase64Bytes,
   type RecordLocator,
   sha256Hex,
 } from "./contract.ts";
@@ -308,8 +309,13 @@ async function validateClaudeHookEnvelope(
   if (!payloadSha256 || !SHA256.test(payloadSha256) || !payloadBase64) {
     return { valid: false, error: "invalid_claude_hook_payload" };
   }
-  const payloadBytes = decodeBase64Bytes(payloadBase64);
-  if (!payloadBytes || await sha256Hex(payloadBytes) !== payloadSha256) {
+  let payloadBytes: Uint8Array;
+  try {
+    payloadBytes = decodeBase64Bytes(payloadBase64);
+  } catch {
+    return { valid: false, error: "invalid_claude_hook_payload_hash" };
+  }
+  if (await sha256Hex(payloadBytes) !== payloadSha256) {
     return { valid: false, error: "invalid_claude_hook_payload_hash" };
   }
   const payload = parseEnvelope(payloadBytes);
@@ -378,15 +384,6 @@ function utcTimestamp(value: unknown): string | null {
     parsed.getUTCSeconds() !== second
   ) return null;
   return candidate;
-}
-
-function decodeBase64Bytes(value: string): Uint8Array | null {
-  try {
-    const decoded = atob(value);
-    return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
-  } catch {
-    return null;
-  }
 }
 
 async function projectCodexBatch(
@@ -1036,7 +1033,7 @@ function utf8Excerpt(bytes: Uint8Array, maximum: number): string {
   if (bytes.byteLength <= maximum) return new TextDecoder().decode(bytes);
   let end = maximum;
   while (end > 0) {
-    const value = new TextDecoder().decode(bytes.slice(0, end));
+    const value = new TextDecoder().decode(bytes.subarray(0, end));
     if (new TextEncoder().encode(value).byteLength <= maximum) return value;
     end -= 1;
   }
@@ -1055,7 +1052,7 @@ function recordBytes(
     trimmedEnd > start &&
     (source[trimmedEnd - 1] === 10 || source[trimmedEnd - 1] === 13)
   ) trimmedEnd -= 1;
-  return source.slice(start, trimmedEnd);
+  return source.subarray(start, trimmedEnd);
 }
 
 function parseEnvelope(bytes: Uint8Array): JsonObject | null {

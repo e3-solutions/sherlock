@@ -282,20 +282,27 @@ class CollectorDrainTests(unittest.TestCase):
     def test_transient_failure_is_requeued_once_per_drain(self):
         manifest, stored = batch("stream-backfill-retry")
         self.spool.enqueue(manifest, stored, workload_class="backfill")
+        later, later_stored = batch(
+            "stream-backfill-retry",
+            manifest.end_offset,
+        )
+        self.spool.enqueue(later, later_stored, workload_class="backfill")
 
         class Transient:
-            calls = 0
+            calls = []
 
-            def upload(inner_self, _item):
-                inner_self.calls += 1
+            def upload(inner_self, item):
+                inner_self.calls.append(item.manifest.start_offset)
                 raise TransientUploadError("try later")
 
         transport = Transient()
         result = Drain(self.spool, transport).run()
 
         self.assertEqual(result.requeued, 1)
-        self.assertEqual(transport.calls, 1)
-        queued = self.spool.load(self.spool.list_pending()[0])
+        self.assertEqual(transport.calls, [0])
+        pending = [self.spool.load(path) for path in self.spool.list_pending()]
+        self.assertEqual(len(pending), 2)
+        queued = next(item for item in pending if item.manifest.start_offset == 0)
         self.assertEqual(queued.metadata["last_upload_error"], "try later")
         self.assertEqual(queued.metadata["workload_class"], "backfill")
 
@@ -350,8 +357,7 @@ class CollectorDrainTests(unittest.TestCase):
             transport.items.append(item)
             if not enqueued:
                 enqueued = True
-                next_manifest, stored = batch("stream-b")
-                self.spool.enqueue(next_manifest, stored)
+                self.enqueue("stream-b")
             return receipt(item.manifest)
 
         transport.upload = upload
@@ -360,6 +366,28 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(result.uploaded, 2)
         self.assertEqual(len(transport.items), 2)
         self.assertEqual(transport.items[0].manifest, first_manifest)
+
+    def test_chained_mid_run_enqueues_are_drained_until_inventory_is_empty(self):
+        wave_count = 6
+        self.enqueue("stream-wave-0")
+        uploaded_streams = []
+
+        class ChainedTransport:
+            def upload(inner_self, item):
+                uploaded_streams.append(item.manifest.source_stream_key)
+                next_wave = len(uploaded_streams)
+                if next_wave < wave_count:
+                    self.enqueue(f"stream-wave-{next_wave}")
+                return receipt(item.manifest)
+
+        result = Drain(self.spool, ChainedTransport()).run()
+
+        self.assertEqual(result.uploaded, wave_count)
+        self.assertEqual(
+            uploaded_streams,
+            [f"stream-wave-{index}" for index in range(wave_count)],
+        )
+        self.assertEqual(self.spool.list_pending(), [])
 
     def test_independent_streams_upload_concurrently(self):
         self.enqueue("stream-a")
@@ -411,6 +439,34 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(result.uploaded, 2)
         self.assertEqual(order, [0, first_manifest.end_offset])
         self.assertEqual(peak, 1)
+
+    def test_same_stream_drain_inventory_work_is_near_linear(self):
+        manifests = []
+        start = 0
+        for _ in range(128):
+            manifest, _ = self.enqueue("stream-linear", start)
+            manifests.append(manifest)
+            start = manifest.end_offset
+
+        transport = SuccessTransport()
+        with (
+            patch.object(self.spool, "load", wraps=self.spool.load) as load,
+            patch.object(
+                self.spool,
+                "list_pending",
+                wraps=self.spool.list_pending,
+            ) as list_pending,
+        ):
+            result = Drain(self.spool, transport, max_workers=8).run()
+
+        self.assertEqual(result.uploaded, len(manifests))
+        self.assertEqual(
+            [item.manifest.start_offset for item in transport.items],
+            [manifest.start_offset for manifest in manifests],
+        )
+        self.assertEqual(self.spool.list_pending(), [])
+        self.assertLessEqual(load.call_count, 3 * len(manifests))
+        self.assertLessEqual(list_pending.call_count, 3)
 
     def test_receipt_mismatch_retains_artifact(self):
         self.enqueue()

@@ -519,14 +519,20 @@ Deno.test("batched reductions coalesce duplicate queue identities", () => {
     workloadClass: "backfill",
   };
   const coalesced = coalesceReductionTargets([
+    {
+      ...base,
+      sessionId: "00000000-0000-4000-8000-000000000000",
+      targetEventId: 5n,
+    },
     base,
     { ...base, targetEventId: 30n },
     { ...base, targetEventId: 20n, workloadClass: "live" },
     { ...base, targetEventId: 0n },
   ]);
-  assert(coalesced.length === 1);
-  assert(coalesced[0].targetEventId === 30n);
-  assert(coalesced[0].workloadClass === "live");
+  assert(coalesced.length === 2);
+  assert(coalesced[0].sessionId.endsWith("000000000000"));
+  assert(coalesced[1].targetEventId === 30n);
+  assert(coalesced[1].workloadClass === "live");
 });
 
 Deno.test("reduction targets only normalized sessions with no workspace scan", async () => {

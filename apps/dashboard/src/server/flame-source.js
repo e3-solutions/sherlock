@@ -531,6 +531,7 @@ activity_candidates as materialized (
       on pe.workspace_id = s.workspace_id and pe.id = s.person_id
     cross join p
    where e.workspace_id = p.workspace_id
+     and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = p.expected_email_domain
      and split_part(pe.email, '@', 3) = ''
      and e.normalizer_version = any(p.normalizer_versions)
@@ -844,6 +845,7 @@ select header.session_id::text session_id, header.semantic_role,
 function projectedEvidenceCte({
   snapshotVisible = false,
   personScoped = false,
+  sessionScoped = false,
   activityThroughReadAt = false,
 } = {}) {
   const visibility = snapshotVisible
@@ -864,9 +866,11 @@ ranked_frame_revisions as materialized (
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     and evidence_person.github_id is distinct from 'sherlock-smoke'
      and split_part(evidence_person.email, '@', 2) = p.expected_email_domain
      and split_part(evidence_person.email, '@', 3) = ''
      ${personScoped ? "and revision.person_id = p.person_id" : ""}
+     ${sessionScoped ? "and revision.session_id = p.session_id" : ""}
      and (
        revision.evidence_kind = 'activity'
        and revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
@@ -1058,6 +1062,9 @@ with p as materialized (
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  // Session identity is stable across revisions and matches the reader index.
+  // Actor role is revisioned, so role filtering must remain after latest-rank selection.
+  sessionScoped: true,
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
@@ -1789,39 +1796,6 @@ export class DirectFlameSource {
           throw new FlameSourceError("flame_work_cursor_invalid");
         }
       }
-      const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const workRows = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
-          this.workspaceId,
-          snapshotReceipt.frameVersion,
-          snapshotReceipt.snapshot,
-          personId,
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          this.expectedEmailDomain,
-          workLimit,
-        ], signal)
-        : await runQuery(tx, INTERVAL_WORK_SQL, [
-          this.workspaceId,
-          bounds.snapshotStart.toISOString(),
-          bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
-          snapshotReceipt.read.toISOString(),
-          snapshotReceipt.snapshot,
-          personId,
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          this.expectedEmailDomain,
-          workLimit,
-        ], signal);
-      if (workRows.length === workLimit) {
-        throw new FlameSourceError("flame_work_result_too_large");
-      }
-      const headerRow = workRows.find((row) =>
-        String(row.session_id) === sessionId && String(row.semantic_role) === role
-      );
-      if (!headerRow) throw new FlameSourceError("flame_work_request_not_found");
-      const header = workFromRow(headerRow);
       const cursorAtMicroseconds = decodedCursor?.atMicroseconds ??
         bucketStartMicroseconds.toString();
       const cursorId = decodedCursor?.id ?? "0";
@@ -1858,6 +1832,7 @@ export class DirectFlameSource {
           pageSize + 1,
         ], signal);
       if (resultRows.length === 0) throw new FlameSourceError("flame_work_request_not_found");
+      const header = workFromRow(resultRows[0]);
       const itemRows = resultRows.filter((row) => row.id !== null && row.id !== undefined);
       const hasMore = itemRows.length > pageSize;
       const pageRows = hasMore ? itemRows.slice(0, pageSize) : itemRows;

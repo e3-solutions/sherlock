@@ -13,6 +13,11 @@ import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
 import { FlameDayCache } from "./src/server/flame-cache.js";
+import {
+  flameRepresentationHeaders,
+  mimeTypeForPath,
+  selectJsonRepresentation,
+} from "./src/server/http-delivery.js";
 import { FreshnessCache } from "./src/server/freshness-cache.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -92,15 +97,6 @@ const SECURITY_HEADERS = {
   "X-Frame-Options": "DENY",
 };
 
-const MIME_TYPES = new Map([
-  [".css", "text/css; charset=utf-8"],
-  [".html", "text/html; charset=utf-8"],
-  [".js", "text/javascript; charset=utf-8"],
-  [".json", "application/json; charset=utf-8"],
-  [".svg", "image/svg+xml"],
-  [".woff2", "font/woff2"],
-]);
-
 function sendJson(response, status, body, headers = {}) {
   if (response.destroyed || response.writableEnded) return;
   response.writeHead(status, {
@@ -144,7 +140,7 @@ async function sendFile(response, filePath, cacheControl) {
       ...SECURITY_HEADERS,
       "Cache-Control": cacheControl,
       "Content-Length": info.size,
-      "Content-Type": MIME_TYPES.get(path.extname(filePath)) ?? "application/octet-stream",
+      "Content-Type": mimeTypeForPath(filePath),
     });
     createReadStream(filePath).pipe(response);
   } catch {
@@ -194,9 +190,20 @@ const server = createServer(async (request, response) => {
         forceRefresh: refresh === "force",
         waitForRefresh: refresh === "wait",
       });
-      sendJson(response, 200, result.payload, {
-        "X-Sherlock-Timeline-Cache": result.state,
+      const representation = selectJsonRepresentation(
+        result,
+        request.headers["accept-encoding"],
+      );
+      if (!representation) {
+        sendJson(response, 406, { error: "not_acceptable" });
+        return;
+      }
+      response.writeHead(200, {
+        ...SECURITY_HEADERS,
+        "Cache-Control": "no-store",
+        ...flameRepresentationHeaders(representation, result.state),
       });
+      response.end(representation.bytes);
     } catch (error) {
       const code = error instanceof FlameSourceError
         ? error.code

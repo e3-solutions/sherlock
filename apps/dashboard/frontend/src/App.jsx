@@ -53,7 +53,6 @@ export default function App() {
   const [state, setState] = useState("loading");
   const [message, setMessage] = useState("");
   const [freshnessState, setFreshnessState] = useState("loading");
-  const [clock, setClock] = useState(() => Date.now());
   const [rankBy, setRankBy] = useState(DEFAULT_PERSON_RANK);
   const lastGoodRef = useRef(null);
   const timerRef = useRef(null);
@@ -96,7 +95,6 @@ export default function App() {
       setData(nextData);
       setMessage("");
       const delayed = timelineFreshness(nextData, Date.now()).delayed;
-      setClock(Date.now());
       setState(delayed ? "delayed" : "ready");
       timerRef.current = window.setTimeout(
         () => load({ refresh: "wait" }),
@@ -170,11 +168,6 @@ export default function App() {
     };
   }, [load, loadFreshness]);
 
-  useEffect(() => {
-    const ageTimer = window.setInterval(() => setClock(Date.now()), 60 * 1000);
-    return () => window.clearInterval(ageTimer);
-  }, []);
-
   if (!data && state === "loading") {
     return (
       <>
@@ -196,8 +189,6 @@ export default function App() {
     );
   }
 
-  const freshness = timelineFreshness(data, clock);
-  const refreshProblem = state === "stale" || freshness.delayed;
   const liveProblem = freshnessState === "delayed" || freshnessState === "stale";
 
   return (
@@ -210,26 +201,45 @@ export default function App() {
             : "Live telemetry freshness is unavailable. Showing the last successful data."}
         </p>
       )}
-      {refreshProblem && (
-        <span className="visually-hidden" role="status">
-          {state === "stale" ? "Timeline refresh failed." : "Timeline update delayed."}
-        </span>
-      )}
       <FlameGraph
         data={data}
         rankBy={rankBy}
         stale={state === "stale" || state === "delayed" || liveProblem}
         onRefresh={() => load({ refresh: "force" })}
         timelineMeta={(
-          <p
-            className={`timeline-read${refreshProblem ? " timeline-read--delayed" : ""}`}
-          >
-            {state === "stale" ? "Refresh failed. " : freshness.delayed ? "Update delayed. " : ""}
-            {freshness.label}
-            {state === "stale" && <span className="visually-hidden"> {message}</span>}
-          </p>
+          <TimelineFreshness data={data} state={state} message={message} />
         )}
       />
+    </>
+  );
+}
+
+function TimelineFreshness({ data, state, message }) {
+  const [clock, setClock] = useState(() => Date.now());
+
+  useEffect(() => setClock(Date.now()), [data.startMs, data.readMs]);
+
+  useEffect(() => {
+    const ageTimer = window.setInterval(() => setClock(Date.now()), 60 * 1000);
+    return () => window.clearInterval(ageTimer);
+  }, []);
+
+  const freshness = timelineFreshness(data, clock);
+  const delayed = state === "delayed" || freshness.delayed;
+  const refreshProblem = state === "stale" || delayed;
+
+  return (
+    <>
+      {refreshProblem && (
+        <span className="visually-hidden" role="status">
+          {state === "stale" ? "Timeline refresh failed." : "Timeline update delayed."}
+        </span>
+      )}
+      <p className={`timeline-read${refreshProblem ? " timeline-read--delayed" : ""}`}>
+        {state === "stale" ? "Refresh failed. " : delayed ? "Update delayed. " : ""}
+        {freshness.label}
+        {state === "stale" && <span className="visually-hidden"> {message}</span>}
+      </p>
     </>
   );
 }

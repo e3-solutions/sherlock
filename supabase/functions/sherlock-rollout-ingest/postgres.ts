@@ -190,6 +190,10 @@ export class PostgresBatchRepository implements BatchRepository {
     );
   }
 
+  async close(): Promise<void> {
+    await this.sql.end();
+  }
+
   async resolveAttribution(
     grant: CollectorGrant,
     identity: CollectorIdentity,
@@ -221,7 +225,9 @@ export class PostgresBatchRepository implements BatchRepository {
         await tx.unsafe(
           `update telemetry.people
               set display_name = $1, github_id = $2, email = $3
-            where workspace_id = $4 and id = $5`,
+            where workspace_id = $4 and id = $5
+              and (display_name, github_id, email)
+                    is distinct from ($1, $2, $3)`,
           [
             identity.name,
             identity.github_id,
@@ -241,6 +247,10 @@ export class PostgresBatchRepository implements BatchRepository {
            display_name = excluded.display_name,
            github_id = excluded.github_id,
            email = excluded.email
+         where (telemetry.people.display_name, telemetry.people.github_id,
+                telemetry.people.email)
+               is distinct from
+               (excluded.display_name, excluded.github_id, excluded.email)
          returning id`,
         [
           crypto.randomUUID(),
@@ -251,7 +261,23 @@ export class PostgresBatchRepository implements BatchRepository {
           identity.email,
         ],
       );
-      return String(inserted[0].id);
+      if (inserted.length > 0) return String(inserted[0].id);
+
+      const unchanged = await tx.unsafe(
+        `select id
+           from telemetry.people
+          where workspace_id = $1 and identity_key = $2
+          limit 1`,
+        [grant.workspace_id, `email:${identity.email}`],
+      );
+      if (unchanged.length === 0) {
+        throw new IngestError(
+          "identity_conflict",
+          "the person identity changed while resolving attribution",
+          409,
+        );
+      }
+      return String(unchanged[0].id);
     });
     return {
       workspace_id: grant.workspace_id,

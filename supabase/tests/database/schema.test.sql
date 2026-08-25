@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(130);
+select plan(134);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -195,6 +195,18 @@ select ok(
       and indexdef like '%WHERE ((parent_session_id IS NULL) AND (parent_native_session_id IS NOT NULL))%'
   ),
   'unresolved session parents have a narrow partial lookup index'
+);
+select ok(
+  exists (
+    select 1
+    from pg_index i
+    where i.indexrelid = 'telemetry.people_workspace_email_key'::regclass
+      and i.indisunique
+      and i.indisvalid
+      and pg_get_indexdef(i.indexrelid) like '%(workspace_id, email)%'
+      and pg_get_expr(i.indpred, i.indrelid) = '(email IS NOT NULL)'
+  ),
+  'nonnull person email is unique within a workspace'
 );
 
 select ok(
@@ -739,6 +751,38 @@ insert into telemetry.people (id, workspace_id, identity_key) values
     'other-test-person'
   );
 
+insert into telemetry.people (id, workspace_id, identity_key, email) values
+  (
+    '00000000-0000-0000-0000-000000000103',
+    '00000000-0000-0000-0000-000000000001',
+    'shared-email-workspace-one',
+    'shared@example.com'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000104',
+    '00000000-0000-0000-0000-000000000002',
+    'shared-email-workspace-two',
+    'shared@example.com'
+  );
+
+select ok(
+  (
+    select count(*) = 2
+    from telemetry.people
+    where email = 'shared@example.com'
+  ),
+  'the same nonnull email remains valid in different workspaces'
+);
+select ok(
+  (
+    select count(*) = 2
+    from telemetry.people
+    where workspace_id = '00000000-0000-0000-0000-000000000001'
+      and email is null
+  ),
+  'multiple null emails remain valid in one workspace'
+);
+
 insert into telemetry.sessions (
   id, workspace_id, person_id, collector_key, native_session_id,
   actor_role, role_version, started_at
@@ -867,6 +911,16 @@ create temporary table constraint_results (
 do $$
 begin
   begin
+    insert into telemetry.people (workspace_id, identity_key, email) values (
+      '00000000-0000-0000-0000-000000000001',
+      'duplicate-shared-email', 'shared@example.com'
+    );
+    insert into constraint_results values ('duplicate email', false);
+  exception when unique_violation then
+    insert into constraint_results values ('duplicate email', true);
+  end;
+
+  begin
     insert into telemetry.ingest_batches (
       workspace_id, person_id, collector_key, source_kind, source_stream_key,
       generation_key, generation_seq, start_offset, end_offset,
@@ -940,6 +994,8 @@ begin
 end
 $$;
 
+select ok(passed, 'a duplicate nonnull email in one workspace is rejected')
+from constraint_results where test_name = 'duplicate email';
 select ok(passed, 'cross-workspace person attribution is rejected')
 from constraint_results where test_name = 'tenant mismatch';
 select ok(passed, 'invalid byte ranges are rejected')
@@ -963,6 +1019,13 @@ begin
     to_regclass('telemetry.ingest_batches') is not null and
     to_regclass('telemetry.native_records') is not null and
     to_regclass('telemetry.events') is not null and
+    exists (
+      select 1
+      from pg_index i
+      where i.indexrelid = 'telemetry.people_workspace_email_key'::regclass
+        and i.indisunique and i.indisvalid
+        and pg_get_expr(i.indpred, i.indrelid) = '(email IS NOT NULL)'
+    ) and
     to_regclass('analytics.activity_spans') is not null and
     to_regclass('processing.telemetry_jobs') is not null and
     (select count(*) = 5 from pg_roles where rolname in (
@@ -1045,7 +1108,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 130,
+  'assertion_count', 134,
   'tables', 11,
   'private_bucket', 'telemetry-raw'
 ) as verification;

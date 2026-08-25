@@ -66,7 +66,12 @@ export function coalesceReductionTargets(
         : "backfill",
     });
   }
-  return [...targets.values()];
+  return [...targets.values()].sort((left, right) =>
+    compareText(left.workspaceId, right.workspaceId) ||
+    compareText(left.sessionId, right.sessionId) ||
+    compareText(left.normalizerVersion, right.normalizerVersion) ||
+    compareText(left.activityVersion, right.activityVersion)
+  );
 }
 
 export class PostgresJobQueue {
@@ -475,6 +480,10 @@ export class PostgresJobQueue {
       return (await tx.unsafe(query, parameters as never[])).length === 1;
     });
   }
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function jobFromRow(row: Record<string, unknown>): TelemetryJob {

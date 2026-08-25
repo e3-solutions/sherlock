@@ -12,7 +12,6 @@ import {
   INTERVAL_PROMPTS_SQL,
   INTERVAL_PROMPT_LIMIT,
   INTERVAL_WORK_SQL,
-  INTERVAL_WORK_LIMIT,
   MAX_WORK_DETAIL_LIMIT,
   MCP_PROMPT_EVIDENCE_LIMIT,
   NORMALIZER_VERSION,
@@ -43,6 +42,27 @@ import {
 const START = new Date("2026-08-16T12:00:00.000Z");
 const READ = new Date("2026-08-17T12:00:01.000Z");
 const PG_SNAPSHOT = "730:741:733,739";
+const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
+const PERSON_ID = "22222222-2222-4222-8222-222222222222";
+const SESSION_ID = "33333333-3333-4333-8333-333333333333";
+const SNAPSHOT = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+
+function mockSource(...results) {
+  const source = Object.create(DirectFlameSource.prototype);
+  source.workspaceId = WORKSPACE_ID;
+  const unsafe = vi.fn();
+  for (const result of results) unsafe.mockResolvedValueOnce(result);
+  const array = vi.fn((values) => values);
+  source.transaction = (callback) => callback({ unsafe, array });
+  return { source, unsafe, array };
+}
+
+function workRequest(overrides = {}) {
+  return {
+    personId: PERSON_ID, start: START.toISOString(), sessionId: SESSION_ID,
+    role: "agent", snapshot: SNAPSHOT, ...overrides,
+  };
+}
 
 function rowsFor(personId, overrides = {}) {
   return Array.from({ length: BUCKET_COUNT }, (_, index) => ({
@@ -412,9 +432,13 @@ describe("Sherlock Flame payload", () => {
     expect(payload.people[0].activeSeconds).toBe(86_400);
   });
 
-  it("excludes stable smoke identities from the complete roster", () => {
+  it("excludes stable smoke identities from roster and direct evidence paths", () => {
     expect(PEOPLE_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
     expect(FLAME_SQL).toContain("github_id is distinct from 'sherlock-smoke'");
+    expect(WORK_DETAIL_SQL).toContain("pe.github_id is distinct from 'sherlock-smoke'");
+    expect(PROJECTION_WORK_DETAIL_SQL).toContain(
+      "evidence_person.github_id is distinct from 'sherlock-smoke'",
+    );
   });
 
   it("requires one approved dashboard email domain", () => {
@@ -859,6 +883,18 @@ describe("Sherlock Flame payload", () => {
     expect(PROJECTION_WORK_DETAIL_SQL.indexOf("limit $12")).toBeLessThan(
       PROJECTION_WORK_DETAIL_SQL.indexOf("left join telemetry.events source"),
     );
+    const detailRevisionScope = PROJECTION_WORK_DETAIL_SQL.indexOf(
+      "and revision.session_id = p.session_id",
+    );
+    expect(detailRevisionScope).toBeGreaterThan(
+      PROJECTION_WORK_DETAIL_SQL.indexOf("ranked_frame_revisions as materialized"),
+    );
+    expect(detailRevisionScope).toBeLessThan(
+      PROJECTION_WORK_DETAIL_SQL.indexOf("), latest_frame_evidence as materialized"),
+    );
+    expect(PROJECTION_INTERVAL_WORK_SQL).not.toContain(
+      "revision.session_id = p.session_id",
+    );
     expect(PROJECTION_FLAME_SQL).toContain(
       "and observed_at >= p.start_at and observed_at < p.read_at",
     );
@@ -1096,12 +1132,8 @@ describe("Sherlock Flame payload", () => {
   });
 
   it("pages canonical work evidence with an opaque timestamp/event cursor", async () => {
-    const source = Object.create(DirectFlameSource.prototype);
-    source.workspaceId = "11111111-1111-4111-8111-111111111111";
-    const personId = "22222222-2222-4222-8222-222222222222";
-    const sessionId = "33333333-3333-4333-8333-333333333333";
     const header = {
-      session_id: sessionId,
+      session_id: SESSION_ID,
       semantic_role: "agent",
       first_at: new Date("2026-08-16T12:00:00.000Z"),
       last_at: new Date("2026-08-16T12:00:03.000Z"),
@@ -1125,30 +1157,15 @@ describe("Sherlock Flame payload", () => {
       content_byte_size: 12,
       content_excerpt: "Patched it.",
     }];
-    const unsafe = vi.fn()
-      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
-      .mockResolvedValueOnce([header])
-      .mockResolvedValueOnce(items);
-    source.transaction = (callback) => callback({
-      unsafe,
-      array: (values) => values,
-    });
-    const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
+    const { source, unsafe } = mockSource(
+      [{ now: new Date("2026-08-17T12:00:02.000Z") }], items,
+    );
 
-    const detail = await source.fetchWork({
-      personId,
-      start: START.toISOString(),
-      sessionId,
-      role: "agent",
-      snapshot,
-      limit: "1",
-    });
+    const detail = await source.fetchWork(workRequest({ limit: "1" }));
 
-    expect(unsafe.mock.calls).toHaveLength(3);
-    expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
-    expect(unsafe.mock.calls[1][1].at(-1)).toBe(INTERVAL_WORK_LIMIT + 1);
-    expect(unsafe.mock.calls[2][0]).toBe(WORK_DETAIL_SQL);
-    expect(unsafe.mock.calls[2][1].at(-1)).toBe(2);
+    expect(unsafe.mock.calls).toHaveLength(2);
+    expect(unsafe.mock.calls[1][0]).toBe(WORK_DETAIL_SQL);
+    expect(unsafe.mock.calls[1][1].at(-1)).toBe(2);
     expect(detail.items).toEqual([expect.objectContaining({
       id: "41",
       role: "user",
@@ -1161,9 +1178,48 @@ describe("Sherlock Flame payload", () => {
       id: "41",
     });
     expect(detail).toMatchObject({
-      workId: `${sessionId}:agent`,
+      workId: `${SESSION_ID}:agent`,
       eventCount: 2,
     });
+  });
+
+  it("returns detail metadata when the selected conversation page is empty", async () => {
+    const { source, unsafe } = mockSource(
+      [{ now: new Date("2026-08-17T12:00:02.000Z") }], [{
+        session_id: SESSION_ID,
+        semantic_role: "unclassified",
+        first_at: new Date("2026-08-16T12:00:00.000Z"),
+        last_at: new Date("2026-08-16T12:00:03.000Z"),
+        event_count: 3,
+        summary: null,
+        id: null,
+        observed_at: null,
+        observed_at_microseconds: null,
+        message_role: null,
+        content_byte_size: null,
+        content_excerpt: null,
+      }],
+    );
+
+    const detail = await source.fetchWork(workRequest({ role: "unclassified" }));
+
+    expect(unsafe).toHaveBeenCalledTimes(2);
+    expect(unsafe.mock.calls[1][0]).toBe(WORK_DETAIL_SQL);
+    expect(detail).toMatchObject({
+      workId: `${SESSION_ID}:unclassified`,
+      sessionId: SESSION_ID,
+      role: "unclassified",
+      eventCount: 3,
+      items: [],
+      nextCursor: null,
+    });
+
+    unsafe.mockReset()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([]);
+    await expect(source.fetchWork(workRequest({ role: "unclassified" })))
+      .rejects.toMatchObject({ code: "flame_work_request_not_found" });
+    expect(unsafe).toHaveBeenCalledTimes(2);
   });
 
   it("round-trips work cursors and enforces page bounds", async () => {
@@ -1180,17 +1236,10 @@ describe("Sherlock Flame payload", () => {
     expect(DEFAULT_WORK_DETAIL_LIMIT).toBe(50);
     expect(MAX_WORK_DETAIL_LIMIT).toBe(100);
 
-    const source = Object.create(DirectFlameSource.prototype);
-    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    const { source } = mockSource();
     source.transaction = vi.fn();
-    await expect(source.fetchWork({
-      personId: "22222222-2222-4222-8222-222222222222",
-      start: START.toISOString(),
-      sessionId: "33333333-3333-4333-8333-333333333333",
-      role: "agent",
-      snapshot: encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ }),
-      limit: "101",
-    })).rejects.toMatchObject({ code: "flame_work_request_invalid" });
+    await expect(source.fetchWork(workRequest({ limit: "101" })))
+      .rejects.toMatchObject({ code: "flame_work_request_invalid" });
     expect(source.transaction).not.toHaveBeenCalled();
   });
 

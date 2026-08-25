@@ -3,12 +3,15 @@ import { PostgresActivityReducer } from "../sherlock-activity-reducer/postgres.t
 import { CLAUDE_NORMALIZER_VERSION } from "./normalizer.ts";
 import {
   type BatchManifest,
+  type CollectorIdentity,
   type CommittedReceipt,
   CONTRACT_VERSION,
+  IngestError,
   RECEIPT_VERSION,
   sha256Hex,
 } from "./contract.ts";
 import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
+import { PostgresBatchRepository } from "./postgres.ts";
 
 const permission = await Deno.permissions.query({
   name: "env",
@@ -17,6 +20,7 @@ const permission = await Deno.permissions.query({
 const databaseUrl = permission.state === "granted"
   ? Deno.env.get("SHERLOCK_TEST_DATABASE_URL")
   : null;
+type Sql = ReturnType<typeof postgres>;
 
 function assert(
   condition: unknown,
@@ -31,20 +35,66 @@ interface BatchFixture {
   source: Uint8Array;
 }
 
+interface BatchOwner {
+  workspaceId: string;
+  personId: string;
+  collectorKey: string;
+}
+
+interface SessionBatchInput extends BatchOwner {
+  nativeSessionId: string;
+  parentNativeSessionId?: string;
+}
+
+interface ClaudeBatchInput extends SessionBatchInput {
+  nativeRecords?: ClaudeNativeRecord[];
+}
+
+interface HookBatchInput extends BatchOwner {
+  nativeSessionId: string;
+  promptUuid: string;
+  assistantUuid: string;
+}
+
 type ClaudeNativeRecord = Record<string, unknown> & {
   type: string;
   timestamp: string;
 };
 
+function committedReceipt(
+  manifest: BatchManifest,
+  batchId: string,
+  owner: BatchOwner,
+  storagePath: string,
+  committedAt: string,
+): CommittedReceipt {
+  return {
+    receipt_version: RECEIPT_VERSION,
+    status: "committed",
+    batch_id: batchId,
+    workspace_id: owner.workspaceId,
+    person_id: owner.personId,
+    collector_key: owner.collectorKey,
+    source_kind: manifest.source_kind,
+    source_stream_key: manifest.source_stream_key,
+    generation_key: manifest.generation_key,
+    generation_seq: manifest.generation_seq,
+    start_offset: manifest.start_offset,
+    end_offset: manifest.end_offset,
+    source_byte_count: manifest.source_byte_count,
+    source_sha256: manifest.source_sha256,
+    storage_path: storagePath,
+    stored_byte_count: manifest.stored_byte_count,
+    stored_sha256: manifest.stored_sha256,
+    record_count: manifest.record_count,
+    contract_version: manifest.contract_version,
+    committed_at: committedAt,
+  };
+}
+
 async function seedBatch(
-  sql: ReturnType<typeof postgres>,
-  input: {
-    workspaceId: string;
-    personId: string;
-    collectorKey: string;
-    nativeSessionId: string;
-    parentNativeSessionId?: string;
-  },
+  sql: Sql,
+  input: SessionBatchInput,
 ): Promise<BatchFixture> {
   const batchId = crypto.randomUUID();
   const timestamp = "2026-08-17T00:00:00.000Z";
@@ -102,28 +152,13 @@ async function seedBatch(
     source_version: "integration-test",
     collector_version: "integration-test",
   };
-  const receipt: CommittedReceipt = {
-    receipt_version: RECEIPT_VERSION,
-    status: "committed",
-    batch_id: batchId,
-    workspace_id: input.workspaceId,
-    person_id: input.personId,
-    collector_key: input.collectorKey,
-    source_kind: "rollout",
-    source_stream_key: sourceStreamKey,
-    generation_key: generationKey,
-    generation_seq: 0,
-    start_offset: 0,
-    end_offset: source.byteLength,
-    source_byte_count: source.byteLength,
-    source_sha256: sourceSha256,
-    storage_path: storagePath,
-    stored_byte_count: 1,
-    stored_sha256: "a".repeat(64),
-    record_count: 1,
-    contract_version: CONTRACT_VERSION,
-    committed_at: timestamp,
-  };
+  const receipt = committedReceipt(
+    manifest,
+    batchId,
+    input,
+    storagePath,
+    timestamp,
+  );
   await sql.begin(async (tx) => {
     await tx.unsafe(
       `insert into telemetry.ingest_batches (
@@ -170,15 +205,8 @@ async function seedBatch(
 }
 
 async function seedClaudeBatch(
-  sql: ReturnType<typeof postgres>,
-  input: {
-    workspaceId: string;
-    personId: string;
-    collectorKey: string;
-    nativeSessionId: string;
-    parentNativeSessionId?: string;
-    nativeRecords?: ClaudeNativeRecord[];
-  },
+  sql: Sql,
+  input: ClaudeBatchInput,
 ): Promise<BatchFixture> {
   const batchId = crypto.randomUUID();
   const promptId = `prompt-${input.nativeSessionId}`;
@@ -303,28 +331,13 @@ async function seedClaudeBatch(
     source_version: "2.0.59",
     collector_version: "integration-test",
   };
-  const receipt: CommittedReceipt = {
-    receipt_version: RECEIPT_VERSION,
-    status: "committed",
-    batch_id: batchId,
-    workspace_id: input.workspaceId,
-    person_id: input.personId,
-    collector_key: input.collectorKey,
-    source_kind: "transcript",
-    source_stream_key: sourceStreamKey,
-    generation_key: generationKey,
-    generation_seq: 0,
-    start_offset: 0,
-    end_offset: source.byteLength,
-    source_byte_count: source.byteLength,
-    source_sha256: sourceSha256,
-    storage_path: storagePath,
-    stored_byte_count: 1,
-    stored_sha256: "b".repeat(64),
-    record_count: records.length,
-    contract_version: CONTRACT_VERSION,
-    committed_at: native.at(-1)!.timestamp,
-  };
+  const receipt = committedReceipt(
+    manifest,
+    batchId,
+    input,
+    storagePath,
+    native.at(-1)!.timestamp,
+  );
   await sql.unsafe(
     `insert into telemetry.ingest_batches (
        id, workspace_id, person_id, collector_key,
@@ -381,15 +394,8 @@ async function seedClaudeBatch(
 }
 
 async function seedClaudeHookBatch(
-  sql: ReturnType<typeof postgres>,
-  input: {
-    workspaceId: string;
-    personId: string;
-    collectorKey: string;
-    nativeSessionId: string;
-    promptUuid: string;
-    assistantUuid: string;
-  },
+  sql: Sql,
+  input: HookBatchInput,
 ): Promise<BatchFixture> {
   const batchId = crypto.randomUUID();
   const timestamp = "2026-08-17T02:00:02.000Z";
@@ -459,28 +465,13 @@ async function seedClaudeHookBatch(
     source_version: "2.0.59",
     collector_version: "integration-test",
   };
-  const receipt: CommittedReceipt = {
-    receipt_version: RECEIPT_VERSION,
-    status: "committed",
-    batch_id: batchId,
-    workspace_id: input.workspaceId,
-    person_id: input.personId,
-    collector_key: input.collectorKey,
-    source_kind: "hook",
-    source_stream_key: sourceStreamKey,
-    generation_key: generationKey,
-    generation_seq: 0,
-    start_offset: 0,
-    end_offset: source.byteLength,
-    source_byte_count: source.byteLength,
-    source_sha256: sourceSha256,
-    storage_path: storagePath,
-    stored_byte_count: 1,
-    stored_sha256: "c".repeat(64),
-    record_count: 1,
-    contract_version: CONTRACT_VERSION,
-    committed_at: timestamp,
-  };
+  const receipt = committedReceipt(
+    manifest,
+    batchId,
+    input,
+    storagePath,
+    timestamp,
+  );
   await sql.unsafe(
     `insert into telemetry.ingest_batches (
        id, workspace_id, person_id, collector_key,
@@ -543,6 +534,34 @@ async function normalize(
   return result.session_ids[0];
 }
 
+async function readPerson(
+  sql: Sql,
+  workspaceId: string,
+  personId: string,
+) {
+  const [row] = await sql.unsafe(
+    `select xmin::text as xmin, display_name, github_id
+       from telemetry.people
+      where workspace_id = $1 and id = $2`,
+    [workspaceId, personId],
+  );
+  return row;
+}
+
+async function readSession(
+  sql: Sql,
+  workspaceId: string,
+  sessionId: string,
+) {
+  const [row] = await sql.unsafe(
+    `select xmin::text as xmin, updated_at::text as updated_at
+       from telemetry.sessions
+      where workspace_id = $1 and id = $2`,
+    [workspaceId, sessionId],
+  );
+  return row;
+}
+
 async function assertParentLink(
   sql: ReturnType<typeof postgres>,
   workspaceId: string,
@@ -573,6 +592,68 @@ async function assertParentLink(
     `expected ${childNativeSessionId} to link to ${parentNativeSessionId}`,
   );
 }
+
+Deno.test({
+  name: "Postgres person attribution skips identical physical updates",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 2 });
+    const repository = PostgresBatchRepository.connect(databaseUrl!);
+    const workspaceId = crypto.randomUUID();
+    const grant = {
+      workspace_id: workspaceId,
+      collector_key_prefix: "identity-integration",
+    };
+    const identity: CollectorIdentity = {
+      name: "Identity Test",
+      github_id: "identity-test",
+      email: "identity-test@example.com",
+      installation_id: crypto.randomUUID(),
+    };
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Identity integration test')`,
+        [workspaceId, `identity-${workspaceId}`],
+      );
+
+      const first = await repository.resolveAttribution(grant, identity);
+      const attributedId = first.person_id;
+      const beforeReplay = await readPerson(sql, workspaceId, attributedId);
+      const replay = await repository.resolveAttribution(grant, identity);
+      const afterReplay = await readPerson(sql, workspaceId, attributedId);
+      assert(replay.person_id === first.person_id);
+      assert(
+        afterReplay.xmin === beforeReplay.xmin,
+        "identical person attribution must not create a new row version",
+      );
+
+      const changed = await repository.resolveAttribution(grant, {
+        ...identity,
+        name: "Changed Identity Test",
+        github_id: "changed-identity-test",
+      });
+      const afterChange = await readPerson(sql, workspaceId, attributedId);
+      assert(changed.person_id === first.person_id);
+      assert(
+        afterChange.xmin !== afterReplay.xmin &&
+          afterChange.display_name === "Changed Identity Test" &&
+          afterChange.github_id === "changed-identity-test",
+        "changed person metadata must create an auditable row version",
+      );
+    } finally {
+      await sql.unsafe("delete from telemetry.people where workspace_id = $1", [
+        workspaceId,
+      ]).catch(() => undefined);
+      await sql.unsafe("delete from telemetry.workspaces where id = $1", [
+        workspaceId,
+      ]).catch(() => undefined);
+      await Promise.allSettled([repository.close(), sql.end()]);
+    }
+  },
+});
 
 Deno.test({
   name:
@@ -659,14 +740,35 @@ Deno.test({
         "child-first-child",
         "child-first-parent",
       );
+      const beforeReplay = await readSession(sql, workspaceId, childSessionId);
       assert(
         await normalize(firstNormalizer, childFirstChild) === childSessionId,
         "child replay must preserve its session id",
+      );
+      const afterReplay = await readSession(sql, workspaceId, childSessionId);
+      assert(
+        afterReplay.xmin === beforeReplay.xmin &&
+          afterReplay.updated_at === beforeReplay.updated_at,
+        "identical session replay must preserve xmin and updated_at",
       );
       assert(
         await normalize(firstNormalizer, childFirstParent) === parentSessionId,
         "parent replay must preserve its session id",
       );
+
+      const wrongPersonReplay = await seedBatch(sql, {
+        workspaceId,
+        personId: otherPersonId,
+        collectorKey,
+        nativeSessionId: "child-first-child",
+      });
+      try {
+        await normalize(firstNormalizer, wrongPersonReplay);
+        assert(false, "wrong-person session replay must conflict");
+      } catch (error) {
+        assert(error instanceof IngestError);
+        assert(error.code === "session_attribution_conflict");
+      }
 
       const concurrentChild = await seedBatch(sql, {
         workspaceId,

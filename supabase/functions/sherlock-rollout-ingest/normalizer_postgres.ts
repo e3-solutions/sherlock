@@ -370,6 +370,37 @@ async function upsertSession(
        started_at = least(telemetry.sessions.started_at, excluded.started_at),
        updated_at = now()
      where telemetry.sessions.person_id = excluded.person_id
+       and row(
+         telemetry.sessions.native_thread_id,
+         telemetry.sessions.parent_session_id,
+         telemetry.sessions.parent_native_session_id,
+         telemetry.sessions.actor_role,
+         telemetry.sessions.role_version,
+         telemetry.sessions.title,
+         telemetry.sessions.project_key,
+         telemetry.sessions.repo_remote,
+         telemetry.sessions.branch,
+         telemetry.sessions.cwd,
+         telemetry.sessions.model,
+         telemetry.sessions.started_at
+       ) is distinct from row(
+         coalesce(excluded.native_thread_id, telemetry.sessions.native_thread_id),
+         coalesce(excluded.parent_session_id, telemetry.sessions.parent_session_id),
+         coalesce(
+           excluded.parent_native_session_id,
+           telemetry.sessions.parent_native_session_id
+         ),
+         case when excluded.actor_role = 'unknown'
+           then telemetry.sessions.actor_role else excluded.actor_role end,
+         excluded.role_version,
+         coalesce(excluded.title, telemetry.sessions.title),
+         coalesce(excluded.project_key, telemetry.sessions.project_key),
+         coalesce(excluded.repo_remote, telemetry.sessions.repo_remote),
+         coalesce(excluded.branch, telemetry.sessions.branch),
+         coalesce(excluded.cwd, telemetry.sessions.cwd),
+         coalesce(excluded.model, telemetry.sessions.model),
+         least(telemetry.sessions.started_at, excluded.started_at)
+       )
      returning id, actor_role`,
     [
       crypto.randomUUID(),
@@ -391,7 +422,20 @@ async function upsertSession(
       session.started_at ?? receipt.committed_at,
     ],
   );
-  if (rows.length === 0) {
+  const resolvedRows = rows.length > 0 ? rows : await tx.unsafe(
+    `select id, actor_role
+         from telemetry.sessions
+        where workspace_id = $1 and collector_key = $2
+          and native_session_id = $3 and person_id = $4
+        limit 1`,
+    [
+      receipt.workspace_id,
+      receipt.collector_key,
+      session.native_session_id,
+      receipt.person_id,
+    ],
+  );
+  if (resolvedRows.length === 0) {
     throw new IngestError(
       "session_attribution_conflict",
       "the native session is already attributed to another person",
@@ -405,7 +449,7 @@ async function upsertSession(
         and parent_native_session_id = $5 and parent_session_id is null
         and id <> $1`,
     [
-      rows[0].id,
+      resolvedRows[0].id,
       receipt.workspace_id,
       receipt.collector_key,
       receipt.person_id,
@@ -413,7 +457,7 @@ async function upsertSession(
     ],
   );
   return {
-    id: String(rows[0].id),
-    actor_role: String(rows[0].actor_role) as ActorRole,
+    id: String(resolvedRows[0].id),
+    actor_role: String(resolvedRows[0].actor_role) as ActorRole,
   };
 }
