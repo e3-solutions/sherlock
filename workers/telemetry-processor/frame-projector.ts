@@ -14,25 +14,6 @@ const ADJACENT_PROMPT_MATCH_MS = 100;
 const ASSISTANT_REPRESENTATION_MATCH_MS = 3_000;
 const DEFAULT_FRAME_LOCK_TIMEOUT_MS = 60_000;
 const REVISION_INSERT_BATCH_SIZE = 3_000;
-export const INTERNAL_NATIVE_PROMPT_PREFIXES = Object.freeze([
-  "<recommended_plugins>",
-  "<in-app-browser-context",
-  "<app-context",
-  "<skills_instructions",
-  "<permissions instructions",
-  "<permissions_instructions>",
-  "<environment_context>",
-  "<collaboration_mode>",
-  "<apps_instructions>",
-  "<plugins_instructions>",
-  "<heartbeat>",
-  "<turn_aborted>",
-  "<automation",
-  "<skill>",
-  "# AGENTS.md instructions",
-  "# Bonaparte Implementation",
-  "The configured soft phase budget has expired.",
-]);
 
 export const FRAME_LOCK_TIMEOUT_SQL =
   "select set_config('statement_timeout', $1, false)";
@@ -60,16 +41,6 @@ export function nativeItemTimestampSql(column: string): string {
     ) / 1000.0)
     else null
   end`;
-}
-
-function nativePromptContentCandidateSql(column: string): string {
-  const prefixExclusions = INTERNAL_NATIVE_PROMPT_PREFIXES.map((prefix) =>
-    `left(btrim(${column}), ${prefix.length}) <> '${
-      prefix.replaceAll("'", "''")
-    }'`
-  ).join("\n       and ");
-  return `${column} is not null and btrim(${column}) <> ''
-       and ${prefixExclusions}`;
 }
 
 export function revisionInsertBatches<T>(values: readonly T[]): T[][] {
@@ -157,7 +128,6 @@ export interface SourceEvent {
   content_sha256: string | null;
   content_byte_size: number | null;
   has_content_excerpt: boolean;
-  native_prompt_content_candidate: boolean;
   error_code: string | null;
   source_batch_id: string;
   source_record_index: number;
@@ -201,8 +171,6 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
        e.native_item_id, e.turn_id, e.message_role, e.message_origin,
        e.content_sha256, e.content_byte_size,
        e.content_excerpt is not null has_content_excerpt,
-       (${nativePromptContentCandidateSql("e.content_excerpt")})
-         native_prompt_content_candidate,
        e.error_code,
        nr.batch_id::text source_batch_id, nr.record_index source_record_index,
        nr.source_start_offset::text source_start_offset,
@@ -618,8 +586,7 @@ function canonicalActivity(
           (event.message_origin === "human" ||
             event.message_origin === "parent_agent") ||
         event.event_subtype === "message" &&
-          event.message_origin === "human" &&
-          event.native_prompt_content_candidate) &&
+          event.message_origin === "human") &&
       event.has_content_excerpt,
     is_tombstone: false,
   }));
@@ -751,8 +718,7 @@ function isStableNativePrompt(
 ): event is SourceEvent & { native_item_id: string } {
   return event.event_subtype === "message" && event.native_item_id !== null &&
     event.source_native_type === "response_item" &&
-    event.source_native_payload_type === "message" &&
-    event.native_prompt_content_candidate;
+    event.source_native_payload_type === "message";
 }
 
 function canonicalSemanticRows(events: readonly SourceEvent[]): SourceEvent[] {
@@ -1112,7 +1078,6 @@ async function fingerprintSourceState(
       event.content_sha256,
       event.content_byte_size,
       event.has_content_excerpt,
-      event.native_prompt_content_candidate,
       event.error_code,
       event.source_batch_id,
       event.source_record_index,
@@ -1200,9 +1165,6 @@ function sourceEventFromRow(row: Record<string, unknown>): SourceEvent {
       ? null
       : Number(row.content_byte_size),
     has_content_excerpt: Boolean(row.has_content_excerpt),
-    native_prompt_content_candidate: Boolean(
-      row.native_prompt_content_candidate,
-    ),
     error_code: nullableString(row.error_code),
     source_batch_id: String(row.source_batch_id),
     source_record_index: Number(row.source_record_index),

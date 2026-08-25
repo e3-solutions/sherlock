@@ -7,7 +7,10 @@ import {
   IngestError,
   receiptFromRow,
 } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
-import { NORMALIZER_VERSION } from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
+import {
+  legacyNormalizerVersionFor,
+  NORMALIZER_VERSION,
+} from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
 import { PostgresBatchNormalizer } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import { validateStoredBatch } from "../../supabase/functions/sherlock-rollout-ingest/service.ts";
 import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";
@@ -59,6 +62,13 @@ export interface ReductionTarget {
   activity_version: string;
   target_event_id: bigint;
   workload_class: WorkloadClass;
+}
+
+export function normalizationTarget(
+  requestedVersion: string | null,
+  manifest: BatchManifest,
+): string {
+  return requestedVersion ?? legacyNormalizerVersionFor(manifest);
 }
 
 export interface TargetedReducer {
@@ -132,6 +142,7 @@ export class TelemetryProcessor {
             source,
             remainingMilliseconds(deadlineAtMs),
             deadlineAtMs,
+            normalizationTarget(job.normalizer_version, batch.manifest),
           );
         const affectedSessionIds = await this.resolveAffectedSessionIds(
           transactionRunner,

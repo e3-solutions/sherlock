@@ -167,7 +167,7 @@ Deno.test({
            actor_role, occurred_at, observed_at, server_received_at,
            message_role, message_origin, content_sha256, content_byte_size,
            content_excerpt
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v1',0,100,'message',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',0,100,'message',
            'user_message','unknown',$4,$4,$4,'user','human',$5,12,'Visible prompt')
          returning id::text id`,
         [
@@ -203,7 +203,7 @@ Deno.test({
            projection_index, canonical_scope_key, logical_event_key,
            source_priority, event_kind, event_subtype, actor_role,
            occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v1',1,'micro-scope',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',1,'micro-scope',
            'micro-logical',100,'reasoning','reasoning','unknown',
            $4::text::timestamptz,$4::text::timestamptz,$4::text::timestamptz)
          returning id::text id`,
@@ -221,7 +221,7 @@ Deno.test({
            projection_index, canonical_scope_key, logical_event_key,
            source_priority, event_kind, event_subtype, actor_role,
            occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v1',2,'micro-scope',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',2,'micro-scope',
            'micro-logical',100,'reasoning','reasoning','unknown',
            $4::text::timestamptz,$4::text::timestamptz,$4::text::timestamptz)
          returning id::text id`,
@@ -334,25 +334,11 @@ Deno.test({
           JSON.stringify(microsecondCanonical)
         }`,
       );
-      await assertRejects(
-        () =>
-          proveAndActivateFrameProjection(sql, {
-            workspaceId,
-            activate: false,
-            windowStart: proofWindowStart,
-          }),
-        "target-workspace normalization backlog must block activation",
-        "normalization or reduction jobs",
-      );
-      const completedNormalize = await sql.unsafe(
-        `update processing.telemetry_jobs
-            set status = 'succeeded', completed_at = now(), updated_at = now()
-          where workspace_id = $1 and batch_id = $2
-            and job_kind = 'normalize'
-          returning id::text id`,
-        [workspaceId, batchId],
-      );
-      assert(completedNormalize.length === 1);
+      await proveAndActivateFrameProjection(sql, {
+        workspaceId,
+        activate: false,
+        windowStart: proofWindowStart,
+      });
       await sql.unsafe(
         `insert into telemetry.sessions (
            id, workspace_id, person_id, collector_key, native_session_id,
@@ -371,7 +357,7 @@ Deno.test({
            workspace_id, session_id, source_record_id, normalizer_version,
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v1',8,100,'lifecycle',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',8,100,'lifecycle',
            'turn_complete','primary',$4,$4,$4)`,
         [workspaceId, oldSessionId, nativeRows[0], "2026-08-18T18:01:00Z"],
       );
@@ -440,7 +426,7 @@ Deno.test({
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
          ) overriding system value values (
-           $1,$2,$3,$4,'sherlock.codex-rollout.v1',0,100,'lifecycle',
+           $1,$2,$3,$4,'sherlock.codex-rollout.v2',0,100,'lifecycle',
            'turn_started','unknown',$5,$5,$5
          )`,
         [
@@ -548,7 +534,7 @@ Deno.test({
            workspace_id, session_id, source_record_id, normalizer_version,
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v1',9,100,'lifecycle',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',9,100,'lifecycle',
            'turn_complete','worker',$4,$4,$4)`,
         [workspaceId, sessionId, nativeRows[0], "2026-08-21T20:00:00Z"],
       );

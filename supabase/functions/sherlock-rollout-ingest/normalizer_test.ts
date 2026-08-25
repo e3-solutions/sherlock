@@ -1,9 +1,12 @@
 import { type BatchManifest, CONTRACT_VERSION, sha256Hex } from "./contract.ts";
 import {
   CLAUDE_NORMALIZER_VERSION,
+  LEGACY_CODEX_NORMALIZER_VERSION,
+  legacyNormalizerVersionFor,
   NORMALIZER_VERSION,
   normalizerVersionFor,
   projectBatch,
+  RUNTIME_CONTEXT_MESSAGE_ORIGIN,
 } from "./normalizer.ts";
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -230,7 +233,7 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
 
   const projection = await projectBatch(manifest, source);
 
-  assert(NORMALIZER_VERSION === "sherlock.codex-rollout.v1");
+  assert(NORMALIZER_VERSION === "sherlock.codex-rollout.v2");
   assert(projection.session?.native_session_id === "child-session");
   assert(projection.session?.parent_native_session_id === "parent-session");
   assert(projection.session?.actor_role === "guardian");
@@ -246,6 +249,9 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
     event.message_role === "user"
   );
   assert(userMessages.length === 2);
+  assert(
+    userMessages.every((event) => event.message_origin === "human"),
+  );
   assert(
     userMessages[0].logical_event_key === userMessages[1].logical_event_key,
   );
@@ -268,6 +274,111 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
   );
   assert(tool?.tool_call_id === "call-1");
   assert(tool?.tool_name === "functions.exec");
+});
+
+Deno.test("Codex v2 classifies the explicit runtime envelope contract", async () => {
+  const machineMessages = [
+    "<recommended_plugins>machine context</recommended_plugins>",
+    '<in-app-browser-context version="2">machine context</in-app-browser-context>',
+    "<app-context>machine context</app-context>",
+    "<skills_instructions>machine context</skills_instructions>",
+    "<permissions instructions>machine context</permissions>",
+    "<permissions_instructions>machine context</permissions_instructions>",
+    "<environment_context>machine context</environment_context>",
+    "<collaboration_mode>machine context</collaboration_mode>",
+    "<apps_instructions>machine context</apps_instructions>",
+    "<plugins_instructions>machine context</plugins_instructions>",
+    '<codex_delegation schema_version="2">machine context</codex_delegation>',
+    "<heartbeat>machine context</heartbeat>",
+    "<turn_aborted>machine context</turn_aborted>",
+    '<automation id="test">machine context</automation>',
+    "<skill>machine context</skill>",
+    "# AGENTS.md instructions for /repo",
+    "# Bonaparte Implementation context",
+    "The configured soft phase budget has expired. Continue.",
+  ];
+  const humanMessages = [
+    "<customer_instructions>human request</customer_instructions>",
+    "<project_context>human-authored context</project_context>",
+    "<legal-delegation>human-authored XML</legal-delegation>",
+    "<order><item>human-authored XML</item></order>",
+    "Build a context-aware parser",
+  ];
+  const records = [...machineMessages, ...humanMessages].map((text, index) => ({
+    timestamp: `2026-08-15T00:01:${String(index).padStart(2, "0")}Z`,
+    type: "response_item",
+    payload: {
+      id: `message-${index}`,
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text }],
+    },
+  }));
+  const { manifest, source } = await fixture([{
+    timestamp: "2026-08-15T00:00:59Z",
+    type: "session_meta",
+    payload: { id: "child-session", source: "cli" },
+  }, ...records]);
+
+  const projection = await projectBatch(manifest, source);
+  const messages = projection.events.filter((event) =>
+    event.event_kind === "message"
+  );
+
+  assert(normalizerVersionFor(manifest) === NORMALIZER_VERSION);
+  assert(messages.length === records.length);
+  assert(
+    messages.slice(0, machineMessages.length).every((event) =>
+      event.message_origin === RUNTIME_CONTEXT_MESSAGE_ORIGIN
+    ),
+  );
+  assert(
+    messages.slice(machineMessages.length).every((event) =>
+      event.message_origin === "human"
+    ),
+  );
+});
+
+Deno.test("Codex v1 remains reproducible while v2 appends corrected facts", async () => {
+  const runtimeText = "<environment_context>injected</environment_context>";
+  const { manifest, source } = await fixture([{
+    timestamp: "2026-08-15T00:01:59Z",
+    type: "session_meta",
+    payload: { id: "child-session", source: "cli" },
+  }, {
+    timestamp: "2026-08-15T00:02:00Z",
+    type: "response_item",
+    payload: {
+      id: "runtime-message",
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: runtimeText }],
+    },
+  }, {
+    timestamp: "2026-08-15T00:02:01Z",
+    type: "event_msg",
+    payload: {
+      type: "user_message",
+      message: runtimeText,
+    },
+  }]);
+
+  const legacy = await projectBatch(
+    manifest,
+    source,
+    LEGACY_CODEX_NORMALIZER_VERSION,
+  );
+  const current = await projectBatch(manifest, source, NORMALIZER_VERSION);
+
+  assert(
+    legacyNormalizerVersionFor(manifest) === LEGACY_CODEX_NORMALIZER_VERSION,
+  );
+  assert(legacy.events[1].message_origin === "human");
+  assert(current.events[1].message_origin === RUNTIME_CONTEXT_MESSAGE_ORIGIN);
+  assert(
+    current.events[2].message_origin === "human",
+    "submitted user_message envelopes remain human facts",
+  );
 });
 
 Deno.test("normalizer emits observable unknown events for malformed records", async () => {

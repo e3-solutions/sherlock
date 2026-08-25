@@ -5,15 +5,22 @@ export const BUCKET_MS = 10 * 60 * 1000;
 // Keep this immutable reader contract aligned with the worker's frame version.
 // The dashboard Docker build context is apps/dashboard, so it cannot import the
 // repository-level worker module at runtime.
-export const FRAME_VERSION = "frame-evidence-v2";
-// Prompt semantics changed in v2, but activity/work semantics did not. During
-// the v2 backfill, continue serving work from the already-active immutable v1
+export const FRAME_VERSION = "frame-evidence-v3";
+// Prompt classification moved into Codex normalization v2. During the v3
+// backfill, continue serving work from the already-active immutable v2
 // projection so interval clicks never regress to raw activity scans.
-export const COMPATIBLE_WORK_FRAME_VERSION = "frame-evidence-v1";
-export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const COMPATIBLE_WORK_FRAME_VERSION = "frame-evidence-v2";
+export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
+// Frozen source universe for raw v3 snapshot tokens. Add a new token version
+// before changing either provider version.
 export const NORMALIZER_VERSIONS = Object.freeze([
   NORMALIZER_VERSION,
+  CLAUDE_NORMALIZER_VERSION,
+]);
+export const LEGACY_NORMALIZER_VERSIONS = Object.freeze([
+  LEGACY_CODEX_NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
 export const DATABASE_ROLE = "sherlock_reader";
@@ -23,6 +30,7 @@ const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
 export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
 const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
+const RAW_SNAPSHOT_TOKEN_VERSION = "v3";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -40,7 +48,7 @@ export const MAX_WORK_DETAIL_LIMIT = 100;
 export const MCP_PROMPT_EVIDENCE_LIMIT = 5;
 export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
 export const SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN = "sixtyfour.ai";
-export const INTERNAL_CONTEXT_PREFIXES = Object.freeze([
+const LEGACY_INTERNAL_CONTEXT_PREFIXES = Object.freeze([
   "<recommended_plugins>",
   "<in-app-browser-context",
   "<app-context",
@@ -51,6 +59,7 @@ export const INTERNAL_CONTEXT_PREFIXES = Object.freeze([
   "<collaboration_mode>",
   "<apps_instructions>",
   "<plugins_instructions>",
+  "<codex_delegation>",
   "<heartbeat>",
   "<turn_aborted>",
   "<automation",
@@ -59,7 +68,6 @@ export const INTERNAL_CONTEXT_PREFIXES = Object.freeze([
   "# Bonaparte Implementation",
   "The configured soft phase budget has expired.",
 ]);
-
 export function validateDashboardEmailDomain(value) {
   if (![PREFERRED_DASHBOARD_EMAIL_DOMAIN, SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN].includes(value)) {
     throw new TypeError("SHERLOCK_DASHBOARD_EMAIL_DOMAIN must be e3group.ai or sixtyfour.ai");
@@ -77,17 +85,16 @@ function nativeItemTimestamp(column) {
   end`;
 }
 
-function internalContextExclusion(column) {
-  return INTERNAL_CONTEXT_PREFIXES.map((prefix) =>
+function nativePromptContentPredicate(column) {
+  const legacyPrefixExclusions = LEGACY_INTERNAL_CONTEXT_PREFIXES.map((prefix) =>
     `left(btrim(${column}), ${prefix.length}) <> '${
       prefix.replaceAll("'", "''")
     }'`
-  ).join("\n     and ");
-}
-
-function nativePromptContentPredicate(column) {
+  ).join("\n       and ");
   return `${column} is not null and btrim(${column}) <> ''
-     and ${internalContextExclusion(column)}`;
+     and (e.normalizer_version <> '${LEGACY_CODEX_NORMALIZER_VERSION}' or (
+       ${legacyPrefixExclusions}
+     ))`;
 }
 
 function activityCte({ joins = "" } = {}) {
@@ -178,8 +185,9 @@ prompt_candidates as materialized (
          e.logical_event_key, e.turn_id, e.normalizer_version, e.event_kind,
          e.event_subtype, e.source_priority,
          e.native_item_id, e.content_sha256,
-         (${nativePromptContentPredicate("e.content_excerpt")})
-           native_prompt_content_candidate,
+         (e.message_origin = 'human'
+          and ${nativePromptContentPredicate("e.content_excerpt")})
+           native_prompt_candidate,
          nr.batch_id source_batch_id, nr.record_index source_record_index,
          nr.source_start_offset, nr.source_end_offset,
          nr.native_type source_native_type,
@@ -277,7 +285,7 @@ prompt_candidates as materialized (
      and native_item_id is not null
      and source_native_type = 'response_item'
      and source_native_payload_type = 'message'
-     and native_prompt_content_candidate
+     and native_prompt_candidate
 -- PostgreSQL has no row-count statistics for these materialized CTEs and otherwise
 -- chooses quadratic nested loops. The materialize-then-filter full joins below keep
 -- every original predicate while giving the planner bounded hash/merge paths; each
@@ -387,7 +395,7 @@ prompt_candidates as materialized (
      and native_item_id is not null
      and source_native_type = 'response_item'
      and source_native_payload_type = 'message'
-     and native_prompt_content_candidate
+     and native_prompt_candidate
 ), prompt_identities as materialized (
   select * from keyed_prompt_sources
   union all
@@ -1057,106 +1065,6 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
 
-// Transition-only prompt counts used while v2 is backfilling. Activity remains
-// on the indexed v1 projection; only stable native human messages are read from
-// telemetry and deduplicated against the v1 prompt identities.
-export const COMPATIBLE_PROMPT_COUNTS_SQL = `
-with p as materialized (
-  select $1::uuid workspace_id, $2::timestamptz start_at,
-         $3::timestamptz end_at, $4::text frame_version,
-         $5::text expected_email_domain, $6::text[] normalizer_versions,
-         null::uuid person_id, null::pg_snapshot snapshot
-), ${projectedEvidenceCte()}, projected_sources as materialized (
-  select person_id, prompt_identity, observed_at, source_event_id, 0 source_rank
-    from projected_prompts
-), native_event_candidates as materialized (
-  select e.workspace_id, e.id, e.session_id, e.native_item_id,
-         e.source_record_id, e.source_priority, e.occurred_at,
-         e.observed_at, e.server_received_at
-    from telemetry.events e cross join p
-   where e.workspace_id = p.workspace_id
-     and e.normalizer_version = any(p.normalizer_versions)
-     and e.event_kind = 'message' and e.event_subtype = 'message'
-     and e.message_origin = 'human' and e.message_role = 'user'
-     and e.content_sha256 is not null and e.content_byte_size > 0
-     and e.error_code is null and not e.is_replay and e.actor_role = 'primary'
-     and e.native_item_id is not null
-     and ${nativePromptContentPredicate("e.content_excerpt")}
-     and (
-       e.occurred_at >= p.start_at and e.occurred_at < p.end_at
-       or e.occurred_at is null
-       and coalesce(
-         ${nativeItemTimestamp("e.native_item_id")},
-         coalesce(e.observed_at, e.server_received_at)
-       ) >= p.start_at
-       and coalesce(
-         ${nativeItemTimestamp("e.native_item_id")},
-         coalesce(e.observed_at, e.server_received_at)
-       ) < p.end_at
-     )
-), native_candidates as materialized (
-  select s.person_id, 'native:' || e.native_item_id prompt_identity,
-         coalesce(
-           ${nativeItemTimestamp("e.native_item_id")},
-           coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-         ) observed_at,
-         e.id source_event_id,
-         row_number() over (
-           partition by s.person_id, e.native_item_id
-           order by e.source_priority desc, e.occurred_at asc nulls last, e.id
-         ) native_rank
-    from native_event_candidates e
-    join telemetry.sessions s
-      on s.workspace_id = e.workspace_id and s.id = e.session_id
-    join telemetry.native_records nr
-      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
-    join telemetry.people pe
-      on pe.workspace_id = s.workspace_id and pe.id = s.person_id
-    cross join p
-   where nr.native_type = 'response_item'
-     and nr.native_payload_type = 'message'
-     and pe.github_id is distinct from 'sherlock-smoke'
-     and split_part(pe.email, '@', 2) = p.expected_email_domain
-     and split_part(pe.email, '@', 3) = ''
-), prompt_sources as materialized (
-  select * from projected_sources
-  union all
-  select native_candidates.person_id, native_candidates.prompt_identity,
-         native_candidates.observed_at, native_candidates.source_event_id,
-         1 source_rank
-    from native_candidates cross join p
-   where native_rank = 1
-     and observed_at >= p.start_at and observed_at < p.end_at
-), canonical_sources as materialized (
-  select ranked.*
-    from (
-      select prompt_sources.*,
-             row_number() over (
-               partition by prompt_sources.person_id,
-                            prompt_sources.prompt_identity
-               order by prompt_sources.source_rank,
-                        prompt_sources.observed_at,
-                        prompt_sources.source_event_id
-             ) canonical_rank
-        from prompt_sources
-    ) ranked
-   where canonical_rank = 1
-), prompt_counts as materialized (
-  select canonical_sources.person_id,
-         date_bin(interval '10 minutes', canonical_sources.observed_at,
-                  p.start_at) bucket_start,
-         count(*)::bigint prompts
-    from canonical_sources cross join p
-   group by canonical_sources.person_id, bucket_start
-), latest_prompt as materialized (
-  select max(observed_at) latest from canonical_sources
-)
-select person_id::text person_id, bucket_start, prompts,
-       latest_prompt.latest latest_prompt
-  from prompt_counts cross join latest_prompt
- order by person_id, bucket_start
-`;
-
 export const PROJECTION_INTERVAL_WORK_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
@@ -1193,19 +1101,10 @@ with p as materialized (
               when evidence.actor_role = 'worker' then 'subagent'
               else 'unclassified' end = grouped.semantic_role
    where evidence.is_summary_candidate
-      or evidence.event_kind = 'message' and evidence.message_role = 'user'
-         and (
-           evidence.event_subtype = 'user_message'
-           and evidence.message_origin in ('human', 'parent_agent')
-           or evidence.event_subtype = 'message'
-           and evidence.message_origin = 'human'
-         )
 ), session_summaries as materialized (
   select candidate.session_id, candidate.semantic_role,
          (array_agg(source.content_excerpt order by candidate.observed_at,
-                    candidate.source_event_id)
-           filter (where ${nativePromptContentPredicate("source.content_excerpt")}
-           ))[1] summary
+                    candidate.source_event_id))[1] summary
     from session_summary_candidates candidate
     join telemetry.events source
       on source.workspace_id = $1 and source.id = candidate.source_event_id
@@ -1247,112 +1146,6 @@ select selected.prompt_identity, selected.session_id::text session_id,
  order by selected.observed_at, selected.prompt_identity
 `;
 
-// Transition-only reader used while v2 is backfilling. It preserves the fast,
-// immutable v1 prompt projection and supplements only stable native prompts in
-// the selected ten-minute bucket. The final identity rank prevents a native
-// row from duplicating an envelope-backed v1 prompt.
-export const COMPATIBLE_INTERVAL_PROMPTS_SQL = `
-with p as materialized (
-  select $1::uuid workspace_id, $2::text frame_version,
-         $3::pg_snapshot snapshot, $4::uuid person_id,
-         $5::timestamptz start_at, $6::timestamptz end_at,
-         $7::timestamptz bucket_start, $8::timestamptz bucket_end,
-         $9::text expected_email_domain, $10::text[] normalizer_versions
-), ${projectedEvidenceCte({
-  snapshotVisible: true,
-  personScoped: true,
-})}, projected_sources as materialized (
-  select prompt_identity, session_id, observed_at, source_event_id,
-         0 source_rank
-    from projected_prompts cross join p
-   where projected_prompts.observed_at >= p.bucket_start
-     and projected_prompts.observed_at < p.bucket_end
-), native_event_candidates as materialized (
-  select e.workspace_id, e.id, e.session_id, e.native_item_id,
-         e.source_record_id, e.source_priority, e.occurred_at,
-         e.observed_at, e.server_received_at
-    from telemetry.events e cross join p
-   where e.workspace_id = p.workspace_id
-     and e.normalizer_version = any(p.normalizer_versions)
-     and e.event_kind = 'message' and e.event_subtype = 'message'
-     and e.message_origin = 'human' and e.message_role = 'user'
-     and e.content_sha256 is not null and e.content_byte_size > 0
-     and e.error_code is null and not e.is_replay and e.actor_role = 'primary'
-     and e.native_item_id is not null
-     and ${nativePromptContentPredicate("e.content_excerpt")}
-     and (
-       e.occurred_at >= p.bucket_start and e.occurred_at < p.bucket_end
-       or e.occurred_at is null
-       and coalesce(
-         ${nativeItemTimestamp("e.native_item_id")},
-         coalesce(e.observed_at, e.server_received_at)
-       ) >= p.bucket_start
-       and coalesce(
-         ${nativeItemTimestamp("e.native_item_id")},
-         coalesce(e.observed_at, e.server_received_at)
-       ) < p.bucket_end
-     )
-     and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)
-), native_candidates as materialized (
-  select 'native:' || e.native_item_id prompt_identity,
-         e.session_id,
-         coalesce(
-           ${nativeItemTimestamp("e.native_item_id")},
-           coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-         ) observed_at,
-         e.id source_event_id,
-         row_number() over (
-           partition by s.person_id, e.native_item_id
-           order by e.source_priority desc, e.occurred_at asc nulls last, e.id
-         ) native_rank
-    from native_event_candidates e
-    join telemetry.sessions s
-      on s.workspace_id = e.workspace_id and s.id = e.session_id
-    join telemetry.native_records nr
-      on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
-    join telemetry.people pe
-      on pe.workspace_id = s.workspace_id and pe.id = s.person_id
-    cross join p
-   where s.person_id = p.person_id
-     and nr.native_type = 'response_item'
-     and nr.native_payload_type = 'message'
-     and pe.github_id is distinct from 'sherlock-smoke'
-     and split_part(pe.email, '@', 2) = p.expected_email_domain
-     and split_part(pe.email, '@', 3) = ''
-), prompt_sources as materialized (
-  select * from projected_sources
-  union all
-  select prompt_identity, session_id, observed_at, source_event_id,
-         1 source_rank
-    from native_candidates
-   where native_rank = 1
-), canonical_sources as materialized (
-  select ranked.*
-    from (
-      select prompt_sources.*,
-             row_number() over (
-               partition by prompt_identity
-               order by source_rank, observed_at, source_event_id
-             ) canonical_rank
-        from prompt_sources
-    ) ranked
-   where canonical_rank = 1
-), selected as materialized (
-  select canonical_sources.*,
-         count(*) over ()::bigint eligible_prompt_count
-    from canonical_sources
-   order by observed_at, prompt_identity
-   limit $11
-)
-select selected.prompt_identity, selected.session_id::text session_id,
-       selected.observed_at, source.content_byte_size, source.content_excerpt,
-       selected.eligible_prompt_count
-  from selected
-  join telemetry.events source
-    on source.workspace_id = $1 and source.id = selected.source_event_id
- order by selected.observed_at, selected.prompt_identity
-`;
-
 export const PROJECTION_WORK_DETAIL_SQL = `
 with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
@@ -1380,15 +1173,7 @@ with p as materialized (
          count(*)::bigint event_count,
          (array_agg(bucket_events.source_event_id order by bucket_events.observed_at,
                     bucket_events.source_event_id)
-           filter (where bucket_events.is_summary_candidate
-             or bucket_events.event_kind = 'message'
-                and bucket_events.message_role = 'user'
-                and (
-                  bucket_events.event_subtype = 'user_message'
-                  and bucket_events.message_origin in ('human', 'parent_agent')
-                  or bucket_events.event_subtype = 'message'
-                  and bucket_events.message_origin = 'human'
-                ))
+           filter (where bucket_events.is_summary_candidate)
          )[1] summary_event_id
     from bucket_events cross join p
    where bucket_events.session_id = p.session_id
@@ -1484,7 +1269,7 @@ export function encodeSnapshotToken({ snapshot, read }) {
   const readAt = asDate(read).toISOString();
   const pgSnapshot = parsePgSnapshot(snapshot);
   return encodeVersionedSnapshotToken(
-    LEGACY_SNAPSHOT_TOKEN_VERSION,
+    RAW_SNAPSHOT_TOKEN_VERSION,
     [pgSnapshot, readAt],
   );
 }
@@ -1506,7 +1291,8 @@ export function decodeSnapshotToken(token) {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
   const [version, body, extra] = token.split(".");
-  if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version) ||
+  if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION,
+    RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
       !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
     throw new FlameSourceError("flame_prompt_request_invalid");
@@ -1517,19 +1303,29 @@ export function decodeSnapshotToken(token) {
       throw new Error("noncanonical_token");
     }
     const value = JSON.parse(decoded);
-    const expectedLength = version === LEGACY_SNAPSHOT_TOKEN_VERSION ? 2 : 3;
+    const expectedLength = version === PROJECTION_SNAPSHOT_TOKEN_VERSION
+      ? 3
+      : 2;
     if (!Array.isArray(value) || value.length !== expectedLength) {
       throw new Error("invalid_payload");
     }
-    const [snapshot, rawRead, frameVersion] = value;
+    const [snapshot, rawRead, pinnedFrameVersion] = value;
     const read = asDate(rawRead);
     if (read.toISOString() !== rawRead) throw new Error("noncanonical_read");
     const receipt = { snapshot: parsePgSnapshot(snapshot), read };
     if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
-      if (![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
+      if (
+        ![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
+          pinnedFrameVersion,
+        )
+      ) {
         throw new Error("unsupported_frame_version");
       }
-      receipt.frameVersion = frameVersion;
+      receipt.frameVersion = pinnedFrameVersion;
+    } else if (version === RAW_SNAPSHOT_TOKEN_VERSION) {
+      receipt.normalizerVersions = NORMALIZER_VERSIONS;
+    } else {
+      receipt.normalizerVersions = LEGACY_NORMALIZER_VERSIONS;
     }
     return receipt;
   } catch {
@@ -1644,10 +1440,7 @@ function snapshotBounds(snapshotReceipt, startAt, read, prefix) {
 export function dashboardWorkSummary(value) {
   if (value === null || value === undefined) return null;
   const summary = String(value).trim();
-  if (summary === "" || INTERNAL_CONTEXT_PREFIXES.some((prefix) =>
-    summary.startsWith(prefix)
-  )) return null;
-  return summary;
+  return summary === "" ? null : summary;
 }
 
 function workFromRow(row) {
@@ -1723,29 +1516,6 @@ function promptEvidenceFromRow(row) {
     excerpt,
     excerptTruncated: contentBytes > Buffer.byteLength(excerpt, "utf8"),
   };
-}
-
-export function applyCompatiblePromptCounts(rows, promptRows) {
-  const counts = new Map(promptRows.map((row) => [
-    `${String(row.person_id)}:${asDate(row.bucket_start).getTime()}`,
-    row.prompts,
-  ]));
-  const promptLatest = promptRows[0]?.latest_prompt == null
-    ? null
-    : asDate(promptRows[0].latest_prompt);
-  return rows.map((row) => {
-    const existingLatest = row.latest == null ? null : asDate(row.latest);
-    return {
-      ...row,
-      prompts: counts.get(
-        `${String(row.person_id)}:${asDate(row.bucket_start).getTime()}`,
-      ) ?? 0,
-      latest: promptLatest !== null &&
-          (existingLatest === null || promptLatest > existingLatest)
-        ? promptLatest
-        : row.latest,
-    };
-  });
 }
 
 export function buildFlamePayload({
@@ -1993,16 +1763,12 @@ export class DirectFlameSource {
       if (roster.length > this.maxPeople) {
         throw new FlameSourceError("flame_database_roster_too_large");
       }
-      const timelineFrameVersion = receipt.frame_projection_active === true
+      const selectedFrameVersion = receipt.frame_projection_active === true
         ? FRAME_VERSION
-        : null;
-      const detailFrameVersion = timelineFrameVersion ??
-        (receipt.compatible_work_projection_active === true
+        : receipt.compatible_work_projection_active === true
           ? COMPATIBLE_WORK_FRAME_VERSION
-          : null);
-      const compatibleTimeline = timelineFrameVersion === null &&
-        receipt.compatible_work_projection_active === true;
-      let rows = timelineFrameVersion === null && !compatibleTimeline
+          : null;
+      const rows = selectedFrameVersion === null
         ? await runQuery(tx, FLAME_SQL, [
           this.workspaceId,
           start.toISOString(),
@@ -2015,28 +1781,17 @@ export class DirectFlameSource {
           this.workspaceId,
           start.toISOString(),
           end.toISOString(),
-          timelineFrameVersion ?? COMPATIBLE_WORK_FRAME_VERSION,
+          selectedFrameVersion,
           read.toISOString(),
           this.expectedEmailDomain,
         ], signal);
-      if (compatibleTimeline) {
-        const promptRows = await runQuery(tx, COMPATIBLE_PROMPT_COUNTS_SQL, [
-          this.workspaceId,
-          start.toISOString(),
-          end.toISOString(),
-          COMPATIBLE_WORK_FRAME_VERSION,
-          this.expectedEmailDomain,
-          tx.array(NORMALIZER_VERSIONS),
-        ], signal);
-        rows = applyCompatiblePromptCounts(rows, promptRows);
-      }
       return buildFlamePayload({
         rows,
         roster,
         start,
         read,
         snapshot: receipt.snapshot,
-        frameVersion: detailFrameVersion,
+        frameVersion: selectedFrameVersion,
       });
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
   }
@@ -2059,6 +1814,8 @@ export class DirectFlameSource {
   async fetchInterval({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "interval");
     const snapshotReceipt = requestSnapshot(snapshot, "interval");
+    const rawNormalizerVersions = snapshotReceipt.normalizerVersions ??
+      NORMALIZER_VERSIONS;
     validateIntervalIdentity(personId, startAt, "interval");
 
     return await this.transaction(async (tx) => {
@@ -2067,11 +1824,10 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
-      const projectedWork = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
-      const projectedPrompts = snapshotReceipt.frameVersion === FRAME_VERSION;
       const workLimit = INTERVAL_WORK_LIMIT + 1;
-      const work = projectedWork
+      const work = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
           this.workspaceId,
           snapshotReceipt.frameVersion,
@@ -2088,7 +1844,7 @@ export class DirectFlameSource {
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,
@@ -2101,7 +1857,7 @@ export class DirectFlameSource {
         throw new FlameSourceError("flame_interval_work_result_too_large");
       }
       const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
-      const prompts = projectedPrompts
+      const prompts = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
           this.workspaceId,
           snapshotReceipt.frameVersion,
@@ -2114,25 +1870,11 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           promptLimit,
         ], signal)
-        : snapshotReceipt.frameVersion === COMPATIBLE_WORK_FRAME_VERSION
-        ? await runQuery(tx, COMPATIBLE_INTERVAL_PROMPTS_SQL, [
-          this.workspaceId,
-          snapshotReceipt.frameVersion,
-          snapshotReceipt.snapshot,
-          personId,
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          this.expectedEmailDomain,
-          tx.array(NORMALIZER_VERSIONS),
-          promptLimit,
-        ], signal)
         : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,
@@ -2159,6 +1901,8 @@ export class DirectFlameSource {
   }) {
     const startAt = requestStart(start, "work");
     const snapshotReceipt = requestSnapshot(snapshot, "work");
+    const rawNormalizerVersions = snapshotReceipt.normalizerVersions ??
+      NORMALIZER_VERSIONS;
     validateIntervalIdentity(personId, startAt, "work");
     if (!UUID_PATTERN.test(sessionId) ||
         !["agent", "subagent", "unclassified"].includes(role)) {
@@ -2206,7 +1950,7 @@ export class DirectFlameSource {
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,
@@ -2249,6 +1993,8 @@ export class DirectFlameSource {
   async fetchPromptEvidence({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "prompt");
     const snapshotReceipt = requestSnapshot(snapshot, "prompt");
+    const rawNormalizerVersions = snapshotReceipt.normalizerVersions ??
+      NORMALIZER_VERSIONS;
     validateIntervalIdentity(personId, startAt, "prompt");
 
     return await this.transaction(async (tx) => {
@@ -2257,7 +2003,8 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const projected = snapshotReceipt.frameVersion === FRAME_VERSION;
+      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+        .includes(snapshotReceipt.frameVersion);
       const rows = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
           this.workspaceId,
@@ -2271,25 +2018,11 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           MCP_PROMPT_EVIDENCE_LIMIT,
         ], signal)
-        : snapshotReceipt.frameVersion === COMPATIBLE_WORK_FRAME_VERSION
-        ? await runQuery(tx, COMPATIBLE_INTERVAL_PROMPTS_SQL, [
-          this.workspaceId,
-          snapshotReceipt.frameVersion,
-          snapshotReceipt.snapshot,
-          personId,
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          startAt.toISOString(),
-          bounds.bucketEnd.toISOString(),
-          this.expectedEmailDomain,
-          tx.array(NORMALIZER_VERSIONS),
-          MCP_PROMPT_EVIDENCE_LIMIT,
-        ], signal)
         : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,

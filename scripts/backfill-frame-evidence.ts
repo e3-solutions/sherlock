@@ -2,6 +2,8 @@
 
 import postgres from "npm:postgres@3.4.7";
 import {
+  FRAME_CLAUDE_NORMALIZER_VERSION,
+  FRAME_CODEX_NORMALIZER_VERSION,
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
@@ -67,17 +69,30 @@ select current_source.session_id::text session_id
  limit 20
 `;
 
-export const FRAME_BLOCKING_JOBS_SQL = `
-select id::text id, session_id::text session_id, status
-  from processing.telemetry_jobs
- where workspace_id = $1 and status in ('queued', 'leased', 'failed')
-   and (
-     job_kind = 'normalize'
-     or job_kind = 'reduce'
-        and normalizer_version = any($2::text[])
-        and activity_version = $3
+export const MISSING_NORMALIZATION_BATCHES_SQL = `
+select batch.id::text batch_id
+  from telemetry.ingest_batches batch
+ where batch.workspace_id = $1
+   and coalesce(batch.last_occurred_at, batch.committed_at)
+       >= $4::timestamptz - make_interval(secs => $5)
+   and exists (
+     select 1
+       from telemetry.native_records record
+      where record.workspace_id = batch.workspace_id
+        and record.batch_id = batch.id
+        and not exists (
+          select 1
+            from telemetry.events event
+           where event.workspace_id = record.workspace_id
+             and event.source_record_id = record.id
+             and event.normalizer_version = case batch.source_provider
+               when 'codex' then $2
+               when 'claude_code' then $3
+               else null
+             end
+        )
    )
- order by id
+ order by batch.id
  limit 20
 `;
 
@@ -89,14 +104,19 @@ export async function proveAndActivateFrameProjection(
     Date.now() - FRAME_WINDOW_HOURS * 60 * 60 * 1_000,
   );
   await sql.begin("isolation level repeatable read", async (tx) => {
-    const blockingJobs = await tx.unsafe(FRAME_BLOCKING_JOBS_SQL, [
-      options.workspaceId,
-      tx.array([...FRAME_NORMALIZER_VERSIONS]),
-      ACTIVITY_VERSION,
-    ]);
-    if (blockingJobs.length > 0) {
+    const missingNormalization = await tx.unsafe(
+      MISSING_NORMALIZATION_BATCHES_SQL,
+      [
+        options.workspaceId,
+        FRAME_CODEX_NORMALIZER_VERSION,
+        FRAME_CLAUDE_NORMALIZER_VERSION,
+        windowStart.toISOString(),
+        FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
+      ],
+    );
+    if (missingNormalization.length > 0) {
       throw new Error(
-        `frame activation blocked by ${blockingJobs.length} sampled unfinished or failed normalization or reduction jobs`,
+        `frame activation blocked by ${missingNormalization.length} sampled batches without current normalization`,
       );
     }
     const missing = await tx.unsafe(FRAME_ACTIVATION_PROOF_SQL, [

@@ -21,7 +21,7 @@ objects.
 - `telemetry.people` is the roster, so real people with zero activity remain
   visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
   excluded; display names are never used as the filter.
-- Canonically selected `sherlock.codex-rollout.v1` and
+- Canonically selected `sherlock.codex-rollout.v2` and
   `sherlock.claude-code-transcript.v1` event presence is grouped into 144
   ten-minute UTC buckets. Canonical winner selection remains scoped by
   normalizer version, so evidence from different provider projections is never
@@ -131,16 +131,19 @@ objects.
   read-consistency boundary, not a durable pipeline publication cutoff: a later
   timeline refresh can correctly include newly normalized evidence.
 - Snapshot tokens remain source-explicit during the frame-projection rollout.
-  Legacy `v1` tokens always use canonical raw-event queries. Once an owner
-  activates the exact immutable `frame-evidence-v2` version for the workspace,
+  Legacy `v1` tokens always use canonical raw-event queries pinned to the v1
+  provider normalizers. A current canonical raw timeline emits a `v3` token
+  pinned to Codex v2 and Claude v1, so later lazy reads cannot mix classifier
+  versions. Once an owner
+  activates the exact immutable `frame-evidence-v3` version for the workspace,
   a projection-backed timeline emits `v2` tokens containing that version and
   every lazy evidence read stays on the matching append-only projection. While
-  v2 is backfilling and immutable v1 is already active, the corrected raw
-  timeline emits a v2 receipt pinned to v1 for unchanged activity/work reads;
-  prompt detail unions v1 prompt facts with only qualified native prompt rows
-  from the selected ten-minute bucket. A projected-read failure is surfaced;
-  it never silently falls back to raw work evidence. Existing v1 tokens remain
-  usable through their normal expiry.
+  v3 is backfilling and immutable frame v2 is already active, the timeline
+  continues to serve frame v2 in full. It never combines frame v2 facts with
+  Codex v2 rows; the owner activates frame v3 only after current-version
+  normalization coverage and exact frame receipts are proven. A
+  projected-read failure is surfaced; it never silently falls back to raw work
+  evidence. Existing v1 tokens remain usable through their normal expiry.
 - Projection-backed timeline reads touch only the indexed analytics receipts
   and evidence revisions. Interval summaries, prompt excerpts, and conversation
   pages select bounded source event IDs first and then use primary-key joins to

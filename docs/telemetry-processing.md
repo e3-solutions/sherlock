@@ -162,18 +162,29 @@ safe.
 
 ## Deploy and rollback order
 
-1. Apply the additive frame tables and projector-role migration. Old workers
-   ignore the new tables.
-2. Deploy the projector-aware Railway worker, enqueue every existing relevant
-   session, and verify receipts cover the intended source state.
-3. Drain and review the queue. In one repeatable-read owner transaction, prove
+1. Deploy the version-aware worker first. It treats legacy normalize jobs whose
+   target version is still null as that provider's v1, so it is safe before and
+   after the queue migration. Existing v1 events and raw batches stay immutable.
+2. Apply the additive frame, versioned-normalization queue, and projector-role
+   migrations. Enqueue Codex v2 history explicitly, one workspace at a time:
+
+   ```sh
+   SUPABASE_DB_URL=... deno run --allow-env --allow-net \
+     scripts/enqueue-codex-v2-backfill.ts --workspace <workspace-uuid>
+   ```
+
+   The command pages through batches and prints restart checkpoints; the schema
+   migration never performs an unbounded historical scan.
+3. Drain the Codex v2 jobs, then enqueue every relevant session for frame v3
+   and verify its receipts cover the intended source state.
+4. Drain and review the queue. In one repeatable-read owner transaction, prove
    each latest receipt exactly matches the session's accepted-version event
    maximum, event count, and `updated_at`, then insert the one
    workspace/version activation fact. The worker cannot self-activate.
-4. Enable the dashboard's versioned projection path. Existing v1 snapshot
+5. Enable the dashboard's versioned projection path. Existing v1 snapshot
    tokens continue on the raw path for their bounded lifetime.
-5. Upload a smoke batch and verify normalized events, search, activity spans,
-   frame receipts, revisions, and indexed frame reads.
+6. Upload a smoke batch and verify v2 normalized message origins, search,
+   activity spans, frame receipts, revisions, and indexed frame reads.
 
 For application rollback, stop minting projection-backed tokens before rolling
 the worker back, then let all queued or leased jobs drain and review or requeue

@@ -15,6 +15,7 @@ interface BaseJob {
 export interface NormalizationJob extends BaseJob {
   job_kind: "normalize";
   batch_id: string;
+  normalizer_version: string | null;
 }
 
 export interface ReductionJob extends BaseJob {
@@ -500,6 +501,10 @@ function jobFromRow(row: Record<string, unknown>): TelemetryJob {
       ...common,
       job_kind: "normalize",
       batch_id: String(row.batch_id),
+      normalizer_version: row.normalizer_version === null ||
+          row.normalizer_version === undefined
+        ? null
+        : String(row.normalizer_version),
     };
   }
   return {
