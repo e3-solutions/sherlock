@@ -17,8 +17,15 @@ import {
   workerConnectionBudget,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
+import type { BatchManifest } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
+import {
+  CLAUDE_NORMALIZER_VERSION,
+  LEGACY_CODEX_NORMALIZER_VERSION,
+  NORMALIZER_VERSION,
+} from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
 import {
   AFFECTED_SESSIONS_SQL,
+  normalizationTarget,
   recordLocatorFromRow,
   reduceAffectedSessions,
   resolveSessionCutoffs,
@@ -40,6 +47,14 @@ function assert(
 ): asserts condition {
   if (!condition) throw new Error(message);
 }
+
+Deno.test("version-aware workers keep pre-migration jobs on provider v1", () => {
+  const codex = { source_provider: "codex" } as BatchManifest;
+  const claude = { source_provider: "claude_code" } as BatchManifest;
+  assert(normalizationTarget(null, codex) === LEGACY_CODEX_NORMALIZER_VERSION);
+  assert(normalizationTarget(null, claude) === CLAUDE_NORMALIZER_VERSION);
+  assert(normalizationTarget(NORMALIZER_VERSION, codex) === NORMALIZER_VERSION);
+});
 
 Deno.test("configuration is bounded and secrets remain required", () => {
   const config = loadConfig({

@@ -451,7 +451,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         snapshot: legacyDay.snapshot,
         now: partialRead,
       });
-      expect(legacyDay.snapshot).toMatch(/^v1\./);
+      expect(legacyDay.snapshot).toMatch(/^v3\./);
       expect(legacyDay.latest).toBe(partialActivityAt.toISOString());
       expect(legacyDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),

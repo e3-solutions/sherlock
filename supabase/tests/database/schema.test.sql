@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(134);
+select plan(137);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -710,6 +710,26 @@ select ok(
   ),
   'summary eligibility is explicit and structurally bounded'
 );
+select ok(
+  pg_get_constraintdef(
+    (
+      select oid from pg_constraint
+       where conrelid = 'telemetry.events'::regclass
+         and conname = 'events_message_origin_check'
+    )
+  ) like '%runtime_context%',
+  'runtime context is an explicit normalized message origin'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+     where schemaname = 'processing'
+       and indexname = 'telemetry_jobs_batch_key'
+       and indexdef like '%workspace_id, batch_id, normalizer_version%'
+       and indexdef like '%WHERE (job_kind = ''normalize''::text)%'
+  ),
+  'normalization jobs retain an auditable versioned batch identity'
+);
 
 select ok(
   not has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'update'),
@@ -875,6 +895,7 @@ select ok(
     where workspace_id = '00000000-0000-0000-0000-000000000001'
       and batch_id = '00000000-0000-0000-0000-000000000301'
       and job_kind = 'normalize'
+      and normalizer_version = 'sherlock.codex-rollout.v2'
       and workload_class = 'live' and status = 'queued'),
   'ingest trigger creates one live job without a session scan'
 );
@@ -899,8 +920,33 @@ select ok(
   (select count(*) = 1 from processing.telemetry_jobs
     where workspace_id = '00000000-0000-0000-0000-000000000001'
       and batch_id = '00000000-0000-0000-0000-000000000302'
-      and job_kind = 'normalize' and workload_class = 'backfill'),
+      and job_kind = 'normalize'
+      and normalizer_version = 'sherlock.codex-rollout.v2'
+      and workload_class = 'backfill'),
   'explicit backfill transport fact isolates recent and timestampless history'
+);
+
+insert into telemetry.ingest_batches (
+  id, workspace_id, person_id, collector_key, source_provider, source_kind,
+  source_stream_key, generation_key, generation_seq, start_offset, end_offset,
+  source_byte_count, source_sha256, storage_path, storage_encoding,
+  stored_byte_count, stored_sha256, record_count, contract_version
+) values (
+  '00000000-0000-0000-0000-000000000303',
+  '00000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000101',
+  'test-collector', 'claude_code', 'transcript', 'test-claude-stream',
+  'test-claude-generation', 0, 0, 1, 1, repeat('f', 64),
+  'test-claude-evidence', 'identity', 1, repeat('0', 64), 1, 'test-v1'
+);
+
+select ok(
+  (select count(*) = 1 from processing.telemetry_jobs
+    where workspace_id = '00000000-0000-0000-0000-000000000001'
+      and batch_id = '00000000-0000-0000-0000-000000000303'
+      and job_kind = 'normalize'
+      and normalizer_version = 'sherlock.claude-code-transcript.v1'),
+  'provider-specific live jobs keep Claude on its compatible normalizer'
 );
 
 create temporary table constraint_results (
@@ -1108,7 +1154,7 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 134,
+  'assertion_count', 137,
   'tables', 11,
   'private_bucket', 'telemetry-raw'
 ) as verification;

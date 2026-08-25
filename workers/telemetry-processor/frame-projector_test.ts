@@ -7,6 +7,7 @@ import {
   revisionInsertBatches,
   type SourceEvent,
 } from "./frame-projector.ts";
+import { MISSING_NORMALIZATION_BATCHES_SQL } from "../../scripts/backfill-frame-evidence.ts";
 
 function assert(
   condition: unknown,
@@ -38,7 +39,7 @@ function sourceEvent(overrides: Partial<SourceEvent> = {}): SourceEvent {
     id: 1n,
     person_id: "person-1",
     session_id: "session-1",
-    normalizer_version: "sherlock.codex-rollout.v1",
+    normalizer_version: "sherlock.codex-rollout.v2",
     canonical_scope_key: null,
     logical_event_key: null,
     source_priority: 100,
@@ -56,7 +57,6 @@ function sourceEvent(overrides: Partial<SourceEvent> = {}): SourceEvent {
     content_sha256: "a".repeat(64),
     content_byte_size: 12,
     has_content_excerpt: true,
-    native_prompt_content_candidate: true,
     error_code: null,
     source_batch_id: "batch-1",
     source_record_index: 0,
@@ -184,7 +184,7 @@ Deno.test("native machine context is not projected as a prompt", () => {
     native_item_id: "msg_01a01f0a-da00-7000-8000-000000000003",
     source_native_type: "response_item",
     source_native_payload_type: "message",
-    native_prompt_content_candidate: false,
+    message_origin: "runtime_context",
   });
   const prompts = canonicalEvidence(
     [internalContext],
@@ -249,13 +249,32 @@ Deno.test("native and envelope copies remain one canonical prompt", () => {
 
 Deno.test("projector reads only bounded source metadata and never copies content", () => {
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt is not null"));
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("native_prompt_content_candidate"));
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("<recommended_plugins>"));
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("<heartbeat>"));
+  assert(!FRAME_SOURCE_EVENTS_SQL.includes("<recommended_plugins>"));
+  assert(!FRAME_SOURCE_EVENTS_SQL.includes("<heartbeat>"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt,"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("storage_path"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("record_sha256"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $4"));
+});
+
+Deno.test("activation proves the exact versioned normalization universe", () => {
+  assert(
+    MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.native_records"),
+  );
+  assert(MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.events"));
+  assert(
+    MISSING_NORMALIZATION_BATCHES_SQL.includes(
+      "when 'codex' then $2",
+    ),
+  );
+  assert(
+    MISSING_NORMALIZATION_BATCHES_SQL.includes(
+      "when 'claude_code' then $3",
+    ),
+  );
+  assert(
+    !MISSING_NORMALIZATION_BATCHES_SQL.includes("processing.telemetry_jobs"),
+  );
 });
 
 Deno.test("large revision writes are split below PostgreSQL's parameter limit", () => {
