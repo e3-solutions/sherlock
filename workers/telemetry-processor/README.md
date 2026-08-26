@@ -33,11 +33,13 @@ half-open claim. Processing errors, control-query errors, and heartbeat errors
 all reopen the same circuit; ordinary job failures continue through fenced retry
 handling.
 
-Set `GITHUB_TOKEN` to a fine-grained token with pull-request read access to
-enable exact session-to-PR links. Repository changes fail closed, terminal
-matches are rechecked every six hours, and auth or rate-limit pauses are logged
-without creating pair failures. Sync runs each minute while backlogged,
-otherwise every five minutes.
+Set `SHERLOCK_GITHUB_WORKSPACE_IDS` to a comma-separated workspace UUID
+allowlist. Adding a workspace enables its backfill and live lookup without a
+code deploy. Set `GITHUB_TOKEN` to a fine-grained token with pull-request read
+access to enable sync; startup rejects a token without an allowlist. Repository
+changes fail closed, terminal matches are rechecked every six hours, and auth or
+rate-limit pauses are logged without creating pair failures. Sync runs each
+minute while backlogged, otherwise every five minutes.
 
 ## First rollout and rollback
 
@@ -55,9 +57,11 @@ schema work or replacement startup:
 
 For exact PR links, keep `GITHUB_TOKEN` unset and apply all migrations through
 `20260826182052_add_exact_session_pull_request_sources.sql` before step 4. Then
-run `deno run --allow-env --allow-net scripts/backfill-session-scm.ts`, wait for
-the replayed jobs to finish, and enable the token. The restart-safe replay is
-limited to the dashboard's 26-hour database-received evidence window.
+set the CodeActivity-only allowlist and run
+`deno run --allow-env --allow-net scripts/backfill-session-scm.ts`, wait for the
+replayed jobs to finish, and enable the token. The restart-safe replay uses the
+same allowlist and is limited to the dashboard's 26-hour database-received
+evidence window.
 
 Rollback to code without this protocol has the same constraint: stop the new
 worker completely, wait for it to exit, then start one old replica. Never run

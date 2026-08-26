@@ -68,6 +68,7 @@ Deno.test("configuration is bounded and secrets remain required", () => {
   assert(config.controlConnections === 4);
   assert(config.processingConnections === 6);
   assert(config.processingTimeoutMilliseconds === 90_000);
+  assert(config.githubWorkspaceIds.length === 0);
   let rejected = false;
   try {
     loadConfig({
@@ -96,6 +97,32 @@ Deno.test("configuration is bounded and secrets remain required", () => {
     }
     assert(invalid, `${concurrency}/${liveReserved} must be rejected`);
   }
+});
+
+Deno.test("GitHub sync requires an explicit workspace allowlist", () => {
+  const env = {
+    SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
+    SUPABASE_URL: "https://example.supabase.co",
+    SUPABASE_SERVICE_ROLE_KEY: "test-secret",
+    GITHUB_TOKEN: "github-secret",
+  };
+  for (const value of [undefined, "not-a-uuid"]) {
+    let rejected = false;
+    try {
+      loadConfig({ ...env, SHERLOCK_GITHUB_WORKSPACE_IDS: value });
+    } catch {
+      rejected = true;
+    }
+    assert(rejected, "missing or invalid tenant allowlists must fail startup");
+  }
+
+  const workspaceId = "00000000-0000-4000-8000-000000000001";
+  const config = loadConfig({
+    ...env,
+    SHERLOCK_GITHUB_WORKSPACE_IDS: `${workspaceId},${workspaceId}`,
+  });
+  assert(config.githubWorkspaceIds.length === 1);
+  assert(config.githubWorkspaceIds[0] === workspaceId);
 });
 
 Deno.test("connection pools and overload reservations stay within bounds", () => {

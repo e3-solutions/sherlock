@@ -1,5 +1,18 @@
 const GITHUB_API_VERSION = "2026-03-10";
 const GITHUB_SYNC_BATCH_SIZE = 25;
+const UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function githubWorkspaceIds(value: string | undefined): string[] {
+  if (!value?.trim()) return [];
+  const ids = value.split(",").map((id) => id.trim().toLowerCase());
+  if (ids.some((id) => !UUID.test(id))) {
+    throw new Error(
+      "SHERLOCK_GITHUB_WORKSPACE_IDS must be comma-separated UUIDs",
+    );
+  }
+  return [...new Set(ids)];
+}
 
 export interface CommitPair {
   workspaceId: string;
@@ -14,7 +27,10 @@ export interface LookupResult extends CommitPair {
 }
 
 export interface LookupStore {
-  pendingGithubCommitPairs(limit: number): Promise<CommitPair[]>;
+  pendingGithubCommitPairs(
+    limit: number,
+    workspaceIds: readonly string[],
+  ): Promise<CommitPair[]>;
   appendGithubLookup(result: LookupResult): Promise<void>;
 }
 
@@ -180,6 +196,7 @@ export async function lookupCommit(
 export async function syncPending(
   store: LookupStore,
   token: string,
+  workspaceIds: readonly string[],
   options: {
     fetcher?: typeof fetch;
     signal?: AbortSignal;
@@ -192,6 +209,7 @@ export async function syncPending(
   options.signal?.throwIfAborted();
   const pending = await store.pendingGithubCommitPairs(
     GITHUB_SYNC_BATCH_SIZE + 1,
+    workspaceIds,
   );
   for (const pair of pending.slice(0, GITHUB_SYNC_BATCH_SIZE)) {
     options.signal?.throwIfAborted();

@@ -10,7 +10,7 @@ import {
   type TelemetryJob,
   type WorkloadClass,
 } from "./queue.ts";
-import { syncPending } from "./github-sync.ts";
+import { githubWorkspaceIds, syncPending } from "./github-sync.ts";
 
 const OVERLOAD_SAMPLE_MILLISECONDS = 10_000;
 const OVERLOAD_SAMPLE_COUNT = 2;
@@ -42,6 +42,7 @@ export interface WorkerConfig {
   overloadExitSeconds: number;
   handoffKey: string;
   githubToken: string | null;
+  githubWorkspaceIds: string[];
 }
 
 export function loadConfig(
@@ -104,6 +105,15 @@ export function loadConfig(
   if (!supabaseUrl.startsWith("https://")) {
     throw new Error("SUPABASE_URL must use HTTPS");
   }
+  const githubToken = env.GITHUB_TOKEN?.trim() || null;
+  const githubWorkspaces = githubWorkspaceIds(
+    env.SHERLOCK_GITHUB_WORKSPACE_IDS,
+  );
+  if (githubToken && githubWorkspaces.length === 0) {
+    throw new Error(
+      "SHERLOCK_GITHUB_WORKSPACE_IDS is required when GITHUB_TOKEN is set",
+    );
+  }
   return {
     databaseUrl: required(env, "SUPABASE_DB_URL"),
     supabaseUrl,
@@ -143,7 +153,8 @@ export function loadConfig(
       env.RAILWAY_ENVIRONMENT_ID ?? "local",
       env.RAILWAY_SERVICE_ID ?? "local",
     ]),
-    githubToken: env.GITHUB_TOKEN?.trim() || null,
+    githubToken,
+    githubWorkspaceIds: githubWorkspaces,
   };
 }
 
@@ -401,6 +412,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       processing_connections: config.processingConnections,
       lease_seconds: config.leaseSeconds,
       github_sync_enabled: config.githubToken !== null,
+      github_workspace_count: config.githubWorkspaceIds.length,
     });
     while (!stopping) {
       if (capacityCircuit.millisecondsUntilReady() > 0) {
@@ -422,15 +434,20 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         Date.now() >= nextGithubSyncAt
       ) {
         nextGithubSyncAt = Date.now() + GITHUB_BACKLOG_INTERVAL_MILLISECONDS;
-        githubTask = syncPending(queue, config.githubToken, {
-          signal: shutdown.signal,
-          onError: (error, pair) =>
-            log("github_sync_lookup_failed", {
-              workspace_id: pair.workspaceId,
-              repository: pair.repositoryFullName,
-              error_code: errorCode(error),
-            }),
-        }).then((result) => {
+        githubTask = syncPending(
+          queue,
+          config.githubToken,
+          config.githubWorkspaceIds,
+          {
+            signal: shutdown.signal,
+            onError: (error, pair) =>
+              log("github_sync_lookup_failed", {
+                workspace_id: pair.workspaceId,
+                repository: pair.repositoryFullName,
+                error_code: errorCode(error),
+              }),
+          },
+        ).then((result) => {
           const pause = result.pause;
           if (pause?.status === 401) {
             githubAuthRejected = true;

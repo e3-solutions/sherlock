@@ -14,14 +14,16 @@ const pair: CommitPair = {
   repositoryFullName: "e3-solutions/sherlock",
   commitSha: "a".repeat(40),
 };
+const workspaceIds = [pair.workspaceId];
 
 function storeFor(
   results: LookupResult[],
   pending = [pair, { ...pair, commitSha: "b".repeat(40) }],
 ) {
   return {
-    pendingGithubCommitPairs(limit: number) {
+    pendingGithubCommitPairs(limit: number, allowed: readonly string[]) {
       assert(limit === 26);
+      assert(allowed.length === 1 && allowed[0] === pair.workspaceId);
       return Promise.resolve(pending);
     },
     appendGithubLookup(result: LookupResult) {
@@ -29,6 +31,13 @@ function storeFor(
       return Promise.resolve();
     },
   };
+}
+
+function sync(
+  store: Parameters<typeof syncPending>[0],
+  options: Parameters<typeof syncPending>[3] = {},
+) {
+  return syncPending(store, "secret", workspaceIds, options);
 }
 
 Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async () => {
@@ -116,7 +125,7 @@ Deno.test("sync pauses globally without writing a pair failure", async () => {
 
   for (const [response, status, retryAtMs] of cases) {
     const results: LookupResult[] = [];
-    const summary = await syncPending(storeFor(results), "secret", {
+    const summary = await sync(storeFor(results), {
       fetcher: () => Promise.resolve(response()),
       now: () => now,
     });
@@ -130,7 +139,7 @@ Deno.test("sync pauses globally without writing a pair failure", async () => {
 
 Deno.test("sync continues after pair-specific HTTP failures", async () => {
   const results: LookupResult[] = [];
-  const summary = await syncPending(storeFor(results), "secret", {
+  const summary = await sync(storeFor(results), {
     fetcher: () =>
       Promise.resolve(
         Response.json({ message: "Resource not accessible" }, { status: 403 }),
@@ -149,7 +158,7 @@ Deno.test("sync processes 25 pairs and reports remaining backlog", async () => {
     ...pair,
     commitSha: index.toString(16).padStart(40, "0"),
   }));
-  const summary = await syncPending(storeFor(results, pending), "secret", {
+  const summary = await sync(storeFor(results, pending), {
     fetcher: () => Promise.resolve(Response.json([])),
   });
   assert(summary.attempted === 25 && results.length === 25);
@@ -160,7 +169,7 @@ Deno.test("sync never converts a persistence error into a failed lookup", async 
   let appends = 0;
   let rejected = false;
   try {
-    await syncPending(
+    await sync(
       {
         pendingGithubCommitPairs: () => Promise.resolve([pair]),
         appendGithubLookup: () => {
@@ -168,7 +177,6 @@ Deno.test("sync never converts a persistence error into a failed lookup", async 
           return Promise.reject(new Error("database unavailable"));
         },
       },
-      "secret",
       { fetcher: () => Promise.resolve(Response.json([])) },
     );
   } catch {

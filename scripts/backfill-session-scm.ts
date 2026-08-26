@@ -1,6 +1,7 @@
 #!/usr/bin/env -S deno run --allow-env --allow-net
 
 import postgres from "npm:postgres@3.4.7";
+import { githubWorkspaceIds } from "../workers/telemetry-processor/github-sync.ts";
 
 const SCM_SOURCE_VERSION = "sherlock.github-scm.v1";
 const PAGE_SIZE = 100;
@@ -14,6 +15,7 @@ with recent_sessions as materialized (
    where normalizer_version in (
      'sherlock.codex-rollout.v1', 'sherlock.codex-rollout.v2'
    )
+     and workspace_id = any($5::uuid[])
      and not is_replay and session_id is not null
      and server_received_at >= now() - interval '26 hours'
 ), candidates as materialized (
@@ -22,6 +24,7 @@ with recent_sessions as materialized (
     join telemetry.ingest_batches batch
       on batch.workspace_id = job.workspace_id and batch.id = job.batch_id
    where job.job_kind = 'normalize' and job.status = 'succeeded'
+     and job.workspace_id = any($5::uuid[])
      and job.id > $1 and job.id <= $2
      and batch.source_provider = 'codex'
      and exists (
@@ -83,6 +86,7 @@ async function scheduleScmBackfillPage(
   sql: Sql,
   afterJobId: bigint,
   throughJobId: bigint,
+  workspaceIds: readonly string[],
 ): Promise<bigint[]> {
   return await sql.begin(async (tx) => {
     await tx.unsafe("set local role sherlock_processor");
@@ -91,6 +95,7 @@ async function scheduleScmBackfillPage(
       throughJobId.toString(),
       SCM_SOURCE_VERSION,
       PAGE_SIZE,
+      workspaceIds,
     ]);
     return rows.map((row) => BigInt(String(row.id)));
   });
@@ -99,6 +104,12 @@ async function scheduleScmBackfillPage(
 if (import.meta.main) {
   const databaseUrl = Deno.env.get("SUPABASE_DB_URL");
   if (!databaseUrl) throw new Error("SUPABASE_DB_URL is required");
+  const workspaceIds = githubWorkspaceIds(
+    Deno.env.get("SHERLOCK_GITHUB_WORKSPACE_IDS"),
+  );
+  if (workspaceIds.length === 0) {
+    throw new Error("SHERLOCK_GITHUB_WORKSPACE_IDS is required");
+  }
   const sql = postgres(databaseUrl, {
     prepare: false,
     max: 1,
@@ -109,7 +120,12 @@ if (import.meta.main) {
     let after = 0n;
     let scheduled = 0;
     while (after < through) {
-      const ids = await scheduleScmBackfillPage(sql, after, through);
+      const ids = await scheduleScmBackfillPage(
+        sql,
+        after,
+        through,
+        workspaceIds,
+      );
       if (ids.length === 0) break;
       after = ids.at(-1)!;
       scheduled += ids.length;
@@ -119,6 +135,7 @@ if (import.meta.main) {
       after_job_id: after.toString(),
       through_job_id: through.toString(),
       scheduled_jobs: scheduled,
+      workspace_count: workspaceIds.length,
     }));
   } finally {
     await sql.end();

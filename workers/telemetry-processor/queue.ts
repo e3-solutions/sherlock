@@ -122,7 +122,10 @@ export class PostgresJobQueue {
     }
   }
 
-  async pendingGithubCommitPairs(limit: number): Promise<CommitPair[]> {
+  async pendingGithubCommitPairs(
+    limit: number,
+    workspaceIds: readonly string[],
+  ): Promise<CommitPair[]> {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
@@ -130,6 +133,7 @@ export class PostgresJobQueue {
            select distinct workspace_id, session_id
              from telemetry.events
             where server_received_at >= now() - interval '26 hours'
+              and workspace_id = any($2::uuid[])
               and session_id is not null and not is_replay
          ), eligible as (
            select scm.workspace_id, scm.repository_full_name, scm.commit_sha
@@ -138,6 +142,7 @@ export class PostgresJobQueue {
                on recent.workspace_id = scm.workspace_id
               and recent.session_id = scm.session_id
             where scm.source_version = 'sherlock.github-scm.v1'
+              and scm.workspace_id = any($2::uuid[])
               and (
                 scm.created_at >= now() - interval '26 hours'
                 or recent.session_id is not null
@@ -169,7 +174,7 @@ export class PostgresJobQueue {
                    observed.workspace_id, observed.repository_full_name,
                    observed.commit_sha
           limit $1`,
-        [limit],
+        [limit, workspaceIds],
       );
       return rows.map((row) => ({
         workspaceId: String(row.workspace_id),

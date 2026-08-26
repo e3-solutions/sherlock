@@ -237,7 +237,39 @@ Deno.test({
             "b".repeat(64),
           ],
         );
+        await tx.unsafe(
+          `with record as (
+             insert into telemetry.native_records (
+               workspace_id, batch_id, record_index, source_start_offset,
+               source_end_offset, record_sha256, native_type, occurred_at,
+               parse_status
+             ) values ($1, $2, 0, 0, 1, repeat('c', 64), 'session_meta',
+                       now(), 'ok')
+             returning id
+           )
+           insert into telemetry.session_scm (
+             workspace_id, source_record_id, session_id, source_version,
+             repository_full_name, commit_sha, observed_at, server_received_at
+           )
+           select $1, id, $3, 'sherlock.github-scm.v1',
+                  'e3-solutions/sherlock', repeat('a', 40), now(), now()
+             from record`,
+          [workspaceId, batchId, sessionId],
+        );
       });
+      assert(
+        (await queue.pendingGithubCommitPairs(1, [crypto.randomUUID()]))
+          .length === 0,
+        "GitHub sync must exclude workspaces outside its allowlist",
+      );
+      const githubPairs = await queue.pendingGithubCommitPairs(1, [
+        workspaceId,
+      ]);
+      assert(
+        githubPairs.length === 1 &&
+          githubPairs[0].workspaceId === workspaceId,
+        "GitHub sync must select an explicitly allowed workspace",
+      );
       await sql.unsafe(
         `insert into processing.telemetry_jobs (
            workspace_id, job_kind, batch_id, normalizer_version, workload_class
@@ -814,6 +846,14 @@ Deno.test({
         [workspaceId],
       );
     } finally {
+      await sql.unsafe(
+        "delete from telemetry.session_scm where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
+      await sql.unsafe(
+        "delete from telemetry.native_records where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
       await sql.unsafe(
         "delete from processing.telemetry_jobs where workspace_id = $1",
         [workspaceId],
