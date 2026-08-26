@@ -109,8 +109,13 @@ objects.
   the first source-backed request for that session across later frames in the
   pinned trailing snapshot: a submitted human/parent-agent
   `user_message` or a stable native human `response_item/message`. Native
-  parent-agent runtime context is excluded and no title is synthesized. The drawer keeps Active Work
-  primary and exposes prompt excerpts through a compact, collapsed disclosure.
+  parent-agent runtime context is excluded and no title is synthesized. As a
+  product-view safeguard, reserved Codex runtime envelopes are skipped during
+  summary selection even if an older normalized fact classified one as human;
+  the next source-backed human request supplies the label when present. This
+  safeguard does not remove or rewrite canonical prompt evidence. The drawer
+  keeps Active Work primary and exposes prompt excerpts through a compact,
+  collapsed disclosure.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
   excerpts. The default page size is 50 and the maximum is 100. Cursors are

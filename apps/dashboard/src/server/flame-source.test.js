@@ -95,11 +95,15 @@ function expectSqlInOrder(sql, ...fragments) {
 }
 
 describe("Sherlock Flame payload", () => {
-  it("renders only summaries already classified by normalized facts", () => {
+  it("renders human summaries while rejecting reserved runtime context", () => {
     expect(dashboardWorkSummary("  Ship the dashboard fix  ")).toBe(
       "Ship the dashboard fix",
     );
     expect(dashboardWorkSummary("   ")).toBeNull();
+    expect(dashboardWorkSummary("<recommended_plugins>machine context"))
+      .toBeNull();
+    expect(dashboardWorkSummary("<environment_context>machine context"))
+      .toBeNull();
     expect(dashboardWorkSummary("<order>human-authored XML</order>"))
       .toBe("<order>human-authored XML</order>");
   });
@@ -911,12 +915,17 @@ describe("Sherlock Flame payload", () => {
     );
   });
 
-  it("trusts projected summary classification without re-reading message text", () => {
-    for (const sql of [PROJECTION_INTERVAL_WORK_SQL, PROJECTION_WORK_DETAIL_SQL]) {
-      expect(sql).toContain("is_summary_candidate");
-      expect(sql).not.toContain("<recommended_plugins>");
-      expect(sql).not.toContain("<codex_delegation>");
-    }
+  it("screens session labels without removing submitted prompt evidence", () => {
+    expect(INTERVAL_WORK_SQL).toContain("<recommended_plugins>");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain("<recommended_plugins>");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain("<codex_delegation>");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain("is_summary_candidate");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain(
+      "array_agg(source.content_excerpt",
+    );
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL).not.toContain(
+      "<recommended_plugins>",
+    );
   });
 
   it("selects MCP prompt excerpts from the exact canonical prompt universe", () => {

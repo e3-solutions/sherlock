@@ -54,7 +54,7 @@ export const MAX_WORK_DETAIL_LIMIT = 100;
 export const MCP_PROMPT_EVIDENCE_LIMIT = 5;
 export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
 export const SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN = "sixtyfour.ai";
-const LEGACY_INTERNAL_CONTEXT_PREFIXES = Object.freeze([
+const INTERNAL_CONTEXT_PREFIXES = Object.freeze([
   "<recommended_plugins>",
   "<in-app-browser-context",
   "<app-context",
@@ -91,16 +91,24 @@ function nativeItemTimestamp(column) {
   end`;
 }
 
-function nativePromptContentPredicate(column) {
-  const legacyPrefixExclusions = LEGACY_INTERNAL_CONTEXT_PREFIXES.map((prefix) =>
+function internalContextPrefixExclusion(column) {
+  return INTERNAL_CONTEXT_PREFIXES.map((prefix) =>
     `left(btrim(${column}), ${prefix.length}) <> '${
       prefix.replaceAll("'", "''")
     }'`
   ).join("\n       and ");
+}
+
+function nativePromptContentPredicate(column) {
   return `${column} is not null and btrim(${column}) <> ''
      and (e.normalizer_version <> '${LEGACY_CODEX_NORMALIZER_VERSION}' or (
-       ${legacyPrefixExclusions}
+       ${internalContextPrefixExclusion(column)}
      ))`;
+}
+
+function dashboardSummaryContentPredicate(column) {
+  return `${column} is not null and btrim(${column}) <> ''
+       and ${internalContextPrefixExclusion(column)}`;
 }
 
 function activityCte({ joins = "" } = {}) {
@@ -825,7 +833,7 @@ with p as materialized (
                and message_origin in ('human', 'parent_agent')
                or event_subtype = 'message' and message_origin = 'human'
              )
-             and content_excerpt is not null
+             and ${dashboardSummaryContentPredicate("content_excerpt")}
          ))[1] summary
     from bucket_events
    group by session_id, semantic_role
@@ -1110,7 +1118,9 @@ with p as materialized (
 ), session_summaries as materialized (
   select candidate.session_id, candidate.semantic_role,
          (array_agg(source.content_excerpt order by candidate.observed_at,
-                    candidate.source_event_id))[1] summary
+                    candidate.source_event_id) filter (
+           where ${dashboardSummaryContentPredicate("source.content_excerpt")}
+         ))[1] summary
     from session_summary_candidates candidate
     join telemetry.events source
       on source.workspace_id = $1 and source.id = candidate.source_event_id
@@ -1446,7 +1456,10 @@ function snapshotBounds(snapshotReceipt, startAt, read, prefix) {
 export function dashboardWorkSummary(value) {
   if (value === null || value === undefined) return null;
   const summary = String(value).trim();
-  return summary === "" ? null : summary;
+  if (summary === "" || INTERNAL_CONTEXT_PREFIXES.some((prefix) =>
+    summary.startsWith(prefix)
+  )) return null;
+  return summary;
 }
 
 function workFromRow(row) {

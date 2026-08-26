@@ -8,6 +8,7 @@ import {
   DirectFlameSource,
   FRAME_VERSION,
   NORMALIZER_VERSION,
+  PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
 } from "./flame-source.js";
 
@@ -147,6 +148,194 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect(payload.people.map(({ id }) => id)).toEqual([e3Id]);
     } finally {
       if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
+  it("uses the next human summary without changing projected prompt evidence", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const bucketStart = new Date("2026-08-18T12:00:00.000Z");
+    const runtimeAt = new Date(bucketStart.getTime() + 1_000);
+    const humanAt = new Date(bucketStart.getTime() + 2_000);
+    const runtimeContent =
+      "<recommended_plugins>machine context</recommended_plugins>";
+    const humanContent = "Fix the dashboard session titles";
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Summary filter fixture')`,
+        [workspaceId, `summary-filter-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (
+           id, workspace_id, identity_key, display_name, email
+         ) values ($1, $2, $3, 'Summary User', 'summary@e3group.ai')`,
+        [personId, workspaceId, `summary-person-${personId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at
+         ) values ($1, $2, $3, 'summary-collector', 'summary-session',
+                   'primary', 'summary-role.v1', $4)`,
+        [sessionId, workspaceId, personId, bucketStart.toISOString()],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_provider,
+           source_kind, source_stream_key, generation_key, generation_seq,
+           start_offset, end_offset, source_byte_count, source_sha256,
+           storage_path, storage_encoding, stored_byte_count, stored_sha256,
+           record_count, contract_version, first_occurred_at, last_occurred_at
+         ) values (
+           $1, $2, $3, 'summary-collector', 'codex', 'rollout',
+           'summary-stream', 'summary-generation', 0, 0, 2, 2, repeat('a', 64),
+           $4, 'identity', 2, repeat('b', 64), 2,
+           'sherlock.rollout-batch.v1', $5, $6
+         )`,
+        [
+          batchId,
+          workspaceId,
+          personId,
+          `summary-tests/${batchId}.jsonl`,
+          runtimeAt.toISOString(),
+          humanAt.toISOString(),
+        ],
+      );
+      const records = await sql.unsafe(
+        `insert into telemetry.native_records (
+           workspace_id, batch_id, record_index, source_start_offset,
+           source_end_offset, record_sha256, native_type,
+           native_payload_type, occurred_at, parse_status
+         ) values
+           ($1, $2, 0, 0, 1, repeat('c', 64), 'event_msg', 'user_message', $3, 'ok'),
+           ($1, $2, 1, 1, 2, repeat('d', 64), 'event_msg', 'user_message', $4, 'ok')
+         returning id`,
+        [workspaceId, batchId, runtimeAt.toISOString(), humanAt.toISOString()],
+      );
+      const events = await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, source_priority, event_kind, event_subtype,
+           actor_role, occurred_at, observed_at, server_received_at,
+           message_role, message_origin, content_sha256, content_byte_size,
+           content_excerpt
+         ) values
+           ($1, $2, $3, $5, 0, 100, 'message', 'user_message', 'primary',
+            $6, $6, $6, 'user', 'human', repeat('e', 64),
+            octet_length($8::text), $8),
+           ($1, $2, $4, $5, 0, 100, 'message', 'user_message', 'primary',
+            $7, $7, $7, 'user', 'human', repeat('f', 64),
+            octet_length($9::text), $9)
+         returning id`,
+        [
+          workspaceId,
+          sessionId,
+          records[0].id,
+          records[1].id,
+          NORMALIZER_VERSION,
+          runtimeAt.toISOString(),
+          humanAt.toISOString(),
+          runtimeContent,
+          humanContent,
+        ],
+      );
+      const receipts = await sql.unsafe(
+        `insert into analytics.frame_projection_receipts (
+           workspace_id, session_id, person_id, frame_version,
+           covered_from, covered_through, through_event_id,
+           source_event_count, source_state_sha256, request_generation,
+           session_updated_at
+         ) values (
+           $1, $2, $3, $4, $5, $6, $7, 2, repeat('1', 64), 1,
+           (select updated_at from telemetry.sessions
+             where workspace_id = $1 and id = $2)
+         ) returning id`,
+        [
+          workspaceId,
+          sessionId,
+          personId,
+          FRAME_VERSION,
+          bucketStart.toISOString(),
+          new Date(bucketStart.getTime() + BUCKET_MS).toISOString(),
+          events[1].id,
+        ],
+      );
+      await sql.unsafe(
+        `insert into analytics.frame_evidence_revisions (
+           receipt_id, workspace_id, session_id, person_id, frame_version,
+           evidence_kind, source_event_id, anchor_observed_at, observed_at,
+           actor_role, event_kind, event_subtype, message_role, message_origin,
+           prompt_identity, is_summary_candidate, is_tombstone
+         ) values
+           ($1, $2, $3, $4, $5, 'activity', $6, $8, $8, 'primary',
+            'message', 'user_message', 'user', 'human', null, true, false),
+           ($1, $2, $3, $4, $5, 'activity', $7, $9, $9, 'primary',
+            'message', 'user_message', 'user', 'human', null, true, false),
+           ($1, $2, $3, $4, $5, 'prompt', $6, $8, $8, 'primary',
+            'message', 'user_message', 'user', 'human', 'event:runtime', false, false),
+           ($1, $2, $3, $4, $5, 'prompt', $7, $9, $9, 'primary',
+            'message', 'user_message', 'user', 'human', 'event:human', false, false)`,
+        [
+          receipts[0].id,
+          workspaceId,
+          sessionId,
+          personId,
+          FRAME_VERSION,
+          events[0].id,
+          events[1].id,
+          runtimeAt.toISOString(),
+          humanAt.toISOString(),
+        ],
+      );
+      const snapshot = (await sql.unsafe(
+        "select pg_current_snapshot()::text snapshot",
+      ))[0].snapshot;
+      const queryArguments = [
+        workspaceId,
+        FRAME_VERSION,
+        snapshot,
+        personId,
+        bucketStart.toISOString(),
+        new Date(bucketStart.getTime() + BUCKET_MS).toISOString(),
+        bucketStart.toISOString(),
+        new Date(bucketStart.getTime() + BUCKET_MS).toISOString(),
+        "e3group.ai",
+      ];
+      const work = await sql.unsafe(PROJECTION_INTERVAL_WORK_SQL, [
+        ...queryArguments,
+        200,
+      ]);
+      const prompts = await sql.unsafe(PROJECTION_INTERVAL_PROMPTS_SQL, [
+        ...queryArguments,
+        200,
+      ]);
+
+      expect(work).toHaveLength(1);
+      expect(work[0].summary).toBe(humanContent);
+      expect(prompts.map(({ content_excerpt }) => content_excerpt)).toEqual([
+        runtimeContent,
+        humanContent,
+      ]);
+      expect(Number(prompts[0].eligible_prompt_count)).toBe(2);
+    } finally {
+      await sql.unsafe(
+        "delete from analytics.frame_evidence_revisions where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
+      await sql.unsafe(
+        "delete from analytics.frame_projection_receipts where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
       try {
         await cleanup(sql, workspaceId);
       } finally {
