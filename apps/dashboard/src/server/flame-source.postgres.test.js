@@ -171,6 +171,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       Math.floor(FIXED_NOW.getTime() / BUCKET_MS) * BUCKET_MS - BUCKET_MS,
     );
     const observedAt = new Date(bucketStart.getTime() + 1_000);
+    const scmReceivedAt = new Date(observedAt.getTime() + 2_000);
     const promptSourceAt = new Date(bucketStart.getTime() - 10_000);
     const promptNativeItemId = nativeItemId(observedAt);
     const partialRead = new Date(FIXED_NOW.getTime() + 2_000);
@@ -218,11 +219,12 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            source_kind, source_stream_key, generation_key, generation_seq,
            start_offset, end_offset, source_byte_count, source_sha256,
            storage_path, storage_encoding, stored_byte_count, stored_sha256,
-           record_count, contract_version, first_occurred_at, last_occurred_at
+           record_count, contract_version, first_occurred_at, last_occurred_at,
+           committed_at
          ) values (
            $1, $2, $3, 'projection-collector', 'codex', 'rollout',
            'projection-stream', 'projection-generation', 0, 0, 1, 1, $4,
-           $5, 'gzip', 1, $6, 1, 'sherlock.rollout-batch.v1', $7, $7
+           $5, 'gzip', 1, $6, 1, 'sherlock.rollout-batch.v1', $7, $7, $8
          )`,
         [
           batchId,
@@ -232,6 +234,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           `projection-tests/${batchId}.jsonl.gz`,
           "b".repeat(64),
           observedAt.toISOString(),
+          scmReceivedAt.toISOString(),
         ],
       );
       const nativeRows = await sql.unsafe(
@@ -246,10 +249,17 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       await sql.unsafe(
         `insert into telemetry.session_scm (
            workspace_id, source_record_id, session_id, source_version,
-           repository_full_name, commit_sha, observed_at
+           repository_full_name, commit_sha, observed_at, server_received_at
          ) values ($1, $2, $3, 'sherlock.github-scm.v1',
-                   'e3-solutions/sherlock', $4, $5)`,
-        [workspaceId, nativeRows[0].id, sessionId, commitSha, observedAt.toISOString()],
+                   'e3-solutions/sherlock', $4, $5, $6)`,
+        [
+          workspaceId,
+          nativeRows[0].id,
+          sessionId,
+          commitSha,
+          observedAt.toISOString(),
+          scmReceivedAt.toISOString(),
+        ],
       );
       await sql.unsafe(
         `insert into github.commit_pr_lookups (
@@ -265,6 +275,20 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         "select pg_current_snapshot()::text snapshot, now() read",
       );
       await expect(linksAt(terminalReceipt)).resolves.toEqual([]);
+      await sql.unsafe(
+        `insert into github.commit_pr_lookups (
+           workspace_id, source_version, repository_full_name, commit_sha,
+           outcome, pull_request_number, pull_request_terminal_at, created_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1',
+                   'e3-solutions/sherlock', $2, 'matched', 54,
+                   $3::timestamptz + interval '1 second',
+                   $4::timestamptz - interval '1 minute')`,
+        [workspaceId, commitSha, observedAt.toISOString(), partialRead.toISOString()],
+      );
+      const [lateReceipt] = await sql.unsafe(
+        "select pg_current_snapshot()::text snapshot, now() read",
+      );
+      await expect(linksAt(lateReceipt)).resolves.toEqual([]);
       await sql.unsafe(
         `insert into github.commit_pr_lookups (
            workspace_id, source_version, repository_full_name, commit_sha,

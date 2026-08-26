@@ -143,7 +143,7 @@ export async function syncPending(
       counts.failed += 1;
       if (
         error instanceof GitHubSyncError &&
-        (error.status === 403 || error.status === 429)
+        (error.status === 401 || error.status === 403 || error.status === 429)
       ) break;
     }
   }

@@ -1031,6 +1031,16 @@ begin
     to_regclass('telemetry.events') is not null and
     to_regclass('telemetry.session_scm') is not null and
     to_regclass('github.commit_pr_lookups') is not null and
+    exists (select 1 from pg_attribute
+      where attrelid = 'processing.telemetry_jobs'::regclass
+        and attname = 'scm_backfill_version' and not attnotnull) and
+    (select attnotnull from pg_attribute
+      where attrelid = 'telemetry.session_scm'::regclass
+        and attname = 'server_received_at') and
+    pg_get_indexdef('telemetry.session_scm_recent_idx'::regclass) like
+      '%(created_at DESC, workspace_id, repository_full_name, commit_sha)%' and
+    pg_get_indexdef('telemetry.events_server_received_brin_idx'::regclass) like
+      '%USING brin (server_received_at)%' and
     exists (
       select 1
       from pg_index i

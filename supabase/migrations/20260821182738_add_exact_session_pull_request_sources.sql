@@ -11,6 +11,7 @@ create table telemetry.session_scm (
   repository_full_name text not null,
   commit_sha text not null,
   observed_at timestamptz not null,
+  server_received_at timestamptz not null,
   created_at timestamptz not null default now(),
   unique (source_record_id, source_version),
   foreign key (workspace_id, source_record_id)
@@ -57,8 +58,11 @@ create table github.commit_pr_lookups (
   )
 );
 
+alter table processing.telemetry_jobs add column scm_backfill_version text
+  check (scm_backfill_version is null or btrim(scm_backfill_version) <> '');
+
 create index session_scm_recent_idx on telemetry.session_scm (
-  observed_at desc, workspace_id, repository_full_name, commit_sha
+  created_at desc, workspace_id, repository_full_name, commit_sha
 );
 create index session_scm_session_idx on telemetry.session_scm (
   workspace_id, session_id
@@ -89,6 +93,14 @@ grant select, insert on github.commit_pr_lookups to sherlock_processor;
 grant select on github.commit_pr_lookups to sherlock_reader;
 grant usage, select on sequence github.commit_pr_lookups_id_seq
   to sherlock_processor;
+grant select (id, workspace_id, batch_id, native_type)
+  on telemetry.native_records to sherlock_processor;
+grant select (source_provider, committed_at)
+  on telemetry.ingest_batches to sherlock_processor;
+grant select (
+  workspace_id, session_id, source_record_id, normalizer_version, is_replay,
+  server_received_at
+) on telemetry.events to sherlock_processor;
 
 alter default privileges in schema github
   revoke all on tables from public, anon, authenticated;
@@ -99,3 +111,5 @@ comment on table telemetry.session_scm is
   'Append-only exact GitHub repository and commit facts from session metadata.';
 comment on table github.commit_pr_lookups is
   'Append-only outcomes from exact GitHub commit-associated PR lookups.';
+comment on column processing.telemetry_jobs.scm_backfill_version is
+  'Latest session SCM source version explicitly scheduled for this normalization job.';

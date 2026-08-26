@@ -756,16 +756,24 @@ Deno.test({
         "identical session replay must preserve xmin and updated_at",
       );
       const scmFacts = await sql.unsafe(
-        `select repository_full_name, commit_sha
-             from telemetry.session_scm
-            where workspace_id = $1 and session_id = $2`,
+        `select scm.repository_full_name, scm.commit_sha,
+                scm.server_received_at = batch.committed_at received_at_ingest
+           from telemetry.session_scm scm
+           join telemetry.native_records record
+             on record.workspace_id = scm.workspace_id
+            and record.id = scm.source_record_id
+           join telemetry.ingest_batches batch
+             on batch.workspace_id = record.workspace_id
+            and batch.id = record.batch_id
+          where scm.workspace_id = $1 and scm.session_id = $2`,
         [workspaceId, childSessionId],
       );
       assert(
         scmFacts.length === 1 &&
           scmFacts[0].repository_full_name === "e3-solutions/sherlock" &&
-          scmFacts[0].commit_sha === "a".repeat(40),
-        "SCM fact insert must be exact and idempotent",
+          scmFacts[0].commit_sha === "a".repeat(40) &&
+          scmFacts[0].received_at_ingest === true,
+        "SCM fact insert must be exact, ingest-timed, and idempotent",
       );
       assert(
         await normalize(firstNormalizer, childFirstParent) === parentSessionId,

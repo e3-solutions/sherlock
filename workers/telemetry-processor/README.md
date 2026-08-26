@@ -35,6 +35,8 @@ handling.
 
 Set `GITHUB_TOKEN` to enable exact session-to-PR links. Use a fine-grained token
 with pull-request read access to the repositories that Sherlock observes.
+Repository renames and transfers deliberately fail closed: the stored canonical
+owner/name must match GitHub's response.
 
 ## First rollout and rollback
 
@@ -49,6 +51,12 @@ schema work or replacement startup:
    their database tests.
 4. Verify the connection gate, deploy the new worker at exactly one replica, and
    confirm it owns the handoff before processing begins.
+
+For exact PR links, keep `GITHUB_TOKEN` unset and apply all migrations through
+`20260826172214_add_events_server_received_brin_index.sql` before step 4. Then
+run `deno run --allow-env --allow-net scripts/backfill-session-scm.ts`, wait for
+the replayed jobs to finish, and enable the token. The restart-safe replay is
+limited to the dashboard's 26-hour database-received evidence window.
 
 Rollback to code without this protocol has the same constraint: stop the new
 worker completely, wait for it to exit, then start one old replica. Never run

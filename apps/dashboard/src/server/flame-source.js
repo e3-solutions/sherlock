@@ -788,6 +788,7 @@ with p as materialized (
          $3::timestamptz snapshot_read, $4::uuid[] session_ids
 ), facts as (
   select scm.session_id, scm.repository_full_name, scm.observed_at,
+         scm.server_received_at,
          lookup.outcome, lookup.pull_request_number,
          lookup.pull_request_terminal_at, lookup.created_at
     from telemetry.session_scm scm cross join p
@@ -818,6 +819,9 @@ having bool_and(coalesce(
       created_at between p.snapshot_read - interval '15 minutes'
                             and p.snapshot_read) and
     observed_at <= coalesce(
+      pull_request_terminal_at, 'infinity'::timestamptz
+    ) and
+    server_received_at <= coalesce(
       pull_request_terminal_at, 'infinity'::timestamptz
     ),
     false

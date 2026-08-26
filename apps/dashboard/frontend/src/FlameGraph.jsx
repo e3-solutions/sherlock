@@ -579,6 +579,7 @@ function IntervalOverview({
 
 function WorkDetail({
   work,
+  pullRequest,
   evidence,
   onBack,
   onClose,
@@ -615,9 +616,9 @@ function WorkDetail({
             <span aria-hidden="true"> · </span>
             {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
           </p>
-          {work.pullRequest && (
+          {pullRequest && (
             <PullRequestLink
-              pullRequest={work.pullRequest}
+              pullRequest={pullRequest}
               className="flame-detail__pull-request--heading"
             />
           )}
@@ -1070,6 +1071,7 @@ export default function FlameGraph({
         }
         setIntervalEvidence({
           state: "ready",
+          snapshot: data.snapshot,
           ...evidence,
           workIncomplete: evidence.work.length < selectedPoint.activity,
         });
@@ -1167,10 +1169,17 @@ export default function FlameGraph({
       firstAtMs: work.firstAtMs,
       lastAtMs: work.lastAtMs,
       eventCount: work.eventCount,
-      pullRequest: work.pullRequest,
       transition: "forward",
     });
   };
+
+  const selectedWorkPullRequest = drawerView.screen === "work" &&
+      intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot
+    ? intervalEvidence.work.find((work) =>
+      work.id === drawerView.workId && work.sessionId === drawerView.sessionId &&
+      work.role === drawerView.role
+    )?.pullRequest ?? null
+    : null;
 
   const backToOverview = () => {
     setDrawerView({ screen: "overview", transition: "back" });
@@ -1306,6 +1315,7 @@ export default function FlameGraph({
           {drawerView.screen === "work" ? (
             <WorkDetail
               work={drawerView}
+              pullRequest={selectedWorkPullRequest}
               evidence={workEvidence}
               stale={stale}
               closing={detailClosing}

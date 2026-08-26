@@ -782,6 +782,41 @@ describe("FlameGraph", () => {
     );
   });
 
+  it("removes a session PR link while refreshed snapshot evidence is pending or unmatched", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    let refreshedInterval;
+    vi.mocked(fetch).mockImplementation((url, options) => {
+      if (String(url).includes("/api/flame/interval?") && String(url).includes("snapshot=v2.snapshot-token")) {
+        refreshedInterval = defaultFetch(url, options).then(async (response) => {
+          const payload = await response.json();
+          return {
+            ok: true,
+            json: () => Promise.resolve({
+              ...payload,
+              work: payload.work.map((work) => ({ ...work, pullRequest: null })),
+            }),
+          };
+        });
+        return refreshedInterval;
+      }
+      return defaultFetch(url, options);
+    });
+
+    const data = model();
+    const view = render(<FlameGraph data={data} chartWidth={1008} />);
+    const wrapper = view.container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(chartBounds);
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: /Subagent session/ }));
+    expect(screen.getByRole("link", { name: "Open PR #55 on GitHub" })).toBeInTheDocument();
+
+    view.rerender(<FlameGraph data={{ ...data, snapshot: "v2.snapshot-token" }} chartWidth={1008} />);
+
+    expect(screen.queryByRole("link", { name: "Open PR #55 on GitHub" })).toBeNull();
+    await act(() => refreshedInterval);
+    expect(screen.queryByRole("link", { name: "Open PR #55 on GitHub" })).toBeNull();
+  });
+
   it("keeps prompt and stable work evidence visible when mutable role metadata is partial", async () => {
     const partialModel = model();
     partialModel.people[0].buckets[0].activity = 5;

@@ -175,6 +175,7 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
         repository_full_name: item.repository_full_name,
         commit_sha: item.commit_sha,
         observed_at: item.observed_at,
+        server_received_at: receipt.committed_at,
       }));
       if (sessionScm.length > 0) {
         await tx`insert into telemetry.session_scm ${
@@ -187,6 +188,7 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
             "repository_full_name",
             "commit_sha",
             "observed_at",
+            "server_received_at",
           )
         } on conflict (source_record_id, source_version) do nothing`;
       }

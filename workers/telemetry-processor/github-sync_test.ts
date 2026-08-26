@@ -15,6 +15,19 @@ const pair: CommitPair = {
   commitSha: "a".repeat(40),
 };
 
+function storeFor(results: LookupResult[]) {
+  return {
+    pendingGithubCommitPairs(limit: number) {
+      assert(limit === 25);
+      return Promise.resolve([pair, { ...pair, commitSha: "b".repeat(40) }]);
+    },
+    appendGithubLookup(result: LookupResult) {
+      results.push(result);
+      return Promise.resolve();
+    },
+  };
+}
+
 Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async () => {
   const pull = {
     number: 57,
@@ -51,21 +64,22 @@ Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async
   }
 });
 
-Deno.test("sync records a failure and stops on rate limiting", async () => {
-  const results: LookupResult[] = [];
-  const store = {
-    pendingGithubCommitPairs(limit: number) {
-      assert(limit === 25);
-      return Promise.resolve([pair, { ...pair, commitSha: "b".repeat(40) }]);
-    },
-    appendGithubLookup(result: LookupResult) {
-      results.push(result);
-      return Promise.resolve();
-    },
-  };
-  const counts = await syncPending(store, "secret", {
-    fetcher: () => Promise.resolve(new Response(null, { status: 429 })),
+for (const status of [401, 429]) {
+  Deno.test(`sync records a failure and stops on HTTP ${status}`, async () => {
+    const results: LookupResult[] = [];
+    const counts = await syncPending(storeFor(results), "secret", {
+      fetcher: () => Promise.resolve(new Response(null, { status })),
+    });
+    assert(counts.attempted === 1 && counts.failed === 1);
+    assert(results[0].outcome === "failed");
   });
-  assert(counts.attempted === 1 && counts.failed === 1);
-  assert(results[0].outcome === "failed");
+}
+
+Deno.test("sync continues after a repository-specific 404", async () => {
+  const results: LookupResult[] = [];
+  const counts = await syncPending(storeFor(results), "secret", {
+    fetcher: () => Promise.resolve(new Response(null, { status: 404 })),
+  });
+  assert(counts.attempted === 2 && counts.failed === 2);
+  assert(results.length === 2);
 });
