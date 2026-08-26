@@ -617,6 +617,13 @@ input { font: inherit; }
   flex-direction: column;
 }
 
+.flame-detail__view[data-transition] {
+  animation: flame-detail-view-enter var(--flame-detail-motion-duration) var(--flame-detail-motion-easing) both;
+}
+
+.flame-detail__view[data-transition="forward"] { --flame-detail-view-offset: 18px; }
+.flame-detail__view[data-transition="back"] { --flame-detail-view-offset: -18px; }
+
 .flame-detail__body { flex: 1; }
 
 @keyframes flame-detail-enter-x {
@@ -638,6 +645,17 @@ input { font: inherit; }
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes flame-detail-view-enter {
+  from {
+    opacity: 0;
+    transform: translateX(var(--flame-detail-view-offset));
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
   }
 }
 

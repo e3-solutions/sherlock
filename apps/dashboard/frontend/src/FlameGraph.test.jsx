@@ -959,6 +959,7 @@ describe("FlameGraph", () => {
     fireEvent.click(row);
 
     expect(screen.getByText("Loading session evidence…")).toBeInTheDocument();
+    expect(document.querySelector('.flame-detail__view[data-transition="forward"]')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText("Conversation")).toBeInTheDocument());
     expect(document.querySelector('.flame-detail__items li[data-role="user"]')).toHaveTextContent("user");
     expect(document.querySelector('.flame-detail__items li[data-role="assistant"]')).toHaveTextContent("assistant");
@@ -976,6 +977,7 @@ describe("FlameGraph", () => {
     const backButton = screen.getByRole("button", { name: "Back to frame" });
     expect(backButton.querySelector("svg")).toBeInTheDocument();
     fireEvent.click(backButton);
+    expect(document.querySelector('.flame-detail__view[data-transition="back"]')).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
   });
 

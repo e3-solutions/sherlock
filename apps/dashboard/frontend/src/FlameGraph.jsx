@@ -432,6 +432,7 @@ function PullRequestLink({ pullRequest, className = "" }) {
 function IntervalOverview({
   person,
   point,
+  transition,
   onClose,
   evidence,
   onRetry,
@@ -484,7 +485,11 @@ function IntervalOverview({
   }
 
   return (
-    <div className="flame-detail__view" data-view="overview">
+    <div
+      className="flame-detail__view"
+      data-view="overview"
+      data-transition={transition}
+    >
       <header className="flame-detail__header">
         <div>
           <p className="flame-detail__eyebrow">Frame evidence</p>
@@ -585,7 +590,11 @@ function WorkDetail({
 }) {
   const headingId = `flame-work-${work.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
   return (
-    <div className="flame-detail__view" data-view="work">
+    <div
+      className="flame-detail__view"
+      data-view="work"
+      data-transition={work.transition}
+    >
       <header className="flame-detail__header flame-detail__header--work">
         <button type="button" className="flame-detail__back" onClick={onBack}>
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24">
@@ -1159,11 +1168,12 @@ export default function FlameGraph({
       lastAtMs: work.lastAtMs,
       eventCount: work.eventCount,
       pullRequest: work.pullRequest,
+      transition: "forward",
     });
   };
 
   const backToOverview = () => {
-    setDrawerView({ screen: "overview" });
+    setDrawerView({ screen: "overview", transition: "back" });
   };
 
   const refreshIntervalTimeline = () => {
@@ -1310,6 +1320,7 @@ export default function FlameGraph({
               key={`${selectedPerson.id}:${selectedPoint.startMs}`}
               person={selectedPerson}
               point={selectedPoint}
+              transition={drawerView.transition}
               evidence={intervalEvidence}
               stale={stale}
               closing={detailClosing}
