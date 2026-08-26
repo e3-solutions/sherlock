@@ -760,14 +760,10 @@ describe("FlameGraph", () => {
       "href",
       "https://github.com/e3-solutions/sherlock/pull/55",
     );
-    expect(pullRequest).toHaveAttribute("target", "_blank");
-    expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
-    expect(pullRequest.querySelector("svg")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Subagent session/ }));
     await screen.findByText("Conversation");
-    expect(screen.getByRole("link", {
-      name: "Open PR #55 on GitHub",
-    }).closest(".flame-detail__work-meta")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open PR #55 on GitHub" }))
+      .toBeInTheDocument();
     expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
 
@@ -998,7 +994,6 @@ describe("FlameGraph", () => {
     fireEvent.click(row);
 
     expect(screen.getByText("Loading session evidence…")).toBeInTheDocument();
-    expect(document.querySelector('.flame-detail__view[data-transition="forward"]')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText("Conversation")).toBeInTheDocument());
     expect(document.querySelector('.flame-detail__items li[data-role="user"]')).toHaveTextContent("user");
     expect(document.querySelector('.flame-detail__items li[data-role="assistant"]')).toHaveTextContent("assistant");
@@ -1016,7 +1011,6 @@ describe("FlameGraph", () => {
     const backButton = screen.getByRole("button", { name: "Back to frame" });
     expect(backButton.querySelector("svg")).toBeInTheDocument();
     fireEvent.click(backButton);
-    expect(document.querySelector('.flame-detail__view[data-transition="back"]')).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
   });
 

@@ -3,7 +3,6 @@ create schema if not exists github;
 revoke all on schema github from public, anon, authenticated;
 
 create table telemetry.session_scm (
-  id bigint generated always as identity primary key,
   workspace_id uuid not null references telemetry.workspaces (id),
   source_record_id bigint not null,
   session_id uuid not null,
@@ -13,7 +12,7 @@ create table telemetry.session_scm (
   observed_at timestamptz not null,
   server_received_at timestamptz not null,
   created_at timestamptz not null default now(),
-  unique (source_record_id, source_version),
+  primary key (source_record_id, source_version),
   foreign key (workspace_id, source_record_id)
     references telemetry.native_records (workspace_id, id),
   foreign key (workspace_id, session_id)
@@ -51,9 +50,7 @@ create table github.commit_pr_lookups (
   check (
     (outcome = 'matched' and pull_request_number is not null and
       pull_request_number > 0) or
-    (outcome in ('none', 'ambiguous') and pull_request_number is null and
-      pull_request_terminal_at is null) or
-    (outcome = 'failed' and pull_request_number is null and
+    (outcome <> 'matched' and pull_request_number is null and
       pull_request_terminal_at is null)
   )
 );
@@ -75,8 +72,7 @@ revoke all on telemetry.session_scm, github.commit_pr_lookups
   from public, anon, authenticated, sherlock_ingest, sherlock_normalizer,
        sherlock_reducer, sherlock_processor, sherlock_frame_projector,
        sherlock_reader;
-revoke all on sequence telemetry.session_scm_id_seq,
-  github.commit_pr_lookups_id_seq
+revoke all on sequence github.commit_pr_lookups_id_seq
   from public, anon, authenticated, sherlock_ingest, sherlock_normalizer,
        sherlock_reducer, sherlock_processor, sherlock_frame_projector,
        sherlock_reader;
@@ -84,9 +80,6 @@ revoke all on sequence telemetry.session_scm_id_seq,
 grant insert on telemetry.session_scm to sherlock_normalizer;
 grant select (source_record_id, source_version)
   on telemetry.session_scm to sherlock_normalizer;
-grant usage, select on sequence telemetry.session_scm_id_seq
-  to sherlock_normalizer;
-
 grant usage on schema github to sherlock_processor, sherlock_reader;
 grant select on telemetry.session_scm to sherlock_processor, sherlock_reader;
 grant select, insert on github.commit_pr_lookups to sherlock_processor;

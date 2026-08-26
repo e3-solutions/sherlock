@@ -132,8 +132,7 @@ export class PostgresJobQueue {
             where server_received_at >= now() - interval '26 hours'
               and session_id is not null and not is_replay
          ), eligible as (
-           select scm.workspace_id, scm.repository_full_name, scm.commit_sha,
-                  scm.observed_at
+           select scm.workspace_id, scm.repository_full_name, scm.commit_sha
              from telemetry.session_scm scm
              left join recent_sessions recent
                on recent.workspace_id = scm.workspace_id
@@ -144,8 +143,7 @@ export class PostgresJobQueue {
                 or recent.session_id is not null
               )
          ), observed as (
-           select workspace_id, repository_full_name, commit_sha,
-                  max(observed_at) observed_at
+           select workspace_id, repository_full_name, commit_sha
              from eligible
             group by workspace_id, repository_full_name, commit_sha
          )

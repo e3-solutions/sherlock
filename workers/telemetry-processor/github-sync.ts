@@ -21,12 +21,10 @@ export interface LookupStore {
 export interface GithubSyncPause {
   status: 401 | 403 | 429;
   retryAtMs: number | null;
-  retrySource: "retry_after" | "rate_reset" | "exponential" | "restart";
 }
 
 export interface GithubSyncSummary {
   attempted: number;
-  matched: number;
   failed: number;
   backlogRemaining: boolean;
   pause: GithubSyncPause | null;
@@ -77,7 +75,7 @@ async function githubPause(
 ): Promise<GithubSyncPause | null> {
   const status = response.status;
   if (status === 401) {
-    return { status, retryAtMs: null, retrySource: "restart" };
+    return { status, retryAtMs: null };
   }
   if (status !== 403 && status !== 429) return null;
 
@@ -90,7 +88,6 @@ async function githubPause(
     return {
       status,
       retryAtMs: Number.isFinite(parsed) ? Math.max(nowMs, parsed) : null,
-      retrySource: "retry_after",
     };
   }
   if (response.headers.get("x-ratelimit-remaining") === "0") {
@@ -101,11 +98,10 @@ async function githubPause(
     return {
       status,
       retryAtMs: Number.isFinite(parsed) ? Math.max(nowMs, parsed) : null,
-      retrySource: Number.isFinite(parsed) ? "rate_reset" : "exponential",
     };
   }
   if (status === 429) {
-    return { status, retryAtMs: null, retrySource: "exponential" };
+    return { status, retryAtMs: null };
   }
 
   let message = "";
@@ -116,7 +112,7 @@ async function githubPause(
     // An ordinary, unstructured 403 is scoped to this repository.
   }
   return /rate limit|abuse detection/i.test(message)
-    ? { status, retryAtMs: null, retrySource: "exponential" }
+    ? { status, retryAtMs: null }
     : null;
 }
 
@@ -191,7 +187,7 @@ export async function syncPending(
     now?: () => number;
   } = {},
 ): Promise<GithubSyncSummary> {
-  const counts = { attempted: 0, matched: 0, failed: 0 };
+  const counts = { attempted: 0, failed: 0 };
   let pause: GithubSyncPause | null = null;
   options.signal?.throwIfAborted();
   const pending = await store.pendingGithubCommitPairs(
@@ -221,7 +217,6 @@ export async function syncPending(
       continue;
     }
     await store.appendGithubLookup(result);
-    if (result.outcome === "matched") counts.matched += 1;
   }
   return {
     ...counts,

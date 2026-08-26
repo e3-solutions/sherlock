@@ -436,7 +436,6 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
             githubAuthRejected = true;
             log("github_sync_paused", {
               http_status: pause.status,
-              retry_source: pause.retrySource,
             });
           } else if (pause) {
             githubRateLimitAttempts += 1;
@@ -452,7 +451,6 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
             );
             log("github_sync_paused", {
               http_status: pause.status,
-              retry_source: pause.retrySource,
               retry_in_ms: Math.max(0, nextGithubSyncAt - now),
             });
           } else {

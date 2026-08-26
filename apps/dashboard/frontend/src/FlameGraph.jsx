@@ -412,10 +412,10 @@ function DrawerCloseButton({ closing, onClose }) {
   );
 }
 
-function PullRequestLink({ pullRequest, className = "" }) {
+function PullRequestLink({ pullRequest }) {
   return (
     <a
-      className={`flame-detail__pull-request ${className}`.trim()}
+      className="flame-detail__pull-request"
       href={pullRequest.url}
       target="_blank"
       rel="noopener noreferrer"
@@ -616,12 +616,7 @@ function WorkDetail({
             <span aria-hidden="true"> · </span>
             {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
           </p>
-          {pullRequest && (
-            <PullRequestLink
-              pullRequest={pullRequest}
-              className="flame-detail__pull-request--heading"
-            />
-          )}
+          {pullRequest && <PullRequestLink pullRequest={pullRequest} />}
         </div>
         {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
       </div>
@@ -1175,10 +1170,8 @@ export default function FlameGraph({
 
   const selectedWorkPullRequest = drawerView.screen === "work" &&
       intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot
-    ? intervalEvidence.work.find((work) =>
-      work.id === drawerView.workId && work.sessionId === drawerView.sessionId &&
-      work.role === drawerView.role
-    )?.pullRequest ?? null
+    ? intervalEvidence.work.find((work) => work.id === drawerView.workId)
+      ?.pullRequest ?? null
     : null;
 
   const backToOverview = () => {

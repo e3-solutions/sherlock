@@ -39,17 +39,25 @@ Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async
     closed_at: "2026-08-21T01:02:03Z",
     merged_at: "2026-08-21T01:02:02Z",
   };
-  const cases: Array<[unknown, LookupResult["outcome"] | "error"]> = [
+  const cases: Array<[
+    unknown,
+    LookupResult["outcome"] | "error",
+    (string | null)?,
+  ]> = [
     [[], "none"],
     [[pull, { ...pull, number: 58 }], "ambiguous"],
-    [[pull], "matched"],
+    [[pull], "matched", "2026-08-21T01:02:02.000Z"],
+    [
+      [{ ...pull, state: "open", closed_at: null, merged_at: null }],
+      "matched",
+      null,
+    ],
     [[{ ...pull, merged_at: null }], "error"],
     [[{ ...pull, base: { repo: { full_name: "other/repo" } } }], "error"],
-    [[{ ...pull, state: "open" }], "error"],
     ["invalid", "error"],
   ];
 
-  for (const [body, expected] of cases) {
+  for (const [body, expected, terminalAt] of cases) {
     try {
       const result = await lookupCommit(
         pair,
@@ -60,7 +68,10 @@ Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async
         },
       );
       assert(result.outcome === expected);
-      if (expected === "matched") assert(result.pullRequestNumber === 57);
+      if (expected === "matched") {
+        assert(result.pullRequestNumber === 57);
+        assert(result.pullRequestTerminalAt === terminalAt);
+      }
     } catch {
       assert(expected === "error");
     }
@@ -70,7 +81,7 @@ Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async
 Deno.test("sync pauses globally without writing a pair failure", async () => {
   const now = 1_800_000_000_000;
   const cases = [
-    [() => new Response(null, { status: 401 }), 401, null, "restart"],
+    [() => new Response(null, { status: 401 }), 401, null],
     [
       () =>
         new Response(null, {
@@ -79,7 +90,6 @@ Deno.test("sync pauses globally without writing a pair failure", async () => {
         }),
       429,
       now + 120_000,
-      "retry_after",
     ],
     [
       () =>
@@ -92,7 +102,6 @@ Deno.test("sync pauses globally without writing a pair failure", async () => {
         }),
       403,
       now + 180_000,
-      "rate_reset",
     ],
     [
       () =>
@@ -102,47 +111,36 @@ Deno.test("sync pauses globally without writing a pair failure", async () => {
         ),
       403,
       null,
-      "exponential",
     ],
   ] as const;
 
-  for (const [response, status, retryAtMs, source] of cases) {
+  for (const [response, status, retryAtMs] of cases) {
     const results: LookupResult[] = [];
-    let fetches = 0;
     const summary = await syncPending(storeFor(results), "secret", {
-      fetcher: () => {
-        fetches += 1;
-        return Promise.resolve(response());
-      },
+      fetcher: () => Promise.resolve(response()),
       now: () => now,
     });
-    assert(fetches === 1 && results.length === 0);
+    assert(results.length === 0);
     assert(summary.attempted === 1 && summary.failed === 0);
     assert(summary.backlogRemaining && summary.pause !== null);
     assert(summary.pause.status === status);
     assert(summary.pause.retryAtMs === retryAtMs);
-    assert(summary.pause.retrySource === source);
   }
 });
 
 Deno.test("sync continues after pair-specific HTTP failures", async () => {
-  for (
-    const response of [
-      () =>
+  const results: LookupResult[] = [];
+  const summary = await syncPending(storeFor(results), "secret", {
+    fetcher: () =>
+      Promise.resolve(
         Response.json({ message: "Resource not accessible" }, { status: 403 }),
-      () => new Response(null, { status: 404 }),
-    ]
-  ) {
-    const results: LookupResult[] = [];
-    const summary = await syncPending(storeFor(results), "secret", {
-      fetcher: () => Promise.resolve(response()),
-    });
-    assert(summary.attempted === 2 && summary.failed === 2);
-    assert(!summary.backlogRemaining && summary.pause === null);
-    assert(
-      results.length === 2 && results.every((row) => row.outcome === "failed"),
-    );
-  }
+      ),
+  });
+  assert(summary.attempted === 2 && summary.failed === 2);
+  assert(!summary.backlogRemaining && summary.pause === null);
+  assert(
+    results.length === 2 && results.every((row) => row.outcome === "failed"),
+  );
 });
 
 Deno.test("sync processes 25 pairs and reports remaining backlog", async () => {

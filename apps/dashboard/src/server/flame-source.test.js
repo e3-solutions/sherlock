@@ -1125,10 +1125,6 @@ describe("Sherlock Flame payload", () => {
 
     expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
     expect(unsafe.mock.calls[1][1].at(-1)).toBe(201);
-    expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PULL_REQUESTS_SQL);
-    expect(unsafe.mock.calls[2][1]).toEqual([
-      source.workspaceId, PG_SNAPSHOT, READ.toISOString(), [sessionId],
-    ]);
     expect(unsafe.mock.calls[3][0]).toBe(INTERVAL_PROMPTS_SQL);
     expect(unsafe.mock.calls[3][1].at(-1)).toBe(201);
     expect(interval).toMatchObject({

@@ -1016,8 +1016,7 @@ input { font: inherit; }
   stroke-width: 1.5;
 }
 
-.flame-detail__pull-request--heading {
-  width: fit-content;
+.flame-detail__work-meta .flame-detail__pull-request {
   margin: 0 0 0 auto;
 }
 

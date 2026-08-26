@@ -124,7 +124,7 @@ export interface SessionScmFact {
 export interface BatchProjection {
   session: SessionProjection | null;
   events: EventProjection[];
-  session_scm: SessionScmFact[];
+  session_scm: SessionScmFact | null;
 }
 
 interface ParsedRecord {
@@ -246,7 +246,7 @@ async function projectClaudeHookBatch(
       projectClaudeHookRecord(record, session, canonicalScopeKey)
     ),
   );
-  return { session, events: projected, session_scm: [] };
+  return { session, events: projected, session_scm: null };
 }
 
 async function projectClaudeHookRecord(
@@ -549,21 +549,16 @@ async function projectCodexBatch(
   );
   const observedAt = metaRecord?.locator.occurred_at ??
     manifest.first_occurred_at;
-  const scmMatched = Boolean(
-    session && observedAt && commitSha && GIT_COMMIT_SHA.test(commitSha) &&
-      repositoryFullName,
-  );
-  const sessionScm = metaRecord && scmMatched
-    ? [
-      {
-        record_index: metaRecord.locator.record_index,
-        source_version: SCM_SOURCE_VERSION,
-        repository_full_name: repositoryFullName!,
-        commit_sha: commitSha!,
-        observed_at: observedAt!,
-      } satisfies SessionScmFact,
-    ]
-    : [];
+  const sessionScm = metaRecord && session && observedAt && commitSha &&
+      GIT_COMMIT_SHA.test(commitSha) && repositoryFullName
+    ? {
+      record_index: metaRecord.locator.record_index,
+      source_version: SCM_SOURCE_VERSION,
+      repository_full_name: repositoryFullName,
+      commit_sha: commitSha,
+      observed_at: observedAt,
+    } satisfies SessionScmFact
+    : null;
   return { session, events, session_scm: sessionScm };
 }
 
@@ -639,7 +634,7 @@ async function projectClaudeBatch(
       )
     ),
   );
-  return { session, events: projected.flat(), session_scm: [] };
+  return { session, events: projected.flat(), session_scm: null };
 }
 
 async function projectClaudeRecord(

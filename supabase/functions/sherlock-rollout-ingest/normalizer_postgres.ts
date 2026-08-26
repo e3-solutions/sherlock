@@ -165,37 +165,28 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
       const normalizedSession = projection.session
         ? await upsertSession(tx, receipt, projection.session)
         : null;
-      if (projection.session_scm.length > 0 && !normalizedSession) {
-        throw new IngestError(
-          "normalization_scm_session_missing",
-          "SCM facts require a normalized session",
-          500,
-        );
-      }
-      const sessionScm = projection.session_scm.map((item) => ({
-        workspace_id: receipt.workspace_id,
-        source_record_id: sourceRecords[item.record_index].id,
-        session_id: normalizedSession!.id,
-        source_version: item.source_version,
-        repository_full_name: item.repository_full_name,
-        commit_sha: item.commit_sha,
-        observed_at: item.observed_at,
-        server_received_at: receipt.committed_at,
-      }));
-      if (sessionScm.length > 0) {
-        await tx`insert into telemetry.session_scm ${
-          tx(
-            sessionScm,
-            "workspace_id",
-            "source_record_id",
-            "session_id",
-            "source_version",
-            "repository_full_name",
-            "commit_sha",
-            "observed_at",
-            "server_received_at",
-          )
-        } on conflict (source_record_id, source_version) do nothing`;
+      const sessionScm = projection.session_scm;
+      if (sessionScm) {
+        if (!normalizedSession) {
+          throw new IngestError(
+            "normalization_scm_session_missing",
+            "SCM facts require a normalized session",
+            500,
+          );
+        }
+        await tx`insert into telemetry.session_scm (
+          workspace_id, source_record_id, session_id, source_version,
+          repository_full_name, commit_sha, observed_at, server_received_at
+        ) values (
+          ${receipt.workspace_id},
+          ${sourceRecords[sessionScm.record_index].id},
+          ${normalizedSession.id},
+          ${sessionScm.source_version},
+          ${sessionScm.repository_full_name},
+          ${sessionScm.commit_sha},
+          ${sessionScm.observed_at},
+          ${receipt.committed_at}
+        ) on conflict (source_record_id, source_version) do nothing`;
       }
       const projectedEvents = normalizedSession &&
           normalizerVersion === CLAUDE_NORMALIZER_VERSION

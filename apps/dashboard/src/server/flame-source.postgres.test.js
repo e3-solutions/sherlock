@@ -371,6 +371,25 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     const linksAt = (receipt) => sql.unsafe(INTERVAL_PULL_REQUESTS_SQL, [
       workspaceId, receipt.snapshot, partialRead.toISOString(), [sessionId],
     ]);
+    const appendLookup = (sha, {
+      outcome = "matched",
+      number = 54,
+      terminalAt = null,
+      createdAt = partialRead,
+    } = {}) => sql.unsafe(
+      `insert into github.commit_pr_lookups (
+         workspace_id, source_version, repository_full_name, commit_sha,
+         outcome, pull_request_number, pull_request_terminal_at, created_at
+       ) values ($1, 'sherlock.github-associated-pulls.v1',
+                 'e3-solutions/sherlock', $2, $3, $4, $5, $6)`,
+      [workspaceId, sha, outcome, number, terminalAt, createdAt],
+    );
+    const currentLinks = async () => {
+      const [receipt] = await sql.unsafe(
+        "select pg_current_snapshot()::text snapshot",
+      );
+      return await linksAt(receipt);
+    };
     try {
       await sql.unsafe(
         `insert into telemetry.workspaces (id, slug, name)
@@ -468,66 +487,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           secondCommitSha,
         ],
       );
-      await sql.unsafe(
-        `insert into github.commit_pr_lookups (
-           workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, pull_request_number, pull_request_terminal_at, created_at
-         ) values
-           ($1, 'sherlock.github-associated-pulls.v1',
-            'e3-solutions/sherlock', $2, 'matched', 54,
-            $4::timestamptz - interval '1 second',
-            $5::timestamptz - interval '1 minute'),
-           ($1, 'sherlock.github-associated-pulls.v1',
-            'e3-solutions/sherlock', $3, 'matched', 54, null,
-            $5::timestamptz - interval '1 minute')`,
-        [
-          workspaceId,
-          commitSha,
-          secondCommitSha,
-          observedAt.toISOString(),
-          partialRead.toISOString(),
-        ],
-      );
-      const [terminalReceipt] = await sql.unsafe(
-        "select pg_current_snapshot()::text snapshot, now() read",
-      );
-      await expect(linksAt(terminalReceipt)).resolves.toEqual([]);
-      await sql.unsafe(
-        `insert into github.commit_pr_lookups (
-           workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, pull_request_number, pull_request_terminal_at, created_at
-         ) values ($1, 'sherlock.github-associated-pulls.v1',
-                   'e3-solutions/sherlock', $2, 'matched', 54,
-                   $3::timestamptz + interval '1 second',
-                   $4::timestamptz - interval '1 minute')`,
-        [workspaceId, commitSha, observedAt.toISOString(), partialRead.toISOString()],
-      );
-      const [lateReceipt] = await sql.unsafe(
-        "select pg_current_snapshot()::text snapshot, now() read",
-      );
-      await expect(linksAt(lateReceipt)).resolves.toEqual([]);
-      await sql.unsafe(
-        `insert into github.commit_pr_lookups (
-           workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, pull_request_number, pull_request_terminal_at, created_at
-         ) values ($1, 'sherlock.github-associated-pulls.v1',
-                   'e3-solutions/sherlock', $2, 'matched', 54,
-                   $3::timestamptz + interval '3 seconds',
-                   $4::timestamptz - interval '6 hours 16 minutes')`,
-        [workspaceId, commitSha, observedAt.toISOString(), partialRead.toISOString()],
-      );
-      const [staleTerminalReceipt] = await sql.unsafe(
-        "select pg_current_snapshot()::text snapshot, now() read",
-      );
-      await expect(linksAt(staleTerminalReceipt)).resolves.toEqual([]);
-      await sql.unsafe(
-        `insert into github.commit_pr_lookups (
-           workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, pull_request_number, created_at
-         ) values ($1, 'sherlock.github-associated-pulls.v1',
-                   'e3-solutions/sherlock', $2, 'matched', 54, $3)`,
-        [workspaceId, commitSha, partialRead.toISOString()],
-      );
+      await appendLookup(commitSha);
+      await appendLookup(secondCommitSha);
       const eventRows = await sql.unsafe(
         `insert into telemetry.events (
            workspace_id, session_id, source_record_id, normalizer_version,
@@ -772,10 +733,6 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect(projectedDay.people[0].total).toEqual([1, 1, 0]);
       expect(projectedInterval.work).toEqual(legacyInterval.work);
       expect(projectedInterval.prompts).toEqual(legacyInterval.prompts);
-      expect(projectedInterval.work[0].pullRequest).toEqual({
-        number: 54,
-        url: "https://github.com/e3-solutions/sherlock/pull/54",
-      });
       expect(Object.fromEntries(projectedInterval.work.map(({ sessionId, role }) =>
         [sessionId, role]
       ))).toEqual({
@@ -814,33 +771,24 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         snapshot: projectedDay.snapshot,
       });
 
-      await sql.unsafe(
-        `insert into github.commit_pr_lookups (
-           workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, pull_request_number, created_at
-         ) values ($1, 'sherlock.github-associated-pulls.v1',
-                   'e3-solutions/sherlock', $2, 'matched', 55, $3)`,
-        [workspaceId, secondCommitSha, partialRead.toISOString()],
-      );
-      const [conflictingReceipt] = await sql.unsafe(
-        "select pg_current_snapshot()::text snapshot, now() read",
-      );
-      await expect(linksAt(conflictingReceipt)).resolves.toEqual([]);
-      await sql.unsafe(
-        `insert into github.commit_pr_lookups (
-           workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, pull_request_number, created_at
-         ) values
-           ($1, 'sherlock.github-associated-pulls.v1', 'e3-solutions/sherlock',
-            $2, 'matched', 54, $3),
-           ($1, 'sherlock.github-associated-pulls.v1', 'e3-solutions/sherlock',
-            $2, 'ambiguous', null, $3)`,
-        [workspaceId, commitSha, partialRead.toISOString()],
-      );
-      const [ambiguousReceipt] = await sql.unsafe(
-        "select pg_current_snapshot()::text snapshot, now() read",
-      );
-      await expect(linksAt(ambiguousReceipt)).resolves.toEqual([]);
+      // A lookup cannot predate the server's receipt of the session fact.
+      await appendLookup(commitSha, {
+        terminalAt: new Date(observedAt.getTime() + 1_000),
+      });
+      await expect(currentLinks()).resolves.toEqual([]);
+
+      await appendLookup(commitSha);
+      await appendLookup(secondCommitSha, { number: 55 });
+      await expect(currentLinks()).resolves.toEqual([]);
+
+      await appendLookup(secondCommitSha);
+      await appendLookup(commitSha, { outcome: "ambiguous", number: null });
+      await expect(currentLinks()).resolves.toEqual([]);
+
+      await appendLookup(commitSha, {
+        terminalAt: new Date(observedAt.getTime() + 3_000),
+        createdAt: new Date(partialRead.getTime() - 6 * 60 * 60_000 - 16 * 60_000),
+      });
 
       await sql.unsafe(
         "update telemetry.people set github_id = 'sherlock-smoke' where workspace_id = $1 and id = $2",

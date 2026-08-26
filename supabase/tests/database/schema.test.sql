@@ -1179,6 +1179,12 @@ begin
     (select attnotnull from pg_attribute
       where attrelid = 'telemetry.session_scm'::regclass
         and attname = 'server_received_at') and
+    exists (
+      select 1 from pg_constraint
+      where conrelid = 'telemetry.session_scm'::regclass and contype = 'p'
+        and pg_get_constraintdef(oid) =
+          'PRIMARY KEY (source_record_id, source_version)'
+    ) and
     pg_get_indexdef('telemetry.session_scm_recent_idx'::regclass) like
       '%(created_at DESC, workspace_id, repository_full_name, commit_sha)%' and
     exists (

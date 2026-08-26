@@ -17,7 +17,7 @@ with recent_sessions as materialized (
      and not is_replay and session_id is not null
      and server_received_at >= now() - interval '26 hours'
 ), candidates as materialized (
-  select job.id, job.workspace_id, job.batch_id
+  select job.id
     from processing.telemetry_jobs job
     join telemetry.ingest_batches batch
       on batch.workspace_id = job.workspace_id and batch.id = job.batch_id
@@ -113,12 +113,6 @@ if (import.meta.main) {
       if (ids.length === 0) break;
       after = ids.at(-1)!;
       scheduled += ids.length;
-      console.log(JSON.stringify({
-        event: "session_scm_backfill_checkpoint",
-        after_job_id: after.toString(),
-        through_job_id: through.toString(),
-        scheduled_jobs: scheduled,
-      }));
     }
     console.log(JSON.stringify({
       event: "session_scm_backfill_scheduled",

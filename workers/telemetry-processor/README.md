@@ -33,13 +33,11 @@ half-open claim. Processing errors, control-query errors, and heartbeat errors
 all reopen the same circuit; ordinary job failures continue through fenced retry
 handling.
 
-Set `GITHUB_TOKEN` to enable exact session-to-PR links. Use a fine-grained token
-with pull-request read access to the repositories that Sherlock observes.
-Repository renames and transfers deliberately fail closed: the stored canonical
-owner/name must match GitHub's response. Terminal matches are rechecked every
-six hours while their session remains dashboard-relevant. Token and rate-limit
-pauses are logged as worker state, not stored as failures for an arbitrary pair.
-Backlogged sync passes run each minute; caught-up passes run every five minutes.
+Set `GITHUB_TOKEN` to a fine-grained token with pull-request read access to
+enable exact session-to-PR links. Repository changes fail closed, terminal
+matches are rechecked every six hours, and auth or rate-limit pauses are logged
+without creating pair failures. Sync runs each minute while backlogged,
+otherwise every five minutes.
 
 ## First rollout and rollback
 
