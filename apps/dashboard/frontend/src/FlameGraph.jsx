@@ -598,19 +598,21 @@ function WorkDetail({
       <div className="flame-detail__work-heading">
         <p className="flame-detail__eyebrow">Session evidence</p>
         <h2 id={headingId}>{roleLabel(work.role)} session</h2>
-        <p>
-          <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
-          <span aria-hidden="true">–</span>
-          <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
-          <span aria-hidden="true"> · </span>
-          {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
-        </p>
-        {work.pullRequest && (
-          <PullRequestLink
-            pullRequest={work.pullRequest}
-            className="flame-detail__pull-request--heading"
-          />
-        )}
+        <div className="flame-detail__work-meta">
+          <p>
+            <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
+            <span aria-hidden="true">–</span>
+            <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
+            <span aria-hidden="true"> · </span>
+            {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
+          </p>
+          {work.pullRequest && (
+            <PullRequestLink
+              pullRequest={work.pullRequest}
+              className="flame-detail__pull-request--heading"
+            />
+          )}
+        </div>
         {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
       </div>
 

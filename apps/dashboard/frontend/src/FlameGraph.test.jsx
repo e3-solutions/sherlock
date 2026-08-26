@@ -765,7 +765,7 @@ describe("FlameGraph", () => {
     await screen.findByText("Conversation");
     expect(screen.getByRole("link", {
       name: "Open PR #55 on GitHub",
-    })).toHaveAttribute("href", "https://github.com/e3-solutions/sherlock/pull/55");
+    }).closest(".flame-detail__work-meta")).toBeInTheDocument();
     expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
 

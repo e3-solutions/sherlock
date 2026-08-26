@@ -1000,7 +1000,7 @@ input { font: inherit; }
 
 .flame-detail__pull-request--heading {
   width: fit-content;
-  margin: 8px 0 0;
+  margin: 0 0 0 auto;
 }
 
 .flame-detail__work-expander {
@@ -1060,7 +1060,13 @@ input { font: inherit; }
   font-weight: 600;
 }
 
-.flame-detail__work-heading > p:not(.flame-detail__eyebrow):not(.flame-detail__stale) {
+.flame-detail__work-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.flame-detail__work-meta > p {
   margin: 0;
   color: var(--flame-muted);
   font-size: 12px;
