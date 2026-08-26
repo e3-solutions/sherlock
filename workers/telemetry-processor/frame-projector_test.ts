@@ -254,27 +254,41 @@ Deno.test("projector reads only bounded source metadata and never copies content
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt,"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("storage_path"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("record_sha256"));
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $4"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $3"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("analytics.normalizer_cutovers"));
+  assert(
+    FRAME_SOURCE_EVENTS_SQL.includes("s.started_at >= cutover.cutover_at"),
+  );
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v1"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v2"));
 });
 
-Deno.test("activation proves the exact versioned normalization universe", () => {
+Deno.test("activation proves only the session-selected normalization version", () => {
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.native_records"),
   );
   assert(MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.events"));
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes(
-      "when 'codex' then $2",
+      "session.started_at",
     ),
   );
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes(
-      "when 'claude_code' then $3",
+      "batch.source_provider = 'claude_code'",
     ),
   );
   assert(
     !MISSING_NORMALIZATION_BATCHES_SQL.includes("processing.telemetry_jobs"),
   );
+  assert(
+    MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v1"),
+  );
+  assert(
+    MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v2"),
+  );
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("not exists ("));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("telemetry.events legacy"));
 });
 
 Deno.test("large revision writes are split below PostgreSQL's parameter limit", () => {

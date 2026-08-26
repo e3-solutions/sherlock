@@ -8,6 +8,7 @@ import {
   COMPATIBLE_WORK_FRAME_VERSION,
   DEFAULT_WORK_DETAIL_LIMIT,
   FRAME_VERSION,
+  FRESHNESS_NORMALIZER_VERSIONS,
   FRESHNESS_SQL,
   FLAME_SQL,
   INTERVAL_PROMPTS_SQL,
@@ -169,7 +170,7 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe).toHaveBeenCalledWith(FRESHNESS_SQL, [
       source.workspaceId,
       source.expectedEmailDomain,
-      { values: NORMALIZER_VERSIONS },
+      { values: FRESHNESS_NORMALIZER_VERSIONS },
       500,
     ]);
   });
@@ -547,12 +548,12 @@ describe("Sherlock Flame payload", () => {
     expect(() => encodeProjectionSnapshotToken({
       snapshot: PG_SNAPSHOT,
       read: READ,
-      frameVersion: "frame-evidence-v4",
+      frameVersion: "frame-evidence-v3",
     })).toThrow(FlameSourceError);
     const unsupported = Buffer.from(JSON.stringify([
       PG_SNAPSHOT,
       READ.toISOString(),
-      "frame-evidence-v4",
+      "frame-evidence-v3",
     ])).toString("base64url");
     expect(() => decodeSnapshotToken(`v2.${unsupported}`)).toThrow(FlameSourceError);
   });

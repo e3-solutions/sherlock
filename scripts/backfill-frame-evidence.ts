@@ -4,6 +4,7 @@ import postgres from "npm:postgres@3.4.7";
 import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
+  FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
@@ -11,6 +12,8 @@ import {
 } from "../packages/frame-evidence/constants.js";
 import { ACTIVITY_VERSION } from "../supabase/functions/sherlock-activity-reducer/reducer.ts";
 import {
+  frameSourceCutoverJoinSql,
+  frameSourceNormalizerPredicateSql,
   nativeItemTimestampSql,
   PostgresFrameEvidenceProjector,
 } from "../workers/telemetry-processor/frame-projector.ts";
@@ -30,32 +33,40 @@ interface ActivationOptions {
 
 const RELEVANT_EVENT_WINDOW_SQL = `(
   coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-    >= $4::timestamptz - make_interval(secs => $5)
+    >= $3::timestamptz - make_interval(secs => $4)
   or ${nativeItemTimestampSql("e.native_item_id")}
-    >= $4::timestamptz - make_interval(secs => $5)
+    >= $3::timestamptz - make_interval(secs => $4)
 )`;
 
 export const FRAME_ACTIVATION_PROOF_SQL = `
-with relevant_sessions as (
-  select distinct e.session_id
+with selected_events as materialized (
+  select e.id, e.session_id, s.updated_at session_updated_at,
+         e.occurred_at, e.observed_at, e.server_received_at, e.native_item_id
     from telemetry.events e
-   where e.workspace_id = $1 and e.normalizer_version = any($2::text[])
-     and not e.is_replay and ${RELEVANT_EVENT_WINDOW_SQL}
-), current_source as (
-  select s.id session_id, s.updated_at session_updated_at,
-         max(e.id) through_event_id, count(*)::bigint source_event_count
-    from telemetry.sessions s
-    join relevant_sessions relevant on relevant.session_id = s.id
-    join telemetry.events e
-      on e.workspace_id = s.workspace_id and e.session_id = s.id
-   where s.workspace_id = $1 and e.normalizer_version = any($2::text[])
+    join telemetry.sessions s
+      on s.workspace_id = e.workspace_id and s.id = e.session_id
+    join telemetry.native_records record
+      on record.workspace_id = e.workspace_id and record.id = e.source_record_id
+    join telemetry.ingest_batches batch
+      on batch.workspace_id = record.workspace_id and batch.id = record.batch_id
+    ${frameSourceCutoverJoinSql("s", "batch", "cutover")}
+   where e.workspace_id = $1
+     and ${frameSourceNormalizerPredicateSql("e", "s", "batch", "cutover")}
      and not e.is_replay
-   group by s.id, s.updated_at
+), relevant_sessions as (
+  select distinct e.session_id from selected_events e
+   where ${RELEVANT_EVENT_WINDOW_SQL}
+), current_source as (
+  select e.session_id, e.session_updated_at,
+         max(e.id) through_event_id, count(*)::bigint source_event_count
+    from selected_events e
+    join relevant_sessions relevant using (session_id)
+   group by e.session_id, e.session_updated_at
 ), latest_receipt as (
   select distinct on (session_id)
          session_id, through_event_id, source_event_count, session_updated_at
     from analytics.frame_projection_receipts
-   where workspace_id = $1 and frame_version = $3
+   where workspace_id = $1 and frame_version = $2
    order by session_id, id desc
 )
 select current_source.session_id::text session_id
@@ -72,9 +83,17 @@ select current_source.session_id::text session_id
 export const MISSING_NORMALIZATION_BATCHES_SQL = `
 select batch.id::text batch_id
   from telemetry.ingest_batches batch
+  left join telemetry.sessions session
+    on session.workspace_id = batch.workspace_id
+   and session.collector_key = batch.collector_key
+   and session.native_session_id = batch.observed_native_session_id
+  left join analytics.normalizer_cutovers cutover
+    on cutover.workspace_id = batch.workspace_id
+   and cutover.source_provider = batch.source_provider
+   and cutover.to_normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
  where batch.workspace_id = $1
    and coalesce(batch.last_occurred_at, batch.committed_at)
-       >= $4::timestamptz - make_interval(secs => $5)
+       >= $2::timestamptz - make_interval(secs => $3)
    and exists (
      select 1
        from telemetry.native_records record
@@ -85,11 +104,30 @@ select batch.id::text batch_id
             from telemetry.events event
            where event.workspace_id = record.workspace_id
              and event.source_record_id = record.id
-             and event.normalizer_version = case batch.source_provider
-               when 'codex' then $2
-               when 'claude_code' then $3
-               else null
-             end
+             and (
+               batch.source_provider = 'claude_code'
+               and event.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
+               or batch.source_provider = 'codex'
+               and (
+                 cutover.cutover_at is null
+                 or coalesce(
+                   session.started_at,
+                   batch.first_occurred_at,
+                   batch.committed_at
+                 ) >= cutover.cutover_at
+               )
+               and event.normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
+               or batch.source_provider = 'codex'
+               and coalesce(
+                 session.started_at,
+                 batch.first_occurred_at,
+                 batch.committed_at
+               ) < cutover.cutover_at
+               and event.normalizer_version in (
+                 '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}',
+                 '${FRAME_CODEX_NORMALIZER_VERSION}'
+               )
+             )
         )
    )
  order by batch.id
@@ -104,12 +142,11 @@ export async function proveAndActivateFrameProjection(
     Date.now() - FRAME_WINDOW_HOURS * 60 * 60 * 1_000,
   );
   await sql.begin("isolation level repeatable read", async (tx) => {
+    await tx.unsafe("set local statement_timeout = '30s'");
     const missingNormalization = await tx.unsafe(
       MISSING_NORMALIZATION_BATCHES_SQL,
       [
         options.workspaceId,
-        FRAME_CODEX_NORMALIZER_VERSION,
-        FRAME_CLAUDE_NORMALIZER_VERSION,
         windowStart.toISOString(),
         FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
       ],
@@ -121,7 +158,6 @@ export async function proveAndActivateFrameProjection(
     }
     const missing = await tx.unsafe(FRAME_ACTIVATION_PROOF_SQL, [
       options.workspaceId,
-      tx.array([...FRAME_NORMALIZER_VERSIONS]),
       FRAME_VERSION,
       windowStart.toISOString(),
       FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
@@ -167,30 +203,40 @@ if (import.meta.main) {
            from telemetry.sessions s
            join telemetry.events e
              on e.workspace_id = s.workspace_id and e.session_id = s.id
-            and e.normalizer_version = any($2::text[]) and not e.is_replay
-            and (
-              coalesce(e.occurred_at, e.observed_at, e.server_received_at)
-                >= $6::timestamptz - make_interval(secs => $7)
-              or ${nativeItemTimestampSql("e.native_item_id")}
-                >= $6::timestamptz - make_interval(secs => $7)
-            )
+           join telemetry.native_records record
+             on record.workspace_id = e.workspace_id
+            and record.id = e.source_record_id
+           join telemetry.ingest_batches batch
+             on batch.workspace_id = record.workspace_id
+            and batch.id = record.batch_id
+           ${frameSourceCutoverJoinSql("s", "batch", "cutover")}
            left join processing.telemetry_jobs j
              on j.workspace_id = s.workspace_id and j.session_id = s.id
             and j.job_kind = 'reduce'
-            and j.normalizer_version = any($2::text[])
-            and j.activity_version = $5
-          where s.workspace_id = $1 and ($3::uuid is null or s.id > $3::uuid)
+            and j.normalizer_version = any($7::text[])
+            and j.activity_version = $4
+          where s.workspace_id = $1 and ($2::uuid is null or s.id > $2::uuid)
+            and ${
+          frameSourceNormalizerPredicateSql("e", "s", "batch", "cutover")
+        }
+            and not e.is_replay
+            and (
+              coalesce(e.occurred_at, e.observed_at, e.server_received_at)
+                >= $5::timestamptz - make_interval(secs => $6)
+              or ${nativeItemTimestampSql("e.native_item_id")}
+                >= $5::timestamptz - make_interval(secs => $6)
+            )
           group by s.id
           order by s.id
-          limit $4`,
+          limit $3`,
         [
           options.workspaceId,
-          sql.array([...FRAME_NORMALIZER_VERSIONS]),
           after,
           options.sessionBatchSize,
           ACTIVITY_VERSION,
           coveredFrom.toISOString(),
           FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
+          sql.array([...FRAME_NORMALIZER_VERSIONS]),
         ],
       );
       for (const session of sessions) {
