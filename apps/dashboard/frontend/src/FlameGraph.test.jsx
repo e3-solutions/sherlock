@@ -760,8 +760,13 @@ describe("FlameGraph", () => {
     );
     expect(pullRequest).toHaveAttribute("target", "_blank");
     expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
-    expect(screen.getByRole("button", { name: /Subagent session/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Subagent session/ }));
+    await screen.findByText("Conversation");
+    expect(screen.getByRole("link", {
+      name: "Open PR #55 on GitHub",
+    })).toHaveAttribute("href", "https://github.com/e3-solutions/sherlock/pull/55");
     expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
 
     const workExpander = screen.getByRole("button", { name: "Show 2 more sessions" });
     expect(workExpander).toHaveAttribute("aria-expanded", "false");

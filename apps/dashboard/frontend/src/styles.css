@@ -985,6 +985,11 @@ input { font: inherit; }
   background: var(--flame-surface-selected);
 }
 
+.flame-detail__pull-request--heading {
+  width: fit-content;
+  margin: 12px 0 0;
+}
+
 .flame-detail__work-expander {
   width: 100%;
   margin-top: 8px;

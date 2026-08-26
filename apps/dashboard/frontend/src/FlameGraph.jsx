@@ -412,6 +412,20 @@ function DrawerCloseButton({ closing, onClose }) {
   );
 }
 
+function PullRequestLink({ pullRequest, className = "" }) {
+  return (
+    <a
+      className={`flame-detail__pull-request ${className}`.trim()}
+      href={pullRequest.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={`Open PR #${pullRequest.number} on GitHub`}
+    >
+      PR #{pullRequest.number}
+    </a>
+  );
+}
+
 function IntervalOverview({
   person,
   point,
@@ -460,15 +474,7 @@ function IntervalOverview({
       <li key={work.id}>
         <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
         {work.pullRequest && (
-          <a
-            className="flame-detail__pull-request"
-            href={work.pullRequest.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label={`Open PR #${work.pullRequest.number} on GitHub`}
-          >
-            PR #{work.pullRequest.number}
-          </a>
+          <PullRequestLink pullRequest={work.pullRequest} />
         )}
       </li>
     );
@@ -596,6 +602,12 @@ function WorkDetail({
           <span aria-hidden="true"> · </span>
           {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
         </p>
+        {work.pullRequest && (
+          <PullRequestLink
+            pullRequest={work.pullRequest}
+            className="flame-detail__pull-request--heading"
+          />
+        )}
         {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
       </div>
 
@@ -1141,6 +1153,7 @@ export default function FlameGraph({
       firstAtMs: work.firstAtMs,
       lastAtMs: work.lastAtMs,
       eventCount: work.eventCount,
+      pullRequest: work.pullRequest,
     });
   };
 
