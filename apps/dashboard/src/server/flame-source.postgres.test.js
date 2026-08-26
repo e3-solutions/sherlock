@@ -178,6 +178,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     const partialActivityAt = new Date(FIXED_NOW.getTime() + 1_000);
     const newestGuardianAt = new Date(partialActivityAt.getTime() + 500);
     const commitSha = "1".repeat(40);
+    const secondCommitSha = "2".repeat(40);
     const linksAt = (receipt) => sql.unsafe(INTERVAL_PULL_REQUESTS_SQL, [
       workspaceId, receipt.snapshot, partialRead.toISOString(), [sessionId],
     ]);
@@ -223,8 +224,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            committed_at
          ) values (
            $1, $2, $3, 'projection-collector', 'codex', 'rollout',
-           'projection-stream', 'projection-generation', 0, 0, 1, 1, $4,
-           $5, 'gzip', 1, $6, 1, 'sherlock.rollout-batch.v1', $7, $7, $8
+           'projection-stream', 'projection-generation', 0, 0, 3, 3, $4,
+           $5, 'gzip', 1, $6, 3, 'sherlock.rollout-batch.v1', $7, $7, $8
          )`,
         [
           batchId,
@@ -242,34 +243,61 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            workspace_id, batch_id, record_index, source_start_offset,
            source_end_offset, record_sha256, native_type,
            native_payload_type, occurred_at, parse_status
-         ) values ($1, $2, 0, 0, 1, $3, 'event_msg', 'user_message', $4, 'ok')
-         returning id::text id`,
-        [workspaceId, batchId, "c".repeat(64), observedAt.toISOString()],
+         ) values
+           ($1, $2, 0, 0, 1, $3, 'event_msg', 'user_message', $4, 'ok'),
+           ($1, $2, 1, 1, 2, $5, 'session_meta', 'session_meta', $4, 'ok'),
+           ($1, $2, 2, 2, 3, $6, 'session_meta', 'session_meta', $4, 'ok')
+         returning id::text id, record_index`,
+        [
+          workspaceId,
+          batchId,
+          "c".repeat(64),
+          observedAt.toISOString(),
+          "1".repeat(64),
+          "2".repeat(64),
+        ],
       );
+      const sourceRecordId = (recordIndex) =>
+        nativeRows.find((row) => row.record_index === recordIndex).id;
       await sql.unsafe(
         `insert into telemetry.session_scm (
            workspace_id, source_record_id, session_id, source_version,
            repository_full_name, commit_sha, observed_at, server_received_at
-         ) values ($1, $2, $3, 'sherlock.github-scm.v1',
-                   'e3-solutions/sherlock', $4, $5, $6)`,
+         ) values
+           ($1, $2, $4, 'sherlock.github-scm.v1',
+            'e3-solutions/sherlock', $5, $6, $7),
+           ($1, $3, $4, 'sherlock.github-scm.v1',
+            'e3-solutions/sherlock', $8, $6, $7)`,
         [
           workspaceId,
-          nativeRows[0].id,
+          sourceRecordId(1),
+          sourceRecordId(2),
           sessionId,
           commitSha,
           observedAt.toISOString(),
           scmReceivedAt.toISOString(),
+          secondCommitSha,
         ],
       );
       await sql.unsafe(
         `insert into github.commit_pr_lookups (
            workspace_id, source_version, repository_full_name, commit_sha,
            outcome, pull_request_number, pull_request_terminal_at, created_at
-         ) values ($1, 'sherlock.github-associated-pulls.v1',
-                   'e3-solutions/sherlock', $2, 'matched', 54,
-                   $3::timestamptz - interval '1 second',
-                   $4::timestamptz - interval '1 minute')`,
-        [workspaceId, commitSha, observedAt.toISOString(), partialRead.toISOString()],
+         ) values
+           ($1, 'sherlock.github-associated-pulls.v1',
+            'e3-solutions/sherlock', $2, 'matched', 54,
+            $4::timestamptz - interval '1 second',
+            $5::timestamptz - interval '1 minute'),
+           ($1, 'sherlock.github-associated-pulls.v1',
+            'e3-solutions/sherlock', $3, 'matched', 54, null,
+            $5::timestamptz - interval '1 minute')`,
+        [
+          workspaceId,
+          commitSha,
+          secondCommitSha,
+          observedAt.toISOString(),
+          partialRead.toISOString(),
+        ],
       );
       const [terminalReceipt] = await sql.unsafe(
         "select pg_current_snapshot()::text snapshot, now() read",
@@ -292,6 +320,20 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       await sql.unsafe(
         `insert into github.commit_pr_lookups (
            workspace_id, source_version, repository_full_name, commit_sha,
+           outcome, pull_request_number, pull_request_terminal_at, created_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1',
+                   'e3-solutions/sherlock', $2, 'matched', 54,
+                   $3::timestamptz + interval '3 seconds',
+                   $4::timestamptz - interval '6 hours 16 minutes')`,
+        [workspaceId, commitSha, observedAt.toISOString(), partialRead.toISOString()],
+      );
+      const [staleTerminalReceipt] = await sql.unsafe(
+        "select pg_current_snapshot()::text snapshot, now() read",
+      );
+      await expect(linksAt(staleTerminalReceipt)).resolves.toEqual([]);
+      await sql.unsafe(
+        `insert into github.commit_pr_lookups (
+           workspace_id, source_version, repository_full_name, commit_sha,
            outcome, pull_request_number, created_at
          ) values ($1, 'sherlock.github-associated-pulls.v1',
                    'e3-solutions/sherlock', $2, 'matched', 54, $3)`,
@@ -311,7 +353,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [
           workspaceId,
           sessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           promptSourceAt.toISOString(),
           promptNativeItemId,
@@ -330,7 +372,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [
           workspaceId,
           sessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           partialActivityAt.toISOString(),
         ],
@@ -356,7 +398,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           workspaceId,
           guardianSessionId,
           workerSessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           new Date(bucketStart.getTime() + 2_000).toISOString(),
           new Date(bucketStart.getTime() + 2_500).toISOString(),
@@ -586,15 +628,15 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       await sql.unsafe(
         `insert into github.commit_pr_lookups (
            workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, created_at
+           outcome, pull_request_number, created_at
          ) values ($1, 'sherlock.github-associated-pulls.v1',
-                   'e3-solutions/sherlock', $2, 'failed', $3)`,
-        [workspaceId, commitSha, partialRead.toISOString()],
+                   'e3-solutions/sherlock', $2, 'matched', 55, $3)`,
+        [workspaceId, secondCommitSha, partialRead.toISOString()],
       );
-      const [failedReceipt] = await sql.unsafe(
+      const [conflictingReceipt] = await sql.unsafe(
         "select pg_current_snapshot()::text snapshot, now() read",
       );
-      await expect(linksAt(failedReceipt)).resolves.toEqual([]);
+      await expect(linksAt(conflictingReceipt)).resolves.toEqual([]);
       await sql.unsafe(
         `insert into github.commit_pr_lookups (
            workspace_id, source_version, repository_full_name, commit_sha,
@@ -606,6 +648,10 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
             $2, 'ambiguous', null, $3)`,
         [workspaceId, commitSha, partialRead.toISOString()],
       );
+      const [ambiguousReceipt] = await sql.unsafe(
+        "select pg_current_snapshot()::text snapshot, now() read",
+      );
+      await expect(linksAt(ambiguousReceipt)).resolves.toEqual([]);
 
       await sql.unsafe(
         "update telemetry.people set github_id = 'sherlock-smoke' where workspace_id = $1 and id = $2",
@@ -669,7 +715,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [
           workspaceId,
           sessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           new Date(observedAt.getTime() + 500).toISOString(),
         ],

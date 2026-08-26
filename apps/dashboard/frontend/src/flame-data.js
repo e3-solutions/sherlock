@@ -370,7 +370,10 @@ function requirePullRequest(value, path) {
   const pullRequest = requireObject(value, path);
   const number = requirePositiveCount(pullRequest.number, `${path}.number`);
   const url = requireNonemptyString(pullRequest.url, `${path}.url`);
-  if (!new RegExp(`^https://github\\.com/[^/]+/[^/]+/pull/${number}$`).test(url)) {
+  const match = new RegExp(
+    `^https://github\\.com/([a-z0-9_.-]+)/([a-z0-9_.-]+)/pull/${number}$`,
+  ).exec(url);
+  if (!match || match.slice(1).some((part) => part === "." || part === "..")) {
     fail(`${path}.url`, "the matching GitHub pull request URL");
   }
   return { number, url };

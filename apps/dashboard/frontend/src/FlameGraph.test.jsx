@@ -814,6 +814,8 @@ describe("FlameGraph", () => {
 
     expect(screen.queryByRole("link", { name: "Open PR #55 on GitHub" })).toBeNull();
     await act(() => refreshedInterval);
+    fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
+    await screen.findByText("3 human prompts");
     expect(screen.queryByRole("link", { name: "Open PR #55 on GitHub" })).toBeNull();
   });
 

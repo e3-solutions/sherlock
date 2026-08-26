@@ -376,7 +376,7 @@ describe("interval and work evidence adapters", () => {
     expect(result.prompts).toEqual([expect.objectContaining({
       id: "native:msg-1", content: "Investigate the cursor",
     })]);
-    value.work[0].pullRequest.url = "https://example.com/not-the-exact-pr";
+    value.work[0].pullRequest.url = "https://github.com/../sherlock/pull/54";
     expect(() => adaptIntervalEvidence(value, expected)).toThrow(FlameDataError);
   });
 

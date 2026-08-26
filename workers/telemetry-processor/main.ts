@@ -17,7 +17,8 @@ const OVERLOAD_SAMPLE_COUNT = 2;
 const CAPACITY_RETRY_BASE_MILLISECONDS = 30_000;
 const CAPACITY_RETRY_MAX_MILLISECONDS = 120_000;
 const HANDOFF_POLL_MILLISECONDS = 1_000;
-const GITHUB_SYNC_INTERVAL_MILLISECONDS = 60_000;
+const GITHUB_BACKLOG_INTERVAL_MILLISECONDS = 60_000;
+const GITHUB_CAUGHT_UP_INTERVAL_MILLISECONDS = 300_000;
 export const MAX_ADMISSIONS_PER_PASS = 1;
 
 export interface WorkerConfig {
@@ -338,6 +339,8 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
   let stopping = false;
   let githubTask: Promise<void> | null = null;
   let nextGithubSyncAt = 0;
+  let githubRateLimitAttempts = 0;
+  let githubAuthRejected = false;
   const shutdown = new AbortController();
   let lastReaperAt = 0;
   let lastOverloadSampleAt = 0;
@@ -415,10 +418,10 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         continue;
       }
       if (
-        config.githubToken && githubTask === null &&
+        config.githubToken && !githubAuthRejected && githubTask === null &&
         Date.now() >= nextGithubSyncAt
       ) {
-        nextGithubSyncAt = Date.now() + GITHUB_SYNC_INTERVAL_MILLISECONDS;
+        nextGithubSyncAt = Date.now() + GITHUB_BACKLOG_INTERVAL_MILLISECONDS;
         githubTask = syncPending(queue, config.githubToken, {
           signal: shutdown.signal,
           onError: (error, pair) =>
@@ -427,7 +430,40 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
               repository: pair.repositoryFullName,
               error_code: errorCode(error),
             }),
-        }).then((result) => log("github_sync_complete", result)).catch(
+        }).then((result) => {
+          const pause = result.pause;
+          if (pause?.status === 401) {
+            githubAuthRejected = true;
+            log("github_sync_paused", {
+              http_status: pause.status,
+              retry_source: pause.retrySource,
+            });
+          } else if (pause) {
+            githubRateLimitAttempts += 1;
+            const now = Date.now();
+            const fallbackDelay = retryDelaySeconds(
+              githubRateLimitAttempts,
+              60,
+              900,
+            ) * 1_000;
+            nextGithubSyncAt = Math.max(
+              nextGithubSyncAt,
+              pause.retryAtMs ?? now + fallbackDelay,
+            );
+            log("github_sync_paused", {
+              http_status: pause.status,
+              retry_source: pause.retrySource,
+              retry_in_ms: Math.max(0, nextGithubSyncAt - now),
+            });
+          } else {
+            githubRateLimitAttempts = 0;
+            nextGithubSyncAt = Date.now() +
+              (result.backlogRemaining
+                ? GITHUB_BACKLOG_INTERVAL_MILLISECONDS
+                : GITHUB_CAUGHT_UP_INTERVAL_MILLISECONDS);
+          }
+          log("github_sync_complete", { ...result });
+        }).catch(
           (error) => {
             if (!shutdown.signal.aborted) {
               log("github_sync_failed", { error_code: errorCode(error) });

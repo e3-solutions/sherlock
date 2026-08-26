@@ -815,9 +815,10 @@ select session_id::text, min(repository_full_name) repository_full_name,
  group by session_id
 having bool_and(coalesce(
     outcome = 'matched' and
-    (pull_request_terminal_at is not null or
-      created_at between p.snapshot_read - interval '15 minutes'
-                            and p.snapshot_read) and
+    created_at between p.snapshot_read - case
+      when pull_request_terminal_at is null then interval '15 minutes'
+      else interval '6 hours 15 minutes'
+    end and p.snapshot_read and
     observed_at <= coalesce(
       pull_request_terminal_at, 'infinity'::timestamptz
     ) and

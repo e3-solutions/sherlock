@@ -160,12 +160,12 @@ export class PostgresJobQueue {
               order by id desc
               limit 1
            ) latest on true
-          where latest.id is null or (
-            latest.created_at < now() - interval '10 minutes' and not (
-              latest.outcome = 'matched' and
-              latest.pull_request_terminal_at is not null
-            )
-          )
+          where latest.id is null or latest.created_at < now() - case
+            when latest.outcome = 'matched' and
+                 latest.pull_request_terminal_at is not null
+              then interval '6 hours'
+            else interval '10 minutes'
+          end
           order by (latest.id is not null), latest.id,
                    observed.workspace_id, observed.repository_full_name,
                    observed.commit_sha

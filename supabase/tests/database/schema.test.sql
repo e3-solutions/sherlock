@@ -1039,8 +1039,14 @@ begin
         and attname = 'server_received_at') and
     pg_get_indexdef('telemetry.session_scm_recent_idx'::regclass) like
       '%(created_at DESC, workspace_id, repository_full_name, commit_sha)%' and
-    pg_get_indexdef('telemetry.events_server_received_brin_idx'::regclass) like
-      '%USING brin (server_received_at)%' and
+    exists (
+      select 1 from pg_index i
+      where i.indexrelid =
+          to_regclass('telemetry.events_server_received_brin_idx')
+        and i.indisvalid
+        and pg_get_indexdef(i.indexrelid) like
+          '%USING brin (server_received_at)%'
+    ) and
     exists (
       select 1
       from pg_index i

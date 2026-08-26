@@ -36,7 +36,10 @@ handling.
 Set `GITHUB_TOKEN` to enable exact session-to-PR links. Use a fine-grained token
 with pull-request read access to the repositories that Sherlock observes.
 Repository renames and transfers deliberately fail closed: the stored canonical
-owner/name must match GitHub's response.
+owner/name must match GitHub's response. Terminal matches are rechecked every
+six hours while their session remains dashboard-relevant. Token and rate-limit
+pauses are logged as worker state, not stored as failures for an arbitrary pair.
+Backlogged sync passes run each minute; caught-up passes run every five minutes.
 
 ## First rollout and rollback
 
@@ -53,7 +56,7 @@ schema work or replacement startup:
    confirm it owns the handoff before processing begins.
 
 For exact PR links, keep `GITHUB_TOKEN` unset and apply all migrations through
-`20260826172214_add_events_server_received_brin_index.sql` before step 4. Then
+`20260826182052_add_exact_session_pull_request_sources.sql` before step 4. Then
 run `deno run --allow-env --allow-net scripts/backfill-session-scm.ts`, wait for
 the replayed jobs to finish, and enable the token. The restart-safe replay is
 limited to the dashboard's 26-hour database-received evidence window.

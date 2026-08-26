@@ -1,4 +1,5 @@
 const GITHUB_API_VERSION = "2026-03-10";
+const GITHUB_SYNC_BATCH_SIZE = 25;
 
 export interface CommitPair {
   workspaceId: string;
@@ -17,8 +18,25 @@ export interface LookupStore {
   appendGithubLookup(result: LookupResult): Promise<void>;
 }
 
+export interface GithubSyncPause {
+  status: 401 | 403 | 429;
+  retryAtMs: number | null;
+  retrySource: "retry_after" | "rate_reset" | "exponential" | "restart";
+}
+
+export interface GithubSyncSummary {
+  attempted: number;
+  matched: number;
+  failed: number;
+  backlogRemaining: boolean;
+  pause: GithubSyncPause | null;
+}
+
 class GitHubSyncError extends Error {
-  constructor(readonly code: string, readonly status: number | null = null) {
+  constructor(
+    readonly code: string,
+    readonly pause: GithubSyncPause | null = null,
+  ) {
     super(code);
   }
 }
@@ -53,11 +71,61 @@ function timestamp(value: unknown): string | null {
   return date.toISOString();
 }
 
+async function githubPause(
+  response: Response,
+  nowMs: number,
+): Promise<GithubSyncPause | null> {
+  const status = response.status;
+  if (status === 401) {
+    return { status, retryAtMs: null, retrySource: "restart" };
+  }
+  if (status !== 403 && status !== 429) return null;
+
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter !== null) {
+    const seconds = /^\d+$/.test(retryAfter) ? Number(retryAfter) : null;
+    const parsed = seconds === null
+      ? Date.parse(retryAfter)
+      : nowMs + seconds * 1_000;
+    return {
+      status,
+      retryAtMs: Number.isFinite(parsed) ? Math.max(nowMs, parsed) : null,
+      retrySource: "retry_after",
+    };
+  }
+  if (response.headers.get("x-ratelimit-remaining") === "0") {
+    const reset = response.headers.get("x-ratelimit-reset");
+    const parsed = reset !== null && /^\d+$/.test(reset)
+      ? Number(reset) * 1_000
+      : NaN;
+    return {
+      status,
+      retryAtMs: Number.isFinite(parsed) ? Math.max(nowMs, parsed) : null,
+      retrySource: Number.isFinite(parsed) ? "rate_reset" : "exponential",
+    };
+  }
+  if (status === 429) {
+    return { status, retryAtMs: null, retrySource: "exponential" };
+  }
+
+  let message = "";
+  try {
+    const body = record(await response.json());
+    if (typeof body?.message === "string") message = body.message.slice(0, 512);
+  } catch {
+    // An ordinary, unstructured 403 is scoped to this repository.
+  }
+  return /rate limit|abuse detection/i.test(message)
+    ? { status, retryAtMs: null, retrySource: "exponential" }
+    : null;
+}
+
 export async function lookupCommit(
   pair: CommitPair,
   token: string,
   fetcher: typeof fetch = fetch,
   signal?: AbortSignal,
+  now: () => number = Date.now,
 ): Promise<LookupResult> {
   const [owner, repository] = pair.repositoryFullName.split("/");
   const url = "https://api.github.com/repos/" + encodeURIComponent(owner) +
@@ -76,7 +144,7 @@ export async function lookupCommit(
   if (!response.ok) {
     throw new GitHubSyncError(
       "github_http_" + response.status,
-      response.status,
+      await githubPause(response, now()),
     );
   }
 
@@ -120,32 +188,44 @@ export async function syncPending(
     fetcher?: typeof fetch;
     signal?: AbortSignal;
     onError?: (error: unknown, pair: CommitPair) => void;
+    now?: () => number;
   } = {},
-): Promise<{ attempted: number; matched: number; failed: number }> {
+): Promise<GithubSyncSummary> {
   const counts = { attempted: 0, matched: 0, failed: 0 };
+  let pause: GithubSyncPause | null = null;
   options.signal?.throwIfAborted();
-  for (const pair of await store.pendingGithubCommitPairs(25)) {
+  const pending = await store.pendingGithubCommitPairs(
+    GITHUB_SYNC_BATCH_SIZE + 1,
+  );
+  for (const pair of pending.slice(0, GITHUB_SYNC_BATCH_SIZE)) {
     options.signal?.throwIfAborted();
     counts.attempted += 1;
+    let result: LookupResult;
     try {
-      const result = await lookupCommit(
+      result = await lookupCommit(
         pair,
         token,
         options.fetcher,
         options.signal,
+        options.now,
       );
-      await store.appendGithubLookup(result);
-      if (result.outcome === "matched") counts.matched += 1;
     } catch (error) {
       if (options.signal?.aborted) options.signal.throwIfAborted();
+      if (error instanceof GitHubSyncError && error.pause) {
+        pause = error.pause;
+        break;
+      }
       options.onError?.(error, pair);
-      await store.appendGithubLookup(outcome(pair, "failed"));
       counts.failed += 1;
-      if (
-        error instanceof GitHubSyncError &&
-        (error.status === 401 || error.status === 403 || error.status === 429)
-      ) break;
+      await store.appendGithubLookup(outcome(pair, "failed"));
+      continue;
     }
+    await store.appendGithubLookup(result);
+    if (result.outcome === "matched") counts.matched += 1;
   }
-  return counts;
+  return {
+    ...counts,
+    backlogRemaining: pause !== null || pending.length > GITHUB_SYNC_BATCH_SIZE,
+    pause,
+  };
 }
