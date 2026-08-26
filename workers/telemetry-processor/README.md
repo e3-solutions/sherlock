@@ -34,9 +34,10 @@ all reopen the same circuit; ordinary job failures continue through fenced retry
 handling.
 
 Set `SHERLOCK_GITHUB_WORKSPACE_IDS` to a comma-separated workspace UUID
-allowlist. Adding a workspace enables its backfill and live lookup without a
-code deploy. Set `GITHUB_TOKEN` to a fine-grained token with pull-request read
-access to enable sync; startup rejects a token without an allowlist. Repository
+allowlist. Live lookup uses it immediately; rerun the manual backfill after
+adding a workspace. Set `GITHUB_TOKEN` to a fine-grained token with
+pull-request read access to enable sync; startup rejects a token without an
+allowlist. Repository
 changes fail closed, terminal matches are rechecked every six hours, and auth or
 rate-limit pauses are logged without creating pair failures. Sync runs each
 minute while backlogged, otherwise every five minutes.

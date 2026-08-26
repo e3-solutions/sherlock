@@ -913,7 +913,6 @@ having bool_and(coalesce(
     ),
     false
   )) and count(distinct (repository_full_name, pull_request_number)) = 1
- order by session_id
 `;
 
 export const WORK_DETAIL_SQL = `
