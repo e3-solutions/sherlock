@@ -422,6 +422,9 @@ function PullRequestLink({ pullRequest, className = "" }) {
       aria-label={`Open PR #${pullRequest.number} on GitHub`}
     >
       PR #{pullRequest.number}
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 16 16">
+        <path d="M5 11 11 5M6 5h5v5" />
+      </svg>
     </a>
   );
 }

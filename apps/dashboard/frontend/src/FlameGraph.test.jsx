@@ -760,6 +760,7 @@ describe("FlameGraph", () => {
     );
     expect(pullRequest).toHaveAttribute("target", "_blank");
     expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
+    expect(pullRequest.querySelector("svg")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Subagent session/ }));
     await screen.findByText("Conversation");
     expect(screen.getByRole("link", {
