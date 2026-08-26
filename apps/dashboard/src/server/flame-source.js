@@ -5,10 +5,27 @@ export const BUCKET_MS = 10 * 60 * 1000;
 // Keep this immutable reader contract aligned with the worker's frame version.
 // The dashboard Docker build context is apps/dashboard, so it cannot import the
 // repository-level worker module at runtime.
-export const FRAME_VERSION = "frame-evidence-v1";
-export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const FRAME_VERSION = "frame-evidence-v4";
+// Prompt classification moved into Codex normalization v2. During the v3
+// backfill, continue serving work from the already-active immutable v2
+// projection so interval clicks never regress to raw activity scans. Frame v4
+// selects Codex v1/v2 per immutable workspace cutover and session start.
+export const COMPATIBLE_WORK_FRAME_VERSION = "frame-evidence-v2";
+export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
+// Frozen source universe for raw v3 snapshot tokens. Add a new token version
+// before changing either provider version.
 export const NORMALIZER_VERSIONS = Object.freeze([
+  NORMALIZER_VERSION,
+  CLAUDE_NORMALIZER_VERSION,
+]);
+export const LEGACY_NORMALIZER_VERSIONS = Object.freeze([
+  LEGACY_CODEX_NORMALIZER_VERSION,
+  CLAUDE_NORMALIZER_VERSION,
+]);
+export const FRESHNESS_NORMALIZER_VERSIONS = Object.freeze([
+  LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
@@ -19,6 +36,7 @@ const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
 export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
 const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
+const RAW_SNAPSHOT_TOKEN_VERSION = "v3";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -36,7 +54,26 @@ export const MAX_WORK_DETAIL_LIMIT = 100;
 export const MCP_PROMPT_EVIDENCE_LIMIT = 5;
 export const PREFERRED_DASHBOARD_EMAIL_DOMAIN = "e3group.ai";
 export const SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN = "sixtyfour.ai";
-
+const INTERNAL_CONTEXT_PREFIXES = Object.freeze([
+  "<recommended_plugins>",
+  "<in-app-browser-context",
+  "<app-context",
+  "<skills_instructions",
+  "<permissions instructions",
+  "<permissions_instructions>",
+  "<environment_context>",
+  "<collaboration_mode>",
+  "<apps_instructions>",
+  "<plugins_instructions>",
+  "<codex_delegation>",
+  "<heartbeat>",
+  "<turn_aborted>",
+  "<automation",
+  "<skill>",
+  "# AGENTS.md instructions",
+  "# Bonaparte Implementation",
+  "The configured soft phase budget has expired.",
+]);
 export function validateDashboardEmailDomain(value) {
   if (![PREFERRED_DASHBOARD_EMAIL_DOMAIN, SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN].includes(value)) {
     throw new TypeError("SHERLOCK_DASHBOARD_EMAIL_DOMAIN must be e3group.ai or sixtyfour.ai");
@@ -52,6 +89,26 @@ function nativeItemTimestamp(column) {
     ) / 1000.0)
     else null
   end`;
+}
+
+function internalContextPrefixExclusion(column) {
+  return INTERNAL_CONTEXT_PREFIXES.map((prefix) =>
+    `left(btrim(${column}), ${prefix.length}) <> '${
+      prefix.replaceAll("'", "''")
+    }'`
+  ).join("\n       and ");
+}
+
+function nativePromptContentPredicate(column) {
+  return `${column} is not null and btrim(${column}) <> ''
+     and (e.normalizer_version <> '${LEGACY_CODEX_NORMALIZER_VERSION}' or (
+       ${internalContextPrefixExclusion(column)}
+     ))`;
+}
+
+function dashboardSummaryContentPredicate(column) {
+  return `${column} is not null and btrim(${column}) <> ''
+       and ${internalContextPrefixExclusion(column)}`;
 }
 
 function activityCte({ joins = "" } = {}) {
@@ -142,6 +199,9 @@ prompt_candidates as materialized (
          e.logical_event_key, e.turn_id, e.normalizer_version, e.event_kind,
          e.event_subtype, e.source_priority,
          e.native_item_id, e.content_sha256,
+         (e.message_origin = 'human'
+          and ${nativePromptContentPredicate("e.content_excerpt")})
+           native_prompt_candidate,
          nr.batch_id source_batch_id, nr.record_index source_record_index,
          nr.source_start_offset, nr.source_end_offset,
          nr.native_type source_native_type,
@@ -154,6 +214,9 @@ prompt_candidates as materialized (
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then max(e.native_item_id) filter (
                 where e.event_subtype = 'message' and e.native_item_id is not null
+                  and nr.native_type = 'response_item'
+                  and nr.native_payload_type = 'message'
+                  and ${nativePromptContentPredicate("e.content_excerpt")}
               ) over (
                 partition by e.session_id, e.canonical_scope_key,
                              e.normalizer_version, e.logical_event_key, e.event_kind
@@ -217,7 +280,7 @@ prompt_candidates as materialized (
            'logical:' || canonical_scope_key || ':' || normalizer_version || ':' ||
              logical_event_key || ':' || event_kind
          ) prompt_identity,
-         keyed_submitted has_submitted,
+         (keyed_submitted or keyed_native_item_id is not null) has_submitted,
          coalesce(
            ${nativeItemTimestamp("keyed_native_item_id")},
            source_observed_at
@@ -234,6 +297,9 @@ prompt_candidates as materialized (
     from prompt_candidates
    where event_subtype = 'message'
      and native_item_id is not null
+     and source_native_type = 'response_item'
+     and source_native_payload_type = 'message'
+     and native_prompt_candidate
 -- PostgreSQL has no row-count statistics for these materialized CTEs and otherwise
 -- chooses quadratic nested loops. The materialize-then-filter full joins below keep
 -- every original predicate while giving the planner bounded hash/merge paths; each
@@ -329,10 +395,27 @@ prompt_candidates as materialized (
   select *
     from unkeyed_prompt_source_rows
    where id is not null
+), native_prompt_sources as materialized (
+  select canonical_prompt_candidates.*,
+         'native:' || native_item_id prompt_identity,
+         true has_submitted,
+         coalesce(
+           ${nativeItemTimestamp("native_item_id")},
+           source_observed_at
+         ) observed_at
+    from canonical_prompt_candidates
+   where (canonical_scope_key is null or logical_event_key is null)
+     and event_subtype = 'message'
+     and native_item_id is not null
+     and source_native_type = 'response_item'
+     and source_native_payload_type = 'message'
+     and native_prompt_candidate
 ), prompt_identities as materialized (
   select * from keyed_prompt_sources
   union all
   select * from unkeyed_prompt_sources
+  union all
+  select * from native_prompt_sources
 ), prompts as materialized (
   select ranked.*
     from (
@@ -744,10 +827,13 @@ with p as materialized (
          min(observed_at) first_at, max(observed_at) last_at,
          count(*)::bigint event_count,
          (array_agg(content_excerpt order by observed_at, id) filter (
-           where event_subtype = 'user_message'
-             and message_role = 'user'
-             and message_origin in ('human', 'parent_agent')
-             and content_excerpt is not null
+           where event_kind = 'message' and message_role = 'user'
+             and (
+               event_subtype = 'user_message'
+               and message_origin in ('human', 'parent_agent')
+               or event_subtype = 'message' and message_origin = 'human'
+             )
+             and ${dashboardSummaryContentPredicate("content_excerpt")}
          ))[1] summary
     from bucket_events
    group by session_id, semantic_role
@@ -855,9 +941,14 @@ with p as materialized (
          min(bucket_events.observed_at) first_at, max(bucket_events.observed_at) last_at,
          count(*)::bigint event_count,
          (array_agg(bucket_events.content_excerpt order by bucket_events.observed_at, bucket_events.id) filter (
-           where bucket_events.event_subtype = 'user_message'
+           where bucket_events.event_kind = 'message'
              and bucket_events.message_role = 'user'
-             and bucket_events.message_origin in ('human', 'parent_agent')
+             and (
+               bucket_events.event_subtype = 'user_message'
+               and bucket_events.message_origin in ('human', 'parent_agent')
+               or bucket_events.event_subtype = 'message'
+               and bucket_events.message_origin = 'human'
+             )
              and bucket_events.content_excerpt is not null
          ))[1] summary
     from bucket_events cross join p
@@ -1041,7 +1132,8 @@ with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
          $3::pg_snapshot snapshot, $4::uuid person_id,
          $5::timestamptz start_at, $6::timestamptz end_at,
-         $7::text expected_email_domain
+         $7::timestamptz bucket_start, $8::timestamptz bucket_end,
+         $9::text expected_email_domain
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
@@ -1050,24 +1142,43 @@ with p as materialized (
          case when actor_role = 'primary' then 'agent'
               when actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role
-    from projected_activity evidence
+    from projected_activity evidence cross join p
+   where evidence.observed_at >= p.bucket_start
+     and evidence.observed_at < p.bucket_end
 ), grouped as materialized (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
-         count(*)::bigint event_count,
-         (array_agg(source_event_id order by observed_at, source_event_id)
-           filter (where is_summary_candidate))[1] summary_event_id
+         count(*)::bigint event_count
     from bucket_events
    group by session_id, semantic_role
    order by first_at, session_id, semantic_role
-   limit $8
+   limit $10
+), session_summary_candidates as materialized (
+  select grouped.session_id, grouped.semantic_role,
+         evidence.source_event_id, evidence.observed_at
+    from grouped
+    join projected_activity evidence
+      on evidence.session_id = grouped.session_id
+     and case when evidence.actor_role = 'primary' then 'agent'
+              when evidence.actor_role = 'worker' then 'subagent'
+              else 'unclassified' end = grouped.semantic_role
+   where evidence.is_summary_candidate
+), session_summaries as materialized (
+  select candidate.session_id, candidate.semantic_role,
+         (array_agg(source.content_excerpt order by candidate.observed_at,
+                    candidate.source_event_id) filter (
+           where ${dashboardSummaryContentPredicate("source.content_excerpt")}
+         ))[1] summary
+    from session_summary_candidates candidate
+    join telemetry.events source
+      on source.workspace_id = $1 and source.id = candidate.source_event_id
+   group by candidate.session_id, candidate.semantic_role
 )
 select grouped.session_id::text session_id, grouped.semantic_role,
        grouped.first_at, grouped.last_at, grouped.event_count,
-       summary.content_excerpt summary
+       session_summaries.summary
   from grouped
-  left join telemetry.events summary
-    on summary.workspace_id = $1 and summary.id = grouped.summary_event_id
+  left join session_summaries using (session_id, semantic_role)
  order by grouped.first_at, grouped.session_id, grouped.semantic_role
 `;
 
@@ -1126,7 +1237,8 @@ with p as materialized (
          count(*)::bigint event_count,
          (array_agg(bucket_events.source_event_id order by bucket_events.observed_at,
                     bucket_events.source_event_id)
-           filter (where bucket_events.is_summary_candidate))[1] summary_event_id
+           filter (where bucket_events.is_summary_candidate)
+         )[1] summary_event_id
     from bucket_events cross join p
    where bucket_events.session_id = p.session_id
      and bucket_events.semantic_role = p.semantic_role
@@ -1221,13 +1333,13 @@ export function encodeSnapshotToken({ snapshot, read }) {
   const readAt = asDate(read).toISOString();
   const pgSnapshot = parsePgSnapshot(snapshot);
   return encodeVersionedSnapshotToken(
-    LEGACY_SNAPSHOT_TOKEN_VERSION,
+    RAW_SNAPSHOT_TOKEN_VERSION,
     [pgSnapshot, readAt],
   );
 }
 
 export function encodeProjectionSnapshotToken({ snapshot, read, frameVersion }) {
-  if (frameVersion !== FRAME_VERSION) {
+  if (![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
     throw new FlameSourceError("flame_snapshot_invalid");
   }
   const readAt = asDate(read).toISOString();
@@ -1243,7 +1355,8 @@ export function decodeSnapshotToken(token) {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
   const [version, body, extra] = token.split(".");
-  if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version) ||
+  if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION,
+    RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
       !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
     throw new FlameSourceError("flame_prompt_request_invalid");
@@ -1254,17 +1367,29 @@ export function decodeSnapshotToken(token) {
       throw new Error("noncanonical_token");
     }
     const value = JSON.parse(decoded);
-    const expectedLength = version === LEGACY_SNAPSHOT_TOKEN_VERSION ? 2 : 3;
+    const expectedLength = version === PROJECTION_SNAPSHOT_TOKEN_VERSION
+      ? 3
+      : 2;
     if (!Array.isArray(value) || value.length !== expectedLength) {
       throw new Error("invalid_payload");
     }
-    const [snapshot, rawRead, frameVersion] = value;
+    const [snapshot, rawRead, pinnedFrameVersion] = value;
     const read = asDate(rawRead);
     if (read.toISOString() !== rawRead) throw new Error("noncanonical_read");
     const receipt = { snapshot: parsePgSnapshot(snapshot), read };
     if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
-      if (frameVersion !== FRAME_VERSION) throw new Error("unsupported_frame_version");
-      receipt.frameVersion = frameVersion;
+      if (
+        ![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
+          pinnedFrameVersion,
+        )
+      ) {
+        throw new Error("unsupported_frame_version");
+      }
+      receipt.frameVersion = pinnedFrameVersion;
+    } else if (version === RAW_SNAPSHOT_TOKEN_VERSION) {
+      receipt.normalizerVersions = NORMALIZER_VERSIONS;
+    } else {
+      receipt.normalizerVersions = LEGACY_NORMALIZER_VERSIONS;
     }
     return receipt;
   } catch {
@@ -1390,12 +1515,19 @@ function pullRequestFromRow(row) {
   };
 }
 
+export function dashboardWorkSummary(value) {
+  if (value === null || value === undefined) return null;
+  const summary = String(value).trim();
+  if (summary === "" || INTERNAL_CONTEXT_PREFIXES.some((prefix) =>
+    summary.startsWith(prefix)
+  )) return null;
+  return summary;
+}
+
 function workFromRow(row, pullRequest = null) {
   const role = String(row.semantic_role);
   const sessionId = String(row.session_id);
-  const summary = row.summary === null || row.summary === undefined
-    ? null
-    : String(row.summary);
+  const summary = dashboardWorkSummary(row.summary);
   return {
     id: `${sessionId}:${role}`,
     sessionId,
@@ -1685,11 +1817,20 @@ export class DirectFlameSource {
                     from analytics.frame_projection_activations activation
                    where activation.workspace_id = $1
                      and activation.frame_version = $2
-                ) frame_projection_active`
+                ) frame_projection_active,
+                exists (
+                  select 1
+                    from analytics.frame_projection_activations activation
+                   where activation.workspace_id = $1
+                     and activation.frame_version = $3
+                ) compatible_work_projection_active`
           : `select transaction_timestamp() as now,
                     pg_current_snapshot()::text as snapshot,
-                    false as frame_projection_active`,
-        projectionEnabled ? [this.workspaceId, FRAME_VERSION] : undefined,
+                    false as frame_projection_active,
+                    false as compatible_work_projection_active`,
+        projectionEnabled
+          ? [this.workspaceId, FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+          : undefined,
         signal,
       ))[0];
       const read = now ? asDate(now) : asDate(receipt.now);
@@ -1704,10 +1845,12 @@ export class DirectFlameSource {
       if (roster.length > this.maxPeople) {
         throw new FlameSourceError("flame_database_roster_too_large");
       }
-      const frameVersion = receipt.frame_projection_active === true
+      const selectedFrameVersion = receipt.frame_projection_active === true
         ? FRAME_VERSION
-        : null;
-      const rows = frameVersion === null
+        : receipt.compatible_work_projection_active === true
+          ? COMPATIBLE_WORK_FRAME_VERSION
+          : null;
+      const rows = selectedFrameVersion === null
         ? await runQuery(tx, FLAME_SQL, [
           this.workspaceId,
           start.toISOString(),
@@ -1720,7 +1863,7 @@ export class DirectFlameSource {
           this.workspaceId,
           start.toISOString(),
           end.toISOString(),
-          frameVersion,
+          selectedFrameVersion,
           read.toISOString(),
           this.expectedEmailDomain,
         ], signal);
@@ -1730,7 +1873,7 @@ export class DirectFlameSource {
         start,
         read,
         snapshot: receipt.snapshot,
-        frameVersion,
+        frameVersion: selectedFrameVersion,
       });
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
   }
@@ -1740,7 +1883,7 @@ export class DirectFlameSource {
       const rows = await runQuery(tx, FRESHNESS_SQL, [
         this.workspaceId,
         this.expectedEmailDomain,
-        tx.array(NORMALIZER_VERSIONS),
+        tx.array(FRESHNESS_NORMALIZER_VERSIONS),
         this.maxPeople,
       ], signal);
       if (rows.length > this.maxPeople) {
@@ -1753,6 +1896,8 @@ export class DirectFlameSource {
   async fetchInterval({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "interval");
     const snapshotReceipt = requestSnapshot(snapshot, "interval");
+    const rawNormalizerVersions = snapshotReceipt.normalizerVersions ??
+      NORMALIZER_VERSIONS;
     validateIntervalIdentity(personId, startAt, "interval");
 
     return await this.transaction(async (tx) => {
@@ -1761,7 +1906,8 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
-      const projected = snapshotReceipt.frameVersion === FRAME_VERSION;
+      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+        .includes(snapshotReceipt.frameVersion);
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
@@ -1769,6 +1915,8 @@ export class DirectFlameSource {
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
           personId,
+          bounds.snapshotStart.toISOString(),
+          bounds.snapshotEnd.toISOString(),
           startAt.toISOString(),
           bounds.bucketEnd.toISOString(),
           this.expectedEmailDomain,
@@ -1778,7 +1926,7 @@ export class DirectFlameSource {
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,
@@ -1820,7 +1968,7 @@ export class DirectFlameSource {
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,
@@ -1850,6 +1998,8 @@ export class DirectFlameSource {
   }) {
     const startAt = requestStart(start, "work");
     const snapshotReceipt = requestSnapshot(snapshot, "work");
+    const rawNormalizerVersions = snapshotReceipt.normalizerVersions ??
+      NORMALIZER_VERSIONS;
     validateIntervalIdentity(personId, startAt, "work");
     if (!UUID_PATTERN.test(sessionId) ||
         !["agent", "subagent", "unclassified"].includes(role)) {
@@ -1864,7 +2014,8 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
-      const projected = snapshotReceipt.frameVersion === FRAME_VERSION;
+      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+        .includes(snapshotReceipt.frameVersion);
       const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
       const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
       if (decodedCursor) {
@@ -1896,7 +2047,7 @@ export class DirectFlameSource {
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,
@@ -1939,6 +2090,8 @@ export class DirectFlameSource {
   async fetchPromptEvidence({ personId, start, snapshot, signal, now }) {
     const startAt = requestStart(start, "prompt");
     const snapshotReceipt = requestSnapshot(snapshot, "prompt");
+    const rawNormalizerVersions = snapshotReceipt.normalizerVersions ??
+      NORMALIZER_VERSIONS;
     validateIntervalIdentity(personId, startAt, "prompt");
 
     return await this.transaction(async (tx) => {
@@ -1947,7 +2100,8 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const projected = snapshotReceipt.frameVersion === FRAME_VERSION;
+      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+        .includes(snapshotReceipt.frameVersion);
       const rows = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
           this.workspaceId,
@@ -1965,7 +2119,7 @@ export class DirectFlameSource {
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
-          tx.array(NORMALIZER_VERSIONS),
+          tx.array(rawNormalizerVersions),
           snapshotReceipt.read.toISOString(),
           snapshotReceipt.snapshot,
           personId,

@@ -125,9 +125,14 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
     source: Uint8Array,
     statementTimeoutMs?: number,
     deadlineAtMs?: number,
+    targetNormalizerVersion = normalizerVersionFor(manifest),
   ): Promise<NormalizationResult> {
-    const projection = await projectBatch(manifest, source);
-    const normalizerVersion = normalizerVersionFor(manifest);
+    const projection = await projectBatch(
+      manifest,
+      source,
+      targetNormalizerVersion,
+    );
+    const normalizerVersion = targetNormalizerVersion;
     const timeout = normalizationStatementTimeout(
       statementTimeoutMs,
       deadlineAtMs,

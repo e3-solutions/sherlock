@@ -471,6 +471,8 @@ describe("FlameGraph", () => {
     expect(Number(stems[0].dataset.stemLength)).toBeGreaterThan(
       Number(stems[1].dataset.stemLength),
     );
+    expect(Number(stems[1].dataset.stemLength)).toBeGreaterThanOrEqual(8);
+    expect(stems[0].querySelector(".flame-prompt-stem__cap")).toHaveAttribute("r", "1.5");
     expect(container.querySelector('.flame-person[aria-labelledby] .flame-prompt-stem[data-bucket-index="143"]')).toBeNull();
   });
 

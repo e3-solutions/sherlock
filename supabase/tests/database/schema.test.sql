@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(137);
+select plan(145);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -36,6 +36,10 @@ select has_table(
 select has_table(
   'analytics', 'frame_projection_activations',
   'frame projection activation is explicit'
+);
+select has_table(
+  'analytics', 'normalizer_cutovers',
+  'normalizer cutovers are auditable facts'
 );
 select ok(
   exists (
@@ -719,6 +723,26 @@ select ok(
   ),
   'summary eligibility is explicit and structurally bounded'
 );
+select ok(
+  pg_get_constraintdef(
+    (
+      select oid from pg_constraint
+       where conrelid = 'telemetry.events'::regclass
+         and conname = 'events_message_origin_check'
+    )
+  ) like '%runtime_context%',
+  'runtime context is an explicit normalized message origin'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+     where schemaname = 'processing'
+       and indexname = 'telemetry_jobs_batch_key'
+       and indexdef like '%workspace_id, batch_id, normalizer_version%'
+       and indexdef like '%WHERE (job_kind = ''normalize''::text)%'
+  ),
+  'normalization jobs retain an auditable versioned batch identity'
+);
 
 select ok(
   not has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'update'),
@@ -744,10 +768,43 @@ select ok(
   not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'delete'),
   'normalizer cannot delete spans'
 );
+select ok(
+  has_table_privilege(
+    'sherlock_frame_projector', 'analytics.normalizer_cutovers', 'select'
+  ) and
+  not has_table_privilege(
+    'sherlock_frame_projector', 'analytics.normalizer_cutovers', 'update'
+  ) and
+  not has_table_privilege(
+    'sherlock_frame_projector', 'analytics.normalizer_cutovers', 'delete'
+  ),
+  'projector can read but cannot mutate cutover facts'
+);
+select ok(
+  has_column_privilege(
+    'sherlock_frame_projector', 'telemetry.ingest_batches',
+    'source_provider', 'select'
+  ),
+  'projector can select the bounded provider identity used by cutovers'
+);
 
 insert into telemetry.workspaces (id, slug, name) values
   ('00000000-0000-0000-0000-000000000001', 'test-one', 'Test One'),
   ('00000000-0000-0000-0000-000000000002', 'test-two', 'Test Two');
+select ok(
+  (
+    select count(*) = 2
+      from analytics.normalizer_cutovers
+     where workspace_id in (
+       '00000000-0000-0000-0000-000000000001',
+       '00000000-0000-0000-0000-000000000002'
+     )
+       and source_provider = 'codex'
+       and from_normalizer_version = 'sherlock.codex-rollout.v1'
+       and to_normalizer_version = 'sherlock.codex-rollout.v2'
+  ),
+  'new workspaces record one Codex v2 session cutover'
+);
 insert into telemetry.people (id, workspace_id, identity_key) values
   (
     '00000000-0000-0000-0000-000000000101',
@@ -884,6 +941,7 @@ select ok(
     where workspace_id = '00000000-0000-0000-0000-000000000001'
       and batch_id = '00000000-0000-0000-0000-000000000301'
       and job_kind = 'normalize'
+      and normalizer_version = 'sherlock.codex-rollout.v2'
       and workload_class = 'live' and status = 'queued'),
   'ingest trigger creates one live job without a session scan'
 );
@@ -908,8 +966,92 @@ select ok(
   (select count(*) = 1 from processing.telemetry_jobs
     where workspace_id = '00000000-0000-0000-0000-000000000001'
       and batch_id = '00000000-0000-0000-0000-000000000302'
-      and job_kind = 'normalize' and workload_class = 'backfill'),
+      and job_kind = 'normalize'
+      and normalizer_version = 'sherlock.codex-rollout.v2'
+      and workload_class = 'backfill'),
   'explicit backfill transport fact isolates recent and timestampless history'
+);
+
+insert into telemetry.ingest_batches (
+  id, workspace_id, person_id, collector_key, source_provider, source_kind,
+  source_stream_key, generation_key, generation_seq, start_offset, end_offset,
+  source_byte_count, source_sha256, storage_path, storage_encoding,
+  stored_byte_count, stored_sha256, record_count, contract_version
+) values (
+  '00000000-0000-0000-0000-000000000303',
+  '00000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000101',
+  'test-collector', 'claude_code', 'transcript', 'test-claude-stream',
+  'test-claude-generation', 0, 0, 1, 1, repeat('f', 64),
+  'test-claude-evidence', 'identity', 1, repeat('0', 64), 1, 'test-v1'
+);
+
+select ok(
+  (select count(*) = 1 from processing.telemetry_jobs
+    where workspace_id = '00000000-0000-0000-0000-000000000001'
+      and batch_id = '00000000-0000-0000-0000-000000000303'
+      and job_kind = 'normalize'
+      and normalizer_version = 'sherlock.claude-code-transcript.v1'),
+  'provider-specific live jobs keep Claude on its compatible normalizer'
+);
+
+insert into telemetry.sessions (
+  id, workspace_id, person_id, collector_key, native_session_id,
+  actor_role, role_version, started_at
+)
+select '00000000-0000-0000-0000-000000000204'::uuid, workspace_id,
+       '00000000-0000-0000-0000-000000000101'::uuid, 'test-cutover-collector',
+       'pre-cutover-session', 'primary', 'test-role-v1',
+       cutover_at - interval '1 second'
+  from analytics.normalizer_cutovers
+ where workspace_id = '00000000-0000-0000-0000-000000000001'
+   and source_provider = 'codex'
+union all
+select '00000000-0000-0000-0000-000000000205'::uuid, workspace_id,
+       '00000000-0000-0000-0000-000000000101'::uuid, 'test-cutover-collector',
+       'post-cutover-session', 'primary', 'test-role-v1',
+       cutover_at + interval '1 second'
+  from analytics.normalizer_cutovers
+ where workspace_id = '00000000-0000-0000-0000-000000000001'
+   and source_provider = 'codex';
+
+insert into telemetry.ingest_batches (
+  id, workspace_id, person_id, collector_key, observed_native_session_id,
+  source_kind, source_stream_key, generation_key, generation_seq,
+  start_offset, end_offset, source_byte_count, source_sha256, storage_path,
+  storage_encoding, stored_byte_count, stored_sha256, record_count,
+  first_occurred_at, last_occurred_at, contract_version
+) values
+  (
+    '00000000-0000-0000-0000-000000000304',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101', 'test-cutover-collector',
+    'pre-cutover-session', 'rollout', 'pre-cutover-stream',
+    'pre-cutover-generation', 0, 0, 1, 1, repeat('1', 64),
+    'test-pre-cutover', 'identity', 1, repeat('2', 64), 1,
+    now(), now(), 'test-v1'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000305',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101', 'test-cutover-collector',
+    'post-cutover-session', 'rollout', 'post-cutover-stream',
+    'post-cutover-generation', 0, 0, 1, 1, repeat('3', 64),
+    'test-post-cutover', 'identity', 1, repeat('4', 64), 1,
+    now(), now(), 'test-v1'
+  );
+
+select ok(
+  exists (
+    select 1 from processing.telemetry_jobs
+     where batch_id = '00000000-0000-0000-0000-000000000304'
+       and normalizer_version = 'sherlock.codex-rollout.v1'
+  ) and exists (
+    select 1 from processing.telemetry_jobs
+     where batch_id = '00000000-0000-0000-0000-000000000305'
+       and normalizer_version = 'sherlock.codex-rollout.v2'
+  ),
+  'new batches keep pre-cutover sessions on v1 and post-cutover sessions on v2'
 );
 
 create temporary table constraint_results (
@@ -1143,8 +1285,8 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 137,
-  'tables', 13,
+  'assertion_count', 145,
+  'tables', 14,
   'private_bucket', 'telemetry-raw'
 ) as verification;
 

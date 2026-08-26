@@ -45,12 +45,12 @@ Keeping one exact definition prevents the architecture notes from drifting.
 - The ingest request durably enqueues work and returns its existing receipt
   without waiting for normalization.
 - Railway dispatches every native record to the immutable provider-specific
-  `sherlock.codex-rollout.v1` or `sherlock.claude-code-transcript.v1`
+  `sherlock.codex-rollout.v2` or `sherlock.claude-code-transcript.v1`
   normalizer, then reduces only affected sessions into append-only
   `sherlock.activity.v1` span revisions.
 - Railway also projects payload-free activity and prompt selections with one
   bounded, fingerprinted session receipt per run. An owner-written activation
-  fact gates dashboard cutover after the initial backfill.
+  fact gates dashboard cutover after the current window is proven.
 - PostgreSQL automatically indexes bounded message excerpts as normalized
   event rows are inserted.
 
@@ -94,7 +94,8 @@ database columns.
 | `analytics.activity_spans` | Versioned, rebuildable activity intervals | Reducer may insert only |
 | `analytics.frame_projection_receipts` | Bounded, fingerprinted proof of one session source state consumed by a frame version | Frame projector may insert only |
 | `analytics.frame_evidence_revisions` | Payload-free activity and prompt selection revisions tied to source events and receipts | Frame projector may insert only |
-| `analytics.frame_projection_activations` | Explicit post-backfill cutover facts by workspace and version | Owner inserts once; application roles read only |
+| `analytics.normalizer_cutovers` | Immutable workspace source-version boundary | Owner inserts once; application roles read only |
+| `analytics.frame_projection_activations` | Explicit proven projection facts by workspace and version | Owner inserts once; application roles read only |
 | `processing.telemetry_jobs` | Mutable leases, retries, workload class, and terminal outcomes | Ingest trigger inserts; Railway transitions with fencing |
 
 Append-only behavior is enforced for application roles through grants. A
@@ -167,7 +168,10 @@ records still need an `unknown` or `ignored` event so normalization coverage is
 observable.
 
 Normalizer versions must be immutable build or content identifiers. Mutable
-aliases such as `latest` cannot reproduce an older interpretation.
+aliases such as `latest` cannot reproduce an older interpretation. Codex v1
+rows are retained beside v2 rows; v2 keeps the native `user` role but records
+machine-injected envelopes as `message_origin = 'runtime_context'` instead of
+rewriting them into human prompt facts.
 
 ### Activity spans are rebuildable
 
@@ -193,11 +197,21 @@ summary-eligibility, and prompt-identity facts without copying excerpts or raw
 payloads.
 
 `frame-evidence-v1` deliberately chooses one semantic winner across the
-projector's bounded session window, rather than changing that winner at each
-dashboard window boundary. This stabilizes duplicate identity over time; a
-malformed duplicate group split exactly across the legacy 24-hour boundary can
-therefore differ from the old window-local query and requires a new frame
-version if that policy changes.
+projector's bounded session window. `frame-evidence-v2` preserves that activity
+policy and adds stable native `response_item` / `message` human-user items as
+prompt evidence when a rollout omitted the separate `user_message` envelope.
+`frame-evidence-v3` consumed Codex v2 globally but was never activated.
+`frame-evidence-v4` keeps those prompt identities and selects Codex v1 for
+sessions before the immutable workspace cutover and v2 after it. In v2, a
+native user-role item is explicitly classified as `human` or
+`runtime_context`. Reserved Codex envelope names and legacy runtime prefixes are
+classified once during normalization; projectors and dashboard reads no longer
+interpret stored excerpt text. A new envelope name requires a new normalizer
+version instead of a broader text heuristic. All versions deduplicate by native
+prompt identity; later frames prefer an existing envelope-backed source when both
+representations are present. This stabilizes
+duplicate identity over time while keeping the semantic change versioned and
+auditable.
 
 Corrections append tombstones or replacement revisions; application roles
 cannot update or delete history. Reads select the latest revision visible in
@@ -208,7 +222,9 @@ every repaired child even at the same event cutoff because the stored actor
 role is the effective display role. Owner-written activation is allowed only
 after a repeatable-read proof matches every relevant session's current maximum
 event ID, event count, and `updated_at` to its latest receipt. The count catches
-late lower-ID commits; `updated_at` catches parent and start-state repairs.
+late lower-ID commits; `updated_at` catches parent and start-state repairs. The
+proof also requires every native record in each relevant immutable batch to
+have a derived event at the current provider normalizer version.
 The unique workspace/version activation is a permanent capability fact queried
 by existence, not a latest-state trail or a mutable feature flag. Rollback stops
 minting new projection-backed tokens without deleting that fact or projection
@@ -283,8 +299,13 @@ The immutable object is written first. One database transaction then inserts
 the batch, native locators, and an `AFTER INSERT` queue row. The existing receipt
 returns after that durable acceptance. Railway re-downloads and revalidates the
 object, upserts the session cache, and inserts one versioned event for every
-native record. It then coalesces the latest event cutoff into one targeted
-reduction job per affected session. The unique source-record/version/projection
+native record. Normalization jobs are unique by workspace, batch, and target
+normalizer version. The immutable cutover selects v1 for new batches belonging
+to an existing pre-cutover session and v2 for post-cutover sessions; no
+historical Codex backfill is required or enqueued. For records already accepted
+during the transition, frame v4 prefers v1 and falls back to an existing v2 fact
+only when that record has no v1 projection. The worker then coalesces the latest
+event cutoff into one targeted reduction job per affected session. The unique source-record/version/projection
 key prevents duplicate events, and a coverage check rejects incomplete
 projections.
 
@@ -297,7 +318,9 @@ The first version recognizes session metadata, turn context, user and assistant
 messages, cumulative token usage, reasoning, common tool calls/results,
 lifecycle records, native errors, and malformed/unknown records. Cumulative
 usage separates cached input and reasoning output from the inclusive native
-totals. Unknown records still produce observable `unknown` events.
+totals. Codex v2 additionally classifies native user-role response items as
+submitted human prompts or injected runtime context. Unknown records still
+produce observable `unknown` events.
 
 Only the bounded message excerpt is copied into PostgreSQL and indexed with a
 partial GIN full-text index. Full prompts, responses, reasoning, tool payloads,
@@ -360,7 +383,7 @@ The command supports a single-session bounded rebuild or a workspace rebuild:
 ```sh
 SUPABASE_DB_URL=... deno run --allow-env --allow-net \
   scripts/reduce-activity.ts --workspace <uuid> \
-  --normalizer-version sherlock.codex-rollout.v1 \
+  --normalizer-version sherlock.codex-rollout.v2 \
   --activity-version sherlock.activity.v1 \
   --through-event-id <id>
 ```

@@ -162,18 +162,24 @@ safe.
 
 ## Deploy and rollback order
 
-1. Apply the additive frame tables and projector-role migration. Old workers
-   ignore the new tables.
-2. Deploy the projector-aware Railway worker, enqueue every existing relevant
-   session, and verify receipts cover the intended source state.
-3. Drain and review the queue. In one repeatable-read owner transaction, prove
+1. Deploy the version-aware worker first. It treats legacy normalize jobs whose
+   target version is still null as that provider's v1, so it is safe before and
+   after the queue migration. Existing v1 events and raw batches stay immutable.
+2. Apply the additive queue and cutover migrations. Each workspace records the
+   first Codex v2 job time as its immutable session boundary. Do not enqueue
+   historical Codex batches: pre-cutover sessions remain on v1 and later
+   sessions use v2. During the already-started transition, a pre-cutover
+   session may use an existing v2 record only when no v1 fact exists for that
+   source record; this closes the live gap without replaying it.
+3. Project the current 26-hour window into frame v4. In one repeatable-read
+   owner transaction, prove
    each latest receipt exactly matches the session's accepted-version event
    maximum, event count, and `updated_at`, then insert the one
    workspace/version activation fact. The worker cannot self-activate.
 4. Enable the dashboard's versioned projection path. Existing v1 snapshot
    tokens continue on the raw path for their bounded lifetime.
-5. Upload a smoke batch and verify normalized events, search, activity spans,
-   frame receipts, revisions, and indexed frame reads.
+5. Upload a smoke batch and verify v2 normalized message origins, search,
+   activity spans, frame receipts, revisions, and indexed frame reads.
 
 For application rollback, stop minting projection-backed tokens before rolling
 the worker back, then let all queued or leased jobs drain and review or requeue

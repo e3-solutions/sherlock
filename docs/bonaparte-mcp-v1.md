@@ -35,7 +35,7 @@ between page calls; every response declares the exact window and `readAt` it use
     "endExclusive": "ISO-8601 timestamp",
     "readAt": "ISO-8601 timestamp"
   },
-  "provenance": { "projectionVersion": "sherlock.codex-rollout.v1" },
+  "provenance": { "projectionVersion": "sherlock.codex-rollout.v2" },
   "coverage": {
     "state": "partial",
     "basis": "observed_canonical_events",

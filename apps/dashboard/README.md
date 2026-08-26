@@ -21,7 +21,7 @@ objects.
 - `telemetry.people` is the roster, so real people with zero activity remain
   visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
   excluded; display names are never used as the filter.
-- Canonically selected `sherlock.codex-rollout.v1` and
+- Canonically selected `sherlock.codex-rollout.v2` and
   `sherlock.claude-code-transcript.v1` event presence is grouped into 144
   ten-minute UTC buckets. Canonical winner selection remains scoped by
   normalizer version, so evidence from different provider projections is never
@@ -105,10 +105,17 @@ objects.
   only the stored database excerpt plus an explicit truncation flag. A work row exists only
   when the same canonical activity universe used by the aggregate contains
   visible evidence for that session and role. Its first/last timestamps are the
-  observed evidence window, not active duration. Its optional summary is the
-  first submitted `user_message` excerpt in the frame; response-only runtime
-  context is excluded and no title is synthesized. The drawer keeps Active Work
-  primary and exposes prompt excerpts through a compact, collapsed disclosure.
+  observed evidence window, not active duration. Its optional summary carries
+  the first source-backed request for that session across later frames in the
+  pinned trailing snapshot: a submitted human/parent-agent
+  `user_message` or a stable native human `response_item/message`. Native
+  parent-agent runtime context is excluded and no title is synthesized. As a
+  product-view safeguard, reserved Codex runtime envelopes are skipped during
+  summary selection even if an older normalized fact classified one as human;
+  the next source-backed human request supplies the label when present. This
+  safeguard does not remove or rewrite canonical prompt evidence. The drawer
+  keeps Active Work primary and exposes prompt excerpts through a compact,
+  collapsed disclosure.
 - `GET /api/flame/work?personId=<uuid>&start=<bucket ISO timestamp>&sessionId=<uuid>&role=<agent|subagent|unclassified>&snapshot=<token>&cursor=<optional>&limit=<optional>`
   lazily pages the selected row's canonical user and assistant conversation
   excerpts. The default page size is 50 and the maximum is 100. Cursors are
@@ -129,12 +136,21 @@ objects.
   read-consistency boundary, not a durable pipeline publication cutoff: a later
   timeline refresh can correctly include newly normalized evidence.
 - Snapshot tokens remain source-explicit during the frame-projection rollout.
-  Legacy `v1` tokens always use the canonical raw-event queries. Once an owner
-  activates the exact immutable `frame-evidence-v1` version for the workspace,
+  Legacy `v1` tokens always use canonical raw-event queries pinned to the v1
+  provider normalizers. A current canonical raw timeline emits a `v3` token
+  pinned to Codex v2 and Claude v1, so later lazy reads cannot mix classifier
+  versions. Once an owner
+  activates the exact immutable `frame-evidence-v4` version for the workspace,
   a projection-backed timeline emits `v2` tokens containing that version and
-  every lazy evidence read stays on the matching append-only projection. A v2
-  failure is surfaced; it never silently falls back to a different evidence
-  universe. Existing v1 tokens remain usable through their normal expiry.
+  every lazy evidence read stays on the matching append-only projection. While
+  v4 is projecting and immutable frame v2 is already active, the timeline
+  continues to serve frame v2 in full. It never combines frame v2 facts with
+  Codex events directly. Frame v4 chooses Codex v1 for sessions before the
+  recorded workspace cutover and v2 for later sessions; old missing-v2 batches
+  therefore cannot block activation. The owner activates v4 only after the
+  selected-version coverage and exact receipts are proven. A
+  projected-read failure is surfaced; it never silently falls back to raw work
+  evidence. Existing v1 tokens remain usable through their normal expiry.
 - Projection-backed timeline reads touch only the indexed analytics receipts
   and evidence revisions. Interval summaries, prompt excerpts, and conversation
   pages select bounded source event IDs first and then use primary-key joins to

@@ -11,7 +11,9 @@ const SCHEDULE_SCM_BACKFILL_SQL = `
 with recent_sessions as materialized (
   select distinct workspace_id, session_id
     from telemetry.events
-   where normalizer_version = 'sherlock.codex-rollout.v1'
+   where normalizer_version in (
+     'sherlock.codex-rollout.v1', 'sherlock.codex-rollout.v2'
+   )
      and not is_replay and session_id is not null
      and server_received_at >= now() - interval '26 hours'
 ), candidates as materialized (
@@ -37,7 +39,9 @@ with recent_sessions as materialized (
            join telemetry.events projection
              on projection.workspace_id = meta.workspace_id
             and projection.source_record_id = meta.id
-            and projection.normalizer_version = 'sherlock.codex-rollout.v1'
+            and projection.normalizer_version in (
+              'sherlock.codex-rollout.v1', 'sherlock.codex-rollout.v2'
+            )
             and not projection.is_replay
            join recent_sessions recent
              on recent.workspace_id = projection.workspace_id

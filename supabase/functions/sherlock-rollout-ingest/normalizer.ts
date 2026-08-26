@@ -5,11 +5,36 @@ import {
   sha256Hex,
 } from "./contract.ts";
 
-export const NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
+export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
 export const ROLE_VERSION = "sherlock.codex-role.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 export const CLAUDE_ROLE_VERSION = "sherlock.claude-code-role.v1";
 export const SCM_SOURCE_VERSION = "sherlock.github-scm.v1";
+
+export const RUNTIME_CONTEXT_MESSAGE_ORIGIN = "runtime_context";
+const RUNTIME_CONTEXT_ENVELOPE_NAMES = new Set([
+  "app-context",
+  "apps_instructions",
+  "automation",
+  "codex_delegation",
+  "collaboration_mode",
+  "environment_context",
+  "heartbeat",
+  "in-app-browser-context",
+  "permissions_instructions",
+  "plugins_instructions",
+  "recommended_plugins",
+  "skill",
+  "skills_instructions",
+  "turn_aborted",
+]);
+const RUNTIME_CONTEXT_TEXT_PREFIXES = Object.freeze([
+  "<permissions instructions",
+  "# AGENTS.md instructions",
+  "# Bonaparte Implementation",
+  "The configured soft phase budget has expired.",
+]);
 
 const CLAUDE_HOOK_SCHEMA_VERSION = "sherlock.claude-hook.v1";
 const CANONICAL_UUID =
@@ -110,12 +135,20 @@ interface ParsedRecord {
 export async function projectBatch(
   manifest: BatchManifest,
   source: Uint8Array,
+  normalizerVersion = normalizerVersionFor(manifest),
 ): Promise<BatchProjection> {
+  if (!normalizerVersionsFor(manifest).includes(normalizerVersion)) {
+    const error = new TypeError(
+      `normalizer ${normalizerVersion} does not support ${manifest.source_provider}`,
+    );
+    Object.assign(error, { code: "unsupported_normalizer_version" });
+    throw error;
+  }
   return manifest.source_provider === "claude_code"
     ? manifest.source_kind === "hook"
       ? await projectClaudeHookBatch(manifest, source)
       : await projectClaudeBatch(manifest, source)
-    : await projectCodexBatch(manifest, source);
+    : await projectCodexBatch(manifest, source, normalizerVersion);
 }
 
 export function normalizerVersionFor(manifest: BatchManifest): string {
@@ -147,6 +180,31 @@ function githubRepositoryFullName(value: unknown): string | null {
     )
   ) return null;
   return parts.join("/");
+}
+
+export function legacyNormalizerVersionFor(manifest: BatchManifest): string {
+  return manifest.source_provider === "claude_code"
+    ? CLAUDE_NORMALIZER_VERSION
+    : LEGACY_CODEX_NORMALIZER_VERSION;
+}
+
+export function normalizerVersionsFor(manifest: BatchManifest): string[] {
+  return manifest.source_provider === "claude_code"
+    ? [CLAUDE_NORMALIZER_VERSION]
+    : [NORMALIZER_VERSION, LEGACY_CODEX_NORMALIZER_VERSION];
+}
+
+export function isRuntimeContextMessage(content: string | null): boolean {
+  if (content === null) return false;
+  const trimmed = content.trimStart();
+  if (
+    RUNTIME_CONTEXT_TEXT_PREFIXES.some((prefix) => trimmed.startsWith(prefix))
+  ) {
+    return true;
+  }
+  const openingTag = /^<([a-z][a-z0-9_-]*)(?:\s[^>\r\n]*)?>/i.exec(trimmed);
+  if (!openingTag) return false;
+  return RUNTIME_CONTEXT_ENVELOPE_NAMES.has(openingTag[1].toLowerCase());
 }
 
 async function projectClaudeHookBatch(
@@ -426,6 +484,7 @@ function utcTimestamp(value: unknown): string | null {
 async function projectCodexBatch(
   manifest: BatchManifest,
   source: Uint8Array,
+  normalizerVersion: string,
 ): Promise<BatchProjection> {
   const records = manifest.records.map((locator) => ({
     locator,
@@ -479,7 +538,9 @@ async function projectCodexBatch(
     ? `session:${session.native_session_id}`
     : `stream:${manifest.source_stream_key}`;
   const events = await Promise.all(
-    records.map((record) => projectRecord(record, session, canonicalScopeKey)),
+    records.map((record) =>
+      projectRecord(record, session, canonicalScopeKey, normalizerVersion)
+    ),
   );
   const metaGit = objectValue(meta?.git);
   const commitSha = stringValue(metaGit?.commit_hash)?.toLowerCase() ?? null;
@@ -855,6 +916,7 @@ async function projectRecord(
   record: ParsedRecord,
   session: SessionProjection | null,
   canonicalScopeKey: string,
+  normalizerVersion: string,
 ): Promise<EventProjection> {
   const { locator, envelope } = record;
   const payload = objectValue(envelope?.payload);
@@ -919,7 +981,12 @@ async function projectRecord(
     return await projectEventMessage(base, payloadType, payload);
   }
   if (nativeType === "response_item") {
-    return await projectResponseItem(base, payloadType, payload);
+    return await projectResponseItem(
+      base,
+      payloadType,
+      payload,
+      normalizerVersion,
+    );
   }
   return base;
 }
@@ -983,6 +1050,7 @@ async function projectResponseItem(
   base: EventProjection,
   payloadType: string | null,
   payload: JsonObject | null,
+  normalizerVersion: string,
 ): Promise<EventProjection> {
   if (payloadType === "message") {
     const role = stringValue(payload?.role);
@@ -994,6 +1062,9 @@ async function projectResponseItem(
       };
     }
     const content = messageText(payload?.content);
+    const runtimeContext = role === "user" &&
+      normalizerVersion === NORMALIZER_VERSION &&
+      isRuntimeContextMessage(content);
     return {
       ...base,
       ...(await messageFields(content)),
@@ -1002,7 +1073,7 @@ async function projectResponseItem(
       phase: stringValue(payload?.phase),
       message_role: role,
       message_origin: role === "user"
-        ? "human"
+        ? runtimeContext ? RUNTIME_CONTEXT_MESSAGE_ORIGIN : "human"
         : assistantMessageOrigin(base.actor_role),
       source_priority: role === "user" ? 50 : 100,
       logical_event_key: messageLogicalKey(base, role),

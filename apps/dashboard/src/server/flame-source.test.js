@@ -5,14 +5,17 @@ import {
   BUCKET_COUNT,
   BUCKET_MS,
   CLAUDE_NORMALIZER_VERSION,
+  COMPATIBLE_WORK_FRAME_VERSION,
   DEFAULT_WORK_DETAIL_LIMIT,
   FRAME_VERSION,
+  FRESHNESS_NORMALIZER_VERSIONS,
   FRESHNESS_SQL,
   FLAME_SQL,
   INTERVAL_PROMPTS_SQL,
   INTERVAL_PULL_REQUESTS_SQL,
   INTERVAL_PROMPT_LIMIT,
   INTERVAL_WORK_SQL,
+  LEGACY_NORMALIZER_VERSIONS,
   MAX_WORK_DETAIL_LIMIT,
   MCP_PROMPT_EVIDENCE_LIMIT,
   NORMALIZER_VERSION,
@@ -32,6 +35,7 @@ import {
   FlameSourceError,
   buildFlamePayload,
   buildFreshnessPayload,
+  dashboardWorkSummary,
   decodeWorkCursor,
   decodeSnapshotToken,
   encodeWorkCursor,
@@ -92,6 +96,19 @@ function expectSqlInOrder(sql, ...fragments) {
 }
 
 describe("Sherlock Flame payload", () => {
+  it("renders human summaries while rejecting reserved runtime context", () => {
+    expect(dashboardWorkSummary("  Ship the dashboard fix  ")).toBe(
+      "Ship the dashboard fix",
+    );
+    expect(dashboardWorkSummary("   ")).toBeNull();
+    expect(dashboardWorkSummary("<recommended_plugins>machine context"))
+      .toBeNull();
+    expect(dashboardWorkSummary("<environment_context>machine context"))
+      .toBeNull();
+    expect(dashboardWorkSummary("<order>human-authored XML</order>"))
+      .toBe("<order>human-authored XML</order>");
+  });
+
   it("maps the live user-visible freshness aggregate without exposing private queue rows", () => {
     const payload = buildFreshnessPayload([{
       read_at: "2026-08-17T12:10:00.000Z",
@@ -158,7 +175,7 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe).toHaveBeenCalledWith(FRESHNESS_SQL, [
       source.workspaceId,
       source.expectedEmailDomain,
-      { values: NORMALIZER_VERSIONS },
+      { values: FRESHNESS_NORMALIZER_VERSIONS },
       500,
     ]);
   });
@@ -215,6 +232,7 @@ describe("Sherlock Flame payload", () => {
     expect(decodeSnapshotToken(payload.snapshot)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
+      normalizerVersions: NORMALIZER_VERSIONS,
     });
   });
 
@@ -290,6 +308,7 @@ describe("Sherlock Flame payload", () => {
     expect(decodeSnapshotToken(payload.snapshot)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
+      normalizerVersions: NORMALIZER_VERSIONS,
     });
     expect(() => buildFlamePayload({
       rows: [{ person_id: "unexpected" }],
@@ -318,7 +337,8 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("'task_started', 'task_complete', 'turn_started', 'turn_complete'");
     expect(FLAME_SQL).not.toContain("analytics.activity_spans");
     expect(FLAME_SQL).toContain("$1::uuid");
-    expect(FLAME_SQL).not.toContain("content_excerpt");
+    expect(FLAME_SQL).not.toContain("e.content_excerpt,");
+    expect(FLAME_SQL).toContain("native_prompt_candidate");
   });
 
   it("excludes guardians only after canonical activity winners are selected", () => {
@@ -489,8 +509,22 @@ describe("Sherlock Flame payload", () => {
   it("round-trips a bounded immutable aggregate snapshot receipt", () => {
     const token = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 
-    expect(token).toMatch(/^v1\.[A-Za-z0-9_-]+$/);
-    expect(decodeSnapshotToken(token)).toEqual({ snapshot: PG_SNAPSHOT, read: READ });
+    expect(token).toMatch(/^v3\.[A-Za-z0-9_-]+$/);
+    expect(decodeSnapshotToken(token)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      normalizerVersions: NORMALIZER_VERSIONS,
+    });
+
+    const legacyBody = Buffer.from(JSON.stringify([
+      PG_SNAPSHOT,
+      READ.toISOString(),
+    ])).toString("base64url");
+    expect(decodeSnapshotToken(`v1.${legacyBody}`)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      normalizerVersions: LEGACY_NORMALIZER_VERSIONS,
+    });
   });
 
   it("pins projection snapshots to the exact immutable frame version", () => {
@@ -506,15 +540,25 @@ describe("Sherlock Flame payload", () => {
       read: READ,
       frameVersion: FRAME_VERSION,
     });
+    const compatibleToken = encodeProjectionSnapshotToken({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: COMPATIBLE_WORK_FRAME_VERSION,
+    });
+    expect(decodeSnapshotToken(compatibleToken)).toEqual({
+      snapshot: PG_SNAPSHOT,
+      read: READ,
+      frameVersion: COMPATIBLE_WORK_FRAME_VERSION,
+    });
     expect(() => encodeProjectionSnapshotToken({
       snapshot: PG_SNAPSHOT,
       read: READ,
-      frameVersion: "frame-evidence-v2",
+      frameVersion: "frame-evidence-v3",
     })).toThrow(FlameSourceError);
     const unsupported = Buffer.from(JSON.stringify([
       PG_SNAPSHOT,
       READ.toISOString(),
-      "frame-evidence-v2",
+      "frame-evidence-v3",
     ])).toString("base64url");
     expect(() => decodeSnapshotToken(`v2.${unsupported}`)).toThrow(FlameSourceError);
   });
@@ -549,6 +593,7 @@ describe("Sherlock Flame payload", () => {
     expect(decodeSnapshotToken(payload.snapshot)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
+      normalizerVersions: NORMALIZER_VERSIONS,
     });
     expect(unsafe.mock.calls[2][1]).toEqual([
       source.workspaceId,
@@ -561,13 +606,16 @@ describe("Sherlock Flame payload", () => {
   });
 
   it.each([
-    [true, PROJECTION_FLAME_SQL, "v2"],
-    [false, FLAME_SQL, "v1"],
-    [null, FLAME_SQL, "v1"],
-  ])("routes an exact-version activation value of %s", async (
+    [true, false, PROJECTION_FLAME_SQL, "v2", FRAME_VERSION],
+    [false, true, PROJECTION_FLAME_SQL, "v2", COMPATIBLE_WORK_FRAME_VERSION],
+    [false, false, FLAME_SQL, "v3", null],
+    [null, null, FLAME_SQL, "v3", null],
+  ])("routes current activation %s and compatible work activation %s", async (
     frameProjectionActive,
+    compatibleWorkProjectionActive,
     expectedSql,
     expectedTokenVersion,
+    expectedFrameVersion,
   ) => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
@@ -579,6 +627,7 @@ describe("Sherlock Flame payload", () => {
         now: READ,
         snapshot: PG_SNAPSHOT,
         frame_projection_active: frameProjectionActive,
+        compatible_work_projection_active: compatibleWorkProjectionActive,
       }])
       .mockResolvedValueOnce(roster)
       .mockResolvedValueOnce(rowsFor("ada"));
@@ -591,15 +640,24 @@ describe("Sherlock Flame payload", () => {
 
     expect(unsafe.mock.calls[0][0]).toContain("exists (");
     expect(unsafe.mock.calls[0][0]).toContain("activation.frame_version = $2");
+    expect(unsafe.mock.calls[0][0]).toContain("activation.frame_version = $3");
     expect(unsafe.mock.calls[0][0]).not.toContain("order by activation");
-    expect(unsafe.mock.calls[0][1]).toEqual([source.workspaceId, FRAME_VERSION]);
+    expect(unsafe.mock.calls[0][1]).toEqual([
+      source.workspaceId,
+      FRAME_VERSION,
+      COMPATIBLE_WORK_FRAME_VERSION,
+    ]);
     expect(unsafe.mock.calls[2][0]).toBe(expectedSql);
     const expectedSnapshot = {
       snapshot: PG_SNAPSHOT,
       read: READ,
     };
+    if (expectedFrameVersion) {
+      expectedSnapshot.frameVersion = expectedFrameVersion;
+    } else {
+      expectedSnapshot.normalizerVersions = NORMALIZER_VERSIONS;
+    }
     if (frameProjectionActive) {
-      expectedSnapshot.frameVersion = FRAME_VERSION;
       expect(unsafe.mock.calls[2][1]).toEqual([
         source.workspaceId,
         START.toISOString(),
@@ -608,6 +666,9 @@ describe("Sherlock Flame payload", () => {
         READ.toISOString(),
         "e3group.ai",
       ]);
+    }
+    if (!frameProjectionActive && compatibleWorkProjectionActive) {
+      expect(unsafe.mock.calls[2][1][3]).toBe(COMPATIBLE_WORK_FRAME_VERSION);
     }
     expect(payload.snapshot).toMatch(new RegExp(`^${expectedTokenVersion}\\.`));
     expect(decodeSnapshotToken(payload.snapshot)).toEqual(expectedSnapshot);
@@ -630,7 +691,7 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.frame_projection_activations");
     expect(unsafe.mock.calls[0][1]).toBeUndefined();
     expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
-    expect(payload.snapshot).toMatch(/^v1\./);
+    expect(payload.snapshot).toMatch(/^v3\./);
   });
 
   it("selects the 30-second transaction timeout only for the cached timeline", async () => {
@@ -738,6 +799,25 @@ describe("Sherlock Flame payload", () => {
     expect(FLAME_SQL).toContain("<= 100 / 1000.0");
   });
 
+  it("accepts stable native prompt evidence without duplicating its identity", () => {
+    expect(FLAME_SQL).toContain("native_prompt_sources as materialized");
+    expect(FLAME_SQL).toContain(
+      "(keyed_submitted or keyed_native_item_id is not null) has_submitted",
+    );
+    expect(FLAME_SQL).toContain("source_native_type = 'response_item'");
+    expect(FLAME_SQL).toContain("source_native_payload_type = 'message'");
+    expect(FLAME_SQL).toContain("partition by person_id, prompt_identity");
+    for (const sql of [FLAME_SQL, INTERVAL_PROMPTS_SQL]) {
+      expect(sql).toContain("e.message_origin = 'human'");
+      expect(sql).toContain("sherlock.codex-rollout.v1");
+      expect(sql).toContain("<recommended_plugins>");
+      expect(sql).toContain("<codex_delegation>");
+      expect(sql).toContain("<heartbeat>");
+    }
+    expect(FLAME_SQL).toContain("native_prompt_candidate");
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL).not.toContain("<recommended_plugins>");
+  });
+
   it("cannot let response-only evidence suppress a submitted prompt identity", () => {
     expect(FLAME_SQL).toContain(
       "from prompt_identities\n       where has_submitted",
@@ -786,6 +866,9 @@ describe("Sherlock Flame payload", () => {
       expect(sql).not.toContain("analytics.activity_spans");
     }
     expect(INTERVAL_WORK_SQL).toContain("group by session_id, semantic_role");
+    expect(INTERVAL_WORK_SQL).toContain(
+      "event_subtype = 'message' and message_origin = 'human'",
+    );
     expect(INTERVAL_WORK_SQL).toContain("and s.person_id = p.person_id");
     expect(INTERVAL_WORK_SQL).toContain("relevant_activity_sessions as materialized");
     expect(INTERVAL_WORK_SQL).toContain(
@@ -803,6 +886,9 @@ describe("Sherlock Flame payload", () => {
     expect(INTERVAL_WORK_SQL).toContain("select distinct e.session_id");
     expect(INTERVAL_WORK_SQL).toContain("limit $11");
     expect(WORK_DETAIL_SQL).toContain("and e.session_id = p.session_id");
+    expect(WORK_DETAIL_SQL).toContain(
+      "bucket_events.event_subtype = 'message'",
+    );
     expect(ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS).toBe(6);
     expect(WORK_DETAIL_SQL).toContain("p.bucket_start - interval '6 seconds'");
     expect(WORK_DETAIL_SQL).toContain("from header left join selected on true");
@@ -827,6 +913,19 @@ describe("Sherlock Flame payload", () => {
     );
     expect(WORK_DETAIL_SQL).toContain(
       "bucket_events.message_origin in ('human', 'parent_agent')",
+    );
+  });
+
+  it("screens session labels without removing submitted prompt evidence", () => {
+    expect(INTERVAL_WORK_SQL).toContain("<recommended_plugins>");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain("<recommended_plugins>");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain("<codex_delegation>");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain("is_summary_candidate");
+    expect(PROJECTION_INTERVAL_WORK_SQL).toContain(
+      "array_agg(source.content_excerpt",
+    );
+    expect(PROJECTION_INTERVAL_PROMPTS_SQL).not.toContain(
+      "<recommended_plugins>",
     );
   });
 
@@ -875,8 +974,19 @@ describe("Sherlock Flame payload", () => {
       expect(query).not.toContain("telemetry.native_records");
       expect(query).not.toContain("telemetry.ingest_batches");
     }
-    expect(PROJECTION_INTERVAL_WORK_SQL.indexOf("limit $8")).toBeLessThan(
-      PROJECTION_INTERVAL_WORK_SQL.indexOf("join telemetry.events summary"),
+    expect(PROJECTION_INTERVAL_WORK_SQL.indexOf("limit $10")).toBeLessThan(
+      PROJECTION_INTERVAL_WORK_SQL.indexOf("join telemetry.events source"),
+    );
+    expectSqlInOrder(
+      PROJECTION_INTERVAL_WORK_SQL,
+      "bucket_events as materialized",
+      "evidence.observed_at >= p.bucket_start",
+      "grouped as materialized",
+      "limit $10",
+      "session_summary_candidates as materialized",
+      "join projected_activity evidence",
+      "session_summaries as materialized",
+      "join telemetry.events source",
     );
     expect(PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("limit $10")).toBeLessThan(
       PROJECTION_INTERVAL_PROMPTS_SQL.indexOf("join telemetry.events source"),
@@ -1045,6 +1155,36 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
+  it("keeps already-issued v1 details on the legacy normalizer universe", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+    source.transaction = (callback) => callback({
+      unsafe,
+      array: (values) => values,
+    });
+    const legacyBody = Buffer.from(JSON.stringify([
+      PG_SNAPSHOT,
+      READ.toISOString(),
+    ])).toString("base64url");
+
+    await source.fetchInterval({
+      personId,
+      start: START.toISOString(),
+      snapshot: `v1.${legacyBody}`,
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[1][1][3]).toEqual(LEGACY_NORMALIZER_VERSIONS);
+    expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[2][1][3]).toEqual(LEGACY_NORMALIZER_VERSIONS);
+  });
+
   it("never silently falls a failing v2 interval back to raw SQL", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
@@ -1066,6 +1206,49 @@ describe("Sherlock Flame payload", () => {
     })).rejects.toBe(failure);
     expect(unsafe).toHaveBeenCalledTimes(2);
     expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
+  });
+
+  it("keeps interval evidence entirely on frame v2 while v3 backfills", async () => {
+    const source = Object.create(DirectFlameSource.prototype);
+    source.workspaceId = "11111111-1111-4111-8111-111111111111";
+    source.expectedEmailDomain = "e3group.ai";
+    const personId = "22222222-2222-4222-8222-222222222222";
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+    source.transaction = (callback) => callback({
+      unsafe,
+      array: (values) => values,
+    });
+
+    await source.fetchInterval({
+      personId,
+      start: START.toISOString(),
+      snapshot: encodeProjectionSnapshotToken({
+        snapshot: PG_SNAPSHOT,
+        read: READ,
+        frameVersion: COMPATIBLE_WORK_FRAME_VERSION,
+      }),
+    });
+
+    expect(unsafe.mock.calls[1][0]).toBe(PROJECTION_INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[1][1][1]).toBe(COMPATIBLE_WORK_FRAME_VERSION);
+    expect(unsafe.mock.calls[1][1].slice(4, 8)).toEqual([
+      START.toISOString(),
+      "2026-08-17T12:00:00.000Z",
+      START.toISOString(),
+      new Date(START.getTime() + 10 * 60 * 1000).toISOString(),
+    ]);
+    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[2][1][1]).toBe(COMPATIBLE_WORK_FRAME_VERSION);
+    expect(unsafe.mock.calls[2][1].slice(4, 8)).toEqual([
+      START.toISOString(),
+      "2026-08-17T12:00:00.000Z",
+      START.toISOString(),
+      new Date(START.getTime() + 10 * 60 * 1000).toISOString(),
+    ]);
+    expect(unsafe.mock.calls[2][1][9]).toBe(INTERVAL_PROMPT_LIMIT + 1);
   });
 
   it("distinguishes an expired snapshot from an invalid frame range", async () => {

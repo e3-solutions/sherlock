@@ -28,8 +28,8 @@ import {
 } from "./flame-data.js";
 
 const LANE_HEIGHT = 82;
-const MIN_PROMPT_STEM_LENGTH = 4;
-const MAX_PROMPT_STEM_LENGTH = 14;
+const MIN_PROMPT_STEM_LENGTH = 8;
+const MAX_PROMPT_STEM_LENGTH = 17;
 const TOOLTIP_EDGE_PADDING = 8;
 const TOOLTIP_GAP = 10;
 const TOOLTIP_ARROW_CENTER_OFFSET = 17.5;

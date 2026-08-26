@@ -65,7 +65,7 @@ describe("Bonaparte MCP usage evidence", () => {
         endExclusive: "2026-08-19T03:30:00.000Z",
         readAt: READ,
       },
-      provenance: { projectionVersion: "sherlock.codex-rollout.v1" },
+      provenance: { projectionVersion: "sherlock.codex-rollout.v2" },
       coverage: {
         state: "partial",
         basis: "observed_canonical_events",

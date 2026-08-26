@@ -104,7 +104,7 @@ function parseArgs(args: string[]): Options {
   return {
     workspaceId,
     normalizerVersion: values.get("normalizer-version") ??
-      "sherlock.codex-rollout.v1",
+      "sherlock.codex-rollout.v2",
     activityVersion: values.get("activity-version") ?? ACTIVITY_VERSION,
     throughEventId: through
       ? positiveBigInt(through, "through-event-id")
