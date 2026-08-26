@@ -7,6 +7,7 @@ import {
   decodeSnapshotToken,
   DirectFlameSource,
   FRAME_VERSION,
+  INTERVAL_PULL_REQUESTS_SQL,
   NORMALIZER_VERSION,
   PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
@@ -52,6 +53,8 @@ function collectPlanIndexes(value, indexes = new Set()) {
 }
 
 async function cleanup(sql, workspaceId) {
+  await sql.unsafe("delete from github.commit_pr_lookups where workspace_id = $1", [workspaceId]);
+  await sql.unsafe("delete from telemetry.session_scm where workspace_id = $1", [workspaceId]);
   await sql.unsafe(
     "delete from processing.telemetry_jobs where workspace_id = $1",
     [workspaceId],
@@ -357,11 +360,36 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       Math.floor(FIXED_NOW.getTime() / BUCKET_MS) * BUCKET_MS - BUCKET_MS,
     );
     const observedAt = new Date(bucketStart.getTime() + 1_000);
+    const scmReceivedAt = new Date(observedAt.getTime() + 2_000);
     const promptSourceAt = new Date(bucketStart.getTime() - 10_000);
     const promptNativeItemId = nativeItemId(observedAt);
     const partialRead = new Date(FIXED_NOW.getTime() + 2_000);
     const partialActivityAt = new Date(FIXED_NOW.getTime() + 1_000);
     const newestGuardianAt = new Date(partialActivityAt.getTime() + 500);
+    const commitSha = "1".repeat(40);
+    const secondCommitSha = "2".repeat(40);
+    const linksAt = (receipt) => sql.unsafe(INTERVAL_PULL_REQUESTS_SQL, [
+      workspaceId, receipt.snapshot, partialRead.toISOString(), [sessionId],
+    ]);
+    const appendLookup = (sha, {
+      outcome = "matched",
+      number = 54,
+      terminalAt = null,
+      createdAt = partialRead,
+    } = {}) => sql.unsafe(
+      `insert into github.commit_pr_lookups (
+         workspace_id, source_version, repository_full_name, commit_sha,
+         outcome, pull_request_number, pull_request_terminal_at, created_at
+       ) values ($1, 'sherlock.github-associated-pulls.v1',
+                 'e3-solutions/sherlock', $2, $3, $4, $5, $6)`,
+      [workspaceId, sha, outcome, number, terminalAt, createdAt],
+    );
+    const currentLinks = async () => {
+      const [receipt] = await sql.unsafe(
+        "select pg_current_snapshot()::text snapshot",
+      );
+      return await linksAt(receipt);
+    };
     try {
       await sql.unsafe(
         `insert into telemetry.workspaces (id, slug, name)
@@ -400,11 +428,12 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            source_kind, source_stream_key, generation_key, generation_seq,
            start_offset, end_offset, source_byte_count, source_sha256,
            storage_path, storage_encoding, stored_byte_count, stored_sha256,
-           record_count, contract_version, first_occurred_at, last_occurred_at
+           record_count, contract_version, first_occurred_at, last_occurred_at,
+           committed_at
          ) values (
            $1, $2, $3, 'projection-collector', 'codex', 'rollout',
-           'projection-stream', 'projection-generation', 0, 0, 1, 1, $4,
-           $5, 'gzip', 1, $6, 1, 'sherlock.rollout-batch.v1', $7, $7
+           'projection-stream', 'projection-generation', 0, 0, 3, 3, $4,
+           $5, 'gzip', 1, $6, 3, 'sherlock.rollout-batch.v1', $7, $7, $8
          )`,
         [
           batchId,
@@ -414,6 +443,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           `projection-tests/${batchId}.jsonl.gz`,
           "b".repeat(64),
           observedAt.toISOString(),
+          scmReceivedAt.toISOString(),
         ],
       );
       const nativeRows = await sql.unsafe(
@@ -421,10 +451,44 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            workspace_id, batch_id, record_index, source_start_offset,
            source_end_offset, record_sha256, native_type,
            native_payload_type, occurred_at, parse_status
-         ) values ($1, $2, 0, 0, 1, $3, 'event_msg', 'user_message', $4, 'ok')
-         returning id::text id`,
-        [workspaceId, batchId, "c".repeat(64), observedAt.toISOString()],
+         ) values
+           ($1, $2, 0, 0, 1, $3, 'event_msg', 'user_message', $4, 'ok'),
+           ($1, $2, 1, 1, 2, $5, 'session_meta', 'session_meta', $4, 'ok'),
+           ($1, $2, 2, 2, 3, $6, 'session_meta', 'session_meta', $4, 'ok')
+         returning id::text id, record_index`,
+        [
+          workspaceId,
+          batchId,
+          "c".repeat(64),
+          observedAt.toISOString(),
+          "1".repeat(64),
+          "2".repeat(64),
+        ],
       );
+      const sourceRecordId = (recordIndex) =>
+        nativeRows.find((row) => row.record_index === recordIndex).id;
+      await sql.unsafe(
+        `insert into telemetry.session_scm (
+           workspace_id, source_record_id, session_id, source_version,
+           repository_full_name, commit_sha, observed_at, server_received_at
+         ) values
+           ($1, $2, $4, 'sherlock.github-scm.v1',
+            'e3-solutions/sherlock', $5, $6, $7),
+           ($1, $3, $4, 'sherlock.github-scm.v1',
+            'e3-solutions/sherlock', $8, $6, $7)`,
+        [
+          workspaceId,
+          sourceRecordId(1),
+          sourceRecordId(2),
+          sessionId,
+          commitSha,
+          observedAt.toISOString(),
+          scmReceivedAt.toISOString(),
+          secondCommitSha,
+        ],
+      );
+      await appendLookup(commitSha);
+      await appendLookup(secondCommitSha);
       const eventRows = await sql.unsafe(
         `insert into telemetry.events (
            workspace_id, session_id, source_record_id, normalizer_version,
@@ -439,7 +503,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [
           workspaceId,
           sessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           promptSourceAt.toISOString(),
           promptNativeItemId,
@@ -458,7 +522,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [
           workspaceId,
           sessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           partialActivityAt.toISOString(),
         ],
@@ -484,7 +548,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           workspaceId,
           guardianSessionId,
           workerSessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           new Date(bucketStart.getTime() + 2_000).toISOString(),
           new Date(bucketStart.getTime() + 2_500).toISOString(),
@@ -707,6 +771,25 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         snapshot: projectedDay.snapshot,
       });
 
+      // A lookup cannot predate the server's receipt of the session fact.
+      await appendLookup(commitSha, {
+        terminalAt: new Date(observedAt.getTime() + 1_000),
+      });
+      await expect(currentLinks()).resolves.toEqual([]);
+
+      await appendLookup(commitSha);
+      await appendLookup(secondCommitSha, { number: 55 });
+      await expect(currentLinks()).resolves.toEqual([]);
+
+      await appendLookup(secondCommitSha);
+      await appendLookup(commitSha, { outcome: "ambiguous", number: null });
+      await expect(currentLinks()).resolves.toEqual([]);
+
+      await appendLookup(commitSha, {
+        terminalAt: new Date(observedAt.getTime() + 3_000),
+        createdAt: new Date(partialRead.getTime() - 6 * 60 * 60_000 - 16 * 60_000),
+      });
+
       await sql.unsafe(
         "update telemetry.people set github_id = 'sherlock-smoke' where workspace_id = $1 and id = $2",
         [workspaceId, personId],
@@ -773,7 +856,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         [
           workspaceId,
           sessionId,
-          nativeRows[0].id,
+          sourceRecordId(0),
           NORMALIZER_VERSION,
           new Date(observedAt.getTime() + 500).toISOString(),
         ],
@@ -837,6 +920,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
       expect(oldSnapshotInterval.prompts).toHaveLength(1);
       expect(newInterval.prompts).toEqual([]);
+      expect(oldSnapshotInterval.work[0].pullRequest?.number).toBe(54);
+      expect(newInterval.work[0]).not.toHaveProperty("pullRequest");
     } finally {
       if (source) await source.close();
       await sql.unsafe(

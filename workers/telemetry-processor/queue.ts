@@ -1,4 +1,5 @@
 import { createPostgresPool, type ReservedSql, type Sql } from "./database.ts";
+import type { CommitPair, LookupResult } from "./github-sync.ts";
 
 export type WorkloadClass = "live" | "backfill";
 export type JobKind = "normalize" | "reduce";
@@ -119,6 +120,85 @@ export class PostgresJobQueue {
     } finally {
       connection.release();
     }
+  }
+
+  async pendingGithubCommitPairs(
+    limit: number,
+    workspaceIds: readonly string[],
+  ): Promise<CommitPair[]> {
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_processor");
+      const rows = await tx.unsafe(
+        `with recent_sessions as materialized (
+           select distinct workspace_id, session_id
+             from telemetry.events
+            where server_received_at >= now() - interval '26 hours'
+              and workspace_id = any($2::uuid[])
+              and session_id is not null and not is_replay
+         ), observed as (
+           select distinct scm.workspace_id, scm.repository_full_name,
+                  scm.commit_sha
+             from telemetry.session_scm scm
+             left join recent_sessions recent
+               on recent.workspace_id = scm.workspace_id
+              and recent.session_id = scm.session_id
+            where scm.source_version = 'sherlock.github-scm.v1'
+              and scm.workspace_id = any($2::uuid[])
+              and (
+                scm.created_at >= now() - interval '26 hours'
+                or recent.session_id is not null
+              )
+         )
+         select observed.*
+           from observed
+           left join lateral (
+             select id, outcome, pull_request_terminal_at, created_at
+               from github.commit_pr_lookups
+              where workspace_id = observed.workspace_id
+                and source_version = 'sherlock.github-associated-pulls.v1'
+                and repository_full_name = observed.repository_full_name
+                and commit_sha = observed.commit_sha
+              order by id desc
+              limit 1
+           ) latest on true
+          where latest.id is null or latest.created_at < now() - case
+            when latest.outcome = 'matched' and
+                 latest.pull_request_terminal_at is not null
+              then interval '6 hours'
+            else interval '10 minutes'
+          end
+          order by (latest.id is not null), latest.id,
+                   observed.workspace_id, observed.repository_full_name,
+                   observed.commit_sha
+          limit $1`,
+        [limit, workspaceIds],
+      );
+      return rows.map((row) => ({
+        workspaceId: String(row.workspace_id),
+        repositoryFullName: String(row.repository_full_name),
+        commitSha: String(row.commit_sha),
+      }));
+    });
+  }
+
+  async appendGithubLookup(result: LookupResult): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_processor");
+      await tx.unsafe(
+        `insert into github.commit_pr_lookups (
+           workspace_id, source_version, repository_full_name, commit_sha,
+           outcome, pull_request_number, pull_request_terminal_at
+         ) values ($1, 'sherlock.github-associated-pulls.v1', $2, $3, $4, $5, $6)`,
+        [
+          result.workspaceId,
+          result.repositoryFullName,
+          result.commitSha,
+          result.outcome,
+          result.pullRequestNumber,
+          result.pullRequestTerminalAt,
+        ],
+      );
+    });
   }
 
   async claim(

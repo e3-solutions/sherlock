@@ -617,6 +617,13 @@ input { font: inherit; }
   flex-direction: column;
 }
 
+.flame-detail__view[data-transition] {
+  animation: flame-detail-view-enter var(--flame-detail-motion-duration) var(--flame-detail-motion-easing) both;
+}
+
+.flame-detail__view[data-transition="forward"] { --flame-detail-view-offset: 18px; }
+.flame-detail__view[data-transition="back"] { --flame-detail-view-offset: -18px; }
+
 .flame-detail__body { flex: 1; }
 
 @keyframes flame-detail-enter-x {
@@ -638,6 +645,17 @@ input { font: inherit; }
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes flame-detail-view-enter {
+  from {
+    opacity: 0;
+    transform: translateX(var(--flame-detail-view-offset));
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
   }
 }
 
@@ -893,7 +911,12 @@ input { font: inherit; }
   list-style: none;
 }
 
-.flame-detail__work li { border-bottom: 1px solid var(--flame-rule); }
+.flame-detail__work li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  border-bottom: 1px solid var(--flame-rule);
+}
 
 .flame-detail__work button {
   display: grid;
@@ -957,6 +980,46 @@ input { font: inherit; }
   font-size: 22px;
 }
 
+.flame-detail__pull-request {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  justify-self: end;
+  gap: 3px;
+  margin: 0 12px 0 4px;
+  padding: 6px 0;
+  color: var(--flame-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.flame-detail__pull-request:hover,
+.flame-detail__pull-request:focus-visible {
+  color: var(--flame-ink);
+}
+
+.flame-detail__pull-request:focus-visible {
+  outline: 1px solid var(--flame-ink);
+  outline-offset: 3px;
+}
+
+.flame-detail__pull-request svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.flame-detail__work-meta .flame-detail__pull-request {
+  margin: 0 0 0 auto;
+}
+
 .flame-detail__work-expander {
   width: 100%;
   margin-top: 8px;
@@ -1014,7 +1077,13 @@ input { font: inherit; }
   font-weight: 600;
 }
 
-.flame-detail__work-heading > p:not(.flame-detail__eyebrow):not(.flame-detail__stale) {
+.flame-detail__work-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.flame-detail__work-meta > p {
   margin: 0;
   color: var(--flame-muted);
   font-size: 12px;

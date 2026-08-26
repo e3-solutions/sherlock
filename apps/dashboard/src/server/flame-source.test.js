@@ -12,6 +12,7 @@ import {
   FRESHNESS_SQL,
   FLAME_SQL,
   INTERVAL_PROMPTS_SQL,
+  INTERVAL_PULL_REQUESTS_SQL,
   INTERVAL_PROMPT_LIMIT,
   INTERVAL_WORK_SQL,
   LEGACY_NORMALIZER_VERSIONS,
@@ -1099,6 +1100,11 @@ describe("Sherlock Flame payload", () => {
         summary: "Inspect the query",
       }])
       .mockResolvedValueOnce([{
+        session_id: sessionId,
+        repository_full_name: "e3-solutions/sherlock",
+        pull_request_number: 54,
+      }])
+      .mockResolvedValueOnce([{
         prompt_identity: "native:msg_1",
         session_id: sessionId,
         observed_at: new Date("2026-08-16T12:00:10.000Z"),
@@ -1119,8 +1125,8 @@ describe("Sherlock Flame payload", () => {
 
     expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
     expect(unsafe.mock.calls[1][1].at(-1)).toBe(201);
-    expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PROMPTS_SQL);
-    expect(unsafe.mock.calls[2][1].at(-1)).toBe(201);
+    expect(unsafe.mock.calls[3][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[3][1].at(-1)).toBe(201);
     expect(interval).toMatchObject({
       personId,
       start: START.toISOString(),
@@ -1131,6 +1137,10 @@ describe("Sherlock Flame payload", () => {
         role: "subagent",
         eventCount: 4,
         summary: "Inspect the query",
+        pullRequest: {
+          number: 54,
+          url: "https://github.com/e3-solutions/sherlock/pull/54",
+        },
       }],
       prompts: [{
         id: "native:msg_1",

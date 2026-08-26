@@ -10,6 +10,7 @@ export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
 export const ROLE_VERSION = "sherlock.codex-role.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 export const CLAUDE_ROLE_VERSION = "sherlock.claude-code-role.v1";
+export const SCM_SOURCE_VERSION = "sherlock.github-scm.v1";
 
 export const RUNTIME_CONTEXT_MESSAGE_ORIGIN = "runtime_context";
 const RUNTIME_CONTEXT_ENVELOPE_NAMES = new Set([
@@ -39,6 +40,8 @@ const CLAUDE_HOOK_SCHEMA_VERSION = "sherlock.claude-hook.v1";
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/;
+const GITHUB_REPOSITORY_PART = /^[a-z0-9_.-]+$/;
 
 type JsonValue =
   | null
@@ -110,9 +113,18 @@ export interface EventProjection {
   attributes: JsonObject | null;
 }
 
+export interface SessionScmFact {
+  record_index: number;
+  source_version: string;
+  repository_full_name: string;
+  commit_sha: string;
+  observed_at: string;
+}
+
 export interface BatchProjection {
   session: SessionProjection | null;
   events: EventProjection[];
+  session_scm: SessionScmFact | null;
 }
 
 interface ParsedRecord {
@@ -143,6 +155,31 @@ export function normalizerVersionFor(manifest: BatchManifest): string {
   return manifest.source_provider === "claude_code"
     ? CLAUDE_NORMALIZER_VERSION
     : NORMALIZER_VERSION;
+}
+
+function githubRepositoryFullName(value: unknown): string | null {
+  const remote = stringValue(value);
+  if (!remote) return null;
+  const prefixes = [
+    "https://github.com/",
+    "ssh://git@github.com/",
+    "git@github.com:",
+  ];
+  const prefix = prefixes.find((candidate) =>
+    remote.toLowerCase().startsWith(candidate)
+  );
+  if (!prefix) return null;
+  let path = remote.slice(prefix.length);
+  if (path.endsWith("/")) path = path.slice(0, -1);
+  if (path.toLowerCase().endsWith(".git")) path = path.slice(0, -4);
+  const parts = path.toLowerCase().split("/");
+  if (
+    parts.length !== 2 ||
+    parts.some((part) =>
+      !GITHUB_REPOSITORY_PART.test(part) || part === "." || part === ".."
+    )
+  ) return null;
+  return parts.join("/");
 }
 
 export function legacyNormalizerVersionFor(manifest: BatchManifest): string {
@@ -209,7 +246,7 @@ async function projectClaudeHookBatch(
       projectClaudeHookRecord(record, session, canonicalScopeKey)
     ),
   );
-  return { session, events: projected };
+  return { session, events: projected, session_scm: null };
 }
 
 async function projectClaudeHookRecord(
@@ -458,6 +495,7 @@ async function projectCodexBatch(
       : parseEnvelope(recordBytes(manifest, source, locator)),
   }));
   const metaRecord = records.find((record) =>
+    record.locator.native_type === "session_meta" &&
     record.envelope?.type === "session_meta" &&
     objectValue(record.envelope.payload) !== null
   );
@@ -504,7 +542,24 @@ async function projectCodexBatch(
       projectRecord(record, session, canonicalScopeKey, normalizerVersion)
     ),
   );
-  return { session, events };
+  const metaGit = objectValue(meta?.git);
+  const commitSha = stringValue(metaGit?.commit_hash)?.toLowerCase() ?? null;
+  const repositoryFullName = githubRepositoryFullName(
+    metaGit?.repository_url,
+  );
+  const observedAt = metaRecord?.locator.occurred_at ??
+    manifest.first_occurred_at;
+  const sessionScm = metaRecord && session && observedAt && commitSha &&
+      GIT_COMMIT_SHA.test(commitSha) && repositoryFullName
+    ? {
+      record_index: metaRecord.locator.record_index,
+      source_version: SCM_SOURCE_VERSION,
+      repository_full_name: repositoryFullName,
+      commit_sha: commitSha,
+      observed_at: observedAt,
+    } satisfies SessionScmFact
+    : null;
+  return { session, events, session_scm: sessionScm };
 }
 
 async function projectClaudeBatch(
@@ -579,7 +634,7 @@ async function projectClaudeBatch(
       )
     ),
   );
-  return { session, events: projected.flat() };
+  return { session, events: projected.flat(), session_scm: null };
 }
 
 async function projectClaudeRecord(

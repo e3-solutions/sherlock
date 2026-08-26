@@ -64,6 +64,7 @@ jobs:
           deno check workers/telemetry-processor/main.ts
           deno check scripts/reduce-activity.ts
           deno check scripts/backfill-frame-evidence.ts
+          deno check scripts/backfill-session-scm.ts
           deno check workers/telemetry-processor/frame-projector.ts
 
       - name: Run collector tests

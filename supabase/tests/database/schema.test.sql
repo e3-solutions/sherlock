@@ -3,11 +3,12 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(142);
+select plan(145);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
 select has_schema('processing', 'processing schema exists');
+select has_schema('github', 'github source schema exists');
 
 select has_table('telemetry', 'workspaces', 'workspaces table exists');
 select has_table('telemetry', 'people', 'people table exists');
@@ -15,6 +16,14 @@ select has_table('telemetry', 'sessions', 'sessions table exists');
 select has_table('telemetry', 'ingest_batches', 'ingest_batches table exists');
 select has_table('telemetry', 'native_records', 'native_records table exists');
 select has_table('telemetry', 'events', 'events table exists');
+select has_table(
+  'telemetry', 'session_scm',
+  'session SCM facts are auditable'
+);
+select has_table(
+  'github', 'commit_pr_lookups',
+  'GitHub commit lookup outcomes are auditable'
+);
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
 select has_table(
   'analytics', 'frame_projection_receipts',
@@ -1155,12 +1164,37 @@ begin
     to_regnamespace('telemetry') is not null and
     to_regnamespace('analytics') is not null and
     to_regnamespace('processing') is not null and
+    to_regnamespace('github') is not null and
     to_regclass('telemetry.workspaces') is not null and
     to_regclass('telemetry.people') is not null and
     to_regclass('telemetry.sessions') is not null and
     to_regclass('telemetry.ingest_batches') is not null and
     to_regclass('telemetry.native_records') is not null and
     to_regclass('telemetry.events') is not null and
+    to_regclass('telemetry.session_scm') is not null and
+    to_regclass('github.commit_pr_lookups') is not null and
+    exists (select 1 from pg_attribute
+      where attrelid = 'processing.telemetry_jobs'::regclass
+        and attname = 'scm_backfill_version' and not attnotnull) and
+    (select attnotnull from pg_attribute
+      where attrelid = 'telemetry.session_scm'::regclass
+        and attname = 'server_received_at') and
+    exists (
+      select 1 from pg_constraint
+      where conrelid = 'telemetry.session_scm'::regclass and contype = 'p'
+        and pg_get_constraintdef(oid) =
+          'PRIMARY KEY (source_record_id, source_version)'
+    ) and
+    pg_get_indexdef('telemetry.session_scm_recent_idx'::regclass) like
+      '%(created_at DESC, workspace_id, repository_full_name, commit_sha)%' and
+    exists (
+      select 1 from pg_index i
+      where i.indexrelid =
+          to_regclass('telemetry.events_server_received_brin_idx')
+        and i.indisvalid
+        and pg_get_indexdef(i.indexrelid) like
+          '%USING brin (server_received_at)%'
+    ) and
     exists (
       select 1
       from pg_index i
@@ -1186,6 +1220,8 @@ begin
     not has_schema_privilege('anon', 'analytics', 'usage') and
     not has_schema_privilege('authenticated', 'telemetry', 'usage') and
     not has_schema_privilege('authenticated', 'analytics', 'usage') and
+    not has_schema_privilege('anon', 'github', 'usage') and
+    not has_schema_privilege('authenticated', 'github', 'usage') and
     not has_schema_privilege('anon', 'processing', 'usage') and
     not has_schema_privilege('authenticated', 'processing', 'usage') and
     not has_table_privilege('anon', 'telemetry.ingest_batches', 'select') and
@@ -1217,6 +1253,11 @@ begin
     not has_table_privilege('sherlock_ingest', 'telemetry.ingest_batches', 'delete') and
     not has_table_privilege('sherlock_normalizer', 'telemetry.events', 'update') and
     not has_table_privilege('sherlock_normalizer', 'telemetry.events', 'delete') and
+    has_table_privilege('sherlock_normalizer', 'telemetry.session_scm', 'insert') and
+    not has_table_privilege('sherlock_normalizer', 'telemetry.session_scm', 'update') and
+    has_table_privilege('sherlock_processor', 'telemetry.session_scm', 'select') and
+    has_table_privilege('sherlock_processor', 'github.commit_pr_lookups', 'insert') and
+    not has_table_privilege('sherlock_processor', 'github.commit_pr_lookups', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'update') and
     not has_table_privilege('sherlock_normalizer', 'analytics.activity_spans', 'delete') and
     has_table_privilege('sherlock_processor', 'processing.telemetry_jobs', 'select') and
@@ -1250,8 +1291,8 @@ $$;
 
 select jsonb_build_object(
   'all_passed', true,
-  'assertion_count', 142,
-  'tables', 12,
+  'assertion_count', 145,
+  'tables', 14,
   'private_bucket', 'telemetry-raw'
 ) as verification;
 

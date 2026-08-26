@@ -344,7 +344,7 @@ describe("interval and work evidence adapters", () => {
   };
 
   it("validates source-backed work rows", () => {
-    const result = adaptIntervalEvidence({
+    const value = {
       personId: expected.personId,
       start: new Date(startMs).toISOString(),
       snapshot: expected.snapshot,
@@ -353,20 +353,31 @@ describe("interval and work evidence adapters", () => {
         firstAt: new Date(startMs + 1000).toISOString(),
         lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
         summary: "Investigate the cursor",
+        pullRequest: {
+          number: 54,
+          url: "https://github.com/e3-solutions/sherlock/pull/54",
+        },
       }],
       prompts: [{
         id: "native:msg-1", sessionId: "s1",
         at: new Date(startMs + 1500).toISOString(),
         content: "Investigate the cursor", truncated: false,
       }],
-    }, expected);
+    };
+    const result = adaptIntervalEvidence(value, expected);
 
     expect(result.work[0]).toMatchObject({
       id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2,
+      pullRequest: {
+        number: 54,
+        url: "https://github.com/e3-solutions/sherlock/pull/54",
+      },
     });
     expect(result.prompts).toEqual([expect.objectContaining({
       id: "native:msg-1", content: "Investigate the cursor",
     })]);
+    value.work[0].pullRequest.url = "https://github.com/../sherlock/pull/54";
+    expect(() => adaptIntervalEvidence(value, expected)).toThrow(FlameDataError);
   });
 
   it("rejects prompt rows whose identities do not match the aggregate count", () => {

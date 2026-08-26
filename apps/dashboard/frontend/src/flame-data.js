@@ -365,6 +365,20 @@ export function mergeFlameFreshness(data, freshness) {
 const SEMANTIC_ROLES = ["agent", "subagent", "unclassified"];
 const CONVERSATION_ROLES = ["user", "assistant"];
 
+function requirePullRequest(value, path) {
+  if (value === null || value === undefined) return null;
+  const pullRequest = requireObject(value, path);
+  const number = requirePositiveCount(pullRequest.number, `${path}.number`);
+  const url = requireNonemptyString(pullRequest.url, `${path}.url`);
+  const match = new RegExp(
+    `^https://github\\.com/([a-z0-9_.-]+)/([a-z0-9_.-]+)/pull/${number}$`,
+  ).exec(url);
+  if (!match || match.slice(1).some((part) => part === "." || part === "..")) {
+    fail(`${path}.url`, "the matching GitHub pull request URL");
+  }
+  return { number, url };
+}
+
 /** Validates the bounded, snapshot-pinned interval overview response. */
 export function adaptIntervalEvidence(value, expected) {
   const payload = requireObject(value, "interval evidence");
@@ -395,6 +409,7 @@ export function adaptIntervalEvidence(value, expected) {
       eventCount: requirePositiveCount(item.eventCount, `${path}.eventCount`),
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
       summary,
+      pullRequest: requirePullRequest(item.pullRequest, `${path}.pullRequest`),
     };
   });
 

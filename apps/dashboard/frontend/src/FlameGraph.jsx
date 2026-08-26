@@ -412,9 +412,27 @@ function DrawerCloseButton({ closing, onClose }) {
   );
 }
 
+function PullRequestLink({ pullRequest }) {
+  return (
+    <a
+      className="flame-detail__pull-request"
+      href={pullRequest.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={`Open PR #${pullRequest.number} on GitHub`}
+    >
+      PR #{pullRequest.number}
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 16 16">
+        <path d="M5 11 11 5M6 5h5v5" />
+      </svg>
+    </a>
+  );
+}
+
 function IntervalOverview({
   person,
   point,
+  transition,
   onClose,
   evidence,
   onRetry,
@@ -426,11 +444,15 @@ function IntervalOverview({
   closing,
 }) {
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const promptedWork = evidence.work.filter(({ summary }) => summary !== null);
-  const additionalWork = evidence.work.filter(({ summary }) => summary === null);
+  const primaryWork = evidence.work.filter(({ summary, pullRequest }) =>
+    summary !== null || pullRequest !== null
+  );
+  const additionalWork = evidence.work.filter(({ summary, pullRequest }) =>
+    summary === null && pullRequest === null
+  );
   const visibleWork = showAdditionalWork
-    ? [...promptedWork, ...additionalWork]
-    : promptedWork;
+    ? [...primaryWork, ...additionalWork]
+    : primaryWork;
 
   function workRow(work) {
     const label = work.summary ?? `${roleLabel(work.role)} session`;
@@ -455,12 +477,19 @@ function IntervalOverview({
     return (
       <li key={work.id}>
         <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
+        {work.pullRequest && (
+          <PullRequestLink pullRequest={work.pullRequest} />
+        )}
       </li>
     );
   }
 
   return (
-    <div className="flame-detail__view" data-view="overview">
+    <div
+      className="flame-detail__view"
+      data-view="overview"
+      data-transition={transition}
+    >
       <header className="flame-detail__header">
         <div>
           <p className="flame-detail__eyebrow">Frame evidence</p>
@@ -550,6 +579,7 @@ function IntervalOverview({
 
 function WorkDetail({
   work,
+  pullRequest,
   evidence,
   onBack,
   onClose,
@@ -561,7 +591,11 @@ function WorkDetail({
 }) {
   const headingId = `flame-work-${work.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
   return (
-    <div className="flame-detail__view" data-view="work">
+    <div
+      className="flame-detail__view"
+      data-view="work"
+      data-transition={work.transition}
+    >
       <header className="flame-detail__header flame-detail__header--work">
         <button type="button" className="flame-detail__back" onClick={onBack}>
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24">
@@ -574,13 +608,16 @@ function WorkDetail({
       <div className="flame-detail__work-heading">
         <p className="flame-detail__eyebrow">Session evidence</p>
         <h2 id={headingId}>{roleLabel(work.role)} session</h2>
-        <p>
-          <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
-          <span aria-hidden="true">–</span>
-          <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
-          <span aria-hidden="true"> · </span>
-          {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
-        </p>
+        <div className="flame-detail__work-meta">
+          <p>
+            <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
+            <span aria-hidden="true">–</span>
+            <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
+            <span aria-hidden="true"> · </span>
+            {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
+          </p>
+          {pullRequest && <PullRequestLink pullRequest={pullRequest} />}
+        </div>
         {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
       </div>
 
@@ -1029,6 +1066,7 @@ export default function FlameGraph({
         }
         setIntervalEvidence({
           state: "ready",
+          snapshot: data.snapshot,
           ...evidence,
           workIncomplete: evidence.work.length < selectedPoint.activity,
         });
@@ -1126,11 +1164,18 @@ export default function FlameGraph({
       firstAtMs: work.firstAtMs,
       lastAtMs: work.lastAtMs,
       eventCount: work.eventCount,
+      transition: "forward",
     });
   };
 
+  const selectedWorkPullRequest = drawerView.screen === "work" &&
+      intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot
+    ? intervalEvidence.work.find((work) => work.id === drawerView.workId)
+      ?.pullRequest ?? null
+    : null;
+
   const backToOverview = () => {
-    setDrawerView({ screen: "overview" });
+    setDrawerView({ screen: "overview", transition: "back" });
   };
 
   const refreshIntervalTimeline = () => {
@@ -1263,6 +1308,7 @@ export default function FlameGraph({
           {drawerView.screen === "work" ? (
             <WorkDetail
               work={drawerView}
+              pullRequest={selectedWorkPullRequest}
               evidence={workEvidence}
               stale={stale}
               closing={detailClosing}
@@ -1277,6 +1323,7 @@ export default function FlameGraph({
               key={`${selectedPerson.id}:${selectedPoint.startMs}`}
               person={selectedPerson}
               point={selectedPoint}
+              transition={drawerView.transition}
               evidence={intervalEvidence}
               stale={stale}
               closing={detailClosing}

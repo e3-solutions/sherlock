@@ -10,12 +10,15 @@ import {
   type TelemetryJob,
   type WorkloadClass,
 } from "./queue.ts";
+import { githubWorkspaceIds, syncPending } from "./github-sync.ts";
 
 const OVERLOAD_SAMPLE_MILLISECONDS = 10_000;
 const OVERLOAD_SAMPLE_COUNT = 2;
 const CAPACITY_RETRY_BASE_MILLISECONDS = 30_000;
 const CAPACITY_RETRY_MAX_MILLISECONDS = 120_000;
 const HANDOFF_POLL_MILLISECONDS = 1_000;
+const GITHUB_BACKLOG_INTERVAL_MILLISECONDS = 60_000;
+const GITHUB_CAUGHT_UP_INTERVAL_MILLISECONDS = 300_000;
 export const MAX_ADMISSIONS_PER_PASS = 1;
 
 export interface WorkerConfig {
@@ -38,6 +41,8 @@ export interface WorkerConfig {
   overloadEnterSeconds: number;
   overloadExitSeconds: number;
   handoffKey: string;
+  githubToken: string | null;
+  githubWorkspaceIds: string[];
 }
 
 export function loadConfig(
@@ -100,6 +105,15 @@ export function loadConfig(
   if (!supabaseUrl.startsWith("https://")) {
     throw new Error("SUPABASE_URL must use HTTPS");
   }
+  const githubToken = env.GITHUB_TOKEN?.trim() || null;
+  const githubWorkspaces = githubWorkspaceIds(
+    env.SHERLOCK_GITHUB_WORKSPACE_IDS,
+  );
+  if (githubToken && githubWorkspaces.length === 0) {
+    throw new Error(
+      "SHERLOCK_GITHUB_WORKSPACE_IDS is required when GITHUB_TOKEN is set",
+    );
+  }
   return {
     databaseUrl: required(env, "SUPABASE_DB_URL"),
     supabaseUrl,
@@ -139,6 +153,8 @@ export function loadConfig(
       env.RAILWAY_ENVIRONMENT_ID ?? "local",
       env.RAILWAY_SERVICE_ID ?? "local",
     ]),
+    githubToken,
+    githubWorkspaceIds: githubWorkspaces,
   };
 }
 
@@ -332,6 +348,11 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     Pick<TelemetryJob, "job_kind" | "workload_class">
   >();
   let stopping = false;
+  let githubTask: Promise<void> | null = null;
+  let nextGithubSyncAt = 0;
+  let githubRateLimitAttempts = 0;
+  let githubAuthRejected = false;
+  const shutdown = new AbortController();
   let lastReaperAt = 0;
   let lastOverloadSampleAt = 0;
   let overload: OverloadState = {
@@ -342,6 +363,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
   const capacityCircuit = new CapacityCircuit();
   const stop = () => {
     stopping = true;
+    shutdown.abort();
     log("shutdown_requested", { active_jobs: active.size });
   };
   Deno.addSignalListener("SIGTERM", stop);
@@ -389,6 +411,8 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       control_connections: config.controlConnections,
       processing_connections: config.processingConnections,
       lease_seconds: config.leaseSeconds,
+      github_sync_enabled: config.githubToken !== null,
+      github_workspace_count: config.githubWorkspaceIds.length,
     });
     while (!stopping) {
       if (capacityCircuit.millisecondsUntilReady() > 0) {
@@ -404,6 +428,65 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       if (capacityCircuit.hasProbeInFlight()) {
         await waitForWork(active, config.pollMilliseconds);
         continue;
+      }
+      if (
+        config.githubToken && !githubAuthRejected && githubTask === null &&
+        Date.now() >= nextGithubSyncAt
+      ) {
+        nextGithubSyncAt = Date.now() + GITHUB_BACKLOG_INTERVAL_MILLISECONDS;
+        githubTask = syncPending(
+          queue,
+          config.githubToken,
+          config.githubWorkspaceIds,
+          {
+            signal: shutdown.signal,
+            onError: (error, pair) =>
+              log("github_sync_lookup_failed", {
+                workspace_id: pair.workspaceId,
+                repository: pair.repositoryFullName,
+                error_code: errorCode(error),
+              }),
+          },
+        ).then((result) => {
+          const pause = result.pause;
+          if (pause?.status === 401) {
+            githubAuthRejected = true;
+            log("github_sync_paused", {
+              http_status: pause.status,
+            });
+          } else if (pause) {
+            githubRateLimitAttempts += 1;
+            const now = Date.now();
+            const fallbackDelay = retryDelaySeconds(
+              githubRateLimitAttempts,
+              60,
+              900,
+            ) * 1_000;
+            nextGithubSyncAt = Math.max(
+              nextGithubSyncAt,
+              pause.retryAtMs ?? now + fallbackDelay,
+            );
+            log("github_sync_paused", {
+              http_status: pause.status,
+              retry_in_ms: Math.max(0, nextGithubSyncAt - now),
+            });
+          } else {
+            githubRateLimitAttempts = 0;
+            nextGithubSyncAt = Date.now() +
+              (result.backlogRemaining
+                ? GITHUB_BACKLOG_INTERVAL_MILLISECONDS
+                : GITHUB_CAUGHT_UP_INTERVAL_MILLISECONDS);
+          }
+          log("github_sync_complete", { ...result });
+        }).catch(
+          (error) => {
+            if (!shutdown.signal.aborted) {
+              log("github_sync_failed", { error_code: errorCode(error) });
+            }
+          },
+        ).finally(() => {
+          githubTask = null;
+        });
       }
       const halfOpen = capacityCircuit.isHalfOpen();
       let claimedAny = false;
@@ -487,6 +570,8 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     }
     await Promise.allSettled(active.keys());
   } finally {
+    shutdown.abort();
+    if (githubTask) await githubTask;
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
     if (processor !== null) await processor.close().catch(() => undefined);

@@ -7,6 +7,7 @@ import {
   normalizerVersionFor,
   projectBatch,
   RUNTIME_CONTEXT_MESSAGE_ORIGIN,
+  SCM_SOURCE_VERSION,
 } from "./normalizer.ts";
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -151,6 +152,7 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
         git: {
           repository_url: "https://github.com/e3-solutions/sherlock.git",
           branch: "arya/test",
+          commit_hash: "A".repeat(40),
         },
       },
     },
@@ -240,6 +242,13 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
   assert(projection.session?.model === "gpt-5");
   assert(projection.session?.cwd === "/repo/current");
   assert(projection.events.length === manifest.record_count);
+  assert(projection.session_scm?.record_index === 0);
+  assert(projection.session_scm.source_version === SCM_SOURCE_VERSION);
+  assert(
+    projection.session_scm.repository_full_name ===
+      "e3-solutions/sherlock",
+  );
+  assert(projection.session_scm.commit_sha === "a".repeat(40));
 
   const messages = projection.events.filter((event) =>
     event.event_kind === "message"

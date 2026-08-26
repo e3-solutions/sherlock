@@ -249,6 +249,10 @@ describe("FlameGraph", () => {
               firstAt: new Date(Date.parse(start) + 4000).toISOString(),
               lastAt: new Date(Date.parse(start) + 5000).toISOString(),
               eventCount: 1, summary: null,
+              pullRequest: {
+                number: 55,
+                url: "https://github.com/e3-solutions/sherlock/pull/55",
+              },
             },
             {
               id: "session-3:agent", sessionId: "session-3", role: "agent",
@@ -738,7 +742,7 @@ describe("FlameGraph", () => {
     const promptDisclosure = await screen.findByText("3 human prompts");
     const detail = screen.getByRole("complementary", { name: "Ada Lovelace" });
     expect(detail).not.toHaveTextContent("prompts recorded in this interval");
-    expect(detail.querySelectorAll(".flame-detail__work li")).toHaveLength(1);
+    expect(detail.querySelectorAll(".flame-detail__work li")).toHaveLength(2);
     expect(detail).not.toHaveTextContent("What happened");
     expect(promptDisclosure.closest("details")).not.toHaveAttribute("open");
     expect(detail).not.toHaveTextContent("Stored excerpt");
@@ -749,10 +753,21 @@ describe("FlameGraph", () => {
     expect(screen.getByText("Repeat the exact request")).toBeInTheDocument();
     expect(screen.getByText("Excerpt")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /First exact prompt/ })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Subagent session evidence/ })).not.toBeInTheDocument();
+    const pullRequest = screen.getByRole("link", {
+      name: "Open PR #55 on GitHub",
+    });
+    expect(pullRequest).toHaveAttribute(
+      "href",
+      "https://github.com/e3-solutions/sherlock/pull/55",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Subagent session/ }));
+    await screen.findByText("Conversation");
+    expect(screen.getByRole("link", { name: "Open PR #55 on GitHub" }))
+      .toBeInTheDocument();
     expect(screen.queryByText("No submitted user message")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
 
-    const workExpander = screen.getByRole("button", { name: "Show 3 more sessions" });
+    const workExpander = screen.getByRole("button", { name: "Show 2 more sessions" });
     expect(workExpander).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(workExpander);
     expect(workExpander).toHaveAttribute("aria-expanded", "true");
@@ -763,6 +778,43 @@ describe("FlameGraph", () => {
       expect.stringContaining("/api/flame/interval?"),
       expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
     );
+  });
+
+  it("removes a session PR link while refreshed snapshot evidence is pending or unmatched", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    let refreshedInterval;
+    vi.mocked(fetch).mockImplementation((url, options) => {
+      if (String(url).includes("/api/flame/interval?") && String(url).includes("snapshot=v2.snapshot-token")) {
+        refreshedInterval = defaultFetch(url, options).then(async (response) => {
+          const payload = await response.json();
+          return {
+            ok: true,
+            json: () => Promise.resolve({
+              ...payload,
+              work: payload.work.map((work) => ({ ...work, pullRequest: null })),
+            }),
+          };
+        });
+        return refreshedInterval;
+      }
+      return defaultFetch(url, options);
+    });
+
+    const data = model();
+    const view = render(<FlameGraph data={data} chartWidth={1008} />);
+    const wrapper = view.container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(chartBounds);
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    fireEvent.click(await screen.findByRole("button", { name: /Subagent session/ }));
+    expect(screen.getByRole("link", { name: "Open PR #55 on GitHub" })).toBeInTheDocument();
+
+    view.rerender(<FlameGraph data={{ ...data, snapshot: "v2.snapshot-token" }} chartWidth={1008} />);
+
+    expect(screen.queryByRole("link", { name: "Open PR #55 on GitHub" })).toBeNull();
+    await act(() => refreshedInterval);
+    fireEvent.click(screen.getByRole("button", { name: "Back to frame" }));
+    await screen.findByText("3 human prompts");
+    expect(screen.queryByRole("link", { name: "Open PR #55 on GitHub" })).toBeNull();
   });
 
   it("keeps prompt and stable work evidence visible when mutable role metadata is partial", async () => {

@@ -104,6 +104,10 @@ async function seedBatch(
       type: "session_meta",
       payload: {
         id: input.nativeSessionId,
+        git: {
+          repository_url: "https://github.com/e3-solutions/sherlock.git",
+          commit_hash: "a".repeat(40),
+        },
         ...(input.parentNativeSessionId
           ? {
             session_id: input.parentNativeSessionId,
@@ -751,6 +755,26 @@ Deno.test({
           afterReplay.updated_at === beforeReplay.updated_at,
         "identical session replay must preserve xmin and updated_at",
       );
+      const scmFacts = await sql.unsafe(
+        `select scm.repository_full_name, scm.commit_sha,
+                scm.server_received_at = batch.committed_at received_at_ingest
+           from telemetry.session_scm scm
+           join telemetry.native_records record
+             on record.workspace_id = scm.workspace_id
+            and record.id = scm.source_record_id
+           join telemetry.ingest_batches batch
+             on batch.workspace_id = record.workspace_id
+            and batch.id = record.batch_id
+          where scm.workspace_id = $1 and scm.session_id = $2`,
+        [workspaceId, childSessionId],
+      );
+      assert(
+        scmFacts.length === 1 &&
+          scmFacts[0].repository_full_name === "e3-solutions/sherlock" &&
+          scmFacts[0].commit_sha === "a".repeat(40) &&
+          scmFacts[0].received_at_ingest === true,
+        "SCM fact insert must be exact, ingest-timed, and idempotent",
+      );
       assert(
         await normalize(firstNormalizer, childFirstParent) === parentSessionId,
         "parent replay must preserve its session id",
@@ -1180,6 +1204,10 @@ Deno.test({
       await sql.unsafe("delete from telemetry.events where workspace_id = $1", [
         workspaceId,
       ]).catch(() => undefined);
+      await sql.unsafe(
+        "delete from telemetry.session_scm where workspace_id = $1",
+        [workspaceId],
+      ).catch(() => undefined);
       await sql.unsafe(
         "delete from telemetry.native_records where workspace_id = $1",
         [workspaceId],
