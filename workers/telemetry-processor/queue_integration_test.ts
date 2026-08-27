@@ -268,14 +268,26 @@ Deno.test({
              ) values ($1, $2, 0, 0, 1, repeat('c', 64), 'session_meta',
                        now(), 'ok')
              returning id
-           )
-           insert into telemetry.session_scm (
+           ), scm as (
+             insert into telemetry.session_scm (
              workspace_id, source_record_id, session_id, source_version,
-             repository_full_name, commit_sha, observed_at, server_received_at
+             repository_full_name, commit_sha, observed_at, server_received_at,
+             created_at
            )
            select $1, id, $3, 'sherlock.github-scm.v1',
-                  'e3-solutions/sherlock', repeat('a', 40), now(), now()
-             from record`,
+                  'e3-solutions/sherlock', repeat('a', 40), now(), now(),
+                  now() - interval '27 hours'
+             from record
+           returning source_record_id
+           )
+           insert into telemetry.events (
+             workspace_id, session_id, source_record_id, normalizer_version,
+             projection_index, source_priority, is_replay, event_kind,
+             occurred_at, server_received_at
+           )
+           select $1, $3, source_record_id, 'queue.github-test.v1', 0, 0,
+                  false, 'lifecycle', now(), now()
+             from scm`,
           [workspaceId, batchId, sessionId],
         );
       });
@@ -290,7 +302,7 @@ Deno.test({
       assert(
         githubPairs.length === 1 &&
           githubPairs[0].workspaceId === workspaceId,
-        "GitHub sync must select an explicitly allowed workspace",
+        "GitHub sync must select an allowed old SCM fact with a recent event",
       );
       await sql.unsafe(
         `insert into processing.telemetry_jobs (

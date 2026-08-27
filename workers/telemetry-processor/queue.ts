@@ -209,24 +209,23 @@ export class PostgresJobQueue {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
-        `with recent_sessions as materialized (
-           select distinct workspace_id, session_id
-             from telemetry.events
-            where server_received_at >= now() - interval '26 hours'
-              and workspace_id = any($2::uuid[])
-              and session_id is not null and not is_replay
-         ), observed as (
+        `with observed as (
            select distinct scm.workspace_id, scm.repository_full_name,
                   scm.commit_sha
              from telemetry.session_scm scm
-             left join recent_sessions recent
-               on recent.workspace_id = scm.workspace_id
-              and recent.session_id = scm.session_id
             where scm.source_version = 'sherlock.github-scm.v1'
               and scm.workspace_id = any($2::uuid[])
               and (
                 scm.created_at >= now() - interval '26 hours'
-                or recent.session_id is not null
+                or exists (
+                  select 1
+                    from telemetry.events recent
+                   where recent.workspace_id = scm.workspace_id
+                     and recent.session_id = scm.session_id
+                     and recent.server_received_at >=
+                       now() - interval '26 hours'
+                     and not recent.is_replay
+                )
               )
          )
          select observed.*
