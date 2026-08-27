@@ -1,0 +1,23 @@
+{{ define "bonaparte.slack.title" -}}
+{{ if gt (len .Alerts.Firing) 0 }}🚨 FIRING{{ else if gt (len .Alerts.Resolved) 0 }}✅ RESOLVED{{ else }}ℹ️ ALERT{{ end }} · Bonaparte
+{{- end }}
+
+{{ define "bonaparte.slack.text" -}}
+{{ if gt (len .Alerts.Firing) 0 }}
+{{ range .Alerts.Firing }}
+*{{ if .Labels.alertname }}{{ .Labels.alertname }}{{ else }}Bonaparte alert{{ end }}*
+{{ if .Annotations.description }}{{ .Annotations.description }}{{ else }}No description was provided by the alert rule.{{ end }}
+{{ if .Labels.severity }}{{ .Labels.severity | toUpper }}{{ else }}UNKNOWN{{ end }} · {{ if .Labels.component }}{{ .Labels.component }}{{ else }}unknown component{{ end }}
+{{ with .Annotations.dashboard }}<{{ . }}|Dashboard>{{ end }}{{ with .Annotations.explore }} · <{{ . }}|Logs>{{ end }}{{ with .Annotations.runbook }} · <{{ . }}|Runbook>{{ end }}
+{{ end }}
+{{ else if gt (len .Alerts.Resolved) 0 }}
+{{ range .Alerts.Resolved }}
+*{{ if .Labels.alertname }}{{ .Labels.alertname }}{{ else }}Bonaparte alert{{ end }}*
+The alert condition has returned to normal.
+{{ if .Labels.severity }}{{ .Labels.severity | toUpper }}{{ else }}UNKNOWN{{ end }} · {{ if .Labels.component }}{{ .Labels.component }}{{ else }}unknown component{{ end }}
+{{ with .Annotations.dashboard }}<{{ . }}|Dashboard>{{ end }}{{ with .Annotations.explore }} · <{{ . }}|Logs>{{ end }}{{ with .Annotations.runbook }} · <{{ . }}|Runbook>{{ end }}
+{{ end }}
+{{ else }}
+Bonaparte alert notification received without firing or resolved instances.
+{{ end }}
+{{- end }}
