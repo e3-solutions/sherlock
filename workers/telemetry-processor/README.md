@@ -35,11 +35,11 @@ concurrency, pool sizes, or replica count without a measured load test proving
 arrival rate is below sustained completion rate and the same connection gate
 continues to hold.
 
-The capacity circuit opens only for PostgreSQL `53300` and pool `EMAX*`
-conditions. It stops claims for a jittered 30–120 seconds and permits one
-half-open claim. Processing errors, control-query errors, and heartbeat errors
-all reopen the same circuit; ordinary job failures continue through fenced retry
-handling.
+The capacity circuit opens only for PostgreSQL `53300`, statement cancellation
+`57014`, and pool `EMAX*` conditions. It stops claims for a jittered 30–120
+seconds and permits one half-open claim. Processing errors, control-query
+errors, and heartbeat errors all reopen the same circuit; ordinary job failures
+continue through fenced retry handling.
 
 Set `SHERLOCK_GITHUB_WORKSPACE_IDS` to a comma-separated workspace UUID
 allowlist. Live lookup uses it immediately; rerun the manual backfill after

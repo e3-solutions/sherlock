@@ -230,7 +230,9 @@ export function maintenanceSampleDue(
 export function isCapacityError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const code = "code" in error ? String(error.code) : "";
-  if (code === "53300" || code.startsWith("EMAX")) return true;
+  if (code === "53300" || code === "57014" || code.startsWith("EMAX")) {
+    return true;
+  }
   return code === "XX000" && /\bEMAX(?:CONNSESSION)?\b/i.test(error.message);
 }
 

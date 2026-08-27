@@ -444,7 +444,7 @@ Deno.test("only database pressure errors open the worker circuit", () => {
     code: "EMAXCONNSESSION",
   })));
   assert(
-    !isCapacityError(Object.assign(
+    isCapacityError(Object.assign(
       new Error("canceling statement due to statement timeout"),
       { code: "57014" },
     )),
@@ -461,6 +461,22 @@ Deno.test("only database pressure errors open the worker circuit", () => {
   );
   assert(capacityRetryMilliseconds(1, () => 0.5) === 30_000);
   assert(capacityRetryMilliseconds(3, () => 0.5) === 120_000);
+});
+
+Deno.test("statement timeout opens one bounded worker probe", () => {
+  let now = 0;
+  const circuit = new CapacityCircuit(() => now, () => 0.5);
+  const timeout = Object.assign(
+    new Error("canceling statement due to statement timeout"),
+    { code: "57014" },
+  );
+  assert(circuit.handle(timeout) === 30_000);
+  assert(circuit.millisecondsUntilReady() === 30_000);
+  now += 30_000;
+  assert(circuit.beginProbe());
+  assert(!circuit.beginProbe());
+  assert(circuit.completeProbe());
+  assert(circuit.millisecondsUntilReady() === 0);
 });
 
 Deno.test("processing and control EMAX stay in one single-probe circuit", () => {
