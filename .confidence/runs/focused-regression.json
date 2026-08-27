@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "id": "focused-regression",
+  "argv": [
+    "deno",
+    "test",
+    "--allow-read",
+    "supabase/functions/sherlock-rollout-ingest/service_test.ts",
+    "workers/telemetry-processor/worker_test.ts"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+  "started_at": "2026-08-27T16:16:36.070201Z",
+  "ended_at": "2026-08-27T16:16:37.250672Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/opt/homebrew/bin/deno",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+    "sha256": "df108f6690363a21804871134e816bd6170e41e03219ac91843a9ead45396ea3"
+  },
+  "log": "runs/focused-regression.log",
+  "log_sha256": "d13b54e7c82a2d5d38545f1fb596258cd49fc083fe584e779553132669109388"
+}

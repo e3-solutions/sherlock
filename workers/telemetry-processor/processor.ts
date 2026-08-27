@@ -102,7 +102,11 @@ export class TelemetryProcessor {
     private readonly storage: SupabaseRawStorage,
     maxConnections = 6,
   ) {
-    this.sql = createPostgresPool(databaseUrl, maxConnections);
+    this.sql = createPostgresPool(
+      databaseUrl,
+      maxConnections,
+      "sherlock-worker-processing",
+    );
     this.frameProjector = new PostgresFrameEvidenceProjector(this.sql);
   }
 

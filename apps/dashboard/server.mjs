@@ -75,13 +75,14 @@ const cache = source
       log: (event) => console.log(JSON.stringify(event)),
     })
   : null;
-cache?.start();
 const freshnessCache = source
   ? new FreshnessCache({
       load: loadFreshness,
       log: (event) => console.log(JSON.stringify(event)),
     })
   : null;
+if (source) await source.reserveCapacity();
+cache?.start();
 freshnessCache?.start();
 const mcpSource = source && cache ? createCachedMcpSource({ cache, source }) : null;
 const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;

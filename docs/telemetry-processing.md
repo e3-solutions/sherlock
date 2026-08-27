@@ -8,7 +8,10 @@ part of receipt latency.
 ## Data flow
 
 1. `sherlock-rollout-ingest` validates the provider/kind contract, compressed
-   bytes, decompressed source, and every record hash.
+   bytes, decompressed source, and every record hash. Hosted Edge Function
+   connections use Supabase transaction pooling on port 6543 with one client
+   per isolate; hosted direct URLs fail closed, and the persistent Railway
+   worker continues to use session pooling.
 2. It creates the immutable object with overwrite disabled.
 3. One Postgres transaction inserts `telemetry.ingest_batches` and
    `telemetry.native_records`. An `AFTER INSERT` trigger creates exactly one
@@ -80,8 +83,10 @@ SUPABASE_SERVICE_ROLE_KEY=... \
 deno run --allow-env --allow-net workers/telemetry-processor/main.ts
 ```
 
-Optional settings are `SHERLOCK_WORKER_CONCURRENCY` (default `4`),
-`SHERLOCK_WORKER_LIVE_RESERVED` (default `3`),
+Optional settings include `SHERLOCK_WORKER_CONCURRENCY` (default `6`),
+`SHERLOCK_WORKER_LIVE_RESERVED` (default `5`),
+`SHERLOCK_WORKER_NORMALIZE_RESERVED` (default `5`),
+`SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS` (default and minimum `8`),
 `SHERLOCK_WORKER_LEASE_SECONDS` (default `120`),
 `SHERLOCK_WORKER_POLL_MS` (default `250`), and retry base/max seconds
 (defaults `5`/`300`). Storage reads time out after 30 seconds and targeted
@@ -121,6 +126,17 @@ Supabase's session pooler on port 5432 so Railway does not depend on the direct
 database host's IPv6-only DNS record. Store a current Supabase secret key in
 `SUPABASE_SERVICE_ROLE_KEY`; the variable name is retained for compatibility,
 but a legacy service-role JWT is not required.
+
+Each dashboard opens and retains two labeled database sessions before serving.
+Before every claim, the worker uses its pinned handoff session to read
+PostgreSQL's usable limit plus live worker/dashboard client counts. It budgets
+the worker's full eleven-session rolling envelope and an eight-session dashboard
+envelope covering both live dashboards plus simultaneous replacements, without
+double-reserving sessions the dashboards already own. Conflicting database URL
+`application_name` parameters are stripped so labels remain authoritative.
+PostgreSQL connection-limit errors still open the jittered circuit while active
+jobs finish, and one half-open probe determines whether normal admission can
+resume.
 
 ## Inspect and recover
 

@@ -15,6 +15,35 @@ import type { BatchRepository, WorkloadClassHint } from "./service.ts";
 type Sql = ReturnType<typeof postgres>;
 type Queryable = Pick<Sql, "unsafe">;
 
+export const EDGE_FUNCTION_DATABASE_POOL_MAX = 1;
+
+export function edgeFunctionDatabaseUrl(databaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    throw new IngestError(
+      "invalid_configuration",
+      "SUPABASE_DB_URL must be a valid Postgres URL",
+      500,
+    );
+  }
+  const hostname = url.hostname.toLowerCase();
+  const isSupabasePooler = hostname === "pooler.supabase.com" ||
+    hostname.endsWith(".pooler.supabase.com");
+  if (isSupabasePooler && (url.port === "" || url.port === "5432")) {
+    url.port = "6543";
+  }
+  if (hostname.startsWith("db.") && hostname.endsWith(".supabase.co")) {
+    throw new IngestError(
+      "invalid_configuration",
+      "SUPABASE_DB_URL must use the Supabase transaction pooler",
+      500,
+    );
+  }
+  return url.toString();
+}
+
 export function advisoryLockIdentity(
   attribution: Attribution,
   manifest: BatchManifest,
@@ -186,7 +215,12 @@ export class PostgresBatchRepository implements BatchRepository {
 
   static connect(databaseUrl: string): PostgresBatchRepository {
     return new PostgresBatchRepository(
-      postgres(databaseUrl, { prepare: false, max: 2, idle_timeout: 20 }),
+      postgres(edgeFunctionDatabaseUrl(databaseUrl), {
+        prepare: false,
+        max: EDGE_FUNCTION_DATABASE_POOL_MAX,
+        idle_timeout: 5,
+        connect_timeout: 5,
+      }),
     );
   }
 

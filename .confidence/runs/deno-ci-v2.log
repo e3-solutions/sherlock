@@ -1,0 +1,149 @@
+Checked 34 files
+Checked 32 files
+Check supabase/functions/sherlock-rollout-ingest/index.ts
+Check workers/telemetry-processor/main.ts
+Check supabase/functions/sherlock-rollout-ingest/index_test.ts
+Check supabase/functions/sherlock-rollout-ingest/normalizer_postgres_integration_test.ts
+Check supabase/functions/sherlock-rollout-ingest/normalizer_test.ts
+Check supabase/functions/sherlock-rollout-ingest/service_test.ts
+Check supabase/functions/sherlock-rollout-ingest/storage_test.ts
+running 3 tests from ./supabase/functions/sherlock-rollout-ingest/index_test.ts
+workload class header is optional and strictly bounded ... ok (0ms)
+unknown collector domain is rejected before backend initialization ... ok (6ms)
+handler passes the server-selected workspace for each approved domain ... ok (1ms)
+running 2 tests from ./supabase/functions/sherlock-rollout-ingest/normalizer_postgres_integration_test.ts
+Postgres person attribution skips identical physical updates ... ignored (0ms)
+Postgres normalizer repairs parent-first, child-first, replayed, and concurrent session trees ... ignored (0ms)
+running 19 tests from ./supabase/functions/sherlock-rollout-ingest/normalizer_test.ts
+normalizer projects sessions, messages, usage, and tools ... ok (8ms)
+Codex v2 classifies the explicit runtime envelope contract ... ok (1ms)
+Codex v1 remains reproducible while v2 appends corrected facts ... ok (0ms)
+normalizer emits observable unknown events for malformed records ... ok (0ms)
+normalizer never parses a native record fragment ... ok (0ms)
+Claude fragments cannot poison provider-specific session facts ... ok (0ms)
+usage without a native session keeps a deterministic stream scope ... ok (0ms)
+a chunk without session metadata does not invent a primary role ... ok (0ms)
+Claude transcripts use a provider-specific projection ... ok (0ms)
+Claude subagent identity remains linked to its parent session ... ok (0ms)
+realistic Claude records keep semantic turns and canonical usage ... ok (0ms)
+Claude meta messages are system-originated, not human prompts ... ok (0ms)
+realistic Claude subagent records inherit their prompt turn ... ok (0ms)
+Claude response-only batches use request identity conservatively ... ok (0ms)
+legacy Claude Stop hooks close only with a collector-derived anchor ... ok (0ms)
+Claude SessionEnd is session evidence and never turn completion ... ok (0ms)
+legacy Claude Stop hooks stay unlinked without a verified prompt anchor ... ok (0ms)
+Claude hook projections reject tampered payloads and identity ... ok (0ms)
+Claude SubagentStop hooks anchor worker turns to the child session ... ok (0ms)
+running 23 tests from ./supabase/functions/sherlock-rollout-ingest/service_test.ts
+edge ingestion uses one transaction-pooled Supabase connection ... ok (0ms)
+exact retry returns the stable existing receipt ... ok (2ms)
+storage success and database failure converges on retry ... ok (0ms)
+database success and response loss converges on exact lookup ... ok (0ms)
+durable acceptance returns without a normalization dependency ... ok (0ms)
+strict timestamp validation rejects impossible calendar dates ... ok (0ms)
+base64 decoding preserves padding rules across runtimes ... ok (0ms)
+ingest base64 size gate runs before decoding ... ok (0ms)
+SHA-256 hashes only a non-zero-offset Uint8Array view ... ok (0ms)
+approved collector domains resolve to configured workspaces ... ok (0ms)
+workspace routing rejects invalid configuration and unknown domains ... ok (0ms)
+collector keys distinguish machines while email remains the person key ... ok (0ms)
+streaming decompression rejects a small gzip bomb ... ok (41ms)
+manifest limits admit 16 MiB source and 17 MiB stored batches ... ok (0ms)
+stored validation accepts an actual 16 MiB source ... ok (52ms)
+fragment manifests use the deterministic 4 MiB partition ... ok (0ms)
+fragment manifests reject incomplete or non-deterministic metadata ... ok (0ms)
+exact retry rejects changed immutable record locators ... ok (0ms)
+exact retry includes immutable fragment identity ... ok (0ms)
+timestamp identity preserves PostgreSQL microseconds ... ok (1ms)
+advisory lock identity is PostgreSQL-safe and tuple-distinct ... ok (0ms)
+ingest parses Claude transcripts without relabeling them as rollouts ... ok (0ms)
+ingest accepts Claude hook evidence but rejects Codex hook batches ... ok (0ms)
+running 6 tests from ./supabase/functions/sherlock-rollout-ingest/storage_test.ts
+409 verification accepts exact streamed bytes without Content-Length ... ok (1ms)
+409 verification does not trust a lying Content-Length ... ok (0ms)
+409 verification rejects declared length mismatch early ... ok (0ms)
+409 verification cancels an oversized response chunk ... ok (5ms)
+409 verification rejects same-length different bytes ... ok (0ms)
+409 verification maps response stream errors to verify failure ... ok (0ms)
+
+ok | 51 passed | 0 failed | 2 ignored (255ms)
+
+Check supabase/functions/sherlock-activity-reducer/postgres_integration_test.ts
+Check supabase/functions/sherlock-activity-reducer/reducer_test.ts
+running 1 test from ./supabase/functions/sherlock-activity-reducer/postgres_integration_test.ts
+activity reducer is deterministic, versioned, isolated, and recoverable ... ignored (0ms)
+running 9 tests from ./supabase/functions/sherlock-activity-reducer/reducer_test.ts
+canonical selection suppresses only keyed duplicates and replays ... ok (1ms)
+canonical ties use source time nulls last and then event id ... ok (0ms)
+completed turn and paired tool retain deterministic evidence ... ok (10ms)
+Claude prompt identity reduces reasoning and tools into one turn ... ok (0ms)
+a response-only Claude request remains a conservative open turn ... ok (0ms)
+open, unpaired, missing, and out-of-order evidence stays conservative ... ok (5ms)
+an unmatched task completion becomes an inferred point ... ok (0ms)
+equal-time task and tool pairs collapse once and retain evidence ... ok (0ms)
+primary, worker, guardian, and automation sessions remain separate ... ok (0ms)
+
+ok | 9 passed | 0 failed | 1 ignored (45ms)
+
+Check workers/telemetry-processor/frame-projector_postgres_test.ts
+Check workers/telemetry-processor/frame-projector_test.ts
+Check workers/telemetry-processor/github-sync_test.ts
+Check workers/telemetry-processor/oversized_rollout_e2e_test.ts
+Check workers/telemetry-processor/queue_integration_test.ts
+Check workers/telemetry-processor/worker_test.ts
+running 1 test from ./workers/telemetry-processor/frame-projector_postgres_test.ts
+frame projector serializes reruns and activation proves source corrections ... ignored (0ms)
+running 11 tests from ./workers/telemetry-processor/frame-projector_test.ts
+frame evidence diff is append-only, idempotent, and tombstones removals ... ok (0ms)
+adjacent event_msg user copies are suppressed from activity ... ok (5ms)
+canonical rank preserves PostgreSQL timestamp microseconds ... ok (0ms)
+native human user messages are prompts without a user_message envelope ... ok (0ms)
+native machine context is not projected as a prompt ... ok (0ms)
+native parent-agent runtime context does not title worker sessions ... ok (0ms)
+native and envelope copies remain one canonical prompt ... ok (0ms)
+projector reads only bounded source metadata and never copies content ... ok (0ms)
+activation proves only the session-selected normalization version ... ok (0ms)
+large revision writes are split below PostgreSQL's parameter limit ... ok (0ms)
+frame projection rechecks the absolute deadline after pool reserve ... ok (1ms)
+running 5 tests from ./workers/telemetry-processor/github-sync_test.ts
+commit lookup accepts one exact PR and fails closed otherwise ... ok (0ms)
+sync pauses globally without writing a pair failure ... ok (0ms)
+sync continues after pair-specific HTTP failures ... ok (0ms)
+sync processes 25 pairs and reports remaining backlog ... ok (0ms)
+sync never converts a persistence error into a failed lookup ... ok (0ms)
+running 2 tests from ./workers/telemetry-processor/oversized_rollout_e2e_test.ts
+72,591,045-byte rollout survives collector, Storage, Postgres, worker, and reduction ... ignored (0ms)
+72,591,045-byte Claude transcript preserves provider topology and later activity end to end ... ignored (0ms)
+running 3 tests from ./workers/telemetry-processor/queue_integration_test.ts
+queue claims are durable, fenced, retryable, and terminally inspectable ... ignored (0ms)
+live normalization claims an ordered backfill prerequisite without borrowing unrelated backfill ... ignored (0ms)
+concurrent live-frontier owners drain a bounded mixed-lane backlog without duplication or reordering ... ignored (0ms)
+running 25 tests from ./workers/telemetry-processor/worker_test.ts
+version-aware workers keep pre-migration jobs on provider v1 ... ok (0ms)
+configuration is bounded and secrets remain required ... ok (0ms)
+GitHub sync requires an explicit workspace allowlist ... ok (0ms)
+connection pools and overload reservations stay within bounds ... ok (0ms)
+reserved transactions commit without pool transaction methods ... ok (0ms)
+reserved transactions roll back and preserve the work error ... ok (0ms)
+reserved transaction BEGIN failure does not issue ROLLBACK ... ok (0ms)
+reserved transaction COMMIT failure rolls back the same session ... ok (0ms)
+reserved transaction runner rejects nesting and cleans up ... ok (0ms)
+Railway rebuilds only for the complete worker dependency closure ... ok (0ms)
+overload mode uses hysteresis and preserves one reduction lane ... ok (0ms)
+overload normalization claims only a live-demand stream frontier ... ok (0ms)
+slow claims cannot starve overload maintenance ... ok (0ms)
+only database pressure errors open the worker circuit ... ok (0ms)
+processing and control EMAX stay in one single-probe circuit ... ok (0ms)
+normalization rechecks its absolute deadline after projection ... ok (0ms)
+live capacity is reserved and backfill remains bounded ... ok (0ms)
+retry backoff grows exponentially and caps ... ok (0ms)
+worker reloads immutable native fragment metadata ... ok (0ms)
+parent repair retargets both normalized parents and their children ... ok (0ms)
+session cutoffs use one index-preserving transaction ... ok (0ms)
+normalization schedules all reductions with one queue call ... ok (0ms)
+batched reductions coalesce duplicate queue identities ... ok (0ms)
+reduction targets only normalized sessions with no workspace scan ... ok (0ms)
+targeted scheduling has no fifty-session ceiling ... ok (0ms)
+
+ok | 41 passed | 0 failed | 6 ignored (175ms)
+

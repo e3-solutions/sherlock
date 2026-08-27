@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "task": {
+    "title": "Prevent Sherlock dashboard starvation under worker overload",
+    "mode": "standard",
+    "type": "bug"
+  },
+  "intent": {
+    "goal": "Prevent database connection pressure from starving Sherlock dashboard refreshes while preserving durable telemetry ingestion and processing throughput.",
+    "must_happen": [
+      "Short-lived Supabase Edge Function ingestion uses transaction-pooled database connections with one client per isolate.",
+      "Each dashboard pre-opens and retains two authoritatively labeled sessions; the Railway worker budgets an eleven-session rolling envelope and preserves eight dashboard sessions before every claim so current and replacement dashboards can overlap safely.",
+      "Healthy-capacity worker concurrency, live/backfill reservations, immutable raw telemetry, and auditable projections remain unchanged."
+    ],
+    "must_not_happen": [
+      "Do not mutate, delete, or rewrite raw telemetry or existing database facts.",
+      "Do not route the persistent Railway worker or dashboards through transaction pooling.",
+      "Do not claim a stale cached dashboard response is live database data."
+    ],
+    "constraints": [
+      "The fix must be code-enforced, reversible, and contain no database credentials.",
+      "Supabase pooler port 5432 is session mode and port 6543 is transaction mode.",
+      "Repository source/product separation and append-only telemetry contracts must remain intact."
+    ],
+    "non_goals": [
+      "Changing the Supabase compute tier or pool-size setting.",
+      "Redesigning dashboard caching or replaying historical telemetry.",
+      "Changing worker concurrency under healthy database capacity."
+    ],
+    "open_questions": [
+      "Production max_connections and pg_stat_activity cannot currently be queried because the project is still connection-saturated."
+    ],
+    "assumptions": [
+      "sherlock-rollout-ingest is the only deployed Supabase Edge Function that opens SUPABASE_DB_URL directly.",
+      "The existing single-replica Railway handoff contract remains in force."
+    ]
+  },
+  "proof_obligations": [
+    {
+      "id": "P1",
+      "claim": "Serverless ingestion cannot pin a two-connection session pool per Edge Function isolate.",
+      "verification": "Fail-before/pass-after unit tests prove Supabase session-pooler URLs are converted to transaction mode and direct/already-transaction URLs are preserved; the ingest pool is capped at one."
+    },
+    {
+      "id": "P2",
+      "claim": "Dashboard-owned sessions remain available and database pressure pauses new worker admissions before the worker consumes reconnect capacity.",
+      "verification": "Dashboard unit/integration tests prove two authoritatively labeled sessions are warmed and retained before serving; exact-boundary worker tests account for the eleven-session rolling worker envelope, eight dashboard sessions, and already-owned dashboard sessions; PostgreSQL integration proves the live capacity query and that URL labels cannot override component labels."
+    },
+    {
+      "id": "P3",
+      "claim": "Healthy worker throughput and lane reservations are unchanged.",
+      "verification": "Existing worker configuration, admission, lane, and queue tests pass with the same six-job concurrency and five live/normalize reservations."
+    },
+    {
+      "id": "P4",
+      "claim": "Raw telemetry and database fact semantics are unchanged.",
+      "verification": "Diff review confirms changes are limited to connection routing/admission classification and tests/docs; focused ingest/worker suites and repository checks pass without migrations or data writes."
+    }
+  ]
+}

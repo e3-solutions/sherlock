@@ -14,6 +14,14 @@ the rollout, connection, or shutdown gates below.
 - An active replica can therefore use at most 10 sessions. A compatible
   replacement opens exactly one control session before handoff, so the maximum
   rolling overlap is 11 sessions.
+- Before each claim, the worker measures PostgreSQL's usable connection limit,
+  live client count, labeled worker sessions, and labeled dashboard sessions on
+  the pinned handoff connection. It budgets the worker's 11-session rolling
+  envelope and preserves an eight-slot dashboard envelope: four owned by the
+  live dashboards and four for their simultaneous replacements. Set
+  `SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS` higher when adding readers;
+  startup rejects values below eight. URL `application_name` parameters are
+  discarded so deployment configuration cannot override these labels.
 - Replica scaling remains disabled. Concurrency is six; overload mode reserves
   five normalization lanes and one reduction lane, permits borrowing when the
   preferred kind is empty, and pauses new backfill claims until live lag exits

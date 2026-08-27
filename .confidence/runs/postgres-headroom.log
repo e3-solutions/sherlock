@@ -1,0 +1,29 @@
+Check workers/telemetry-processor/queue_integration_test.ts
+running 3 tests from ./workers/telemetry-processor/queue_integration_test.ts
+queue claims are durable, fenced, retryable, and terminally inspectable ... FAILED (206ms)
+live normalization claims an ordered backfill prerequisite without borrowing unrelated backfill ... FAILED (3ms)
+concurrent live-frontier owners drain a bounded mixed-lane backlog without duplication or reordering ... FAILED (4ms)
+
+ ERRORS 
+
+queue claims are durable, fenced, retryable, and terminally inspectable => ./workers/telemetry-processor/queue_integration_test.ts:156:6
+error: Error: connect ECONNREFUSED 127.0.0.1:55432
+    at TCPConnectWrap._afterConnect [as oncomplete] (node:net:177:16)
+
+live normalization claims an ordered backfill prerequisite without borrowing unrelated backfill => ./workers/telemetry-processor/queue_integration_test.ts:894:6
+error: Error: connect ECONNREFUSED 127.0.0.1:55432
+    at TCPConnectWrap._afterConnect [as oncomplete] (node:net:177:16)
+
+concurrent live-frontier owners drain a bounded mixed-lane backlog without duplication or reordering => ./workers/telemetry-processor/queue_integration_test.ts:1047:6
+error: Error: connect ECONNREFUSED 127.0.0.1:55432
+    at TCPConnectWrap._afterConnect [as oncomplete] (node:net:177:16)
+
+ FAILURES 
+
+queue claims are durable, fenced, retryable, and terminally inspectable => ./workers/telemetry-processor/queue_integration_test.ts:156:6
+live normalization claims an ordered backfill prerequisite without borrowing unrelated backfill => ./workers/telemetry-processor/queue_integration_test.ts:894:6
+concurrent live-frontier owners drain a bounded mixed-lane backlog without duplication or reordering => ./workers/telemetry-processor/queue_integration_test.ts:1047:6
+
+FAILED | 0 passed | 3 failed (219ms)
+
+error: Test failed

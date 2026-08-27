@@ -90,12 +90,24 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
   });
 
   it("lets the shared backend login assume the MCP read-only role", async () => {
+    const workspaceId = crypto.randomUUID();
+    const conflictingDatabaseUrl = new URL(DATABASE_URL);
+    conflictingDatabaseUrl.searchParams.set("application_name", "railway");
     const source = new DirectFlameSource({
-      databaseUrl: DATABASE_URL,
-      workspaceId: crypto.randomUUID(),
+      databaseUrl: conflictingDatabaseUrl.toString(),
+      workspaceId,
       expectedEmailDomain: "e3group.ai",
     });
+    const inspector = postgres(DATABASE_URL, { max: 1, prepare: false });
     try {
+      await source.reserveCapacity();
+      const capacityRows = await inspector.unsafe(
+        `select count(*)::integer as connections
+           from pg_stat_activity
+          where application_name = $1`,
+        [`sherlock-dashboard:${workspaceId}`],
+      );
+      expect(capacityRows[0].connections).toBe(2);
       await expect(source.readiness()).resolves.toEqual({
         status: "ok",
         mode: "sherlock_backend_aggregate",
@@ -106,6 +118,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
     } finally {
       await source.close();
+      await inspector.end({ timeout: 5 });
     }
   }, 30_000);
 

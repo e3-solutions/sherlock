@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "id": "release-postgres-v3",
+  "argv": [
+    "sh",
+    "-c",
+    "SHERLOCK_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres deno test --allow-env --allow-net workers/telemetry-processor/queue_integration_test.ts && cd apps/dashboard && SHERLOCK_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres pnpm test:postgres"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+  "started_at": "2026-08-27T16:45:41.489944Z",
+  "ended_at": "2026-08-27T16:45:46.105506Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/bin/sh",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+    "sha256": "0db0f8d19eef931e2d0450e5cf3900d2ea7f94752c6c1f51626fe9a1efb4b994"
+  },
+  "log": "runs/release-postgres-v3.log",
+  "log_sha256": "d7a786255f25fead1b8cd3f48300f7856160164bf077c2a08ebc2256a5578807"
+}

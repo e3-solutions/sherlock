@@ -1,0 +1,18 @@
+running 3 tests from ./workers/telemetry-processor/queue_integration_test.ts
+queue claims are durable, fenced, retryable, and terminally inspectable ... ok (2s)
+live normalization claims an ordered backfill prerequisite without borrowing unrelated backfill ... ok (69ms)
+concurrent live-frontier owners drain a bounded mixed-lane backlog without duplication or reordering ... ok (148ms)
+
+ok | 3 passed | 0 failed (2s)
+
+[WARN] Unsupported engine: wanted: {"node":"^22.22.2 || ^24.15.0 || >=26.0.0"} (current: {"node":"v25.2.1","pnpm":"11.19.0"})
+$ vitest run --config frontend/vitest.config.js --environment node src/server/flame-source.postgres.test.js
+
+ RUN  v4.1.10 /Users/aryagm/.codex/worktrees/be57/sherlock/apps/dashboard/frontend
+
+
+ Test Files  1 passed (1)
+      Tests  9 passed (9)
+   Start at  12:37:08
+   Duration  969ms (transform 50ms, setup 147ms, import 56ms, tests 653ms, environment 0ms)
+

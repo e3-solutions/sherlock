@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "id": "postgres-headroom",
+  "argv": [
+    "env",
+    "SHERLOCK_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres",
+    "deno",
+    "test",
+    "--allow-env",
+    "--allow-net",
+    "workers/telemetry-processor/queue_integration_test.ts"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+  "started_at": "2026-08-27T16:21:47.528117Z",
+  "ended_at": "2026-08-27T16:21:48.594349Z",
+  "exit_code": 1,
+  "termination_reason": null,
+  "resolved_executable": "/usr/bin/env",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+    "sha256": "b0237e0f71de9ade5abb59cdb5304c57c797da368b07522ea5f33c95038cf965"
+  },
+  "log": "runs/postgres-headroom.log",
+  "log_sha256": "85461d2598aed07fb02e724d2a822d153db3e01fe17c08d1e9c95b6778b57c06"
+}

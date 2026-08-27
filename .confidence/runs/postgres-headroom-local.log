@@ -1,0 +1,8 @@
+Check workers/telemetry-processor/queue_integration_test.ts
+running 3 tests from ./workers/telemetry-processor/queue_integration_test.ts
+queue claims are durable, fenced, retryable, and terminally inspectable ... ok (2s)
+live normalization claims an ordered backfill prerequisite without borrowing unrelated backfill ... ok (65ms)
+concurrent live-frontier owners drain a bounded mixed-lane backlog without duplication or reordering ... ok (136ms)
+
+ok | 3 passed | 0 failed (2s)
+

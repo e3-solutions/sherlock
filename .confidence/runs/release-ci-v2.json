@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "id": "release-ci-v2",
+  "argv": [
+    "sh",
+    "-c",
+    "deno fmt --check supabase/functions workers scripts && deno lint supabase/functions workers scripts && deno check supabase/functions/sherlock-rollout-ingest/index.ts && deno check workers/telemetry-processor/main.ts && deno test supabase/functions/sherlock-rollout-ingest && deno test supabase/functions/sherlock-activity-reducer && deno test --allow-read=railway.toml workers/telemetry-processor && cd apps/dashboard && pnpm check && pnpm test && pnpm build && cd ../.. && git diff --check"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+  "started_at": "2026-08-27T16:41:26.148564Z",
+  "ended_at": "2026-08-27T16:41:32.796318Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/bin/sh",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+    "sha256": "d7b23c1d0c3883dbf5af8a78e6d1464de05a1b8df25130bb10a66267320b145a"
+  },
+  "log": "runs/release-ci-v2.log",
+  "log_sha256": "ab5c84530604fc65c89a81d7eab2d2b8e30a915cec9a0b7de0814377849fb854"
+}

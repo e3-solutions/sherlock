@@ -27,7 +27,12 @@ import {
   IngestService,
   validateStoredBatch,
 } from "./service.ts";
-import { advisoryLockIdentity, assertExactRecords } from "./postgres.ts";
+import {
+  advisoryLockIdentity,
+  assertExactRecords,
+  EDGE_FUNCTION_DATABASE_POOL_MAX,
+  edgeFunctionDatabaseUrl,
+} from "./postgres.ts";
 
 function assert(
   condition: unknown,
@@ -35,6 +40,34 @@ function assert(
 ): asserts condition {
   if (!condition) throw new Error(message);
 }
+
+Deno.test("edge ingestion uses one transaction-pooled Supabase connection", () => {
+  const session = edgeFunctionDatabaseUrl(
+    "postgresql://worker:secret@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require",
+  );
+  const transaction = edgeFunctionDatabaseUrl(
+    "postgresql://worker:secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require",
+  );
+  const implicitSession = edgeFunctionDatabaseUrl(
+    "postgresql://worker:secret@aws-0-us-east-1.pooler.supabase.com/postgres",
+  );
+  assert(EDGE_FUNCTION_DATABASE_POOL_MAX === 1);
+  const routed = new URL(session);
+  assert(routed.port === "6543");
+  assert(routed.username === "worker" && routed.password === "secret");
+  assert(routed.searchParams.get("sslmode") === "require");
+  assert(new URL(transaction).port === "6543");
+  assert(new URL(implicitSession).port === "6543");
+  try {
+    edgeFunctionDatabaseUrl(
+      "postgresql://worker:secret@db.example.supabase.co:5432/postgres",
+    );
+    assert(false, "hosted direct connections must fail closed");
+  } catch (error) {
+    assert(error instanceof IngestError);
+    assert(error.code === "invalid_configuration");
+  }
+});
 
 const COLLECTOR = {
   name: "Test User",

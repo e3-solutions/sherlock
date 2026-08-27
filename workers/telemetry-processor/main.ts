@@ -31,6 +31,7 @@ export interface WorkerConfig {
   normalizeReserved: number;
   controlConnections: number;
   processingConnections: number;
+  dashboardReservedConnections: number;
   leaseSeconds: number;
   pollMilliseconds: number;
   retryBaseSeconds: number;
@@ -88,6 +89,15 @@ export function loadConfig(
       "SHERLOCK_WORKER_PROCESSING_CONNECTIONS must cover worker concurrency",
     );
   }
+  const dashboardReservedConnections = positiveInteger(
+    env.SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS,
+    8,
+  );
+  if (dashboardReservedConnections < 8) {
+    throw new Error(
+      "SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS must cover both dashboards and their replacements",
+    );
+  }
   const overloadEnterSeconds = positiveInteger(
     env.SHERLOCK_WORKER_OVERLOAD_ENTER_SECONDS,
     120,
@@ -124,6 +134,7 @@ export function loadConfig(
     normalizeReserved,
     controlConnections,
     processingConnections,
+    dashboardReservedConnections,
     leaseSeconds: positiveInteger(env.SHERLOCK_WORKER_LEASE_SECONDS, 120),
     pollMilliseconds: positiveInteger(env.SHERLOCK_WORKER_POLL_MS, 250),
     retryBaseSeconds: positiveInteger(
@@ -355,6 +366,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
   const shutdown = new AbortController();
   let lastReaperAt = 0;
   let lastOverloadSampleAt = 0;
+  let databaseHeadroomBlocked = false;
   let overload: OverloadState = {
     active: false,
     enterSamples: 0,
@@ -410,6 +422,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       normalize_reserved: config.normalizeReserved,
       control_connections: config.controlConnections,
       processing_connections: config.processingConnections,
+      dashboard_reserved_connections: config.dashboardReservedConnections,
       lease_seconds: config.leaseSeconds,
       github_sync_enabled: config.githubToken !== null,
       github_workspace_count: config.githubWorkspaceIds.length,
@@ -517,6 +530,24 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
           !stopping &&
           admissionAvailable(admissions, active.size, config.concurrency)
         ) {
+          const hasHeadroom = await queue.hasAdmissionHeadroom(
+            config.dashboardReservedConnections,
+            handoffOverlapConnectionBudget(config),
+          );
+          if (!hasHeadroom) {
+            if (!databaseHeadroomBlocked) {
+              log("database_admission_paused", {
+                dashboard_reserved_connections:
+                  config.dashboardReservedConnections,
+              });
+              databaseHeadroomBlocked = true;
+            }
+            break;
+          }
+          if (databaseHeadroomBlocked) {
+            log("database_admission_resumed", {});
+            databaseHeadroomBlocked = false;
+          }
           const job = overload.active
             ? await claimOverloadJob(queue, active, config)
             : await claimNormalJob(queue, active, config);
