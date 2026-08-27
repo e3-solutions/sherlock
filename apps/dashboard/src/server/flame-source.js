@@ -31,7 +31,7 @@ export const FRESHNESS_NORMALIZER_VERSIONS = Object.freeze([
 ]);
 export const DATABASE_ROLE = "sherlock_reader";
 const DEFAULT_STATEMENT_TIMEOUT_MS = 20_000;
-const TIMELINE_STATEMENT_TIMEOUT_MS = 30_000;
+const TIMELINE_STATEMENT_TIMEOUT_MS = 60_000;
 const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
 export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
@@ -985,24 +985,76 @@ function projectedEvidenceCte({
   personScoped = false,
   sessionScoped = false,
   activityThroughReadAt = false,
+  splitEvidenceWindows = false,
 } = {}) {
   const visibility = snapshotVisible
     ? "and pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)"
     : "";
   const activityEnd = activityThroughReadAt ? "p.read_at" : "p.end_at";
-  return `
-ranked_frame_revisions as materialized (
-  select revision.*,
-         row_number() over (
-           partition by revision.evidence_kind, revision.source_event_id
-           order by revision.id desc
-         ) latest_rank
+  const splitCandidates = splitEvidenceWindows
+    ? `
+frame_revision_candidates as materialized (
+  select revision.id, revision.session_id, revision.person_id,
+         revision.evidence_kind, revision.source_event_id,
+         revision.anchor_observed_at, revision.observed_at,
+         revision.actor_role, null::text prompt_identity,
+         revision.is_tombstone
     from analytics.frame_evidence_revisions revision
+    join roster evidence_person
+      on evidence_person.person_id = revision.person_id
+    cross join p
+   where revision.workspace_id = p.workspace_id
+     and revision.frame_version = p.frame_version
+     and revision.evidence_kind = 'activity'
+     and revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+     and revision.observed_at < ${activityEnd} + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+  union all
+  select revision.id, revision.session_id, revision.person_id,
+         revision.evidence_kind, revision.source_event_id,
+         revision.anchor_observed_at, revision.observed_at,
+         revision.actor_role, revision.prompt_identity,
+         revision.is_tombstone
+    from analytics.frame_evidence_revisions revision
+    join roster evidence_person
+      on evidence_person.person_id = revision.person_id
+    cross join p
+   where revision.workspace_id = p.workspace_id
+     and revision.frame_version = p.frame_version
+     and revision.evidence_kind = 'prompt'
+     and revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+     and revision.anchor_observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+  union all
+  select revision.id, revision.session_id, revision.person_id,
+         revision.evidence_kind, revision.source_event_id,
+         revision.anchor_observed_at, revision.observed_at,
+         revision.actor_role, revision.prompt_identity,
+         revision.is_tombstone
+    from analytics.frame_evidence_revisions revision
+    join roster evidence_person
+      on evidence_person.person_id = revision.person_id
+    cross join p
+   where revision.workspace_id = p.workspace_id
+     and revision.frame_version = p.frame_version
+     and revision.evidence_kind = 'prompt'
+     and revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+     and revision.observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+     and not coalesce(
+       revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+       and revision.anchor_observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds',
+       false
+     )
+), `
+    : "";
+  const rankedSource = splitEvidenceWindows
+    ? "frame_revision_candidates revision"
+    : `analytics.frame_evidence_revisions revision
     join telemetry.people evidence_person
       on evidence_person.workspace_id = revision.workspace_id
      and evidence_person.id = revision.person_id
-    cross join p
-   where revision.workspace_id = p.workspace_id
+    cross join p`;
+  const rankedPredicate = splitEvidenceWindows
+    ? "true"
+    : `revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
      and evidence_person.github_id is distinct from 'sherlock-smoke'
      and split_part(evidence_person.email, '@', 2) = p.expected_email_domain
@@ -1021,11 +1073,31 @@ ranked_frame_revisions as materialized (
          and revision.observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
        )
      )
-     ${visibility}
+     ${visibility}`;
+  const rankedProjection = splitEvidenceWindows
+    ? `select distinct on (revision.evidence_kind, revision.source_event_id)
+             revision.*
+         from ${rankedSource}
+        where ${rankedPredicate}
+        order by revision.evidence_kind, revision.source_event_id,
+                 revision.id desc`
+    : `select revision.*,
+              row_number() over (
+                partition by revision.evidence_kind, revision.source_event_id
+                order by revision.id desc
+              ) latest_rank
+         from ${rankedSource}
+        where ${rankedPredicate}`;
+  const latestPredicate = splitEvidenceWindows
+    ? "not is_tombstone"
+    : "latest_rank = 1 and not is_tombstone";
+  return `
+${splitCandidates}ranked_frame_revisions as materialized (
+  ${rankedProjection}
 ), latest_frame_evidence as materialized (
   select *
     from ranked_frame_revisions
-   where latest_rank = 1 and not is_tombstone
+   where ${latestPredicate}
 ), projected_activity as materialized (
   select latest_frame_evidence.*
    from latest_frame_evidence cross join p
@@ -1068,7 +1140,10 @@ with p as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start
     from p
-), ${projectedEvidenceCte({ activityThroughReadAt: true })}, bucket_activity as materialized (
+), ${projectedEvidenceCte({
+  activityThroughReadAt: true,
+  splitEvidenceWindows: true,
+})}, bucket_activity as materialized (
   select evidence.person_id,
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,

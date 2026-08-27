@@ -122,6 +122,25 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     }
   }, 30_000);
 
+  it("keeps frame evidence planner statistics on the tuned threshold", async () => {
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [table] = await sql.unsafe(
+        `select reloptions
+           from pg_class c
+           join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = 'analytics'
+            and c.relname = 'frame_evidence_revisions'`,
+      );
+      expect(table.reloptions).toEqual(expect.arrayContaining([
+        "autovacuum_analyze_scale_factor=0.02",
+        "autovacuum_analyze_threshold=5000",
+      ]));
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+
   it("shows only the dashboard's expected email domain", async () => {
     const workspaceId = crypto.randomUUID();
     const coreEdgeId = crypto.randomUUID();
@@ -744,6 +763,9 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         partialActivityAt.toISOString(),
       );
       expect(projectedDay.people[0].total).toEqual([1, 1, 0]);
+      expect(
+        projectedDay.people[0].buckets[bucketIndex(observedAt)][3],
+      ).toBe(1);
       expect(projectedInterval.work).toEqual(legacyInterval.work);
       expect(projectedInterval.prompts).toEqual(legacyInterval.prompts);
       expect(Object.fromEntries(projectedInterval.work.map(({ sessionId, role }) =>

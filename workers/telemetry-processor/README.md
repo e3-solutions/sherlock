@@ -7,30 +7,30 @@ the rollout, connection, or shutdown gates below.
 ## Connection and scheduling contract
 
 - One active replica owns an environment-and-service advisory lock.
-- The control pool has four sessions. The pinned handoff lock consumes one,
-  leaving three for claims, heartbeats, and the reaper.
-- The shared processing pool has six sessions. Normalizer, reducer, and frame
+- The control pool has two sessions. The pinned handoff lock consumes one,
+  leaving one for claims, heartbeats, and the reaper.
+- The shared processing pool has four sessions. Normalizer, reducer, and frame
   projection adapters borrow from it and do not close it.
-- An active replica can therefore use at most 10 sessions. A compatible
+- An active replica can therefore use at most six sessions. A compatible
   replacement opens exactly one control session before handoff, so the maximum
-  rolling overlap is 11 sessions.
+  rolling overlap is seven sessions.
 - Before each claim, the worker measures PostgreSQL's usable connection limit,
   live client count, labeled worker sessions, and labeled dashboard sessions on
-  the pinned handoff connection. It budgets the worker's 11-session rolling
+  the pinned handoff connection. It budgets the worker's seven-session rolling
   envelope and preserves an eight-slot dashboard envelope: four owned by the
   live dashboards and four for their simultaneous replacements. Set
   `SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS` higher when adding readers;
   startup rejects values below eight. URL `application_name` parameters are
   discarded so deployment configuration cannot override these labels.
-- Replica scaling remains disabled. Concurrency is six; overload mode reserves
-  five normalization lanes and one reduction lane, permits borrowing when the
+- Replica scaling remains disabled. Concurrency is four; overload mode reserves
+  three normalization lanes and one reduction lane, permits borrowing when the
   preferred kind is empty, and pauses new backfill claims until live lag exits
   hysteresis.
 
 Before starting or replacing the worker, require zero active blocked database
 waiters and enough measured headroom that the current total plus the sessions
 the operation adds remains at or below 80% of `max_connections`. A cold start
-adds up to 10; a compatible replacement adds one during handoff. Do not raise
+adds up to six; a compatible replacement adds one during handoff. Do not raise
 concurrency, pool sizes, or replica count without a measured load test proving
 arrival rate is below sustained completion rate and the same connection gate
 continues to hold.
