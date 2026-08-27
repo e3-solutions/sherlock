@@ -1731,6 +1731,12 @@ export function buildFreshnessPayload(rows, maxPeople) {
   };
 }
 
+export function dashboardDatabaseUrl(databaseUrl) {
+  const url = new URL(databaseUrl);
+  url.searchParams.delete("application_name");
+  return url.toString();
+}
+
 export class DirectFlameSource {
   constructor({
     databaseUrl,
@@ -1743,12 +1749,38 @@ export class DirectFlameSource {
     this.expectedEmailDomain = validateDashboardEmailDomain(expectedEmailDomain);
     this.maxPeople = maxPeople;
     this.projectionEnabled = projectionEnabled;
-    this.sql = postgres(databaseUrl, {
+    this.applicationName = `sherlock-dashboard:${workspaceId}`;
+    this.sql = postgres(dashboardDatabaseUrl(databaseUrl), {
       prepare: false,
       max: 2,
-      idle_timeout: 20,
+      idle_timeout: null,
       connect_timeout: 10,
+      max_lifetime: null,
+      connection: { application_name: this.applicationName },
     });
+  }
+
+  async reserveCapacity() {
+    const reservations = await Promise.allSettled([
+      this.sql.reserve(),
+      this.sql.reserve(),
+    ]);
+    const connections = reservations
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value);
+    try {
+      const failed = reservations.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+      await Promise.all(
+        connections.map((connection) => connection.unsafe("select 1")),
+      );
+    } catch (error) {
+      throw new FlameSourceError("flame_database_capacity_unavailable", {
+        cause: error,
+      });
+    } finally {
+      connections.forEach((connection) => connection.release());
+    }
   }
 
   async close() {

@@ -15,15 +15,23 @@ export class ProcessingDeadlineError extends Error {
   }
 }
 
+export function databaseUrlWithoutApplicationName(databaseUrl: string): string {
+  const url = new URL(databaseUrl);
+  url.searchParams.delete("application_name");
+  return url.toString();
+}
+
 export function createPostgresPool(
   databaseUrl: string,
   maxConnections: number,
+  applicationName = "sherlock-worker",
 ): Sql {
-  return postgres(databaseUrl, {
+  return postgres(databaseUrlWithoutApplicationName(databaseUrl), {
     prepare: false,
     max: maxConnections,
     idle_timeout: 20,
     connect_timeout: 10,
+    connection: { application_name: applicationName },
   });
 }
 

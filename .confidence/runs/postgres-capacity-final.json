@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "id": "postgres-capacity-final",
+  "argv": [
+    "sh",
+    "-c",
+    "SHERLOCK_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres deno test --allow-env --allow-net workers/telemetry-processor/queue_integration_test.ts && cd apps/dashboard && SHERLOCK_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres pnpm test:postgres"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+  "started_at": "2026-08-27T16:31:49.201643Z",
+  "ended_at": "2026-08-27T16:31:53.868942Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/bin/sh",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/be57/sherlock",
+    "sha256": "33da623cecf3545d9f306d4d1ed4164eed5beb8f5db6c10773a333cc62d40cb1"
+  },
+  "log": "runs/postgres-capacity-final.log",
+  "log_sha256": "e3d3104743b592ebc77b9eb255149f9f83a040126c4d74b544fd9801fa80cc76"
+}

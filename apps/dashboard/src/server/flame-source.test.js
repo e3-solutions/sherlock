@@ -30,6 +30,7 @@ import {
   WORK_DETAIL_SQL,
   ASSISTANT_REPRESENTATION_MATCH_SECONDS,
   DirectFlameSource,
+  dashboardDatabaseUrl,
   UNKEYED_PROMPT_REPRESENTATION_MILLISECONDS,
   UNKEYED_PROMPT_MATCH_SECONDS,
   FlameSourceError,
@@ -251,6 +252,35 @@ describe("Sherlock Flame payload", () => {
       mode: "sherlock_backend_aggregate",
     });
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.activity_spans");
+  });
+
+  it("warms both owned dashboard connections before serving", async () => {
+    const first = { unsafe: vi.fn().mockResolvedValue([]), release: vi.fn() };
+    const second = { unsafe: vi.fn().mockResolvedValue([]), release: vi.fn() };
+    const source = Object.create(DirectFlameSource.prototype);
+    source.sql = {
+      reserve: vi.fn()
+        .mockResolvedValueOnce(first)
+        .mockResolvedValueOnce(second),
+    };
+
+    await source.reserveCapacity();
+
+    expect(source.sql.reserve).toHaveBeenCalledTimes(2);
+    expect(first.unsafe).toHaveBeenCalledWith("select 1");
+    expect(second.unsafe).toHaveBeenCalledWith("select 1");
+    expect(first.release).toHaveBeenCalledOnce();
+    expect(second.release).toHaveBeenCalledOnce();
+  });
+
+  it("makes the dashboard label authoritative over URL parameters", () => {
+    const cleaned = new URL(dashboardDatabaseUrl(
+      "postgresql://reader:secret@example.invalid/postgres?sslmode=require&application_name=railway",
+    ));
+    expect(cleaned.searchParams.get("application_name")).toBeNull();
+    expect(cleaned.searchParams.get("sslmode")).toBe("require");
+    expect(cleaned.username).toBe("reader");
+    expect(cleaned.password).toBe("secret");
   });
 
   it("configures default source transactions before pinning the read-only role", async () => {

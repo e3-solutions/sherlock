@@ -232,6 +232,13 @@ sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
 exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
 the additive frame-projection migration or when stopping new v2 token minting.
 
+Each dashboard opens and retains its two labeled database sessions before the
+HTTP server starts. Startup fails closed if both cannot be acquired. The worker
+accounts for these owned sessions in its admission budget and preserves missing
+slots for both live dashboards and a simultaneous replacement generation. A
+database URL `application_name` parameter is discarded so deployment
+configuration cannot override the capacity labels.
+
 ## Bonaparte MCP
 
 `/mcp` is a stateless Streamable HTTP MCP endpoint for agent-assisted usage and

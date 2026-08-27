@@ -31,8 +31,12 @@ import {
   resolveSessionCutoffs,
   SESSION_CUTOFFS_SQL,
 } from "./processor.ts";
-import { createReservedTransactionRunner } from "./database.ts";
 import {
+  createReservedTransactionRunner,
+  databaseUrlWithoutApplicationName,
+} from "./database.ts";
+import {
+  admissionHeadroomAvailable,
   coalesceReductionTargets,
   type ReductionEnqueueOptions,
   type TelemetryJob,
@@ -67,8 +71,24 @@ Deno.test("configuration is bounded and secrets remain required", () => {
   assert(config.normalizeReserved === 5);
   assert(config.controlConnections === 4);
   assert(config.processingConnections === 6);
+  assert(config.dashboardReservedConnections === 8);
   assert(config.processingTimeoutMilliseconds === 90_000);
   assert(config.githubWorkspaceIds.length === 0);
+  let reserveRejected = false;
+  try {
+    loadConfig({
+      SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
+      SUPABASE_URL: "https://example.supabase.co",
+      SUPABASE_SERVICE_ROLE_KEY: "test-secret",
+      SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS: "7",
+    });
+  } catch {
+    reserveRejected = true;
+  }
+  assert(
+    reserveRejected,
+    "both dashboards and their replacements must retain eight slots",
+  );
   let rejected = false;
   try {
     loadConfig({
@@ -97,6 +117,54 @@ Deno.test("configuration is bounded and secrets remain required", () => {
     }
     assert(invalid, `${concurrency}/${liveReserved} must be rejected`);
   }
+});
+
+Deno.test("database admission preserves owned dashboard sessions at the exact boundary", () => {
+  const base = {
+    max_connections: 22,
+    superuser_reserved_connections: 3,
+    reserved_connections: 0,
+    client_connections: 1,
+    worker_connections: 1,
+    dashboard_connections: 0,
+  };
+  assert(
+    admissionHeadroomAvailable(base, 8, 11),
+    "the full worker overlap must leave both dashboard generations eight slots",
+  );
+  assert(
+    !admissionHeadroomAvailable(
+      {
+        ...base,
+        client_connections: 2,
+      },
+      8,
+      11,
+    ),
+    "one unrelated client must stop admission before consuming the reserve",
+  );
+  assert(
+    admissionHeadroomAvailable(
+      {
+        ...base,
+        client_connections: 14,
+        worker_connections: 10,
+        dashboard_connections: 4,
+      },
+      8,
+      11,
+    ),
+    "owned sessions count while replacement and handoff slots remain reserved",
+  );
+});
+
+Deno.test("worker database labels override contradictory URL parameters", () => {
+  const cleaned = new URL(databaseUrlWithoutApplicationName(
+    "postgresql://worker:secret@example.invalid/postgres?sslmode=require&application_name=railway",
+  ));
+  assert(cleaned.searchParams.get("application_name") === null);
+  assert(cleaned.searchParams.get("sslmode") === "require");
+  assert(cleaned.username === "worker" && cleaned.password === "secret");
 });
 
 Deno.test("GitHub sync requires an explicit workspace allowlist", () => {
@@ -365,7 +433,7 @@ Deno.test("slow claims cannot starve overload maintenance", () => {
   assert(claims === 4);
 });
 
-Deno.test("only pool capacity errors open the worker circuit", () => {
+Deno.test("only database pressure errors open the worker circuit", () => {
   assert(isCapacityError(Object.assign(new Error("too many connections"), {
     code: "53300",
   })));
@@ -375,6 +443,12 @@ Deno.test("only pool capacity errors open the worker circuit", () => {
   assert(isCapacityError(Object.assign(new Error("session pool exhausted"), {
     code: "EMAXCONNSESSION",
   })));
+  assert(
+    !isCapacityError(Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    )),
+  );
   assert(
     !isCapacityError(Object.assign(new Error("serialization"), {
       code: "40001",

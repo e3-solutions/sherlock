@@ -161,7 +161,12 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { prepare: false, max: 4 });
-    const queue = PostgresJobQueue.connect(databaseUrl!, 4);
+    const conflictingDatabaseUrl = new URL(databaseUrl!);
+    conflictingDatabaseUrl.searchParams.set("application_name", "railway");
+    const queue = PostgresJobQueue.connect(
+      conflictingDatabaseUrl.toString(),
+      4,
+    );
     const replacementQueue = PostgresJobQueue.connect(databaseUrl!, 4);
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
@@ -170,6 +175,23 @@ Deno.test({
     try {
       const handoffKey = `queue-test-${workspaceId}`;
       assert(await queue.tryAcquireHandoff(handoffKey));
+      const controlSessions = await sql.unsafe(
+        `select count(*)::integer as connections
+           from pg_stat_activity
+          where application_name = 'sherlock-worker-control'`,
+      );
+      assert(
+        controlSessions[0].connections >= 1,
+        "the worker control label must override a conflicting URL parameter",
+      );
+      assert(
+        await queue.hasAdmissionHeadroom(0, 11),
+        "an unconstrained admission must see ordinary local database headroom",
+      );
+      assert(
+        !(await queue.hasAdmissionHeadroom(1_000_000, 11)),
+        "admission must stop when the requested reader reserve cannot fit",
+      );
       assert(
         !(await replacementQueue.tryAcquireHandoff(handoffKey)),
         "a replacement must wait with one control session",

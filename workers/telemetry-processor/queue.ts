@@ -31,6 +31,56 @@ export interface ReductionJob extends BaseJob {
 export type TelemetryJob = NormalizationJob | ReductionJob;
 export type CompletionResult = "succeeded" | "requeued" | "fenced";
 
+export interface DatabaseConnectionCapacity {
+  max_connections: number;
+  superuser_reserved_connections: number;
+  reserved_connections: number;
+  client_connections: number;
+  worker_connections: number;
+  dashboard_connections: number;
+}
+
+export const ADMISSION_HEADROOM_SQL = `
+select current_setting('max_connections')::integer as max_connections,
+       current_setting('superuser_reserved_connections')::integer
+         as superuser_reserved_connections,
+       coalesce(
+         nullif(current_setting('reserved_connections', true), ''),
+         '0'
+       )::integer as reserved_connections,
+       count(*)::integer as client_connections,
+       count(*) filter (
+         where application_name in (
+           'sherlock-worker-control',
+           'sherlock-worker-processing'
+         )
+       )::integer as worker_connections,
+       count(*) filter (
+         where application_name like 'sherlock-dashboard:%'
+       )::integer as dashboard_connections
+from pg_stat_activity
+where backend_type = 'client backend'
+`;
+
+export function admissionHeadroomAvailable(
+  capacity: DatabaseConnectionCapacity,
+  dashboardReservedConnections: number,
+  workerConnectionBudget: number,
+): boolean {
+  const usableConnections = capacity.max_connections -
+    capacity.superuser_reserved_connections - capacity.reserved_connections;
+  const unopenedWorkerConnections = Math.max(
+    0,
+    workerConnectionBudget - capacity.worker_connections,
+  );
+  const missingDashboardConnections = Math.max(
+    0,
+    dashboardReservedConnections - capacity.dashboard_connections,
+  );
+  return usableConnections - capacity.client_connections -
+      unopenedWorkerConnections >= missingDashboardConnections;
+}
+
 export interface ReductionEnqueueOptions {
   workspaceId: string;
   sessionId: string;
@@ -86,7 +136,11 @@ export class PostgresJobQueue {
     maxConnections: number,
   ): PostgresJobQueue {
     return new PostgresJobQueue(
-      createPostgresPool(databaseUrl, maxConnections),
+      createPostgresPool(
+        databaseUrl,
+        maxConnections,
+        "sherlock-worker-control",
+      ),
     );
   }
 
@@ -120,6 +174,32 @@ export class PostgresJobQueue {
     } finally {
       connection.release();
     }
+  }
+
+  async hasAdmissionHeadroom(
+    dashboardReservedConnections: number,
+    workerConnectionBudget: number,
+  ): Promise<boolean> {
+    if (this.handoffConnection === null) {
+      throw new Error("database headroom requires the active handoff session");
+    }
+    const rows = await this.handoffConnection.unsafe(ADMISSION_HEADROOM_SQL);
+    if (rows.length !== 1) return false;
+    const row = rows[0];
+    return admissionHeadroomAvailable(
+      {
+        max_connections: Number(row.max_connections),
+        superuser_reserved_connections: Number(
+          row.superuser_reserved_connections,
+        ),
+        reserved_connections: Number(row.reserved_connections),
+        client_connections: Number(row.client_connections),
+        worker_connections: Number(row.worker_connections),
+        dashboard_connections: Number(row.dashboard_connections),
+      },
+      dashboardReservedConnections,
+      workerConnectionBudget,
+    );
   }
 
   async pendingGithubCommitPairs(
