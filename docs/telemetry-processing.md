@@ -83,9 +83,9 @@ SUPABASE_SERVICE_ROLE_KEY=... \
 deno run --allow-env --allow-net workers/telemetry-processor/main.ts
 ```
 
-Optional settings include `SHERLOCK_WORKER_CONCURRENCY` (default `6`),
-`SHERLOCK_WORKER_LIVE_RESERVED` (default `5`),
-`SHERLOCK_WORKER_NORMALIZE_RESERVED` (default `5`),
+Optional settings include `SHERLOCK_WORKER_CONCURRENCY` (default `4`),
+`SHERLOCK_WORKER_LIVE_RESERVED` (default `3`),
+`SHERLOCK_WORKER_NORMALIZE_RESERVED` (default `3`),
 `SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS` (default and minimum `8`),
 `SHERLOCK_WORKER_LEASE_SECONDS` (default `120`),
 `SHERLOCK_WORKER_POLL_MS` (default `250`), and retry base/max seconds
@@ -130,7 +130,7 @@ but a legacy service-role JWT is not required.
 Each dashboard opens and retains two labeled database sessions before serving.
 Before every claim, the worker uses its pinned handoff session to read
 PostgreSQL's usable limit plus live worker/dashboard client counts. It budgets
-the worker's full eleven-session rolling envelope and an eight-session dashboard
+the worker's full seven-session rolling envelope and an eight-session dashboard
 envelope covering both live dashboards plus simultaneous replacements, without
 double-reserving sessions the dashboards already own. Conflicting database URL
 `application_name` parameters are stripped so labels remain authoritative.

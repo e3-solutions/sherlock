@@ -509,8 +509,12 @@ describe("Sherlock Flame payload", () => {
       expect(query).toContain("split_part(pe.email, '@', 2) = p.expected_email_domain");
       expect(query).toContain("split_part(pe.email, '@', 3) = ''");
     }
+    expect(PROJECTION_FLAME_SQL).toContain("expected_email_domain");
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "split_part(pe.email, '@', 2) = p.expected_email_domain",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain("split_part(pe.email, '@', 3) = ''");
     for (const query of [
-      PROJECTION_FLAME_SQL,
       PROJECTION_INTERVAL_WORK_SQL,
       PROJECTION_INTERVAL_PROMPTS_SQL,
       PROJECTION_WORK_DETAIL_SQL,
@@ -724,7 +728,7 @@ describe("Sherlock Flame payload", () => {
     expect(payload.snapshot).toMatch(/^v3\./);
   });
 
-  it("selects the 30-second transaction timeout only for the cached timeline", async () => {
+  it("selects the 60-second transaction timeout only for the cached timeline", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     const signal = new AbortController().signal;
     source.transaction = vi.fn().mockResolvedValue("timeline");
@@ -734,7 +738,7 @@ describe("Sherlock Flame payload", () => {
     expect(source.transaction).toHaveBeenCalledOnce();
     expect(source.transaction).toHaveBeenCalledWith(
       expect.any(Function),
-      { signal, statementTimeoutMs: 30_000 },
+      { signal, statementTimeoutMs: 60_000 },
     );
   });
 
@@ -982,6 +986,32 @@ describe("Sherlock Flame payload", () => {
     expect(PROJECTION_FLAME_SQL).not.toContain("analytics.frame_projection_receipts");
     expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.events");
     expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.sessions");
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "frame_revision_candidates as materialized",
+    );
+    expect(
+      PROJECTION_FLAME_SQL.match(/join roster evidence_person/g),
+    ).toHaveLength(3);
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "revision.actor_role, null::text prompt_identity",
+    );
+    expect(PROJECTION_FLAME_SQL).toContain(
+      "select distinct on (revision.evidence_kind, revision.source_event_id)",
+    );
+    expect(PROJECTION_FLAME_SQL.match(/union all/g)).toHaveLength(2);
+    expectSqlInOrder(
+      PROJECTION_FLAME_SQL,
+      "revision.evidence_kind = 'activity'",
+      "revision.observed_at >= p.start_at",
+      "union all",
+      "revision.evidence_kind = 'prompt'",
+      "revision.anchor_observed_at >= p.start_at",
+      "union all",
+      "revision.evidence_kind = 'prompt'",
+      "revision.observed_at >= p.start_at",
+      "and not coalesce(",
+      "ranked_frame_revisions as materialized",
+    );
     for (const query of [
       PROJECTION_INTERVAL_WORK_SQL,
       PROJECTION_INTERVAL_PROMPTS_SQL,
@@ -1055,8 +1085,17 @@ describe("Sherlock Flame payload", () => {
   });
 
   it("excludes projected guardians after latest-revision selection", () => {
-    for (const sql of [
+    expectSqlInOrder(
       PROJECTION_FLAME_SQL,
+      "ranked_frame_revisions as materialized",
+      "select distinct on (revision.evidence_kind, revision.source_event_id)",
+      "latest_frame_evidence as materialized",
+      "where not is_tombstone",
+      "projected_activity as materialized",
+      "and actor_role <> 'guardian'",
+      "projected_prompt_candidates as materialized",
+    );
+    for (const sql of [
       PROJECTION_INTERVAL_WORK_SQL,
       PROJECTION_INTERVAL_PROMPTS_SQL,
       PROJECTION_WORK_DETAIL_SQL,

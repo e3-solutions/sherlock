@@ -66,11 +66,11 @@ Deno.test("configuration is bounded and secrets remain required", () => {
     SUPABASE_URL: "https://example.supabase.co",
     SUPABASE_SERVICE_ROLE_KEY: "test-secret",
   });
-  assert(config.concurrency === 6);
-  assert(config.liveReserved === 5);
-  assert(config.normalizeReserved === 5);
-  assert(config.controlConnections === 4);
-  assert(config.processingConnections === 6);
+  assert(config.concurrency === 4);
+  assert(config.liveReserved === 3);
+  assert(config.normalizeReserved === 3);
+  assert(config.controlConnections === 2);
+  assert(config.processingConnections === 4);
   assert(config.dashboardReservedConnections === 8);
   assert(config.processingTimeoutMilliseconds === 90_000);
   assert(config.githubWorkspaceIds.length === 0);
@@ -121,7 +121,7 @@ Deno.test("configuration is bounded and secrets remain required", () => {
 
 Deno.test("database admission preserves owned dashboard sessions at the exact boundary", () => {
   const base = {
-    max_connections: 22,
+    max_connections: 18,
     superuser_reserved_connections: 3,
     reserved_connections: 0,
     client_connections: 1,
@@ -129,7 +129,7 @@ Deno.test("database admission preserves owned dashboard sessions at the exact bo
     dashboard_connections: 0,
   };
   assert(
-    admissionHeadroomAvailable(base, 8, 11),
+    admissionHeadroomAvailable(base, 8, 7),
     "the full worker overlap must leave both dashboard generations eight slots",
   );
   assert(
@@ -139,7 +139,7 @@ Deno.test("database admission preserves owned dashboard sessions at the exact bo
         client_connections: 2,
       },
       8,
-      11,
+      7,
     ),
     "one unrelated client must stop admission before consuming the reserve",
   );
@@ -147,12 +147,12 @@ Deno.test("database admission preserves owned dashboard sessions at the exact bo
     admissionHeadroomAvailable(
       {
         ...base,
-        client_connections: 14,
-        worker_connections: 10,
+        client_connections: 10,
+        worker_connections: 6,
         dashboard_connections: 4,
       },
       8,
-      11,
+      7,
     ),
     "owned sessions count while replacement and handoff slots remain reserved",
   );
@@ -200,14 +200,14 @@ Deno.test("connection pools and overload reservations stay within bounds", () =>
     SUPABASE_SERVICE_ROLE_KEY: "test-secret",
   });
   assert(workerConnectionBudget(config, "handoff_wait") === 1);
-  assert(workerConnectionBudget(config, "active") === 10);
-  assert(handoffOverlapConnectionBudget(config) === 11);
-  assert(config.controlConnections - 1 === 3);
+  assert(workerConnectionBudget(config, "active") === 6);
+  assert(handoffOverlapConnectionBudget(config) === 7);
+  assert(config.controlConnections - 1 === 1);
   for (
     const invalid of [
       { SHERLOCK_WORKER_CONTROL_CONNECTIONS: "1" },
-      { SHERLOCK_WORKER_PROCESSING_CONNECTIONS: "5" },
-      { SHERLOCK_WORKER_NORMALIZE_RESERVED: "6" },
+      { SHERLOCK_WORKER_PROCESSING_CONNECTIONS: "3" },
+      { SHERLOCK_WORKER_NORMALIZE_RESERVED: "4" },
       {
         SHERLOCK_WORKER_OVERLOAD_ENTER_SECONDS: "60",
         SHERLOCK_WORKER_OVERLOAD_EXIT_SECONDS: "60",

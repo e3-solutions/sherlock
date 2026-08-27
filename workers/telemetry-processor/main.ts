@@ -49,7 +49,7 @@ export interface WorkerConfig {
 export function loadConfig(
   env: Record<string, string | undefined>,
 ): WorkerConfig {
-  const concurrency = positiveInteger(env.SHERLOCK_WORKER_CONCURRENCY, 6);
+  const concurrency = positiveInteger(env.SHERLOCK_WORKER_CONCURRENCY, 4);
   if (concurrency < 2) {
     throw new Error("SHERLOCK_WORKER_CONCURRENCY must be at least 2");
   }
@@ -73,7 +73,7 @@ export function loadConfig(
   }
   const controlConnections = positiveInteger(
     env.SHERLOCK_WORKER_CONTROL_CONNECTIONS,
-    4,
+    2,
   );
   if (controlConnections < 2) {
     throw new Error(
@@ -82,7 +82,7 @@ export function loadConfig(
   }
   const processingConnections = positiveInteger(
     env.SHERLOCK_WORKER_PROCESSING_CONNECTIONS,
-    6,
+    4,
   );
   if (processingConnections < concurrency) {
     throw new Error(
