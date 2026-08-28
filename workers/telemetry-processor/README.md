@@ -15,18 +15,18 @@ the rollout, connection, or shutdown gates below.
   session. Slow or blocked SCM reads cannot consume the remaining control
   session used by claims, lease heartbeats, completions, and the reaper.
 - An active replica can therefore use at most seven sessions with GitHub sync
-  enabled, or six without it. A compatible replacement opens exactly one
-  control session before handoff, so the maximum rolling overlap is eight or
-  seven sessions respectively.
+  enabled, or six without it. A compatible replacement opens exactly one control
+  session before handoff, so the maximum rolling overlap is eight or seven
+  sessions respectively.
 - Before each claim, the worker measures PostgreSQL's usable connection limit,
   live client count, labeled worker sessions, and labeled dashboard sessions on
   the pinned handoff connection. It budgets the worker's conditional
   eight-session rolling envelope and preserves an eight-slot dashboard envelope:
-  four owned by the
-  live dashboards and four for their simultaneous replacements. Set
-  `SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS` higher when adding readers;
-  startup rejects values below eight. URL `application_name` parameters are
-  discarded so deployment configuration cannot override these labels.
+  four owned by the live dashboards and four for their simultaneous
+  replacements. Set `SHERLOCK_WORKER_DASHBOARD_RESERVED_CONNECTIONS` higher when
+  adding readers; startup rejects values below eight. URL `application_name`
+  parameters are discarded so deployment configuration cannot override these
+  labels.
 - Replica scaling remains disabled. Concurrency is four; overload mode reserves
   three normalization lanes and one reduction lane, permits borrowing when the
   preferred kind is empty, and pauses new backfill claims until live lag exits
@@ -50,11 +50,12 @@ handling.
 Set `SHERLOCK_GITHUB_WORKSPACE_IDS` to a comma-separated workspace UUID
 allowlist. Live lookup uses it immediately; rerun the manual backfill after
 adding a workspace. Set `GITHUB_TOKEN` to a fine-grained token with pull-request
-read access to enable sync; startup rejects a token without an allowlist. The dedicated sync pool is fixed
-at one connection and is included in admission accounting and shutdown.
-Repository changes fail closed, terminal matches are rechecked every six hours,
-and auth or rate-limit pauses are logged without creating pair failures. Sync
-runs each minute while backlogged, otherwise every five minutes.
+read access to enable sync; startup rejects a token without an allowlist. The
+dedicated sync pool is fixed at one connection and is included in admission
+accounting and shutdown. Repository changes fail closed, terminal matches are
+rechecked every six hours, and auth or rate-limit pauses are logged without
+creating pair failures. Sync runs each minute while backlogged, otherwise every
+five minutes.
 
 ## First rollout and rollback
 
