@@ -36,6 +36,7 @@ export interface WorkerConfig {
   dashboardReservedConnections: number;
   leaseSeconds: number;
   pollMilliseconds: number;
+  controlLoopStallMilliseconds: number;
   retryBaseSeconds: number;
   retryMaxSeconds: number;
   storageTimeoutMilliseconds: number;
@@ -128,6 +129,22 @@ export function loadConfig(
     );
   }
   const githubConnections = githubToken ? 1 : 0;
+  const pollMilliseconds = positiveInteger(
+    env.SHERLOCK_WORKER_POLL_MS,
+    250,
+  );
+  const controlLoopStallMilliseconds = positiveInteger(
+    env.SHERLOCK_WORKER_CONTROL_STALL_SECONDS,
+    60,
+  ) * 1_000;
+  if (
+    controlLoopStallMilliseconds <
+      Math.max(30_000, pollMilliseconds * 4)
+  ) {
+    throw new Error(
+      "SHERLOCK_WORKER_CONTROL_STALL_SECONDS must allow four polling intervals and at least 30 seconds",
+    );
+  }
   return {
     databaseUrl: required(env, "SUPABASE_DB_URL"),
     supabaseUrl,
@@ -140,7 +157,8 @@ export function loadConfig(
     processingConnections,
     dashboardReservedConnections,
     leaseSeconds: positiveInteger(env.SHERLOCK_WORKER_LEASE_SECONDS, 120),
-    pollMilliseconds: positiveInteger(env.SHERLOCK_WORKER_POLL_MS, 250),
+    pollMilliseconds,
+    controlLoopStallMilliseconds,
     retryBaseSeconds: positiveInteger(
       env.SHERLOCK_WORKER_RETRY_BASE_SECONDS,
       5,
@@ -172,6 +190,46 @@ export function loadConfig(
     githubWorkspaceIds: githubWorkspaces,
     githubConnections,
   };
+}
+
+export class WorkerProgressWatchdog {
+  private lastProgressAt: number;
+  private tripped = false;
+
+  constructor(
+    private readonly stallMilliseconds: number,
+    private readonly now: () => number = Date.now,
+  ) {
+    this.lastProgressAt = now();
+  }
+
+  touch(): void {
+    this.lastProgressAt = this.now();
+  }
+
+  check(onStall: (elapsedMilliseconds: number) => void): boolean {
+    if (this.tripped) return false;
+    const elapsed = Math.max(0, this.now() - this.lastProgressAt);
+    if (elapsed < this.stallMilliseconds) return false;
+    this.tripped = true;
+    onStall(elapsed);
+    return true;
+  }
+}
+
+export function startWorkerProgressWatchdog(
+  watchdog: WorkerProgressWatchdog,
+  intervalMilliseconds: number,
+  onStall: (elapsedMilliseconds: number) => void,
+  schedule: (
+    callback: () => void,
+    milliseconds: number,
+  ) => () => void = (callback, milliseconds) => {
+    const interval = setInterval(callback, milliseconds);
+    return () => clearInterval(interval);
+  },
+): () => void {
+  return schedule(() => watchdog.check(onStall), intervalMilliseconds);
 }
 
 export interface OverloadState {
@@ -475,6 +533,26 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
   let githubRateLimitAttempts = 0;
   let githubAuthRejected = false;
   const shutdown = new AbortController();
+  const progressWatchdog = new WorkerProgressWatchdog(
+    config.controlLoopStallMilliseconds,
+  );
+  const stopProgressWatchdog = startWorkerProgressWatchdog(
+    progressWatchdog,
+    Math.min(
+      5_000,
+      Math.max(1_000, Math.floor(config.controlLoopStallMilliseconds / 4)),
+    ),
+    (elapsedMilliseconds) => {
+      if (!stopping) {
+        log("worker_progress_stalled", {
+          elapsed_ms: elapsedMilliseconds,
+          limit_ms: config.controlLoopStallMilliseconds,
+          active_jobs: active.size,
+        });
+        Deno.exit(1);
+      }
+    },
+  );
   let lastReaperAt = 0;
   let lastOverloadSampleAt = 0;
   let databaseHeadroomBlocked = false;
@@ -508,8 +586,16 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
   try {
     let waitingLogged = false;
     while (!stopping) {
+      progressWatchdog.touch();
+      const recoveryWait = databaseRecoveryCircuit.millisecondsUntilReady();
+      if (recoveryWait > 0) {
+        await delay(Math.min(HANDOFF_POLL_MILLISECONDS, recoveryWait));
+        continue;
+      }
       try {
-        if (await queue.tryAcquireHandoff(config.handoffKey)) break;
+        const acquired = await queue.tryAcquireHandoff(config.handoffKey);
+        progressWatchdog.touch();
+        if (acquired) break;
         if (!waitingLogged) {
           log("worker_handoff_waiting", { worker_id: config.workerId });
           waitingLogged = true;
@@ -517,9 +603,6 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         await delay(HANDOFF_POLL_MILLISECONDS);
       } catch (error) {
         if (!openDatabaseRecoveryCircuit(error, "handoff")) throw error;
-        await delay(
-          Math.max(1, databaseRecoveryCircuit.millisecondsUntilReady()),
-        );
       }
     }
     if (stopping) return;
@@ -544,8 +627,10 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       github_sync_enabled: config.githubToken !== null,
       github_workspace_count: config.githubWorkspaceIds.length,
       github_connections: config.githubConnections,
+      control_loop_stall_ms: config.controlLoopStallMilliseconds,
     });
     while (!stopping) {
+      progressWatchdog.touch();
       if (databaseRecoveryCircuit.millisecondsUntilReady() > 0) {
         await waitForWork(
           active,
@@ -627,11 +712,13 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       try {
         if (maintenanceSampleDue(Date.now(), lastReaperAt)) {
           const terminalized = await queue.terminalizeExpired();
+          progressWatchdog.touch();
           if (terminalized > 0) log("expired_jobs_failed", { terminalized });
           lastReaperAt = Date.now();
         }
         if (maintenanceSampleDue(Date.now(), lastOverloadSampleAt)) {
           const age = await queue.oldestLiveNormalizationAgeSeconds();
+          progressWatchdog.touch();
           const previous = overload.active;
           overload = updateOverloadState(overload, age, config);
           if (previous !== overload.active) {
@@ -655,6 +742,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
             config.dashboardReservedConnections,
             handoffOverlapConnectionBudget(config),
           );
+          progressWatchdog.touch();
           if (!hasHeadroom) {
             if (!databaseHeadroomBlocked) {
               log("database_admission_paused", {
@@ -670,8 +758,18 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
             databaseHeadroomBlocked = false;
           }
           const job = overload.active
-            ? await claimOverloadJob(queue, active, config)
-            : await claimNormalJob(queue, active, config);
+            ? await claimOverloadJob(
+              queue,
+              active,
+              config,
+              () => progressWatchdog.touch(),
+            )
+            : await claimNormalJob(
+              queue,
+              active,
+              config,
+              () => progressWatchdog.touch(),
+            );
           if (!job) break;
           admissions += 1;
           claimedAny = true;
@@ -724,6 +822,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     }
     await Promise.allSettled(active.keys());
   } finally {
+    stopProgressWatchdog();
     shutdown.abort();
     await stopGithubSync(githubQueue, githubTask);
     Deno.removeSignalListener("SIGTERM", stop);
@@ -767,6 +866,7 @@ async function claimNormalJob(
   queue: PostgresJobQueue,
   active: Map<Promise<void>, Pick<TelemetryJob, "job_kind" | "workload_class">>,
   config: WorkerConfig,
+  onProgress: () => void = () => {},
 ): Promise<TelemetryJob | null> {
   const activeLive =
     [...active.values()].filter((job) => job.workload_class === "live").length;
@@ -777,21 +877,24 @@ async function claimNormalJob(
     config.workerId,
     config.leaseSeconds,
   );
+  onProgress();
   if (preferredJob) return preferredJob;
   const alternate = alternateLane(preferred, activeBackfill, config);
-  return alternate
-    ? await queue.claim(
-      alternate,
-      config.workerId,
-      config.leaseSeconds,
-    )
-    : null;
+  if (!alternate) return null;
+  const alternateJob = await queue.claim(
+    alternate,
+    config.workerId,
+    config.leaseSeconds,
+  );
+  onProgress();
+  return alternateJob;
 }
 
 export async function claimOverloadJob(
   queue: PostgresJobQueue,
   active: Map<Promise<void>, Pick<TelemetryJob, "job_kind" | "workload_class">>,
   config: WorkerConfig,
+  onProgress: () => void = () => {},
 ): Promise<TelemetryJob | null> {
   const jobs = [...active.values()];
   const activeNormalize =
@@ -815,8 +918,13 @@ export async function claimOverloadJob(
         "reduce",
       );
   const preferredJob = await claim(preferred);
+  onProgress();
   if (preferredJob) return preferredJob;
-  return await claim(preferred === "normalize" ? "reduce" : "normalize");
+  const alternateJob = await claim(
+    preferred === "normalize" ? "reduce" : "normalize",
+  );
+  onProgress();
+  return alternateJob;
 }
 
 async function waitForWork(

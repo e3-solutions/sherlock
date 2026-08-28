@@ -52,6 +52,7 @@ CLAUDE_HOOK_EVENTS = {
 HOOK_EVENTS = CODEX_HOOK_EVENTS | CLAUDE_HOOK_EVENTS
 POST_TOOL_DEBOUNCE_SECONDS = 30
 POST_TOOL_STATE_VERSION = 1
+SUBAGENT_DISCOVERY_LOOKBACK_SECONDS = 5 * 60
 COORDINATION_TOOLS = {
     "spawn_agent",
     "wait_agent",
@@ -211,7 +212,23 @@ def _capture_hook(
         else discover_rollouts(
             home,
             hook_payload=payload,
-            scan_recent_files=event_name == "SessionStart",
+            lookback_seconds=(
+                SUBAGENT_DISCOVERY_LOOKBACK_SECONDS
+                if event_name == "SubagentStart"
+                else DEFAULT_LOOKBACK_SECONDS
+            ),
+            scan_recent_files=event_name in {"SessionStart", "SubagentStart"},
+            recent_file_parent_native_session_id=(
+                payload.get("session_id")
+                if event_name == "SubagentStart"
+                else None
+            ),
+            recent_file_native_session_id=(
+                payload.get("agent_id")
+                if event_name == "SubagentStart"
+                else None
+            ),
+            only_matching_recent_files=event_name == "SubagentStart",
         )
     )
     environment = os.environ.copy()

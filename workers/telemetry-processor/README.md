@@ -31,6 +31,12 @@ the rollout, connection, or shutdown gates below.
   three normalization lanes and one reduction lane, permits borrowing when the
   preferred kind is empty, and pauses new backfill claims until live lag exits
   hysteresis.
+- The queue-control loop updates an in-process progress watchdog every polling
+  pass. If a control query remains wedged for 60 seconds, the worker emits
+  `worker_progress_stalled` and exits non-zero so Railway's `ON_FAILURE` policy
+  replaces the single replica. Set `SHERLOCK_WORKER_CONTROL_STALL_SECONDS` only
+  above both 30 seconds and four polling intervals; job processing and the
+  isolated GitHub task do not block this watchdog.
 
 Before starting or replacing the worker, require zero active blocked database
 waiters and enough measured headroom that the current total plus the sessions
