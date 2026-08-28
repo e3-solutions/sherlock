@@ -17,6 +17,7 @@ import {
   superviseWorker,
   updateOverloadState,
   type WorkerConfig,
+  workerPoolSpecifications,
   workerConnectionBudget,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
@@ -74,6 +75,7 @@ Deno.test("configuration is bounded and secrets remain required", () => {
   assert(config.normalizeReserved === 3);
   assert(config.controlConnections === 2);
   assert(config.processingConnections === 4);
+  assert(config.githubConnections === 0);
   assert(config.dashboardReservedConnections === 8);
   assert(config.processingTimeoutMilliseconds === 90_000);
   assert(config.githubWorkspaceIds.length === 0);
@@ -194,6 +196,15 @@ Deno.test("GitHub sync requires an explicit workspace allowlist", () => {
   });
   assert(config.githubWorkspaceIds.length === 1);
   assert(config.githubWorkspaceIds[0] === workspaceId);
+  assert(config.githubConnections === 1);
+  assert(
+    workerPoolSpecifications(config).map((pool) => pool.applicationName)
+      .join(",") ===
+      "sherlock-worker-control,sherlock-worker-github-sync",
+    "GitHub sync must have a dedicated pool rather than sharing control",
+  );
+  assert(workerConnectionBudget(config, "active") === 7);
+  assert(handoffOverlapConnectionBudget(config) === 8);
 });
 
 Deno.test("connection pools and overload reservations stay within bounds", () => {
