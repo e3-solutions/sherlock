@@ -67,7 +67,7 @@ backoff capped at fifteen minutes.
 The worker pins `e3-solutions/postgres@a7bc76a` with integrity hashes. It is
 postgres.js 3.4.9 plus upstream PR #1168 and two reserved-connection guards.
 Remove the fork after an upstream release contains all three guards and the
-active/idle disconnect regression passes against that release.
+synthetic-socket and idle-reservation regressions pass against that release.
 
 ## First rollout and rollback
 

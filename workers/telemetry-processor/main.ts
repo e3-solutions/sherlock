@@ -22,7 +22,6 @@ const CONNECTIVITY_RETRY_MAX_MILLISECONDS = 30_000;
 const HANDOFF_POLL_MILLISECONDS = 1_000;
 const GITHUB_BACKLOG_INTERVAL_MILLISECONDS = 60_000;
 const GITHUB_CAUGHT_UP_INTERVAL_MILLISECONDS = 300_000;
-const GITHUB_FAILURE_MAX_INTERVAL_MILLISECONDS = 900_000;
 export const MAX_ADMISSIONS_PER_PASS = 1;
 
 export interface WorkerConfig {
@@ -490,14 +489,6 @@ export function retryDelaySeconds(
   return Math.min(maximumSeconds, baseSeconds * 2 ** Math.max(0, attempt - 1));
 }
 
-export function githubFailureRetryMilliseconds(attempt: number): number {
-  return Math.min(
-    GITHUB_FAILURE_MAX_INTERVAL_MILLISECONDS,
-    GITHUB_BACKLOG_INTERVAL_MILLISECONDS *
-      2 ** Math.max(0, attempt - 1),
-  );
-}
-
 export async function stopGithubSync(
   queue: Pick<PostgresJobQueue, "close"> | null,
   task: Promise<void> | null,
@@ -701,9 +692,11 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
           (error) => {
             if (!shutdown.signal.aborted) {
               githubFailureAttempts += 1;
-              const retryInMilliseconds = githubFailureRetryMilliseconds(
+              const retryInMilliseconds = retryDelaySeconds(
                 githubFailureAttempts,
-              );
+                60,
+                900,
+              ) * 1_000;
               nextGithubSyncAt = Date.now() + retryInMilliseconds;
               log("github_sync_failed", {
                 error_code: errorCode(error),

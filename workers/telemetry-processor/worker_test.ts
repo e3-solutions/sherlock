@@ -8,7 +8,6 @@ import {
   DatabaseRecoveryCircuit,
   databaseRetryMilliseconds,
   enqueueReductionTargets,
-  githubFailureRetryMilliseconds,
   handoffOverlapConnectionBudget,
   isCapacityError,
   isRetryableDatabaseError,
@@ -856,9 +855,6 @@ Deno.test("retry backoff grows exponentially and caps", () => {
   assert(retryDelaySeconds(1, 5, 300) === 5);
   assert(retryDelaySeconds(4, 5, 300) === 40);
   assert(retryDelaySeconds(20, 5, 300) === 300);
-  assert(githubFailureRetryMilliseconds(1) === 60_000);
-  assert(githubFailureRetryMilliseconds(4) === 480_000);
-  assert(githubFailureRetryMilliseconds(20) === 900_000);
 });
 
 Deno.test("worker reloads immutable native fragment metadata", () => {
