@@ -17,8 +17,8 @@ import {
   superviseWorker,
   updateOverloadState,
   type WorkerConfig,
-  workerPoolSpecifications,
   workerConnectionBudget,
+  workerPoolSpecifications,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import type { BatchManifest } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
