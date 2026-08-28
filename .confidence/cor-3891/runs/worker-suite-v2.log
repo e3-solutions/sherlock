@@ -1,0 +1,37 @@
+Check workers/telemetry-processor/worker_test.ts
+running 29 tests from ./workers/telemetry-processor/worker_test.ts
+version-aware workers keep pre-migration jobs on provider v1 ... ok (0ms)
+configuration is bounded and secrets remain required ... ok (0ms)
+database admission preserves owned dashboard sessions at the exact boundary ... ok (0ms)
+worker database labels override contradictory URL parameters ... ok (0ms)
+GitHub sync requires an explicit workspace allowlist ... ok (0ms)
+connection pools and overload reservations stay within bounds ... ok (0ms)
+reserved transactions commit without pool transaction methods ... ok (0ms)
+reserved transactions roll back and preserve the work error ... ok (0ms)
+reserved transaction BEGIN failure does not issue ROLLBACK ... ok (0ms)
+reserved transaction COMMIT failure rolls back the same session ... ok (0ms)
+reserved transaction runner rejects nesting and cleans up ... ok (0ms)
+Railway rebuilds only for the complete worker dependency closure ... ok (0ms)
+overload mode uses hysteresis and preserves one reduction lane ... ok (0ms)
+overload normalization claims only a live-demand stream frontier ... ok (0ms)
+slow claims cannot starve overload maintenance ... ok (0ms)
+only database pressure errors open the worker circuit ... ok (0ms)
+transient database refusal is recoverable without hiding permanent failures ... ok (0ms)
+processing and control failures stay in one single-probe circuit ... ok (0ms)
+worker supervisor retries connectivity failures without consuming platform restarts ...
+------- output -------
+{"timestamp":"2026-08-28T00:56:47.984Z","event":"worker_database_recovery_waiting","error_code":"XX000","failure_kind":"connectivity","retry_in_ms":1000}
+----- output end -----
+worker supervisor retries connectivity failures without consuming platform restarts ... ok (2ms)
+normalization rechecks its absolute deadline after projection ... ok (0ms)
+live capacity is reserved and backfill remains bounded ... ok (0ms)
+retry backoff grows exponentially and caps ... ok (0ms)
+worker reloads immutable native fragment metadata ... ok (0ms)
+parent repair retargets both normalized parents and their children ... ok (0ms)
+session cutoffs use one index-preserving transaction ... ok (0ms)
+normalization schedules all reductions with one queue call ... ok (0ms)
+batched reductions coalesce duplicate queue identities ... ok (0ms)
+reduction targets only normalized sessions with no workspace scan ... ok (0ms)
+targeted scheduling has no fifty-session ceiling ... ok (0ms)
+
+ok | 29 passed | 0 failed (8ms)

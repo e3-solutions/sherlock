@@ -52,7 +52,8 @@ select current_setting('max_connections')::integer as max_connections,
        count(*) filter (
          where application_name in (
            'sherlock-worker-control',
-           'sherlock-worker-processing'
+           'sherlock-worker-processing',
+           'sherlock-worker-github-sync'
          )
        )::integer as worker_connections,
        count(*) filter (
@@ -134,12 +135,13 @@ export class PostgresJobQueue {
   static connect(
     databaseUrl: string,
     maxConnections: number,
+    applicationName = "sherlock-worker-control",
   ): PostgresJobQueue {
     return new PostgresJobQueue(
       createPostgresPool(
         databaseUrl,
         maxConnections,
-        "sherlock-worker-control",
+        applicationName,
       ),
     );
   }

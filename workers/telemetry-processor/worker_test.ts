@@ -1,20 +1,25 @@
 import {
   admissionAvailable,
   alternateLane,
-  CapacityCircuit,
   capacityRetryMilliseconds,
   chooseLane,
   chooseOverloadJobKind,
   claimOverloadJob,
+  DatabaseRecoveryCircuit,
+  databaseRetryMilliseconds,
   enqueueReductionTargets,
   handoffOverlapConnectionBudget,
   isCapacityError,
+  isRetryableDatabaseError,
   loadConfig,
   maintenanceSampleDue,
   retryDelaySeconds,
+  stopGithubSync,
+  superviseWorker,
   updateOverloadState,
   type WorkerConfig,
   workerConnectionBudget,
+  workerPoolSpecifications,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import type { BatchManifest } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
@@ -71,6 +76,7 @@ Deno.test("configuration is bounded and secrets remain required", () => {
   assert(config.normalizeReserved === 3);
   assert(config.controlConnections === 2);
   assert(config.processingConnections === 4);
+  assert(config.githubConnections === 0);
   assert(config.dashboardReservedConnections === 8);
   assert(config.processingTimeoutMilliseconds === 90_000);
   assert(config.githubWorkspaceIds.length === 0);
@@ -191,6 +197,32 @@ Deno.test("GitHub sync requires an explicit workspace allowlist", () => {
   });
   assert(config.githubWorkspaceIds.length === 1);
   assert(config.githubWorkspaceIds[0] === workspaceId);
+  assert(config.githubConnections === 1);
+  assert(
+    workerPoolSpecifications(config).map((pool) => pool.applicationName)
+      .join(",") ===
+      "sherlock-worker-control,sherlock-worker-github-sync",
+    "GitHub sync must have a dedicated pool rather than sharing control",
+  );
+  assert(workerConnectionBudget(config, "active") === 7);
+  assert(handoffOverlapConnectionBudget(config) === 8);
+});
+
+Deno.test("shutdown closes the GitHub pool before awaiting blocked sync", async () => {
+  const calls: string[] = [];
+  let releaseSync: (() => void) | undefined;
+  const syncTask = new Promise<void>((resolve) => {
+    releaseSync = resolve;
+  });
+  const queue = {
+    close() {
+      calls.push("close");
+      releaseSync?.();
+      return Promise.resolve();
+    },
+  };
+  await stopGithubSync(queue as never, syncTask);
+  assert(calls.join(",") === "close");
 });
 
 Deno.test("connection pools and overload reservations stay within bounds", () => {
@@ -463,9 +495,78 @@ Deno.test("only database pressure errors open the worker circuit", () => {
   assert(capacityRetryMilliseconds(3, () => 0.5) === 120_000);
 });
 
-Deno.test("processing and control EMAX stay in one single-probe circuit", () => {
+Deno.test("transient database refusal is recoverable without hiding permanent failures", () => {
+  assert(
+    isRetryableDatabaseError(Object.assign(
+      new Error("Failed to connect to database: {:error, :econnrefused}"),
+      { code: "XX000" },
+    )),
+    "the exact production Supavisor refusal must recover in-process",
+  );
+  for (
+    const code of [
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ECHECKOUTTIMEOUT",
+      "08006",
+      "57P03",
+    ]
+  ) {
+    assert(
+      isRetryableDatabaseError(
+        Object.assign(new Error("connection unavailable"), {
+          code,
+        }),
+      ),
+      code,
+    );
+  }
+  for (
+    const [code, message] of [
+      ["28P01", "password authentication failed"],
+      ["40001", "serialization failure"],
+      ["57014", "statement timeout"],
+      ["08004", "server rejected establishment of SQL connection"],
+      ["XX000", "generic internal error"],
+      ["XX000", "Failed to connect to database: {:error, :tenant_not_found}"],
+      [
+        "XX000",
+        "Failed to connect to database: password authentication failed",
+      ],
+    ]
+  ) {
+    assert(
+      !isRetryableDatabaseError(Object.assign(new Error(message), { code })),
+      `${code} must fail fast`,
+    );
+  }
+  const productionError = Object.assign(
+    new Error("Failed to connect to database: {:error, :econnrefused}"),
+    { code: "XX000" },
+  );
+  assert(databaseRetryMilliseconds(productionError, 1, () => 0.5) === 1_000);
+  assert(databaseRetryMilliseconds(productionError, 6, () => 0.5) === 30_000);
+  const checkoutError = Object.assign(new Error("pool checkout exhausted"), {
+    code: "ECHECKOUTTIMEOUT",
+  });
+  assert(databaseRetryMilliseconds(checkoutError, 1, () => 0.5) === 30_000);
   let now = 0;
-  const circuit = new CapacityCircuit(() => now, () => 0.5);
+  const circuit = new DatabaseRecoveryCircuit(() => now, () => 0.5);
+  assert(
+    circuit.handle(productionError) === 1_000,
+    "the in-loop circuit must absorb the exact production refusal",
+  );
+  assert(!circuit.beginProbe());
+  now += 1_000;
+  assert(circuit.beginProbe(), "only one half-open probe may reconnect");
+  assert(!circuit.beginProbe());
+  assert(circuit.completeProbe());
+});
+
+Deno.test("processing and control failures stay in one single-probe circuit", () => {
+  let now = 0;
+  const circuit = new DatabaseRecoveryCircuit(() => now, () => 0.5);
   const processingError = Object.assign(new Error("job EMAX"), {
     code: "XX000",
   });
@@ -498,6 +599,59 @@ Deno.test("processing and control EMAX stay in one single-probe circuit", () => 
   );
   assert(circuit.completeProbe());
   assert(circuit.millisecondsUntilReady() === 0);
+});
+
+Deno.test("worker supervisor retries connectivity failures without consuming platform restarts", async () => {
+  const config = loadConfig({
+    SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
+    SUPABASE_URL: "https://example.supabase.co",
+    SUPABASE_SERVICE_ROLE_KEY: "test-secret",
+  });
+  const productionError = Object.assign(
+    new Error("Failed to connect to database: {:error, :econnrefused}"),
+    { code: "XX000" },
+  );
+  let runs = 0;
+  const waits: number[] = [];
+  await superviseWorker(
+    config,
+    () => {
+      runs += 1;
+      return runs === 1 ? Promise.reject(productionError) : Promise.resolve();
+    },
+    (milliseconds) => {
+      waits.push(milliseconds);
+      return Promise.resolve();
+    },
+    () => 0.5,
+  );
+  assert(
+    runs === 2,
+    "the same process must start a fresh worker after refusal",
+  );
+  assert(waits.length === 1 && waits[0] === 1_000);
+
+  const authenticationError = Object.assign(
+    new Error("password authentication failed"),
+    { code: "28P01" },
+  );
+  let caught: unknown;
+  try {
+    await superviseWorker(
+      config,
+      () => Promise.reject(authenticationError),
+      () => {
+        throw new Error("permanent failures must not wait or retry");
+      },
+      () => 0.5,
+    );
+  } catch (error) {
+    caught = error;
+  }
+  assert(
+    caught === authenticationError,
+    "authentication errors must fail fast",
+  );
 });
 
 Deno.test("normalization rechecks its absolute deadline after projection", () => {
