@@ -31,10 +31,17 @@ try {
           const pid = Number(backend.pid);
           const blocked = Promise.resolve(
             connection.unsafe("select pg_sleep(30)"),
+          ).then(
+            () => ({ ok: true as const }),
+            (error) => ({ ok: false as const, error }),
           );
           await waitUntilQueryIsActive(admin, pid);
           await admin.unsafe("select pg_terminate_backend($1)", [pid]);
-          await blocked;
+          const outcome = await blocked;
+          if (outcome.ok) {
+            throw new Error("terminated query unexpectedly succeeded");
+          }
+          throw outcome.error;
         },
       );
     } catch (error) {
