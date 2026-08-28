@@ -441,6 +441,15 @@ export function retryDelaySeconds(
   return Math.min(maximumSeconds, baseSeconds * 2 ** Math.max(0, attempt - 1));
 }
 
+export async function stopGithubSync(
+  queue: Pick<PostgresJobQueue, "close"> | null,
+  task: Promise<void> | null,
+): Promise<void> {
+  const closing = queue?.close().catch(() => undefined) ??
+    Promise.resolve();
+  await Promise.allSettled(task === null ? [closing] : [closing, task]);
+}
+
 export async function runWorker(config: WorkerConfig): Promise<void> {
   const [controlPool, githubPool] = workerPoolSpecifications(config);
   const queue = PostgresJobQueue.connect(
@@ -716,13 +725,10 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     await Promise.allSettled(active.keys());
   } finally {
     shutdown.abort();
-    if (githubTask) await githubTask;
+    await stopGithubSync(githubQueue, githubTask);
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
     if (processor !== null) await processor.close().catch(() => undefined);
-    if (githubQueue !== null) {
-      await githubQueue.close().catch(() => undefined);
-    }
     await queue.close().catch(() => undefined);
     log("worker_stopped", {});
   }
