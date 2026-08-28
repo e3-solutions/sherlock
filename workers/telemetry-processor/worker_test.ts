@@ -14,10 +14,12 @@ import {
   loadConfig,
   maintenanceSampleDue,
   retryDelaySeconds,
+  stopGithubSync,
   superviseWorker,
   updateOverloadState,
   type WorkerConfig,
   workerConnectionBudget,
+  workerPoolSpecifications,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import type { BatchManifest } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
@@ -74,6 +76,7 @@ Deno.test("configuration is bounded and secrets remain required", () => {
   assert(config.normalizeReserved === 3);
   assert(config.controlConnections === 2);
   assert(config.processingConnections === 4);
+  assert(config.githubConnections === 0);
   assert(config.dashboardReservedConnections === 8);
   assert(config.processingTimeoutMilliseconds === 90_000);
   assert(config.githubWorkspaceIds.length === 0);
@@ -194,6 +197,32 @@ Deno.test("GitHub sync requires an explicit workspace allowlist", () => {
   });
   assert(config.githubWorkspaceIds.length === 1);
   assert(config.githubWorkspaceIds[0] === workspaceId);
+  assert(config.githubConnections === 1);
+  assert(
+    workerPoolSpecifications(config).map((pool) => pool.applicationName)
+      .join(",") ===
+      "sherlock-worker-control,sherlock-worker-github-sync",
+    "GitHub sync must have a dedicated pool rather than sharing control",
+  );
+  assert(workerConnectionBudget(config, "active") === 7);
+  assert(handoffOverlapConnectionBudget(config) === 8);
+});
+
+Deno.test("shutdown closes the GitHub pool before awaiting blocked sync", async () => {
+  const calls: string[] = [];
+  let releaseSync: (() => void) | undefined;
+  const syncTask = new Promise<void>((resolve) => {
+    releaseSync = resolve;
+  });
+  const queue = {
+    close() {
+      calls.push("close");
+      releaseSync?.();
+      return Promise.resolve();
+    },
+  };
+  await stopGithubSync(queue as never, syncTask);
+  assert(calls.join(",") === "close");
 });
 
 Deno.test("connection pools and overload reservations stay within bounds", () => {
