@@ -1,8 +1,5 @@
 import postgres from "npm:postgres@3.4.7";
-import {
-  ADMISSION_HEADROOM_SQL,
-  PostgresJobQueue,
-} from "./queue.ts";
+import { ADMISSION_HEADROOM_SQL, PostgresJobQueue } from "./queue.ts";
 
 const permission = await Deno.permissions.query({
   name: "env",
@@ -1190,7 +1187,6 @@ Deno.test({
     }
   },
 });
-
 
 Deno.test({
   name:
