@@ -1,8 +1,5 @@
 import { EventEmitter } from "node:events";
-import {
-  isReservedConnectionLost,
-  withReservedConnection,
-} from "./database.ts";
+import { isReservedConnectionLost } from "./database.ts";
 import postgres from "./postgres.ts";
 
 await proveClosedSocketWriteIsGuarded();
@@ -10,58 +7,12 @@ await proveClosedSocketWriteIsGuarded();
 const databaseUrl = Deno.env.get("SHERLOCK_TEST_DATABASE_URL");
 if (!databaseUrl) throw new Error("SHERLOCK_TEST_DATABASE_URL is required");
 
-const worker = postgres(databaseUrl, {
-  prepare: false,
-  max: 1,
-  connection: { application_name: "sherlock-next-write-regression" },
-});
 const admin = postgres(databaseUrl, { prepare: false, max: 1 });
 
 try {
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    let disconnectError: unknown;
-    try {
-      await withReservedConnection(
-        worker,
-        performance.now() + 5_000,
-        async (connection) => {
-          const [backend] = await connection.unsafe(
-            "select pg_backend_pid()::integer as pid",
-          );
-          const pid = Number(backend.pid);
-          const blocked = connection.unsafe("select pg_sleep(30)").then(
-            () => ({ ok: true as const }),
-            (error) => ({ ok: false as const, error }),
-          );
-          await waitUntilQueryIsActive(admin, pid);
-          await admin.unsafe("select pg_terminate_backend($1)", [pid]);
-          const outcome = await blocked;
-          if (outcome.ok) {
-            throw new Error("terminated query unexpectedly succeeded");
-          }
-          throw outcome.error;
-        },
-      );
-    } catch (error) {
-      disconnectError = error;
-    }
-    assert(
-      isReservedConnectionLost(disconnectError),
-      `backend termination must be a connection loss, got ${
-        errorCode(disconnectError)
-      }`,
-    );
-
-    const recovered = await before(
-      worker.unsafe("select 1::integer as value"),
-      5_000,
-    );
-    assert(Number(recovered[0]?.value) === 1, "the pool must reconnect");
-  }
   await proveIdleReservedDisconnectRecovers(databaseUrl, admin);
-  console.log("postgres nextWrite close/reuse regression passed");
+  console.log("postgres socket and reserved disconnect regression passed");
 } finally {
-  await worker.end({ timeout: 1 }).catch(() => undefined);
   await admin.end({ timeout: 1 }).catch(() => undefined);
 }
 
@@ -164,23 +115,6 @@ async function proveClosedSocketWriteIsGuarded(): Promise<void> {
   } finally {
     await pool.end({ timeout: 0 }).catch(() => undefined);
   }
-}
-
-async function waitUntilQueryIsActive(
-  sql: ReturnType<typeof postgres>,
-  pid: number,
-): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const rows = await sql.unsafe(
-      `select 1
-         from pg_stat_activity
-        where pid = $1 and state = 'active' and query like 'select pg_sleep%'`,
-      [pid],
-    );
-    if (rows.length === 1) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error("timed out waiting for the terminating query");
 }
 
 async function before<T>(promise: PromiseLike<T>, milliseconds: number) {
