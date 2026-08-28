@@ -14,6 +14,7 @@ import {
   loadConfig,
   maintenanceSampleDue,
   retryDelaySeconds,
+  stopGithubSync,
   superviseWorker,
   updateOverloadState,
   type WorkerConfig,
@@ -205,6 +206,23 @@ Deno.test("GitHub sync requires an explicit workspace allowlist", () => {
   );
   assert(workerConnectionBudget(config, "active") === 7);
   assert(handoffOverlapConnectionBudget(config) === 8);
+});
+
+Deno.test("shutdown closes the GitHub pool before awaiting blocked sync", async () => {
+  const calls: string[] = [];
+  let releaseSync: (() => void) | undefined;
+  const syncTask = new Promise<void>((resolve) => {
+    releaseSync = resolve;
+  });
+  const queue = {
+    close() {
+      calls.push("close");
+      releaseSync?.();
+      return Promise.resolve();
+    },
+  };
+  await stopGithubSync(queue as never, syncTask);
+  assert(calls.join(",") === "close");
 });
 
 Deno.test("connection pools and overload reservations stay within bounds", () => {
