@@ -32,6 +32,17 @@ export function isReservedConnectionLost(error: unknown): boolean {
   ].includes(code);
 }
 
+export function throwIfReservedConnectionLost(
+  error: unknown,
+  cause: unknown,
+): void {
+  if (!isReservedConnectionLost(error)) return;
+  if (error instanceof Error && error.cause === undefined) {
+    Object.defineProperty(error, "cause", { value: cause });
+  }
+  throw error;
+}
+
 export class ProcessingDeadlineError extends Error {
   readonly code = "processing_deadline_exceeded";
 
@@ -132,15 +143,7 @@ export function createReservedTransactionRunner(
           try {
             await connection.unsafe("rollback");
           } catch (rollbackError) {
-            if (isReservedConnectionLost(rollbackError)) {
-              if (
-                rollbackError instanceof Error &&
-                rollbackError.cause === undefined
-              ) {
-                Object.defineProperty(rollbackError, "cause", { value: error });
-              }
-              throw rollbackError;
-            }
+            throwIfReservedConnectionLost(rollbackError, error);
             // Preserve the callback/commit/deadline error when rollback itself
             // fails without losing the connection.
           }

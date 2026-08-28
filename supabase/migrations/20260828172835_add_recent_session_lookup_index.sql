@@ -22,6 +22,7 @@ begin
          i.indnkeyatts = 2 and i.indnatts = 3 and
          pg_get_indexdef(i.indexrelid) like
            '%(workspace_id, server_received_at DESC) INCLUDE (session_id)%' and
+         i.indpred is not null and
          pg_get_expr(i.indpred, i.indrelid) =
            '((session_id IS NOT NULL) AND (NOT is_replay))'
     into current_oid, current_is_valid, current_is_ready,

@@ -3,6 +3,7 @@ import {
   isReservedConnectionLost,
   ProcessingDeadlineError,
   reserveBefore,
+  throwIfReservedConnectionLost,
 } from "./database.ts";
 import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
@@ -568,15 +569,7 @@ export class PostgresFrameEvidenceProjector {
           try {
             await connection.unsafe(FRAME_ROLLBACK_SQL);
           } catch (rollbackError) {
-            if (isReservedConnectionLost(rollbackError)) {
-              if (
-                rollbackError instanceof Error &&
-                rollbackError.cause === undefined
-              ) {
-                Object.defineProperty(rollbackError, "cause", { value: error });
-              }
-              throw rollbackError;
-            }
+            throwIfReservedConnectionLost(rollbackError, error);
             // Preserve the projection failure when rollback itself fails
             // without losing the connection.
           }
