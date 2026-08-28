@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(145);
+select plan(146);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -60,6 +60,18 @@ select has_table('processing', 'telemetry_jobs', 'durable telemetry queue exists
 select has_function(
   'analytics', 'read_dashboard_freshness', array['uuid', 'text', 'text[]', 'integer'],
   'dashboard freshness has an aggregate-only database contract'
+);
+select ok(
+  array['enable_nestloop=off', 'enable_seqscan=off']::text[] <@ coalesce(
+    (
+      select proconfig
+        from pg_proc
+       where oid =
+         'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+    ),
+    '{}'::text[]
+  ),
+  'dashboard freshness avoids misestimated full and nested event rescans'
 );
 select ok(
   has_function_privilege(
