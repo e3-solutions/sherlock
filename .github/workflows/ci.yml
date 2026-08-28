@@ -61,11 +61,11 @@ jobs:
       - name: Type-check Deno entrypoints
         run: |
           deno check supabase/functions/sherlock-rollout-ingest/index.ts
-          deno check workers/telemetry-processor/main.ts
+          deno check --config workers/telemetry-processor/deno.json workers/telemetry-processor/main.ts
           deno check scripts/reduce-activity.ts
           deno check scripts/backfill-frame-evidence.ts
           deno check scripts/backfill-session-scm.ts
-          deno check workers/telemetry-processor/frame-projector.ts
+          deno check --config workers/telemetry-processor/deno.json workers/telemetry-processor/frame-projector.ts
 
       - name: Run collector tests
         env:
@@ -76,7 +76,7 @@ jobs:
         run: |
           deno test supabase/functions/sherlock-rollout-ingest
           deno test supabase/functions/sherlock-activity-reducer
-          deno test --allow-read=railway.toml workers/telemetry-processor
+          deno test --config workers/telemetry-processor/deno.json --allow-read=railway.toml workers/telemetry-processor
 
       - name: Verify dashboard
         working-directory: apps/dashboard
@@ -118,14 +118,21 @@ jobs:
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
         run: >-
-          deno test --allow-env --allow-net
+          deno test --config workers/telemetry-processor/deno.json --allow-env --allow-net
           workers/telemetry-processor/queue_integration_test.ts
+
+      - name: Run PostgreSQL reconnect regression
+        env:
+          SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: >-
+          deno run --config workers/telemetry-processor/deno.json --allow-env --allow-net
+          workers/telemetry-processor/postgres_next_write_regression.ts
 
       - name: Run frame projector database integration test
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
         run: >-
-          deno test --allow-env --allow-net
+          deno test --config workers/telemetry-processor/deno.json --allow-env --allow-net
           workers/telemetry-processor/frame-projector_postgres_test.ts
 
       - name: Run oversized provider end-to-end tests
@@ -135,7 +142,7 @@ jobs:
           eval "$(supabase status -o env)"
           SHERLOCK_TEST_SUPABASE_URL="$API_URL" \
           SHERLOCK_TEST_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY" \
-          deno test --allow-env --allow-net --allow-read --allow-write --allow-run=python3,node \
+          deno test --config workers/telemetry-processor/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run=python3,node \
             workers/telemetry-processor/oversized_rollout_e2e_test.ts
 
       - name: Stop isolated Supabase database

@@ -41,10 +41,13 @@ import {
 import {
   createReservedTransactionRunner,
   databaseUrlWithoutApplicationName,
+  isReservedConnectionLost,
+  withReservedConnection,
 } from "./database.ts";
 import {
   admissionHeadroomAvailable,
   coalesceReductionTargets,
+  PostgresJobQueue,
   type ReductionEnqueueOptions,
   type TelemetryJob,
 } from "./queue.ts";
@@ -372,6 +375,103 @@ Deno.test("reserved transactions roll back and preserve the work error", async (
   assert(calls.join(",") === "begin,work,rollback");
 });
 
+Deno.test("lost reserved connections skip rollback cleanup", async () => {
+  const calls: string[] = [];
+  const lost = Object.assign(new Error("connection closed"), {
+    code: "CONNECTION_CLOSED",
+  });
+  const connection = {
+    unsafe(sql: string) {
+      calls.push(sql);
+      return sql === "begin" ? Promise.resolve([]) : Promise.reject(lost);
+    },
+  };
+  const run = createReservedTransactionRunner(connection as never);
+  let caught: unknown;
+  try {
+    await run(async () => {
+      await connection.unsafe("work");
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught === lost);
+  assert(isReservedConnectionLost(caught));
+  assert(calls.join(",") === "begin,work");
+});
+
+Deno.test("lost reservations are not released back into the pool", async () => {
+  for (
+    const [error, expectedReleases] of [
+      [
+        Object.assign(new Error("connection closed"), { code: "57P01" }),
+        0,
+      ],
+      [Object.assign(new Error("storage timed out"), { code: "ETIMEDOUT" }), 1],
+    ] as const
+  ) {
+    let releases = 0;
+    const connection = { release: () => releases += 1 };
+    let caught: unknown;
+    try {
+      await withReservedConnection(
+        { reserve: () => Promise.resolve(connection) } as never,
+        performance.now() + 1_000,
+        () => Promise.reject(error),
+      );
+    } catch (caughtError) {
+      caught = caughtError;
+    }
+    assert(caught === error);
+    assert(releases === expectedReleases);
+  }
+});
+
+Deno.test("rollback connection loss overrides a healthy SQL error", async () => {
+  const calls: string[] = [];
+  const timeout = Object.assign(new Error("statement timeout"), {
+    code: "57014",
+  });
+  const lost = Object.assign(new Error("connection closed during rollback"), {
+    code: "CONNECTION_CLOSED",
+  });
+  const connection = {
+    unsafe(sql: string) {
+      calls.push(sql);
+      return sql === "rollback" ? Promise.reject(lost) : Promise.resolve([]);
+    },
+  };
+  const run = createReservedTransactionRunner(connection as never);
+  let caught: unknown;
+  try {
+    await run(() => Promise.reject(timeout));
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught === lost);
+  assert(lost.cause === timeout);
+  assert(calls.join(",") === "begin,rollback");
+});
+
+Deno.test("handoff connection loss invalidates queue ownership", async () => {
+  const lost = Object.assign(new Error("connection closed"), {
+    code: "CONNECTION_CLOSED",
+  });
+  const queue = Object.assign(Object.create(PostgresJobQueue.prototype), {
+    handoffConnection: {
+      unsafe: () => Promise.reject(lost),
+    },
+  }) as PostgresJobQueue;
+  let caught: unknown;
+  try {
+    await queue.hasAdmissionHeadroom(8, 8);
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught === lost);
+  assert(!queue.hasHandoff(), "lost advisory-lock ownership must be cleared");
+});
+
 Deno.test("reserved transaction BEGIN failure does not issue ROLLBACK", async () => {
   const calls: string[] = [];
   const beginError = new Error("begin failed");
@@ -574,16 +674,19 @@ Deno.test("transient database refusal is recoverable without hiding permanent fa
       "ECONNRESET",
       "ETIMEDOUT",
       "ECHECKOUTTIMEOUT",
+      "CONNECTION_CLOSED",
       "08006",
       "57P03",
     ]
   ) {
+    const error = Object.assign(new Error("connection unavailable"), {
+      code,
+      ...(["ECONNRESET", "ETIMEDOUT"].includes(code)
+        ? { query: "select 1" }
+        : {}),
+    });
     assert(
-      isRetryableDatabaseError(
-        Object.assign(new Error("connection unavailable"), {
-          code,
-        }),
-      ),
+      isRetryableDatabaseError(error),
       code,
     );
   }
@@ -592,6 +695,7 @@ Deno.test("transient database refusal is recoverable without hiding permanent fa
       ["28P01", "password authentication failed"],
       ["40001", "serialization failure"],
       ["57014", "statement timeout"],
+      ["ETIMEDOUT", "storage download timed out"],
       ["08004", "server rejected establishment of SQL connection"],
       ["XX000", "generic internal error"],
       ["XX000", "Failed to connect to database: {:error, :tenant_not_found}"],

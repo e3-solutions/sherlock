@@ -491,7 +491,7 @@ export class SupabaseRawStorage {
 }
 
 async function setStatementTimeout(
-  sql: Sql,
+  sql: Pick<Sql, "unsafe">,
   milliseconds: number,
 ): Promise<void> {
   await sql.unsafe("select set_config('statement_timeout', $1, true)", [

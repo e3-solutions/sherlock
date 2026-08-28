@@ -1196,6 +1196,16 @@ begin
           '%USING brin (server_received_at)%'
     ) and
     exists (
+      select 1 from pg_index i
+      where i.indexrelid =
+          to_regclass('telemetry.events_recent_sessions_idx')
+        and i.indisvalid and i.indisready
+        and pg_get_indexdef(i.indexrelid) like
+          '%(workspace_id, server_received_at DESC) INCLUDE (session_id)%'
+        and pg_get_expr(i.indpred, i.indrelid) =
+          '((session_id IS NOT NULL) AND (NOT is_replay))'
+    ) and
+    exists (
       select 1
       from pg_index i
       where i.indexrelid = 'telemetry.people_workspace_email_key'::regclass

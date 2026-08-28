@@ -1,5 +1,11 @@
-import postgres from "npm:postgres@3.4.7";
-import { ProcessingDeadlineError, reserveBefore } from "./database.ts";
+import postgres from "./postgres.ts";
+import {
+  isReservedConnectionLost,
+  ProcessingDeadlineError,
+  releaseReservedConnection,
+  reserveBefore,
+  throwIfReservedConnectionLost,
+} from "./database.ts";
 import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
@@ -364,6 +370,8 @@ export class PostgresFrameEvidenceProjector {
       : await reserveBefore(this.sql, options.deadlineAtMs);
     let lockAcquired = false;
     let sessionTimeoutSet = false;
+    let operationFailed = false;
+    const releaseErrors: unknown[] = [];
     try {
       // Pool acquisition consumes the same absolute budget. Recompute only
       // after reserve so its wait cannot be added to a stale statement timeout.
@@ -558,32 +566,54 @@ export class PostgresFrameEvidenceProjector {
         transactionOpen = false;
         return result;
       } catch (error) {
-        if (transactionOpen) {
+        if (transactionOpen && !isReservedConnectionLost(error)) {
           try {
             await connection.unsafe(FRAME_ROLLBACK_SQL);
-          } catch {
-            // Preserve the projection failure; the reserved connection is
-            // released below even when rollback cleanup also fails.
+          } catch (rollbackError) {
+            throwIfReservedConnectionLost(rollbackError, error);
+            // Preserve the projection failure when rollback itself fails
+            // without losing the connection.
           }
         }
         throw error;
       }
+    } catch (error) {
+      operationFailed = true;
+      releaseErrors.push(error);
+      throw error;
     } finally {
-      try {
-        if (lockAcquired) {
-          await connection.unsafe(FRAME_ADVISORY_UNLOCK_SQL, [lockKey]);
-        }
-      } finally {
+      let cleanupError: unknown;
+      if (!releaseErrors.some(isReservedConnectionLost) && lockAcquired) {
         try {
-          if (sessionTimeoutSet) {
-            await connection.unsafe(FRAME_RESET_TIMEOUT_SQL);
-          }
-        } finally {
-          connection.release();
+          await connection.unsafe(FRAME_ADVISORY_UNLOCK_SQL, [lockKey]);
+        } catch (error) {
+          releaseErrors.push(error);
+          cleanupError = error;
         }
+      }
+      if (
+        !releaseErrors.some(isReservedConnectionLost) && sessionTimeoutSet
+      ) {
+        try {
+          await connection.unsafe(FRAME_RESET_TIMEOUT_SQL);
+        } catch (error) {
+          releaseErrors.push(error);
+          cleanupError ??= error;
+        }
+      }
+      releaseReservedConnection(
+        connection,
+        releaseErrors.find(isReservedConnectionLost),
+      );
+      if (!operationFailed && cleanupError !== undefined) {
+        raise(cleanupError);
       }
     }
   }
+}
+
+function raise(error: unknown): never {
+  throw error;
 }
 
 export function canonicalEvidence(

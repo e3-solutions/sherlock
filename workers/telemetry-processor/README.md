@@ -61,7 +61,13 @@ dedicated sync pool is fixed at one connection and is included in admission
 accounting and shutdown. Repository changes fail closed, terminal matches are
 rechecked every six hours, and auth or rate-limit pauses are logged without
 creating pair failures. Sync runs each minute while backlogged, otherwise every
-five minutes.
+five minutes. Database failures retry from failure completion with exponential
+backoff capped at fifteen minutes.
+
+The worker pins `e3-solutions/postgres@a7bc76a` with integrity hashes. It is
+postgres.js 3.4.9 plus upstream PR #1168 and two reserved-connection guards.
+Remove the fork after an upstream release contains all three guards and the
+synthetic-socket and idle-reservation regressions pass against that release.
 
 ## First rollout and rollback
 
