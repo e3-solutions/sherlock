@@ -9,16 +9,16 @@
     }
   },
   "remote": {
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/bytes.js": "53b73b5ee2919ab5561229c62a4e2db578f63ca613b795b380c23cb684f2d514",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/connection.js": "984414287cf9075c3a45ac8ab14a6c3da64690c8f804277a6661bf88d73f514a",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/errors.js": "85cfbed9a5ab0db41ab8e97b806c881af29807dfe99bc656fdf1a18c1c13b6c6",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/index.js": "4e21f5733e70d79cffc10d10d4ef01031de4a9ac862210e43f8870029fd103ed",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/large.js": "05ea787f79cefaf16310f14119fbfd36d2fed0795581b0df1b0e63b591a3ed94",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/query.js": "67c45a5151032aa46b587abc15381fe4efd97c696e5c1b53082b8161309c4ee2",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/queue.js": "15e6345adb6708bf3b99ad39fc2231c2fb61de5f6cba4b7a7a6be881482a4ec3",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/result.js": "001ff5e0c8d634674f483d07fbcd620a797e3101f842d6c20ca3ace936260465",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/subscribe.js": "5d0b1ec9705281ed4a60236fe5f65654038bae117845a71d19e35374d34c0cfa",
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/types.js": "1883bd4536eab1c94b9e708d325b13708b0f18ec80020e3a825f34a72f603b81"
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/bytes.js": "53b73b5ee2919ab5561229c62a4e2db578f63ca613b795b380c23cb684f2d514",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/connection.js": "984414287cf9075c3a45ac8ab14a6c3da64690c8f804277a6661bf88d73f514a",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/errors.js": "85cfbed9a5ab0db41ab8e97b806c881af29807dfe99bc656fdf1a18c1c13b6c6",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/index.js": "c361f2c291383c3ede8b0db01d40407de6c9b637391ce19d2e93c73a1c1c4144",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/large.js": "05ea787f79cefaf16310f14119fbfd36d2fed0795581b0df1b0e63b591a3ed94",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/query.js": "67c45a5151032aa46b587abc15381fe4efd97c696e5c1b53082b8161309c4ee2",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/queue.js": "15e6345adb6708bf3b99ad39fc2231c2fb61de5f6cba4b7a7a6be881482a4ec3",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/result.js": "001ff5e0c8d634674f483d07fbcd620a797e3101f842d6c20ca3ace936260465",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/subscribe.js": "5d0b1ec9705281ed4a60236fe5f65654038bae117845a71d19e35374d34c0cfa",
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/types.js": "1883bd4536eab1c94b9e708d325b13708b0f18ec80020e3a825f34a72f603b81"
   },
   "workspace": {
     "dependencies": [

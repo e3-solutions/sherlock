@@ -1,4 +1,9 @@
-import { createPostgresPool, type ReservedSql, type Sql } from "./database.ts";
+import {
+  createPostgresPool,
+  isReservedConnectionLost,
+  type ReservedSql,
+  type Sql,
+} from "./database.ts";
 import type { CommitPair, LookupResult } from "./github-sync.ts";
 
 export type WorkloadClass = "live" | "backfill";
@@ -149,8 +154,11 @@ export class PostgresJobQueue {
   }
 
   async close(): Promise<void> {
-    await this.releaseHandoff();
-    await this.sql.end({ timeout: 5 });
+    try {
+      await this.releaseHandoff();
+    } finally {
+      await this.sql.end({ timeout: 5 });
+    }
   }
 
   async tryAcquireHandoff(lockKey: string): Promise<boolean> {
@@ -165,7 +173,9 @@ export class PostgresJobQueue {
       this.handoffConnection = connection;
       return true;
     } finally {
-      if (this.handoffConnection !== connection) connection.release();
+      if (this.handoffConnection !== connection) {
+        connection.release();
+      }
     }
   }
 
@@ -180,6 +190,10 @@ export class PostgresJobQueue {
     }
   }
 
+  hasHandoff(): boolean {
+    return this.handoffConnection !== null;
+  }
+
   async hasAdmissionHeadroom(
     dashboardReservedConnections: number,
     workerConnectionBudget: number,
@@ -187,7 +201,13 @@ export class PostgresJobQueue {
     if (this.handoffConnection === null) {
       throw new Error("database headroom requires the active handoff session");
     }
-    const rows = await this.handoffConnection.unsafe(ADMISSION_HEADROOM_SQL);
+    let rows;
+    try {
+      rows = await this.handoffConnection.unsafe(ADMISSION_HEADROOM_SQL);
+    } catch (error) {
+      if (isReservedConnectionLost(error)) this.handoffConnection = null;
+      throw error;
+    }
     if (rows.length !== 1) return false;
     const row = rows[0];
     return admissionHeadroomAvailable(

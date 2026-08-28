@@ -11,6 +11,7 @@ import {
   type WorkloadClass,
 } from "./queue.ts";
 import { githubWorkspaceIds, syncPending } from "./github-sync.ts";
+import { isReservedConnectionLost } from "./database.ts";
 
 const OVERLOAD_SAMPLE_MILLISECONDS = 10_000;
 const OVERLOAD_SAMPLE_COUNT = 2;
@@ -307,25 +308,14 @@ export function isCapacityError(error: unknown): boolean {
 export function isDatabaseConnectivityError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const code = "code" in error ? String(error.code).toUpperCase() : "";
+  if (code === "08004") return false;
+  if (isReservedConnectionLost(error)) return true;
   if (
     [
       "ECONNREFUSED",
-      "ECONNRESET",
-      "ETIMEDOUT",
-      "EPIPE",
-      "ENETUNREACH",
-      "EHOSTUNREACH",
       "CONNECT_TIMEOUT",
-      "CONNECTION_DESTROYED",
       "ECHECKOUTTIMEOUT",
     ].includes(code)
-  ) {
-    return true;
-  }
-  if (
-    ["08000", "08001", "08003", "08006", "57P01", "57P02", "57P03"].includes(
-      code,
-    )
   ) {
     return true;
   }
@@ -831,6 +821,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
           log("database_capacity_circuit_closed", {});
         }
       } catch (error) {
+        if (!queue.hasHandoff()) throw error;
         if (!openDatabaseRecoveryCircuit(error, "queue_control")) throw error;
       }
       await waitForWork(

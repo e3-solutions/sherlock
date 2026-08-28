@@ -1,10 +1,10 @@
 {
   "imports": {
     "npm:postgres@3.4.7": "npm:postgres@3.4.9",
-    "postgres-fixed": "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/index.js"
+    "postgres-fixed": "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/index.js"
   },
   "scopes": {
-    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/": {
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/": {
       "crypto": "node:crypto",
       "fs": "node:fs",
       "net": "node:net",
