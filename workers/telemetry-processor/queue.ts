@@ -1,6 +1,7 @@
 import {
   createPostgresPool,
   isReservedConnectionLost,
+  releaseReservedConnection,
   type ReservedSql,
   type Sql,
 } from "./database.ts";
@@ -164,6 +165,7 @@ export class PostgresJobQueue {
   async tryAcquireHandoff(lockKey: string): Promise<boolean> {
     if (this.handoffConnection !== null) return true;
     const connection = await this.sql.reserve();
+    let failure: unknown;
     try {
       const rows = await connection.unsafe(
         "select pg_try_advisory_lock(hashtextextended($1, 0)) as acquired",
@@ -172,9 +174,12 @@ export class PostgresJobQueue {
       if (rows[0]?.acquired !== true) return false;
       this.handoffConnection = connection;
       return true;
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
       if (this.handoffConnection !== connection) {
-        connection.release();
+        releaseReservedConnection(connection, failure);
       }
     }
   }
@@ -183,10 +188,14 @@ export class PostgresJobQueue {
     const connection = this.handoffConnection;
     if (connection === null) return;
     this.handoffConnection = null;
+    let failure: unknown;
     try {
       await connection.unsafe("select pg_advisory_unlock_all()");
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
-      connection.release();
+      releaseReservedConnection(connection, failure);
     }
   }
 

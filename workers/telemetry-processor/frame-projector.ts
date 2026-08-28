@@ -2,6 +2,7 @@ import postgres from "./postgres.ts";
 import {
   isReservedConnectionLost,
   ProcessingDeadlineError,
+  releaseReservedConnection,
   reserveBefore,
   throwIfReservedConnectionLost,
 } from "./database.ts";
@@ -600,7 +601,10 @@ export class PostgresFrameEvidenceProjector {
           cleanupError ??= error;
         }
       }
-      connection.release();
+      releaseReservedConnection(
+        connection,
+        releaseErrors.find(isReservedConnectionLost),
+      );
       if (!operationFailed && cleanupError !== undefined) {
         raise(cleanupError);
       }

@@ -43,6 +43,13 @@ export function throwIfReservedConnectionLost(
   throw error;
 }
 
+export function releaseReservedConnection(
+  connection: ReservedSql,
+  error?: unknown,
+): void {
+  if (!isReservedConnectionLost(error)) connection.release();
+}
+
 export class ProcessingDeadlineError extends Error {
   readonly code = "processing_deadline_exceeded";
 
@@ -111,10 +118,14 @@ export async function withReservedConnection<T>(
   callback: (connection: ReservedSql) => Promise<T>,
 ): Promise<T> {
   const connection = await reserveBefore(sql, deadlineAtMs);
+  let failure: unknown;
   try {
     return await callback(connection);
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    connection.release();
+    releaseReservedConnection(connection, failure);
   }
 }
 

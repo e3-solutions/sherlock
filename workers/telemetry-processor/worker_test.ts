@@ -43,6 +43,7 @@ import {
   createReservedTransactionRunner,
   databaseUrlWithoutApplicationName,
   isReservedConnectionLost,
+  withReservedConnection,
 } from "./database.ts";
 import {
   admissionHeadroomAvailable,
@@ -398,6 +399,33 @@ Deno.test("lost reserved connections skip rollback cleanup", async () => {
   assert(caught === lost);
   assert(isReservedConnectionLost(caught));
   assert(calls.join(",") === "begin,work");
+});
+
+Deno.test("lost reservations are not released back into the pool", async () => {
+  for (
+    const [error, expectedReleases] of [
+      [
+        Object.assign(new Error("connection closed"), { code: "57P01" }),
+        0,
+      ],
+      [Object.assign(new Error("storage timed out"), { code: "ETIMEDOUT" }), 1],
+    ] as const
+  ) {
+    let releases = 0;
+    const connection = { release: () => releases += 1 };
+    let caught: unknown;
+    try {
+      await withReservedConnection(
+        { reserve: () => Promise.resolve(connection) } as never,
+        performance.now() + 1_000,
+        () => Promise.reject(error),
+      );
+    } catch (caughtError) {
+      caught = caughtError;
+    }
+    assert(caught === error);
+    assert(releases === expectedReleases);
+  }
 });
 
 Deno.test("rollback connection loss overrides a healthy SQL error", async () => {
