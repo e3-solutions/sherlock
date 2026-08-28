@@ -46,6 +46,7 @@ export interface WorkerConfig {
   handoffKey: string;
   githubToken: string | null;
   githubWorkspaceIds: string[];
+  githubConnections: number;
 }
 
 export function loadConfig(
@@ -126,6 +127,7 @@ export function loadConfig(
       "SHERLOCK_GITHUB_WORKSPACE_IDS is required when GITHUB_TOKEN is set",
     );
   }
+  const githubConnections = githubToken ? 1 : 0;
   return {
     databaseUrl: required(env, "SUPABASE_DB_URL"),
     supabaseUrl,
@@ -168,6 +170,7 @@ export function loadConfig(
     ]),
     githubToken,
     githubWorkspaceIds: githubWorkspaces,
+    githubConnections,
   };
 }
 
@@ -362,17 +365,48 @@ export class DatabaseRecoveryCircuit {
   }
 }
 
+export interface WorkerPoolSpecification {
+  maxConnections: number;
+  applicationName: string;
+}
+
+export function workerPoolSpecifications(
+  config: Pick<
+    WorkerConfig,
+    "controlConnections" | "githubConnections"
+  >,
+): WorkerPoolSpecification[] {
+  const pools: WorkerPoolSpecification[] = [{
+    maxConnections: config.controlConnections,
+    applicationName: "sherlock-worker-control",
+  }];
+  if (config.githubConnections > 0) {
+    pools.push({
+      maxConnections: config.githubConnections,
+      applicationName: "sherlock-worker-github-sync",
+    });
+  }
+  return pools;
+}
+
 export function workerConnectionBudget(
-  config: Pick<WorkerConfig, "controlConnections" | "processingConnections">,
+  config: Pick<
+    WorkerConfig,
+    "controlConnections" | "processingConnections" | "githubConnections"
+  >,
   state: "handoff_wait" | "active",
 ): number {
   return state === "handoff_wait"
     ? 1
-    : config.controlConnections + config.processingConnections;
+    : config.controlConnections + config.processingConnections +
+      config.githubConnections;
 }
 
 export function handoffOverlapConnectionBudget(
-  config: Pick<WorkerConfig, "controlConnections" | "processingConnections">,
+  config: Pick<
+    WorkerConfig,
+    "controlConnections" | "processingConnections" | "githubConnections"
+  >,
 ): number {
   return workerConnectionBudget(config, "active") +
     workerConnectionBudget(config, "handoff_wait");
@@ -408,10 +442,19 @@ export function retryDelaySeconds(
 }
 
 export async function runWorker(config: WorkerConfig): Promise<void> {
+  const [controlPool, githubPool] = workerPoolSpecifications(config);
   const queue = PostgresJobQueue.connect(
     config.databaseUrl,
-    config.controlConnections,
+    controlPool.maxConnections,
+    controlPool.applicationName,
   );
+  const githubQueue = githubPool
+    ? PostgresJobQueue.connect(
+      config.databaseUrl,
+      githubPool.maxConnections,
+      githubPool.applicationName,
+    )
+    : null;
   let processor: TelemetryProcessor | null = null;
   const active = new Map<
     Promise<void>,
@@ -491,6 +534,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       lease_seconds: config.leaseSeconds,
       github_sync_enabled: config.githubToken !== null,
       github_workspace_count: config.githubWorkspaceIds.length,
+      github_connections: config.githubConnections,
     });
     while (!stopping) {
       if (databaseRecoveryCircuit.millisecondsUntilReady() > 0) {
@@ -512,8 +556,11 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         Date.now() >= nextGithubSyncAt
       ) {
         nextGithubSyncAt = Date.now() + GITHUB_BACKLOG_INTERVAL_MILLISECONDS;
+        if (githubQueue === null) {
+          throw new Error("GitHub sync pool is required when its token is set");
+        }
         githubTask = syncPending(
-          queue,
+          githubQueue,
           config.githubToken,
           config.githubWorkspaceIds,
           {
@@ -673,6 +720,9 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
     if (processor !== null) await processor.close().catch(() => undefined);
+    if (githubQueue !== null) {
+      await githubQueue.close().catch(() => undefined);
+    }
     await queue.close().catch(() => undefined);
     log("worker_stopped", {});
   }
