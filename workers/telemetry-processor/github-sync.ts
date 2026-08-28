@@ -24,6 +24,7 @@ export interface LookupResult extends CommitPair {
   outcome: "matched" | "none" | "ambiguous" | "failed";
   pullRequestNumber: number | null;
   pullRequestTerminalAt: string | null;
+  errorCode: string | null;
 }
 
 export interface LookupStore {
@@ -60,12 +61,14 @@ function outcome(
   value: LookupResult["outcome"],
   pullRequestNumber: number | null = null,
   pullRequestTerminalAt: string | null = null,
+  errorCode: string | null = null,
 ): LookupResult {
   return {
     ...pair,
     outcome: value,
     pullRequestNumber,
     pullRequestTerminalAt,
+    errorCode,
   };
 }
 
@@ -132,6 +135,22 @@ async function githubPause(
     : null;
 }
 
+async function githubFailureCode(
+  response: Response,
+  pair: CommitPair,
+): Promise<string> {
+  const fallback = "github_http_" + response.status;
+  if (response.status !== 422) return fallback;
+  try {
+    const body = record(await response.json());
+    return body?.message === `No commit found for SHA: ${pair.commitSha}`
+      ? "commit_not_found"
+      : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export async function lookupCommit(
   pair: CommitPair,
   token: string,
@@ -154,9 +173,12 @@ export async function lookupCommit(
     },
   });
   if (!response.ok) {
+    const pause = await githubPause(response, now());
     throw new GitHubSyncError(
-      "github_http_" + response.status,
-      await githubPause(response, now()),
+      pause
+        ? "github_http_" + response.status
+        : await githubFailureCode(response, pair),
+      pause,
     );
   }
 
@@ -186,11 +208,11 @@ export async function lookupCommit(
     !Number.isSafeInteger(number) || Number(number) < 1 ||
     (state !== "open" && state !== "closed") ||
     (state === "open" && (closedAt || mergedAt)) ||
-    (state === "closed" && (!closedAt || !mergedAt)) ||
+    (state === "closed" && !closedAt) ||
     (mergedAt && mergedAt > closedAt!)
   ) throw new GitHubSyncError("invalid_pull");
 
-  return outcome(pair, "matched", Number(number), mergedAt);
+  return outcome(pair, "matched", Number(number), mergedAt ?? closedAt);
 }
 
 export async function syncPending(
@@ -231,7 +253,13 @@ export async function syncPending(
       }
       options.onError?.(error, pair);
       counts.failed += 1;
-      await store.appendGithubLookup(outcome(pair, "failed"));
+      await store.appendGithubLookup(outcome(
+        pair,
+        "failed",
+        null,
+        null,
+        error instanceof GitHubSyncError ? error.code : "github_lookup_failed",
+      ));
       continue;
     }
     await store.appendGithubLookup(result);

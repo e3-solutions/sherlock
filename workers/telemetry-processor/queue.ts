@@ -270,7 +270,8 @@ export class PostgresJobQueue {
          select observed.*
            from observed
            left join lateral (
-             select id, outcome, pull_request_terminal_at, created_at
+             select id, outcome, error_code, pull_request_terminal_at,
+                    created_at
                from github.commit_pr_lookups
               where workspace_id = observed.workspace_id
                 and source_version = 'sherlock.github-associated-pulls.v1'
@@ -283,6 +284,9 @@ export class PostgresJobQueue {
             when latest.outcome = 'matched' and
                  latest.pull_request_terminal_at is not null
               then interval '6 hours'
+            when latest.outcome = 'failed' and
+                 latest.error_code = 'commit_not_found'
+              then interval '1 hour'
             else interval '10 minutes'
           end
           order by (latest.id is not null), latest.id,
@@ -305,8 +309,8 @@ export class PostgresJobQueue {
       await tx.unsafe(
         `insert into github.commit_pr_lookups (
            workspace_id, source_version, repository_full_name, commit_sha,
-           outcome, pull_request_number, pull_request_terminal_at
-         ) values ($1, 'sherlock.github-associated-pulls.v1', $2, $3, $4, $5, $6)`,
+           outcome, pull_request_number, pull_request_terminal_at, error_code
+         ) values ($1, 'sherlock.github-associated-pulls.v1', $2, $3, $4, $5, $6, $7)`,
         [
           result.workspaceId,
           result.repositoryFullName,
@@ -314,6 +318,7 @@ export class PostgresJobQueue {
           result.outcome,
           result.pullRequestNumber,
           result.pullRequestTerminalAt,
+          result.errorCode,
         ],
       );
     });
