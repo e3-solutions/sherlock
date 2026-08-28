@@ -1,0 +1,17 @@
+{
+  "imports": {
+    "npm:postgres@3.4.7": "npm:postgres@3.4.9",
+    "postgres-fixed": "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/index.js"
+  },
+  "scopes": {
+    "https://raw.githubusercontent.com/porsager/postgres/c3c82a682b8f1fbfad8529a5def0ef14a5f75483/src/": {
+      "crypto": "node:crypto",
+      "fs": "node:fs",
+      "net": "node:net",
+      "os": "node:os",
+      "perf_hooks": "node:perf_hooks",
+      "stream": "node:stream",
+      "tls": "node:tls"
+    }
+  }
+}

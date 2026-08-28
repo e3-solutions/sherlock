@@ -1,4 +1,4 @@
-import postgres from "npm:postgres@3.4.7";
+import postgres from "./postgres.ts";
 import { ProcessingDeadlineError, reserveBefore } from "./database.ts";
 import {
   FRAME_CLAUDE_NORMALIZER_VERSION,

@@ -1,4 +1,4 @@
-import postgres from "npm:postgres@3.4.7";
+import postgres from "./postgres.ts";
 
 export type Sql = ReturnType<typeof postgres>;
 export type ReservedSql = Awaited<ReturnType<Sql["reserve"]>>;

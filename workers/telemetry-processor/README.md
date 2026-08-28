@@ -61,7 +61,8 @@ dedicated sync pool is fixed at one connection and is included in admission
 accounting and shutdown. Repository changes fail closed, terminal matches are
 rechecked every six hours, and auth or rate-limit pauses are logged without
 creating pair failures. Sync runs each minute while backlogged, otherwise every
-five minutes.
+five minutes. Database failures retry from failure completion with exponential
+backoff capped at fifteen minutes.
 
 ## First rollout and rollback
 

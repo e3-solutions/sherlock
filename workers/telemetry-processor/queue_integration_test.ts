@@ -1,5 +1,9 @@
-import postgres from "npm:postgres@3.4.7";
-import { ADMISSION_HEADROOM_SQL, PostgresJobQueue } from "./queue.ts";
+import postgres from "./postgres.ts";
+import {
+  ADMISSION_HEADROOM_SQL,
+  GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS,
+  PostgresJobQueue,
+} from "./queue.ts";
 
 const permission = await Deno.permissions.query({
   name: "env",
@@ -151,6 +155,99 @@ async function deleteQueueFixture(
     "delete from telemetry.workspaces where id = $1",
     [workspaceId],
   ).catch(() => undefined);
+}
+
+async function insertGithubFact(
+  sql: Sql,
+  input: {
+    workspaceId: string;
+    personId: string;
+    label: string;
+    commitSha: string;
+    createdAt: string;
+    recentEvent: "live" | "replay" | null;
+  },
+): Promise<void> {
+  const sessionId = crypto.randomUUID();
+  const batchId = crypto.randomUUID();
+  await sql.unsafe(
+    `insert into telemetry.sessions (
+       id, workspace_id, person_id, collector_key, native_session_id,
+       actor_role, role_version, started_at
+     ) values ($1, $2, $3, 'github-query-test', $4,
+               'primary', 'test.v1', now())`,
+    [sessionId, input.workspaceId, input.personId, input.label],
+  );
+  await insertQueueBatch(sql, {
+    id: batchId,
+    workspaceId: input.workspaceId,
+    personId: input.personId,
+    sourceKind: "rollout",
+    streamKey: input.label,
+    generationKey: input.label,
+    startOffset: 0,
+  });
+  const [record] = await sql.unsafe(
+    `insert into telemetry.native_records (
+       workspace_id, batch_id, record_index, source_start_offset,
+       source_end_offset, record_sha256, native_type, occurred_at,
+       parse_status
+     ) values ($1, $2, 0, 0, 1, repeat('a', 64), 'session_meta',
+               now(), 'ok')
+     returning id`,
+    [input.workspaceId, batchId],
+  );
+  await sql.unsafe(
+    `insert into telemetry.session_scm (
+       workspace_id, source_record_id, session_id, source_version,
+       repository_full_name, commit_sha, observed_at, server_received_at,
+       created_at
+     ) values ($1, $2, $3, 'sherlock.github-scm.v1', $4, $5,
+               now(), now(), $6)`,
+    [
+      input.workspaceId,
+      record.id,
+      sessionId,
+      `e3-solutions/${input.label}`,
+      input.commitSha,
+      input.createdAt,
+    ],
+  );
+  if (input.recentEvent !== null) {
+    await sql.unsafe(
+      `insert into telemetry.events (
+         workspace_id, session_id, source_record_id, normalizer_version,
+         projection_index, source_priority, is_replay, event_kind,
+         occurred_at, server_received_at
+       ) values ($1, $2, $3, 'queue.github-query-test.v1', 0, 0, $4,
+                 'lifecycle', now(), now())`,
+      [
+        input.workspaceId,
+        sessionId,
+        record.id,
+        input.recentEvent === "replay",
+      ],
+    );
+  }
+}
+
+async function deleteGithubFixture(sql: Sql, workspaceId: string) {
+  await sql.unsafe("delete from telemetry.events where workspace_id = $1", [
+    workspaceId,
+  ]).catch(() => undefined);
+  await sql.unsafe(
+    "delete from telemetry.session_scm where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
+    "delete from telemetry.native_records where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await sql.unsafe(
+    "delete from telemetry.sessions where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
+  await deleteQueueFixture(sql, workspaceId);
 }
 
 Deno.test({
@@ -919,6 +1016,88 @@ Deno.test({
 
 Deno.test({
   name:
+    "GitHub candidates union recent SCM with non-replay active sessions once",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 2 });
+    const queue = PostgresJobQueue.connect(databaseUrl!, 1);
+    const { workspaceId, personId } = await insertQueueFixture(
+      sql,
+      "github-candidates",
+    );
+    const now = Date.now();
+    try {
+      await insertGithubFact(sql, {
+        workspaceId,
+        personId,
+        label: "recent-and-active",
+        commitSha: "a".repeat(40),
+        createdAt: new Date(now).toISOString(),
+        recentEvent: "live",
+      });
+      await insertGithubFact(sql, {
+        workspaceId,
+        personId,
+        label: "old-but-active",
+        commitSha: "b".repeat(40),
+        createdAt: new Date(now - 27 * 60 * 60 * 1_000).toISOString(),
+        recentEvent: "live",
+      });
+      await insertGithubFact(sql, {
+        workspaceId,
+        personId,
+        label: "old-replay-only",
+        commitSha: "c".repeat(40),
+        createdAt: new Date(now - 27 * 60 * 60 * 1_000).toISOString(),
+        recentEvent: "replay",
+      });
+      await insertGithubFact(sql, {
+        workspaceId,
+        personId,
+        label: "old-inactive",
+        commitSha: "d".repeat(40),
+        createdAt: new Date(now - 27 * 60 * 60 * 1_000).toISOString(),
+        recentEvent: null,
+      });
+
+      assert(
+        GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS === 20_000,
+        "GitHub candidate selection must have a short server-side deadline",
+      );
+      assert(
+        (await queue.pendingGithubCommitPairs(10, [crypto.randomUUID()]))
+          .length === 0,
+        "recent events must not cross the workspace allowlist",
+      );
+      const pairs = await queue.pendingGithubCommitPairs(10, [workspaceId]);
+      assert(
+        pairs.length === 2,
+        "only recent SCM and non-replay active-session facts are candidates",
+      );
+      assert(
+        new Set(pairs.map((pair) => pair.repositoryFullName)).size === 2,
+        "a fact present in both branches must be returned once",
+      );
+      assert(
+        pairs.some((pair) =>
+          pair.repositoryFullName === "e3-solutions/recent-and-active"
+        ) &&
+          pairs.some((pair) =>
+            pair.repositoryFullName === "e3-solutions/old-but-active"
+          ),
+        "both candidate sources must remain visible",
+      );
+    } finally {
+      await deleteGithubFixture(sql, workspaceId);
+      await Promise.allSettled([queue.close(), sql.end()]);
+    }
+  },
+});
+
+Deno.test({
+  name:
     "live normalization claims an ordered backfill prerequisite without borrowing unrelated backfill",
   ignore: !databaseUrl,
   sanitizeOps: false,
@@ -1264,6 +1443,24 @@ Deno.test({
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       assert(githubWaiting, "the GitHub query must be blocked on its own pool");
+
+      const [githubActivity] = await sql.unsafe(
+        `select query
+           from pg_stat_activity
+          where application_name = 'sherlock-worker-github-sync'
+            and wait_event_type = 'Lock'
+          limit 1`,
+      );
+      assert(
+        String(githubActivity.query).includes(
+          "with recent_sessions as materialized",
+        ) && String(githubActivity.query).includes("union"),
+        "GitHub sync must materialize recent sessions once and union candidates",
+      );
+      assert(
+        !String(githubActivity.query).includes("or exists"),
+        "GitHub sync must not probe historical session events once per SCM fact",
+      );
 
       const labels = await sql.unsafe(
         `select application_name, count(*)::integer as connections
