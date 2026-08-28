@@ -1,0 +1,10 @@
+Check workers/telemetry-processor/worker_test.ts
+TS2305 [ERROR]: Module '"file:///private/tmp/sherlock-cor3891/workers/telemetry-processor/main.ts"' has no exported member 'isRetryableDatabaseError'.
+  isRetryableDatabaseError,
+  ~~~~~~~~~~~~~~~~~~~~~~~~
+    at file:///private/tmp/sherlock-cor3891/workers/telemetry-processor/worker_test.ts:12:3
+
+error: Type checking failed.
+
+  info: The program failed type-checking, but it still might work correctly.
+  hint: Re-run with --no-check to skip type-checking.

@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "task": {
+    "title": "Transient database refusal recovery",
+    "mode": "standard",
+    "type": "bug"
+  },
+  "intent": {
+    "goal": "Keep the telemetry processor alive and self-recovering across brief Supabase/Supavisor connection refusals so canonical dashboard data resumes without consuming Railway's finite restart budget.",
+    "must_happen": [
+      "The exact production XX000/econnrefused error is classified as a retryable database connectivity failure.",
+      "Retryable database failures back off inside the active worker loop, and a top-level supervisor retries any recoverable failure that escapes worker setup or control flow.",
+      "Authentication, configuration, statement timeout, serialization, and unrelated internal errors continue to fail fast.",
+      "Existing singleton handoff, concurrency, connection budgets, and dashboard reserve semantics remain unchanged."
+    ],
+    "must_not_happen": [
+      "Do not mutate raw telemetry, rewrite queue facts, add DDL, or hide non-transient failures behind an infinite retry loop.",
+      "Do not induce a production database outage to prove recovery."
+    ],
+    "constraints": [
+      "Use bounded exponential backoff with jitter and preserve graceful SIGTERM/SIGINT shutdown.",
+      "The durable recovery path must not require increasing Supabase compute or Railway restart retries."
+    ],
+    "non_goals": [
+      "Optimizing the independent GitHub SCM sync query.",
+      "Changing Supabase schema, pool size, worker concurrency, or deployment region."
+    ],
+    "open_questions": [],
+    "assumptions": [
+      "postgres.js preserves SQLSTATE or network codes on errors and the observed Supavisor refusal remains represented by the exact production message when surfaced as XX000."
+    ]
+  },
+  "proof_obligations": [
+    {
+      "id": "P1",
+      "claim": "The exact production XX000/econnrefused error is recoverable while auth and unrelated database errors are not.",
+      "verification": "Fail-then-pass focused classification tests using the exact observed error plus negative controls."
+    },
+    {
+      "id": "P2",
+      "claim": "A transient failure escaping runWorker is retried in-process with bounded delay, and a later successful run exits normally.",
+      "verification": "Deterministic supervisor unit test with injected run and delay functions, plus a non-retryable fail-fast test."
+    },
+    {
+      "id": "P3",
+      "claim": "Existing worker capacity, handoff, admission, and processing behavior remains intact.",
+      "verification": "Focused telemetry worker suite and repository CI tests."
+    },
+    {
+      "id": "P4",
+      "claim": "The reviewed change runs in production without freshness regression or recurring connection failures.",
+      "verification": "Independent read-only review, passing PR checks, deployment health/log inspection, and post-deploy dashboard/queue freshness checks."
+    }
+  ]
+}

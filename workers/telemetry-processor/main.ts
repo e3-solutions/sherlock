@@ -16,6 +16,8 @@ const OVERLOAD_SAMPLE_MILLISECONDS = 10_000;
 const OVERLOAD_SAMPLE_COUNT = 2;
 const CAPACITY_RETRY_BASE_MILLISECONDS = 30_000;
 const CAPACITY_RETRY_MAX_MILLISECONDS = 120_000;
+const CONNECTIVITY_RETRY_BASE_MILLISECONDS = 1_000;
+const CONNECTIVITY_RETRY_MAX_MILLISECONDS = 30_000;
 const HANDOFF_POLL_MILLISECONDS = 1_000;
 const GITHUB_BACKLOG_INTERVAL_MILLISECONDS = 60_000;
 const GITHUB_CAUGHT_UP_INTERVAL_MILLISECONDS = 300_000;
@@ -229,9 +231,49 @@ export function maintenanceSampleDue(
 
 export function isCapacityError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  const code = "code" in error ? String(error.code) : "";
-  if (code === "53300" || code.startsWith("EMAX")) return true;
-  return code === "XX000" && /\bEMAX(?:CONNSESSION)?\b/i.test(error.message);
+  const code = "code" in error ? String(error.code).toUpperCase() : "";
+  if (
+    code === "53300" || code === "ECHECKOUTTIMEOUT" ||
+    code.startsWith("EMAX")
+  ) {
+    return true;
+  }
+  return code === "XX000" &&
+    /\b(?:EMAX(?:CONNSESSION)?|ECHECKOUTTIMEOUT)\b/i.test(error.message);
+}
+
+export function isDatabaseConnectivityError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = "code" in error ? String(error.code).toUpperCase() : "";
+  if (
+    [
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "EPIPE",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+      "CONNECT_TIMEOUT",
+      "CONNECTION_DESTROYED",
+      "ECHECKOUTTIMEOUT",
+    ].includes(code)
+  ) {
+    return true;
+  }
+  if (
+    ["08000", "08001", "08003", "08006", "57P01", "57P02", "57P03"].includes(
+      code,
+    )
+  ) {
+    return true;
+  }
+  return code === "XX000" &&
+    /\{\s*:error\s*,\s*:(?:econnrefused|econnreset|etimedout)\s*\}/i
+      .test(error.message);
+}
+
+export function isRetryableDatabaseError(error: unknown): boolean {
+  return isCapacityError(error) || isDatabaseConnectivityError(error);
 }
 
 export function capacityRetryMilliseconds(
@@ -246,7 +288,23 @@ export function capacityRetryMilliseconds(
   return Math.round(capped * (0.8 + 0.4 * random()));
 }
 
-export class CapacityCircuit {
+export function databaseRetryMilliseconds(
+  error: unknown,
+  failureCount: number,
+  random: () => number = Math.random,
+): number {
+  if (isCapacityError(error)) {
+    return capacityRetryMilliseconds(failureCount, random);
+  }
+  const capped = Math.min(
+    CONNECTIVITY_RETRY_MAX_MILLISECONDS,
+    CONNECTIVITY_RETRY_BASE_MILLISECONDS *
+      2 ** Math.min(5, Math.max(0, failureCount - 1)),
+  );
+  return Math.round(capped * (0.8 + 0.4 * random()));
+}
+
+export class DatabaseRecoveryCircuit {
   private failures = 0;
   private openUntilMs = 0;
   private probeInFlight = false;
@@ -257,10 +315,11 @@ export class CapacityCircuit {
   ) {}
 
   handle(error: unknown): number | null {
-    if (!isCapacityError(error)) return null;
+    if (!isRetryableDatabaseError(error)) return null;
     this.failures += 1;
     this.probeInFlight = false;
-    const delayMilliseconds = capacityRetryMilliseconds(
+    const delayMilliseconds = databaseRetryMilliseconds(
+      error,
       this.failures,
       this.random,
     );
@@ -372,7 +431,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     enterSamples: 0,
     exitSamples: 0,
   };
-  const capacityCircuit = new CapacityCircuit();
+  const databaseRecoveryCircuit = new DatabaseRecoveryCircuit();
   const stop = () => {
     stopping = true;
     shutdown.abort();
@@ -380,12 +439,16 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
   };
   Deno.addSignalListener("SIGTERM", stop);
   Deno.addSignalListener("SIGINT", stop);
-  const openCapacityCircuit = (error: unknown, source: string): boolean => {
-    const delayMilliseconds = capacityCircuit.handle(error);
+  const openDatabaseRecoveryCircuit = (
+    error: unknown,
+    source: string,
+  ): boolean => {
+    const delayMilliseconds = databaseRecoveryCircuit.handle(error);
     if (delayMilliseconds === null) return false;
     log("database_capacity_circuit_open", {
       source,
       error_code: errorCode(error),
+      failure_kind: isCapacityError(error) ? "capacity" : "connectivity",
       retry_in_ms: delayMilliseconds,
     });
     return true;
@@ -401,8 +464,10 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         }
         await delay(HANDOFF_POLL_MILLISECONDS);
       } catch (error) {
-        if (!openCapacityCircuit(error, "handoff")) throw error;
-        await delay(Math.max(1, capacityCircuit.millisecondsUntilReady()));
+        if (!openDatabaseRecoveryCircuit(error, "handoff")) throw error;
+        await delay(
+          Math.max(1, databaseRecoveryCircuit.millisecondsUntilReady()),
+        );
       }
     }
     if (stopping) return;
@@ -428,17 +493,17 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       github_workspace_count: config.githubWorkspaceIds.length,
     });
     while (!stopping) {
-      if (capacityCircuit.millisecondsUntilReady() > 0) {
+      if (databaseRecoveryCircuit.millisecondsUntilReady() > 0) {
         await waitForWork(
           active,
           Math.min(
             config.pollMilliseconds,
-            capacityCircuit.millisecondsUntilReady(),
+            databaseRecoveryCircuit.millisecondsUntilReady(),
           ),
         );
         continue;
       }
-      if (capacityCircuit.hasProbeInFlight()) {
+      if (databaseRecoveryCircuit.hasProbeInFlight()) {
         await waitForWork(active, config.pollMilliseconds);
         continue;
       }
@@ -501,7 +566,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
           githubTask = null;
         });
       }
-      const halfOpen = capacityCircuit.isHalfOpen();
+      const halfOpen = databaseRecoveryCircuit.isHalfOpen();
       let claimedAny = false;
       try {
         if (maintenanceSampleDue(Date.now(), lastReaperAt)) {
@@ -559,7 +624,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
             processor,
             job,
             config,
-            (error, source) => openCapacityCircuit(error, source),
+            (error, source) => openDatabaseRecoveryCircuit(error, source),
           ).catch((error) => {
             log("job_task_failed", {
               ...jobFields(job),
@@ -567,7 +632,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
             });
           }).finally(() => {
             active.delete(task);
-            if (halfOpen && capacityCircuit.completeProbe()) {
+            if (halfOpen && databaseRecoveryCircuit.completeProbe()) {
               log("database_capacity_circuit_closed", {
                 probe_job_id: job.id.toString(),
               });
@@ -578,8 +643,10 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
             workload_class: job.workload_class,
           });
           if (halfOpen) {
-            if (!capacityCircuit.beginProbe()) {
-              throw new Error("capacity circuit admitted multiple probes");
+            if (!databaseRecoveryCircuit.beginProbe()) {
+              throw new Error(
+                "database recovery circuit admitted multiple probes",
+              );
             }
             log("database_capacity_circuit_half_open", {
               probe_job_id: job.id.toString(),
@@ -588,11 +655,11 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
           }
         }
         if (halfOpen && !claimedAny) {
-          capacityCircuit.close();
+          databaseRecoveryCircuit.close();
           log("database_capacity_circuit_closed", {});
         }
       } catch (error) {
-        if (!openCapacityCircuit(error, "queue_control")) throw error;
+        if (!openDatabaseRecoveryCircuit(error, "queue_control")) throw error;
       }
       await waitForWork(
         active,
@@ -608,6 +675,35 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     if (processor !== null) await processor.close().catch(() => undefined);
     await queue.close().catch(() => undefined);
     log("worker_stopped", {});
+  }
+}
+
+export async function superviseWorker(
+  config: WorkerConfig,
+  run: (config: WorkerConfig) => Promise<void> = runWorker,
+  waitForRetry: (milliseconds: number) => Promise<void> = delay,
+  random: () => number = Math.random,
+): Promise<void> {
+  let failures = 0;
+  while (true) {
+    try {
+      await run(config);
+      return;
+    } catch (error) {
+      if (!isRetryableDatabaseError(error)) throw error;
+      failures += 1;
+      const retryInMilliseconds = databaseRetryMilliseconds(
+        error,
+        failures,
+        random,
+      );
+      log("worker_database_recovery_waiting", {
+        error_code: errorCode(error),
+        failure_kind: isCapacityError(error) ? "capacity" : "connectivity",
+        retry_in_ms: retryInMilliseconds,
+      });
+      await waitForRetry(retryInMilliseconds);
+    }
   }
 }
 
@@ -686,7 +782,7 @@ async function runJob(
   processor: TelemetryProcessor,
   job: TelemetryJob,
   config: WorkerConfig,
-  onCapacityError: (error: unknown, source: string) => void,
+  onDatabaseRecovery: (error: unknown, source: string) => void,
 ): Promise<void> {
   const startedAt = performance.now();
   let leaseLost = false;
@@ -697,8 +793,8 @@ async function runJob(
     try {
       leaseLost = !(await queue.heartbeat(job, config.leaseSeconds));
     } catch (error) {
-      if (isCapacityError(error)) {
-        onCapacityError(error, "lease_heartbeat");
+      if (isRetryableDatabaseError(error)) {
+        onDatabaseRecovery(error, "lease_heartbeat");
       }
       log("lease_heartbeat_failed", {
         ...jobFields(job),
@@ -729,7 +825,9 @@ async function runJob(
       duration_ms: Math.round(performance.now() - startedAt),
     });
   } catch (error) {
-    if (isCapacityError(error)) onCapacityError(error, "job_processing");
+    if (isRetryableDatabaseError(error)) {
+      onDatabaseRecovery(error, "job_processing");
+    }
     const code = errorCode(error);
     const message = safeError(error);
     const terminal = job.attempt_count >= job.attempt_limit;
@@ -748,8 +846,8 @@ async function runJob(
           message,
         );
     } catch (recordError) {
-      if (isCapacityError(recordError)) {
-        onCapacityError(recordError, "job_failure_record");
+      if (isRetryableDatabaseError(recordError)) {
+        onDatabaseRecovery(recordError, "job_failure_record");
       }
       log("job_failure_record_deferred", {
         ...jobFields(job),
@@ -867,5 +965,5 @@ function delay(milliseconds: number): Promise<void> {
 }
 
 if (import.meta.main) {
-  await runWorker(loadConfig(Deno.env.toObject()));
+  await superviseWorker(loadConfig(Deno.env.toObject()));
 }

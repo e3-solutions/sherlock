@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "supervisor-pass-v2",
+  "argv": [
+    "deno",
+    "test",
+    "--allow-read",
+    "--filter",
+    "worker supervisor",
+    "workers/telemetry-processor/worker_test.ts"
+  ],
+  "cwd": "/private/tmp/sherlock-cor3891",
+  "started_at": "2026-08-28T01:02:00.924545Z",
+  "ended_at": "2026-08-28T01:02:01.847952Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/opt/homebrew/bin/deno",
+  "workspace": {
+    "kind": "git",
+    "root": "/private/tmp/sherlock-cor3891",
+    "sha256": "553712478541ea1e1b081cedb0d32438784a596325bf1b51b1da5585abc4397a"
+  },
+  "log": "runs/supervisor-pass-v2.log",
+  "log_sha256": "a3d77fd420ecaccda69ad71d7fe56092d2ad4ddecaad4f35fa4b80c876656def"
+}

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "exact-refusal-fail",
+  "argv": [
+    "deno",
+    "test",
+    "--allow-read",
+    "--filter",
+    "transient database refusal",
+    "workers/telemetry-processor/worker_test.ts"
+  ],
+  "cwd": "/private/tmp/sherlock-cor3891",
+  "started_at": "2026-08-28T00:46:06.133424Z",
+  "ended_at": "2026-08-28T00:46:06.841066Z",
+  "exit_code": 1,
+  "termination_reason": null,
+  "resolved_executable": "/opt/homebrew/bin/deno",
+  "workspace": {
+    "kind": "git",
+    "root": "/private/tmp/sherlock-cor3891",
+    "sha256": "8981a8730df561b386db9b4eacaaaa8e4c2878bca938587a0c49829dd50e28c2"
+  },
+  "log": "runs/exact-refusal-fail.log",
+  "log_sha256": "099f1fc6bbaf8d80bc7c9837795d4dee43bf0f379a2df085a65b515d6feeb7ae"
+}

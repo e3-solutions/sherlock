@@ -1,0 +1,9 @@
+Check workers/telemetry-processor/worker_test.ts
+running 1 test from ./workers/telemetry-processor/worker_test.ts
+worker supervisor retries connectivity failures without consuming platform restarts ...
+------- output -------
+{"timestamp":"2026-08-28T01:02:01.810Z","event":"worker_database_recovery_waiting","error_code":"XX000","failure_kind":"connectivity","retry_in_ms":1000}
+----- output end -----
+worker supervisor retries connectivity failures without consuming platform restarts ... ok (3ms)
+
+ok | 1 passed | 0 failed | 28 filtered out (6ms)
