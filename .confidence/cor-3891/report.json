@@ -1,0 +1,93 @@
+{
+  "version": 3,
+  "task_title": "Transient database refusal recovery",
+  "mode": "standard",
+  "outcome": "Implemented, independently reviewed SHIP, and locally verified; PR CI and production rollout remain pending.",
+  "changes": [
+    "Added a narrow retryable database classifier for the exact Supavisor refusal, direct network failures, selected transient SQLSTATEs, shutdown errors, and existing capacity failures.",
+    "Generalized the single-probe database circuit with fast 1-30 second connectivity backoff while preserving 30-120 second capacity backoff and existing alert event names.",
+    "Added a top-level supervisor so recoverable failures escaping worker setup/control flow recreate pools in-process instead of consuming Railway restart retries.",
+    "Extended heartbeat, processing, and failure-record paths to open the same recovery circuit without changing queue, raw telemetry, handoff, concurrency, or admission semantics.",
+    "Added exact negative controls, deterministic supervisor coverage, and a real postgres.js refused-connection subprocess boundary."
+  ],
+  "evidence": [
+    {
+      "obligation_id": "P1",
+      "status": "pass",
+      "details": "The exact production XX000/econnrefused wrapper, direct transient codes, and selected SQLSTATEs recover; auth, 08004, serialization, statement timeout, tenant-not-found, and unrelated XX000 errors fail fast. ECHECKOUTTIMEOUT retains capacity backoff.",
+      "artifacts": [
+        ".confidence/cor-3891/runs/exact-refusal-pass-v2.log",
+        ".confidence/cor-3891/runs/worker-suite-v2.log"
+      ],
+      "run_ids": ["exact-refusal-pass-v2", "worker-suite-v2"],
+      "diagnostic_run_ids": ["exact-refusal-fail"]
+    },
+    {
+      "obligation_id": "P2",
+      "status": "pass",
+      "details": "The supervisor retries the exact wrapped refusal with deterministic backoff. The real main.ts/postgres.js process survives two direct ECONNREFUSED attempts, receives SIGTERM during backoff, and closes cleanly with no uncaught error.",
+      "artifacts": [
+        ".confidence/cor-3891/runs/supervisor-pass-v2.log",
+        ".confidence/cor-3891/runs/real-refusal-boundary-v2.log",
+        ".confidence/cor-3891/run_worker_refusal_integration.ts"
+      ],
+      "run_ids": ["supervisor-pass-v2", "real-refusal-boundary-v2"],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P3",
+      "status": "pass",
+      "details": "Worker suite passes 29/29. Broader Deno formatting, lint, checks, ingest, reducer, and telemetry suites pass without changing concurrency, handoff, connection budgets, raw facts, or queue semantics.",
+      "artifacts": [
+        ".confidence/cor-3891/runs/worker-suite-v2.log",
+        ".confidence/cor-3891/runs/deno-ci-v2.log"
+      ],
+      "run_ids": ["worker-suite-v2", "deno-ci-v2"],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P4",
+      "status": "partial",
+      "details": "Independent integration review reached SHIP after all P1/P2 findings were fixed. PR CI, merge, deployment, and live freshness checks remain operational rollout gates.",
+      "artifacts": [".confidence/cor-3891/review.md"],
+      "run_ids": [],
+      "diagnostic_run_ids": []
+    }
+  ],
+  "tests": {
+    "passed": [
+      "Exact production refusal fail-then-pass regression.",
+      "Worker focused suite: 29 passed, 0 failed.",
+      "Broader Deno gate: format, lint, check, ingest, reducer, and telemetry suites passed.",
+      "Real postgres.js boundary: two ECONNREFUSED recoveries in one process and graceful SIGTERM shutdown."
+    ],
+    "failed": [],
+    "not_run": [
+      "Deliberately inducing the Supavisor XX000 wrapper in production is unsafe; the exact wrapper is covered deterministically and direct refusal is covered at the real driver boundary.",
+      "PR-hosted full CI and post-deploy production verification."
+    ]
+  },
+  "simplicity": {
+    "code_gate": "pass",
+    "test_gate": "pass",
+    "notes": "The change reuses the existing worker loop, postgres.js pools, circuit, and Railway process. It introduces no service, schema, DDL, queue mutation, or raw-data path."
+  },
+  "review": {
+    "required": true,
+    "reason": "The change controls recovery at the external Supabase/Supavisor boundary in a production worker.",
+    "roles": ["integration_reviewer"],
+    "findings": [
+      "Initial review verdict NO SHIP: overly broad retry classification, incorrect checkout-timeout backoff, broken alert event compatibility, and no real worker boundary proof.",
+      "All findings were remediated with narrow allowlists and negative controls, capacity backoff restoration, established event names, and a real refused-connection subprocess test.",
+      "Final independent integration review verdict: SHIP with no remaining P1/P2 findings."
+    ]
+  },
+  "risks": [
+    "A real Supavisor XX000 wrapper was not intentionally induced in production; exact wrapper classification and real direct ECONNREFUSED recovery provide complementary evidence.",
+    "The supervisor intentionally retries transient infrastructure failures without a count limit at a bounded delay; production freshness monitoring must alert if an outage persists."
+  ],
+  "rollback": "Redeploy the preceding known-good Railway image/commit; no database rollback is required because this change contains no schema or data mutation.",
+  "user_decisions": [
+    "User explicitly requested the durable fix after the process restart recovered service but did not prevent recurrence."
+  ]
+}

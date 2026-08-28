@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "id": "deno-ci-v2",
+  "argv": [
+    "sh",
+    "-c",
+    "deno fmt --check supabase/functions workers scripts .confidence/cor-3891/run_worker_refusal_integration.ts && deno lint supabase/functions workers scripts .confidence/cor-3891/run_worker_refusal_integration.ts && deno check supabase/functions/sherlock-rollout-ingest/index.ts && deno check workers/telemetry-processor/main.ts && deno test supabase/functions/sherlock-rollout-ingest && deno test supabase/functions/sherlock-activity-reducer && deno test --allow-read=railway.toml workers/telemetry-processor && git diff --check"
+  ],
+  "cwd": "/private/tmp/sherlock-cor3891",
+  "started_at": "2026-08-28T00:57:12.395803Z",
+  "ended_at": "2026-08-28T00:57:15.681812Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/bin/sh",
+  "workspace": {
+    "kind": "git",
+    "root": "/private/tmp/sherlock-cor3891",
+    "sha256": "553712478541ea1e1b081cedb0d32438784a596325bf1b51b1da5585abc4397a"
+  },
+  "log": "runs/deno-ci-v2.log",
+  "log_sha256": "54d2d1cfea3706d0796fdc22ef194c7dc9c6168db08639f4215e3173fc573028"
+}
