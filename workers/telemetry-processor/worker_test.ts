@@ -14,12 +14,14 @@ import {
   loadConfig,
   maintenanceSampleDue,
   retryDelaySeconds,
+  startWorkerProgressWatchdog,
   stopGithubSync,
   superviseWorker,
   updateOverloadState,
   type WorkerConfig,
   workerConnectionBudget,
   workerPoolSpecifications,
+  WorkerProgressWatchdog,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import type { BatchManifest } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
@@ -79,6 +81,7 @@ Deno.test("configuration is bounded and secrets remain required", () => {
   assert(config.githubConnections === 0);
   assert(config.dashboardReservedConnections === 8);
   assert(config.processingTimeoutMilliseconds === 90_000);
+  assert(config.controlLoopStallMilliseconds === 60_000);
   assert(config.githubWorkspaceIds.length === 0);
   let reserveRejected = false;
   try {
@@ -123,6 +126,61 @@ Deno.test("configuration is bounded and secrets remain required", () => {
     }
     assert(invalid, `${concurrency}/${liveReserved} must be rejected`);
   }
+  let watchdogRejected = false;
+  try {
+    loadConfig({
+      SUPABASE_DB_URL: "postgresql://example.invalid/postgres",
+      SUPABASE_URL: "https://example.supabase.co",
+      SUPABASE_SERVICE_ROLE_KEY: "test-secret",
+      SHERLOCK_WORKER_CONTROL_STALL_SECONDS: "29",
+    });
+  } catch {
+    watchdogRejected = true;
+  }
+  assert(watchdogRejected, "the watchdog must not permit restart thrashing");
+});
+
+Deno.test("worker progress watchdog trips once after a bounded stall", () => {
+  let now = 10_000;
+  const watchdog = new WorkerProgressWatchdog(60_000, () => now);
+  const stalls: number[] = [];
+  const onStall = (elapsed: number) => stalls.push(elapsed);
+
+  now += 59_999;
+  assert(!watchdog.check(onStall));
+  watchdog.touch();
+  now += 60_000;
+  assert(watchdog.check(onStall));
+  assert(stalls.length === 1 && stalls[0] === 60_000);
+  now += 60_000;
+  assert(!watchdog.check(onStall), "a tripped watchdog must fire only once");
+  assert(stalls.length === 1);
+});
+
+Deno.test("worker progress timer invokes and cancels fatal recovery", () => {
+  let now = 0;
+  let tick = () => {};
+  let canceled = false;
+  const stalls: number[] = [];
+  const watchdog = new WorkerProgressWatchdog(60_000, () => now);
+  const stop = startWorkerProgressWatchdog(
+    watchdog,
+    5_000,
+    (elapsed) => stalls.push(elapsed),
+    (callback, milliseconds) => {
+      assert(milliseconds === 5_000);
+      tick = callback;
+      return () => {
+        canceled = true;
+      };
+    },
+  );
+
+  now = 60_000;
+  tick();
+  assert(stalls.length === 1 && stalls[0] === 60_000);
+  stop();
+  assert(canceled);
 });
 
 Deno.test("database admission preserves owned dashboard sessions at the exact boundary", () => {
@@ -388,6 +446,8 @@ Deno.test("Railway rebuilds only for the complete worker dependency closure", ()
   }
   assert(railwayConfig.includes("drainingSeconds = 120"));
   assert(railwayConfig.includes("overlapSeconds = 0"));
+  assert(railwayConfig.includes('restartPolicyType = "ON_FAILURE"'));
+  assert(railwayConfig.includes("restartPolicyMaxRetries = 10"));
 });
 
 Deno.test("overload mode uses hysteresis and preserves one reduction lane", () => {
@@ -424,6 +484,7 @@ Deno.test("overload normalization claims only a live-demand stream frontier", as
       return Promise.resolve(null);
     },
   };
+  let progress = 0;
   const claimed = await claimOverloadJob(
     queue as never,
     new Map(),
@@ -432,9 +493,13 @@ Deno.test("overload normalization claims only a live-demand stream frontier", as
       leaseSeconds: 120,
       normalizeReserved: 5,
     } as WorkerConfig,
+    () => {
+      progress += 1;
+    },
   );
   assert(claimed === prerequisite);
   assert(calls.join(",") === "frontier:worker-a:120");
+  assert(progress === 1, "a successful control query must refresh progress");
 });
 
 Deno.test("slow claims cannot starve overload maintenance", () => {

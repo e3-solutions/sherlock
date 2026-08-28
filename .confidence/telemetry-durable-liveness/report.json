@@ -1,0 +1,107 @@
+{
+  "version": 3,
+  "task_title": "Durable subagent freshness and worker progress recovery",
+  "mode": "standard",
+  "outcome": "implemented_and_locally_verified",
+  "changes": [
+    "SubagentStart now performs a five-minute, active-session-only scan and selects the exact child by agent ID or object-shaped parent metadata when Codex SQLite registration and transcript paths are not yet available.",
+    "Codex session_meta identity is authoritative, preserving correct IDs for valid rollout filenames that contain multiple UUIDs.",
+    "The telemetry processor now has a validated 60-second progress watchdog that exits non-zero after a control-loop stall so Railway's existing ON_FAILURE policy replaces the process.",
+    "Worker progress is acknowledged after successful handoff, maintenance, capacity, and queue-claim database operations, including bounded ticks during PR #75 database recovery waits.",
+    "Normalizer and worker topology regressions prove the discovered child remains linked to its parent and classified as a worker."
+  ],
+  "evidence": [
+    {
+      "obligation_id": "P1",
+      "status": "pass",
+      "details": "The regression failed before implementation and now captures the exact recent child with no agent_transcript_path and no SQLite row. A newer unrelated 65 MiB rollout and a stale child do not consume the live capture. A read-only scan of real local session metadata identified the current subagent with invalid=0.",
+      "artifacts": [
+        "tests/collector/test_plugin.py",
+        "packages/telemetry-collector/src/sherlock_collector/discovery.py",
+        "packages/telemetry-collector/src/sherlock_collector/hook.py"
+      ],
+      "run_ids": [],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P2",
+      "status": "pass",
+      "details": "Deterministic clock tests prove fresh progress remains healthy, a 60-second stall trips exactly once, the scheduled callback is cancelable, and successful queue claims refresh progress. Railway ON_FAILURE and retry settings are statically asserted.",
+      "artifacts": [
+        "workers/telemetry-processor/main.ts",
+        "workers/telemetry-processor/worker_test.ts",
+        "workers/telemetry-processor/README.md",
+        "railway.toml"
+      ],
+      "run_ids": [],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P3",
+      "status": "pass",
+      "details": "All collector, rollout-ingest, and worker unit suites pass. No schema, stored raw telemetry, pool sizing, or production configuration was mutated. Independent integration review returned SHIP after verifying composition with PR #75 recovery and PR #76 GitHub isolation.",
+      "artifacts": [
+        "supabase/functions/sherlock-rollout-ingest/normalizer_test.ts",
+        ".confidence/telemetry-durable-liveness/review.md"
+      ],
+      "run_ids": [],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P4",
+      "status": "pass",
+      "details": "Discovery is restricted to a five-minute window and the UTC session date roots intersecting it; identity parsing reads at most 64 records or 256 KiB per candidate. The watchdog configuration rejects thresholds below 30 seconds or four poll intervals. Rollback is code-only.",
+      "artifacts": [
+        "packages/telemetry-collector/src/sherlock_collector/discovery.py",
+        "workers/telemetry-processor/main.ts"
+      ],
+      "run_ids": [],
+      "diagnostic_run_ids": []
+    }
+  ],
+  "tests": {
+    "passed": [
+      "Collector: 123 tests",
+      "Rollout ingest: 52 tests",
+      "Telemetry processor: 48 tests",
+      "Deno formatting: 34 files",
+      "Deno lint: 32 files",
+      "Deno type checks for ingest and worker",
+      "Python compileall",
+      "git diff --check"
+    ],
+    "failed": [],
+    "not_run": [
+      "Two rollout-ingest Postgres integration tests require the isolated CI database.",
+      "Seven worker database and oversized-rollout integration tests require external test services.",
+      "PR CI, merge, deployment, and live production verification remain pending."
+    ]
+  },
+  "simplicity": {
+    "code_gate": "pass",
+    "test_gate": "pass",
+    "notes": "The collector adds one bounded fallback to an existing lifecycle event; the worker adds one small deterministic watchdog using Railway's existing restart policy. No schema, queue, capacity, or product-query redesign is introduced."
+  },
+  "review": {
+    "required": true,
+    "reason": "Collector-to-normalizer and worker-to-Railway behavior cross service boundaries.",
+    "roles": [
+      "independent integration reviewer"
+    ],
+    "findings": [
+      "Initial NO SHIP: unrelated recent rollouts could consume capture budget; remediated with exact-child-only selection and an adversarial 65 MiB competing file.",
+      "Initial NO SHIP: sparse progress touches could restart a healthy slow loop; remediated by acknowledging successful blocking operations and polling recovery waits in bounded ticks.",
+      "Initial NO SHIP: the fixture did not match real object-shaped Codex source metadata or prove normalized topology; both regressions were added.",
+      "Final verdict: SHIP; no remaining blocker."
+    ]
+  },
+  "risks": [
+    "If the child rollout does not yet exist during the one-shot SubagentStart scan, the next lifecycle hook or normal discovery signal must capture it.",
+    "An in-process timer cannot recover a JavaScript event loop that is completely CPU-blocked; Railway-level health supervision remains the outer recovery boundary.",
+    "Production behavior is not yet proven until the PR is merged, deployed, and observed."
+  ],
+  "rollback": "Revert the implementation commit and redeploy the previous worker/collector versions. No database, schema, queue, or raw-telemetry rollback is required.",
+  "user_decisions": [
+    "Use the Confidence Protocol to fix both linked reliability failures."
+  ]
+}

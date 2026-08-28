@@ -18,6 +18,8 @@ DEFAULT_DATABASE_LIMIT = 8
 DEFAULT_ROWS_PER_DATABASE = 128
 CLAUDE_IDENTITY_SCAN_BYTES = 256 * 1024
 CLAUDE_IDENTITY_SCAN_RECORDS = 64
+CODEX_IDENTITY_SCAN_BYTES = 256 * 1024
+CODEX_IDENTITY_SCAN_RECORDS = 64
 CODEX_BACKFILL_MAX_FILES = 4096
 CODEX_BACKFILL_MAX_BYTES = 512 * 1024 * 1024
 CLAUDE_BACKFILL_MAX_FILES = 4096
@@ -51,6 +53,8 @@ class _CodexCandidate:
     mtime_ns: int
     path: Path
     native_id: str | None
+    parent_id: str | None
+    is_subagent: bool
     snapshot: SourceSnapshot
 
 
@@ -151,6 +155,9 @@ def discover_rollouts(
     lookback_seconds: int = DEFAULT_LOOKBACK_SECONDS,
     rows_per_database: int = DEFAULT_ROWS_PER_DATABASE,
     scan_recent_files: bool = False,
+    recent_file_parent_native_session_id: object | None = None,
+    recent_file_native_session_id: object | None = None,
+    only_matching_recent_files: bool = False,
 ) -> DiscoveryResult:
     home = Path(codex_home or default_codex_home()).expanduser().resolve()
     cutoff_ms = int(time.time() * 1000) - max(1, lookback_seconds) * 1000
@@ -160,6 +167,8 @@ def discover_rollouts(
     payload = hook_payload or {}
     payload_session = payload.get("session_id")
     payload_agent = payload.get("agent_id")
+    priority_parent = _native_session_id(recent_file_parent_native_session_id)
+    priority_native = _native_session_id(recent_file_native_session_id)
     source_snapshots: dict[str, SourceSnapshot] = {}
     invalid_count = 0
     selected_bytes = 0
@@ -204,11 +213,26 @@ def discover_rollouts(
     if scan_recent_files:
         cutoff_ns = cutoff_ms * 1_000_000
         try:
-            candidates, invalid_count = _recent_codex_candidates(home, cutoff_ns)
+            candidates, invalid_count = _recent_codex_candidates(
+                home,
+                cutoff_ns,
+                active_sessions_only=only_matching_recent_files,
+            )
         except OSError as error:
             errors.append(f"sessions discovery: {error}")
             candidates = []
         for candidate in candidates:
+            matches_priority = (
+                candidate.native_id == priority_native
+                if priority_native is not None
+                else (
+                    priority_parent is not None
+                    and candidate.is_subagent
+                    and candidate.parent_id == priority_parent
+                )
+            )
+            if only_matching_recent_files and not matches_priority:
+                continue
             previous = discovered.get(candidate.path)
             native_id = (
                 previous[1]
@@ -221,6 +245,8 @@ def discover_rollouts(
             )
             source_snapshots[str(candidate.path)] = candidate.snapshot
             selected_bytes += candidate.snapshot.end_offset
+            if matches_priority:
+                payload_paths.append(candidate.path)
     ordered = sorted(
         discovered,
         key=lambda item: (discovered[item][0], str(item)),
@@ -320,10 +346,17 @@ def discover_claude_transcripts(
 def _recent_codex_candidates(
     codex_home: Path,
     cutoff_ns: int,
+    *,
+    active_sessions_only: bool = False,
 ) -> tuple[list[_CodexCandidate], int]:
     candidates: list[_CodexCandidate] = []
     invalid_count = 0
-    for root in (codex_home / "sessions", codex_home / "archived_sessions"):
+    roots = (
+        _active_codex_session_roots(codex_home, cutoff_ns)
+        if active_sessions_only
+        else (codex_home / "sessions", codex_home / "archived_sessions")
+    )
+    for root in roots:
         if not root.exists():
             continue
         if root.is_symlink() or not root.is_dir():
@@ -354,15 +387,22 @@ def _recent_codex_candidates(
                                     handle,
                                     details.st_size,
                                 )
+                                identity = _codex_rollout_identity(handle)
                         except (OSError, ValueError):
                             invalid_count += 1
                             continue
-                        native_id = _native_session_id(path.stem[-36:])
+                        filename_id = _native_session_id(path.stem[-36:])
+                        # The session metadata is authoritative. Some Codex rollout
+                        # filenames contain more than one UUID, so the final UUID is
+                        # not always the session ID.
+                        native_id = identity[0] if identity else filename_id
                         candidates.append(
                             _CodexCandidate(
                                 mtime_ns=details.st_mtime_ns,
                                 path=path,
                                 native_id=native_id,
+                                parent_id=identity[1] if identity else None,
+                                is_subagent=identity[2] if identity else False,
                                 snapshot=SourceSnapshot(
                                     device=details.st_dev,
                                     inode=details.st_ino,
@@ -376,6 +416,50 @@ def _recent_codex_candidates(
                 invalid_count += 1
     candidates.sort(key=lambda item: (-item.mtime_ns, str(item.path)))
     return candidates, invalid_count
+
+
+def _active_codex_session_roots(
+    codex_home: Path,
+    cutoff_ns: int,
+) -> tuple[Path, ...]:
+    dates = {
+        time.strftime("%Y/%m/%d", time.gmtime(timestamp))
+        for timestamp in (cutoff_ns / 1_000_000_000, time.time())
+    }
+    return tuple(codex_home / "sessions" / value for value in sorted(dates))
+
+
+def _codex_rollout_identity(handle) -> tuple[str | None, str | None, bool] | None:
+    handle.seek(0)
+    remaining = CODEX_IDENTITY_SCAN_BYTES
+    for _ in range(CODEX_IDENTITY_SCAN_RECORDS):
+        if remaining <= 0:
+            break
+        line = handle.readline(remaining + 1)
+        if not line or len(line) > remaining:
+            break
+        remaining -= len(line)
+        try:
+            value = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or value.get("type") != "session_meta":
+            continue
+        payload = value.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        native_id = _native_session_id(payload.get("id"))
+        declared_id = _native_session_id(payload.get("session_id"))
+        parent_id = _native_session_id(payload.get("parent_thread_id"))
+        if parent_id is None and declared_id != native_id:
+            parent_id = declared_id
+        source = payload.get("source")
+        is_subagent = (
+            isinstance(source, dict)
+            and isinstance(source.get("subagent"), dict)
+        )
+        return native_id, parent_id, is_subagent
+    return None
 
 
 def _recent_claude_candidates(
