@@ -29,9 +29,7 @@ try {
             "select pg_backend_pid()::integer as pid",
           );
           const pid = Number(backend.pid);
-          const blocked = Promise.resolve(
-            connection.unsafe("select pg_sleep(30)"),
-          ).then(
+          const blocked = connection.unsafe("select pg_sleep(30)").then(
             () => ({ ok: true as const }),
             (error) => ({ ok: false as const, error }),
           );
