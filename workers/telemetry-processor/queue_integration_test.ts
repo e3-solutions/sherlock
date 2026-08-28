@@ -1,5 +1,8 @@
 import postgres from "npm:postgres@3.4.7";
-import { PostgresJobQueue } from "./queue.ts";
+import {
+  ADMISSION_HEADROOM_SQL,
+  PostgresJobQueue,
+} from "./queue.ts";
 
 const permission = await Deno.permissions.query({
   name: "env",
@@ -1184,6 +1187,157 @@ Deno.test({
     } finally {
       await deleteQueueFixture(sql, workspaceId);
       await Promise.allSettled([queue.close(), sql.end()]);
+    }
+  },
+});
+
+
+Deno.test({
+  name:
+    "blocked GitHub SQL leaves control leases available and closes within the drain window",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 4 });
+    const blocker = postgres(databaseUrl!, { prepare: false, max: 1 });
+    const controlQueue = PostgresJobQueue.connect(databaseUrl!, 2);
+    const githubQueue = PostgresJobQueue.connect(
+      databaseUrl!,
+      1,
+      "sherlock-worker-github-sync",
+    );
+    let workspaceId: string | null = null;
+    let releaseLock: (() => void) | undefined;
+    let blockingTransaction: Promise<unknown> | null = null;
+    let githubClosed = false;
+    try {
+      const fixture = await insertQueueFixture(sql, "github-pool-isolation");
+      workspaceId = fixture.workspaceId;
+      await insertQueueBatch(sql, {
+        id: crypto.randomUUID(),
+        workspaceId,
+        personId: fixture.personId,
+        sourceKind: "rollout",
+        streamKey: "github-pool-isolation",
+        generationKey: "github-pool-isolation",
+        startOffset: 0,
+        workloadClass: "live",
+      });
+      assert(
+        await controlQueue.tryAcquireHandoff(
+          `github-pool-isolation-${workspaceId}`,
+        ),
+      );
+      const claimed = await controlQueue.claim(
+        "live",
+        "github-pool-isolation",
+        120,
+      );
+      assert(claimed !== null, "the fixture job must be leased");
+
+      let lockAcquired: (() => void) | undefined;
+      const lockReady = new Promise<void>((resolve) => {
+        lockAcquired = resolve;
+      });
+      const holdLock = new Promise<void>((resolve) => {
+        releaseLock = resolve;
+      });
+      blockingTransaction = blocker.begin(async (tx) => {
+        await tx.unsafe(
+          "lock table telemetry.session_scm in access exclusive mode",
+        );
+        lockAcquired?.();
+        await holdLock;
+      });
+      await lockReady;
+
+      const syncTask = githubQueue.pendingGithubCommitPairs(1, [workspaceId]);
+      let githubWaiting = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const [row] = await sql.unsafe(
+          `select count(*)::integer as connections
+             from pg_stat_activity
+            where application_name = 'sherlock-worker-github-sync'
+              and wait_event_type = 'Lock'`,
+        );
+        if (Number(row.connections) === 1) {
+          githubWaiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert(githubWaiting, "the GitHub query must be blocked on its own pool");
+
+      const labels = await sql.unsafe(
+        `select application_name, count(*)::integer as connections
+           from pg_stat_activity
+          where application_name in (
+            'sherlock-worker-control',
+            'sherlock-worker-processing',
+            'sherlock-worker-github-sync'
+          )
+          group by application_name`,
+      );
+      assert(
+        labels.some((row) =>
+          row.application_name === "sherlock-worker-control" &&
+          Number(row.connections) >= 1
+        ),
+        "the control pool label must remain present",
+      );
+      assert(
+        labels.some((row) =>
+          row.application_name === "sherlock-worker-github-sync" &&
+          Number(row.connections) === 1
+        ),
+        "the blocked query must use exactly one dedicated session",
+      );
+      const [capacity] = await sql.unsafe(ADMISSION_HEADROOM_SQL);
+      const labeledConnections = labels.reduce(
+        (sum, row) => sum + Number(row.connections),
+        0,
+      );
+      assert(
+        Number(capacity.worker_connections) === labeledConnections,
+        "admission accounting must include the dedicated GitHub session",
+      );
+
+      assert(
+        await controlQueue.heartbeat(claimed, 120),
+        "a blocked GitHub query must not starve the lease heartbeat",
+      );
+      assert(
+        await controlQueue.complete(claimed) === "succeeded",
+        "a blocked GitHub query must not fence control completion",
+      );
+
+      const closeStartedAt = performance.now();
+      const closedPromptly = await Promise.race([
+        Promise.allSettled([githubQueue.close(), syncTask]).then(() => true),
+        new Promise<false>((resolve) =>
+          setTimeout(() => resolve(false), 7_000)
+        ),
+      ]);
+      assert(
+        closedPromptly && performance.now() - closeStartedAt < 7_000,
+        "shutdown must terminate blocked GitHub SQL before Railway drains",
+      );
+      githubClosed = true;
+    } finally {
+      releaseLock?.();
+      if (blockingTransaction !== null) {
+        await blockingTransaction.catch(() => undefined);
+      }
+      if (!githubClosed) {
+        await githubQueue.close().catch(() => undefined);
+      }
+      await controlQueue.close().catch(() => undefined);
+      if (workspaceId !== null) {
+        await deleteQueueFixture(sql, workspaceId);
+      }
+      await blocker.end({ timeout: 1 }).catch(() => undefined);
+      await sql.end({ timeout: 1 }).catch(() => undefined);
     }
   },
 });
