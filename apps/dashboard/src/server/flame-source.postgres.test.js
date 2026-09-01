@@ -8,10 +8,12 @@ import {
   DirectFlameSource,
   FRAME_VERSION,
   INTERVAL_PULL_REQUESTS_SQL,
+  LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
   PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
 } from "./flame-source.js";
+import { createSherlockQuerySource } from "./mcp-query-source.js";
 
 const DATABASE_URL = process.env.SHERLOCK_TEST_DATABASE_URL;
 const FIXED_NOW = new Date("2026-08-18T12:10:00.000Z");
@@ -1927,6 +1929,206 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         "Also cover cancellation.",
       ]);
       expect(evidence.eligiblePromptCount).toBe(2);
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
+  it("queries canonical usage with projector parity and a canonical baseline", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const start = new Date("2026-08-18T11:00:00.000Z");
+    const end = new Date("2026-08-18T12:00:00.000Z");
+    let source;
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'MCP usage fixture')`,
+        [workspaceId, `mcp-usage-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (
+           id, workspace_id, identity_key, display_name, email
+         ) values ($1, $2, $3, 'Usage User', 'usage@e3group.ai')`,
+        [personId, workspaceId, `mcp-usage-person-${personId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, model, started_at, created_at
+         ) values ($1, $2, $3, 'mcp-usage-collector', 'mcp-usage-session',
+                   'primary', 'mcp-usage-role.v1', 'gpt-5.6-sol', $4, $4)`,
+        [sessionId, workspaceId, personId, "2026-08-18T10:00:00.000Z"],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_provider,
+           source_kind, source_stream_key, generation_key, generation_seq,
+           start_offset, end_offset, source_byte_count, source_sha256,
+           storage_path, storage_encoding, stored_byte_count, stored_sha256,
+           record_count, contract_version, first_occurred_at, last_occurred_at
+         ) values (
+           $1, $2, $3, 'mcp-usage-collector', 'codex', 'rollout',
+           'mcp-usage-stream', 'mcp-usage-generation', 0, 0, 8, 8,
+           repeat('a', 64), $4, 'identity', 8, repeat('b', 64), 8,
+           'sherlock.rollout-batch.v1', $5, $6
+         )`,
+        [
+          batchId,
+          workspaceId,
+          personId,
+          `mcp-usage-tests/${batchId}.jsonl`,
+          "2026-08-18T10:40:00.000Z",
+          "2026-08-18T11:50:00.000Z",
+        ],
+      );
+      const records = await sql.unsafe(
+        `insert into telemetry.native_records (
+           workspace_id, batch_id, record_index, source_start_offset,
+           source_end_offset, record_sha256, native_type,
+           native_payload_type, occurred_at, parse_status
+         )
+         select $1, $2, index, index, index + 1,
+                lpad(to_hex(index + 1), 64, '0'), 'event_msg', 'token_count',
+                $3::timestamptz + index * interval '10 minutes', 'ok'
+           from generate_series(0, 7) index
+          order by index
+         returning id, record_index`,
+        [workspaceId, batchId, "2026-08-18T10:40:00.000Z"],
+      );
+      const recordId = (index) =>
+        records.find((record) => record.record_index === index).id;
+      const insertUsage = async ({
+        record, version = LEGACY_CODEX_NORMALIZER_VERSION, projection = 0,
+        priority = 100, at, scope, logical, stream, cumulative, total,
+        output = 0,
+      }) => await sql.unsafe(
+        `insert into telemetry.events (
+           workspace_id, session_id, source_record_id, normalizer_version,
+           projection_index, canonical_scope_key, logical_event_key,
+           source_priority, event_kind, actor_role, occurred_at, observed_at,
+           server_received_at, model, usage_stream_key, usage_scope,
+           usage_is_cumulative, input_tokens, cached_input_tokens,
+           output_tokens, reasoning_tokens, total_tokens
+         ) values (
+           $1, $2, $3, $4, $5, $6, $7, $8, 'usage', 'primary', $9, $9, $9,
+           'gpt-5.6-sol', $10, 'session', $11, $12, 0, $13, 0, $12
+         )`,
+        [
+          workspaceId, sessionId, recordId(record), version, projection,
+          scope, logical, priority, at, stream, cumulative, total, output,
+        ],
+      );
+
+      // The later raw baseline duplicate loses to the higher-priority row.
+      await insertUsage({
+        record: 0, at: "2026-08-18T10:40:00.000Z", scope: "baseline",
+        logical: "baseline", stream: "main", cumulative: true, total: 100,
+      });
+      await insertUsage({
+        record: 0, projection: 1, priority: 10,
+        at: "2026-08-18T10:50:00.000Z", scope: "baseline",
+        logical: "baseline", stream: "main", cumulative: true, total: 130,
+      });
+      await insertUsage({
+        record: 1, priority: 10, at: "2026-08-18T11:10:00.000Z",
+        scope: "inside-one", logical: "inside-one", stream: "main",
+        cumulative: true, total: 140,
+      });
+      await insertUsage({
+        record: 1, projection: 1, priority: 100,
+        at: "2026-08-18T11:10:00.000Z", scope: "inside-one",
+        logical: "inside-one", stream: "main", cumulative: true, total: 150,
+      });
+      await insertUsage({
+        record: 2, at: "2026-08-18T11:20:00.000Z", scope: "inside-two",
+        logical: "inside-two", stream: "main", cumulative: true, total: 170,
+      });
+
+      // Pre-cutover v2 is active only when this source record has no v1 row.
+      await insertUsage({
+        record: 3, version: NORMALIZER_VERSION,
+        at: "2026-08-18T11:30:00.000Z", scope: "fallback",
+        logical: "fallback", stream: "main", cumulative: true, total: 180,
+      });
+      await insertUsage({
+        record: 4, at: "2026-08-18T11:35:00.000Z", scope: "paired",
+        logical: "paired", stream: "paired", cumulative: false, total: 7,
+        output: null,
+      });
+      await insertUsage({
+        record: 4, version: NORMALIZER_VERSION,
+        at: "2026-08-18T11:35:00.000Z", scope: "paired-v2",
+        logical: "paired-v2", stream: "paired-v2", cumulative: false,
+        total: 999,
+      });
+
+      // A regressed cumulative stream is entirely omitted, not clamped.
+      for (const [record, total] of [[5, 100], [6, 90], [7, 110]]) {
+        await insertUsage({
+          record, at: `2026-08-18T11:${40 + (record - 5) * 5}:00.000Z`,
+          scope: `regression-${record}`, logical: `regression-${record}`,
+          stream: "regression", cumulative: true, total,
+        });
+      }
+
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL,
+        workspaceId,
+        expectedEmailDomain: "e3group.ai",
+      });
+      const querySource = createSherlockQuerySource(source);
+      const usage = await querySource.fetchUsage({
+        start: start.toISOString(),
+        end: end.toISOString(),
+        now: end,
+      });
+      const coverage = await querySource.fetchCoverage({
+        start: start.toISOString(),
+        end: end.toISOString(),
+        now: end,
+      });
+      const sessions = await querySource.fetchSessions({
+        start: "2026-08-18T09:00:00.000Z",
+        end: end.toISOString(),
+        now: end,
+      });
+      const session = await querySource.fetchSession({ sessionId });
+
+      expect(usage.groups).toHaveLength(1);
+      expect(usage.groups[0]).toMatchObject({
+        personId,
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        tokens: { input: 87, cachedInput: 0, output: null, reasoning: 0, total: 87 },
+        usageEventCount: 7,
+      });
+      expect(usage.coverage).toMatchObject({
+        state: "partial",
+        observedUsageEvents: 7,
+        streams: 3,
+        regressedCumulativeStreams: 1,
+        missingTokenComponents: ["output"],
+      });
+      expect(coverage).toMatchObject({
+        state: "partial",
+        observedSessions: 1,
+        observedUsageEvents: 7,
+      });
+      expect(sessions.sessions.map(({ sessionId: id }) => id)).toEqual([sessionId]);
+      expect(session).toMatchObject({
+        session: { sessionId, provider: "codex", model: "gpt-5.6-sol" },
+        observedEventCounts: { messages: 0, toolCalls: 0, usage: 8 },
+      });
     } finally {
       if (source) await source.close();
       try {

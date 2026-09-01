@@ -11,6 +11,7 @@ import {
 } from "./src/server/flame-source.js";
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
+import { createSherlockQuerySource } from "./src/server/mcp-query-source.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
 import { FlameDayCache } from "./src/server/flame-cache.js";
 import {
@@ -84,7 +85,11 @@ const freshnessCache = source
 if (source) await source.reserveCapacity();
 cache?.start();
 freshnessCache?.start();
-const mcpSource = source && cache ? createCachedMcpSource({ cache, source }) : null;
+const mcpSource = source && cache ? createCachedMcpSource({
+  cache,
+  source,
+  querySource: createSherlockQuerySource(source),
+}) : null;
 const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
 
 const SECURITY_HEADERS = {
