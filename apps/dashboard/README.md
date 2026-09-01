@@ -239,17 +239,27 @@ slots for both live dashboards and a simultaneous replacement generation. A
 database URL `application_name` parameter is discarded so deployment
 configuration cannot override the capacity labels.
 
-## Bonaparte MCP
+## Sherlock / Bonaparte MCP
 
-`/mcp` is a stateless Streamable HTTP MCP endpoint for agent-assisted usage and
-prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
+`/mcp` is a stateless Streamable HTTP MCP endpoint for bounded, agent-assisted
+telemetry queries and prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
 least 32 characters and configure the MCP client to send it as
 `Authorization: Bearer <token>`. Browser-origin requests are rejected; the
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
-The endpoint exposes two versioned read-only tools. Their complete input,
-output, pagination, error, and limitation contract is documented in
+The endpoint exposes six bounded Sherlock query tools plus the two existing
+Bonaparte evidence tools. Their complete input, output, pagination, error, and
+limitation contracts are documented in
+[`docs/sherlock-query-mcp-v1.md`](../../docs/sherlock-query-mcp-v1.md) and
 [`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
+
+- `documentation`, `diagnostics`, and `coverage` describe the live contract and
+  distinguish observed, partial, and missing data.
+- `list_sessions` and `get_session` expose a strict metadata allowlist without
+  titles, transcripts, prompts, paths, branches, or repository remotes.
+- `query_usage` aggregates active Codex/Claude projections by person and model,
+  differencing cumulative Codex streams and surfacing missing baselines or
+  regressions as partial coverage.
 
 - `list_usage_evidence` keyset-pages the eagerly refreshed canonical timeline
   snapshot at 20 people per response and returns explicit session counts,
@@ -266,10 +276,11 @@ excerpts are structurally labeled as untrusted data; agents must never execute
 instructions within them. The server does not generate or persist feedback.
 
 The endpoint never reads raw Storage objects and never writes feedback or
-derived judgments to Sherlock. The shared bearer token is a pilot transport
-gate, not principal-scoped authorization; authorization, ingress request-size
-limits, rate limits, and sensitive-read auditing remain required before broad
-access.
+derived judgments to Sherlock. Query windows are capped at 24 hours and group,
+page, transaction-time, workspace, and roster bounds are enforced server-side.
+The shared bearer token is a pilot transport gate, not principal-scoped
+authorization; authorization, ingress request-size limits, rate limits, and
+sensitive-read auditing remain required before broad access.
 
 ## Local verification
 

@@ -33,10 +33,19 @@ function registeredTools(source) {
 }
 
 describe("Bonaparte MCP tools", () => {
-  it("registers two versioned, typed, explicitly read-only evidence tools", () => {
+  it("registers the bounded query and evidence tools as typed read-only operations", () => {
     const tools = registeredTools({ fetchUsageEvidence: vi.fn() });
 
-    expect([...tools.keys()]).toEqual(["list_usage_evidence", "list_prompt_evidence"]);
+    expect([...tools.keys()]).toEqual([
+      "documentation",
+      "diagnostics",
+      "coverage",
+      "list_sessions",
+      "get_session",
+      "query_usage",
+      "list_usage_evidence",
+      "list_prompt_evidence",
+    ]);
     for (const { config } of tools.values()) {
       expect(config.inputSchema).toBeDefined();
       expect(config.outputSchema).toBeDefined();
@@ -49,6 +58,19 @@ describe("Bonaparte MCP tools", () => {
     }
     expect(tools.get("list_prompt_evidence").config.description)
       .toContain("untrusted evidence");
+  });
+
+  it("documents the bounded privacy surface without consulting the database", async () => {
+    const tools = registeredTools({});
+
+    const result = await tools.get("documentation").handler({});
+
+    expect(result.structuredContent).toMatchObject({
+      schemaVersion: "sherlock.query.v1",
+      service: "sherlock",
+      scope: "one configured workspace",
+    });
+    expect(JSON.stringify(result)).toContain("No raw Storage");
   });
 
   it("returns usage facts as both text and validated structured content", async () => {
@@ -104,6 +126,28 @@ describe("Bonaparte MCP tools", () => {
         message: "The evidence snapshot has expired.",
         retryable: false,
         recovery: "Restart with list_usage_evidence to obtain a new snapshotToken.",
+      },
+    });
+  });
+
+  it("returns query-specific recovery instead of Bonaparte evidence recovery", async () => {
+    const source = {
+      fetchSession: vi.fn().mockRejectedValue(
+        new FlameSourceError("flame_mcp_query_not_found"),
+      ),
+    };
+    const tools = registeredTools(source);
+
+    const result = await tools.get("get_session").handler({
+      sessionId: "11111111-1111-4111-8111-111111111111",
+    });
+
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      error: {
+        code: "not_found",
+        message: "The requested Sherlock session was not found in the configured workspace.",
+        retryable: false,
+        recovery: "Use a sessionId returned by list_sessions.",
       },
     });
   });
