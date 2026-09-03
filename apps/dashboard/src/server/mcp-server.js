@@ -103,7 +103,7 @@ const promptOutputSchema = z.object({
 
 const queryWindowInput = {
   start: ISO_TIMESTAMP.optional()
-    .describe("Inclusive start. Defaults to 24 hours before end; maximum window is 24 hours."),
+    .describe("Inclusive start. Defaults to 1970-01-01, covering all possible Sherlock history."),
   end: ISO_TIMESTAMP.optional()
     .describe("Exclusive end. Defaults to the server read time and cannot be in the future."),
 };
@@ -268,12 +268,12 @@ const QUERY_DOCUMENTATION = Object.freeze({
     "Read-only private-schema queries through the constrained sherlock_reader role.",
     "No raw Storage or SQL execution is exposed; the new query tools also omit transcript search, message and prompt content, filesystem paths, and repository remotes.",
     "The pre-existing list_prompt_evidence tool still returns bounded, explicitly untrusted prompt excerpts.",
-    "All time-window queries are capped at 24 hours; split longer analysis into explicit windows.",
-    "The shared bearer is an admin pilot gate, not principal-scoped authorization.",
+    "Time-window queries search all stored history by default and accept any valid historical duration; row, group, transaction-time, workspace, and roster safety bounds still apply.",
+    "The shared bearer is a transport gate, not principal-scoped authorization; Cosmos provides authenticated org-wide access and call auditing.",
   ],
   tools: [
     { name: "diagnostics", purpose: "Check the read-only backend and normalization freshness without running an activity query." },
-    { name: "coverage", purpose: "Check observed session/usage coverage and pending normalization for one bounded window." },
+    { name: "coverage", purpose: "Check observed session/usage coverage and pending normalization for any historical window." },
     { name: "list_sessions", purpose: "Page through safe session metadata; no titles, content, paths, branches, or repository remotes." },
     { name: "get_session", purpose: "Read one workspace-scoped session metadata record and aggregate event counts." },
     { name: "query_usage", purpose: "Aggregate Codex and Claude token observations by person/model with cumulative streams differenced correctly." },
@@ -331,7 +331,7 @@ const QUERY_ERROR_OVERRIDES = {
   invalid_argument: {
     message: "The Sherlock query is invalid.",
     retryable: false,
-    recovery: "Use canonical timestamps, a window of at most 24 hours, allowed enum values, and the exact prior window and filters with a cursor.",
+    recovery: "Use canonical timestamps with start before end and no future end, allowed enum values, and the exact prior window and filters with a cursor.",
   },
   not_found: {
     message: "The requested Sherlock session was not found in the configured workspace.",
@@ -415,7 +415,7 @@ export function registerBonaparteTools(server, source) {
     "coverage",
     {
       title: "Sherlock coverage",
-      description: "Report observed session and usage coverage for at most 24 hours. Missing and partial states remain explicit and are never converted to zero-confidence claims.",
+      description: "Report observed session and usage coverage for any historical window. Omitting start searches all stored history. Missing and partial states remain explicit and are never converted to zero-confidence claims.",
       inputSchema: coverageInputSchema,
       outputSchema: coverageOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -433,7 +433,7 @@ export function registerBonaparteTools(server, source) {
     "list_sessions",
     {
       title: "List Sherlock sessions",
-      description: "Keyset-page safe session metadata for at most 24 hours. Titles, transcripts, prompts, paths, branches, and repository remotes are omitted.",
+      description: "Keyset-page safe session metadata for any historical window. Omitting start searches all stored history. Titles, transcripts, prompts, paths, branches, and repository remotes are omitted.",
       inputSchema: listSessionsInputSchema,
       outputSchema: listSessionsOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -469,7 +469,7 @@ export function registerBonaparteTools(server, source) {
     "query_usage",
     {
       title: "Query Sherlock token usage",
-      description: "Aggregate observed Codex and Claude token facts by person, model, or both for at most 24 hours. Codex cumulative streams are differenced; Claude incremental facts are summed. Coverage exposes missing baselines, regressions, and pending normalization.",
+      description: "Aggregate observed Codex and Claude token facts by person, model, or both for any historical window. Omitting start searches all stored history. Codex cumulative streams are differenced; Claude incremental facts are summed. Coverage exposes missing baselines, regressions, and pending normalization.",
       inputSchema: queryUsageInputSchema,
       outputSchema: queryUsageOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,

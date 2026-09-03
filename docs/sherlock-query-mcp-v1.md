@@ -13,8 +13,11 @@ repository remotes, arbitrary SQL, or write operations.
 3. Call `query_usage`, normally with `groupBy: "person_model"`.
 4. Use `list_sessions` and `get_session` only for metadata drill-down.
 
-Every time-window query defaults to the preceding 24 hours and is capped at 24
-hours. Longer analyses must be split into explicit, non-overlapping windows.
+Every time-window query defaults to all stored Sherlock history, from
+`1970-01-01T00:00:00.000Z` through the server read time. Callers may still provide
+an explicit historical start and end, with no duration cap. Future and
+non-positive windows remain invalid. Row, group, transaction-time, workspace,
+and roster safety bounds still apply.
 `list_sessions` uses a query-bound keyset cursor; callers must reuse the exact
 window and filters from the preceding page.
 
@@ -82,5 +85,6 @@ that are explicitly labeled as untrusted data.
 All database calls run in repeatable-read, read-only transactions after assuming
 the constrained `sherlock_reader` role and have a statement timeout. The service
 is scoped to one configured workspace and roster email domain. Its shared bearer
-remains an admin pilot gate, not principal-scoped authorization; Cosmos should
-mount the entire leaf admin-only and disable blind health probing.
+is a transport gate, not principal-scoped authorization; Cosmos authorizes every
+authenticated org member to the shared measurement surface and disables blind
+health probing.

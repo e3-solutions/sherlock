@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { FlameSourceError } from "./flame-source.js";
 import {
-  MCP_QUERY_MAX_WINDOW_MS,
+  MCP_QUERY_HISTORY_START,
   buildUsageResult,
   createSherlockQuerySource,
   decodeSessionCursor,
@@ -11,19 +11,27 @@ import {
 } from "./mcp-query-source.js";
 
 const NOW = new Date("2026-09-01T20:00:00.000Z");
-const START = new Date(NOW.getTime() - MCP_QUERY_MAX_WINDOW_MS);
+const START = new Date(MCP_QUERY_HISTORY_START);
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("Sherlock MCP query source", () => {
-  it("defaults to one bounded day and rejects wider or future windows", () => {
+  it("defaults to all history, accepts longer windows, and rejects invalid bounds", () => {
     expect(queryWindow({}, NOW)).toMatchObject({ startAt: START, endAt: NOW, readAt: NOW });
-    expect(() => queryWindow({
-      start: new Date(START.getTime() - 1).toISOString(),
+    expect(queryWindow({
+      start: "2026-08-01T20:00:00.000Z",
       end: NOW.toISOString(),
-    }, NOW)).toThrow(FlameSourceError);
+    }, NOW)).toMatchObject({
+      startAt: new Date("2026-08-01T20:00:00.000Z"),
+      endAt: NOW,
+      readAt: NOW,
+    });
     expect(() => queryWindow({
       start: START.toISOString(),
       end: new Date(NOW.getTime() + 1).toISOString(),
+    }, NOW)).toThrow(FlameSourceError);
+    expect(() => queryWindow({
+      start: NOW.toISOString(),
+      end: START.toISOString(),
     }, NOW)).toThrow(FlameSourceError);
   });
 
@@ -41,6 +49,122 @@ describe("Sherlock MCP query source", () => {
     });
     expect(() => decodeSessionCursor(cursor, "different-query"))
       .toThrowError(new FlameSourceError("flame_mcp_query_cursor_invalid"));
+  });
+
+  it("keeps omitted session bounds pinned to the first page read time", async () => {
+    const secondSessionId = "22222222-2222-4222-8222-222222222222";
+    const row = (sessionId, createdAt) => ({
+      session_id: sessionId,
+      person_id: "33333333-3333-4333-8333-333333333333",
+      display_name: "Ada",
+      normalizer_version: "sherlock.codex-rollout.v2",
+      actor_role: "primary",
+      model: "gpt-5.6-sol",
+      started_at: createdAt,
+      ended_at: null,
+      parent_session_id: null,
+      created_at: createdAt,
+    });
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([
+        row(SESSION_ID, "2026-08-01T10:00:00.000Z"),
+        row(secondSessionId, "2026-07-01T10:00:00.000Z"),
+      ])
+      .mockResolvedValueOnce([]);
+    const source = {
+      workspaceId: "44444444-4444-4444-8444-444444444444",
+      expectedEmailDomain: "e3group.ai",
+      maxPeople: 500,
+      readiness: vi.fn(),
+      transaction: vi.fn(async (callback) => await callback({ unsafe })),
+    };
+    const querySource = createSherlockQuerySource(source);
+
+    const first = await querySource.fetchSessions({ limit: 1, now: NOW });
+    const later = new Date(NOW.getTime() + 60_000);
+    const second = await querySource.fetchSessions({
+      limit: 1,
+      cursor: first.nextCursor,
+      now: later,
+    });
+
+    expect(first.window).toMatchObject({
+      startInclusive: MCP_QUERY_HISTORY_START,
+      endExclusive: NOW.toISOString(),
+      readAt: NOW.toISOString(),
+    });
+    expect(second.window).toEqual(first.window);
+    expect(unsafe.mock.calls[1][1].slice(1, 4)).toEqual([
+      MCP_QUERY_HISTORY_START,
+      NOW.toISOString(),
+      NOW.toISOString(),
+    ]);
+  });
+
+  it("rejects a cursor that claims a future server read time", async () => {
+    const future = new Date(NOW.getTime() + 60_000);
+    const cursor = encodeSessionCursor({
+      readAt: future,
+      createdAt: NOW,
+      sessionId: SESSION_ID,
+      fingerprint: "caller-forged",
+    });
+    const source = {
+      workspaceId: "44444444-4444-4444-8444-444444444444",
+      expectedEmailDomain: "e3group.ai",
+      maxPeople: 500,
+      readiness: vi.fn(),
+      transaction: vi.fn(),
+    };
+
+    await expect(createSherlockQuerySource(source).fetchSessions({ cursor, now: NOW }))
+      .rejects.toThrowError(new FlameSourceError("flame_mcp_query_cursor_invalid"));
+    expect(source.transaction).not.toHaveBeenCalled();
+  });
+
+  it("continues a 24-hour cursor issued before the all-history default", async () => {
+    const legacyStart = new Date(NOW.getTime() - 24 * 60 * 60 * 1000);
+    const row = (sessionId, createdAt) => ({
+      session_id: sessionId,
+      person_id: "33333333-3333-4333-8333-333333333333",
+      display_name: "Ada",
+      normalizer_version: "sherlock.codex-rollout.v2",
+      actor_role: "primary",
+      model: "gpt-5.6-sol",
+      started_at: createdAt,
+      ended_at: null,
+      parent_session_id: null,
+      created_at: createdAt,
+    });
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([
+        row(SESSION_ID, "2026-09-01T10:00:00.000Z"),
+        row("22222222-2222-4222-8222-222222222222", "2026-09-01T09:00:00.000Z"),
+      ])
+      .mockResolvedValueOnce([]);
+    const source = {
+      workspaceId: "44444444-4444-4444-8444-444444444444",
+      expectedEmailDomain: "e3group.ai",
+      maxPeople: 500,
+      readiness: vi.fn(),
+      transaction: vi.fn(async (callback) => await callback({ unsafe })),
+    };
+    const querySource = createSherlockQuerySource(source);
+    const first = await querySource.fetchSessions({
+      start: legacyStart.toISOString(),
+      end: NOW.toISOString(),
+      limit: 1,
+      now: NOW,
+    });
+
+    const second = await querySource.fetchSessions({
+      cursor: first.nextCursor,
+      limit: 1,
+      now: new Date(NOW.getTime() + 60_000),
+    });
+
+    expect(second.window).toEqual(first.window);
+    expect(second.window.startInclusive).toBe(legacyStart.toISOString());
   });
 
   it("keeps coverage partial when cumulative baselines or normalization are missing", () => {
@@ -181,6 +305,36 @@ describe("Sherlock MCP query source", () => {
       observedSessions: 2,
       observedUsageEvents: 4,
     });
+    expect(unsafe.mock.calls.at(-1)[1][1]).toBe(MCP_QUERY_HISTORY_START);
+  });
+
+  it("passes the all-history default through to usage SQL", async () => {
+    const unsafe = vi.fn()
+      .mockResolvedValueOnce([{ person_count: 0 }])
+      .mockResolvedValueOnce([{
+        pending_normalize_count: 0,
+        raw_watermark: null,
+        canonical_watermark: null,
+      }])
+      .mockResolvedValueOnce([]);
+    const source = {
+      workspaceId: "22222222-2222-4222-8222-222222222222",
+      expectedEmailDomain: "e3group.ai",
+      maxPeople: 500,
+      readiness: vi.fn(),
+      transaction: vi.fn(async (callback) => await callback({ unsafe })),
+    };
+
+    const result = await createSherlockQuerySource(source).fetchUsage({ now: NOW });
+
+    expect(result.window).toMatchObject({
+      startInclusive: MCP_QUERY_HISTORY_START,
+      endExclusive: NOW.toISOString(),
+    });
+    expect(unsafe.mock.calls[2][1].slice(1, 3)).toEqual([
+      MCP_QUERY_HISTORY_START,
+      NOW.toISOString(),
+    ]);
   });
 
   it("fails closed when the configured roster exceeds the query safety bound", async () => {
