@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import (
@@ -16,6 +19,7 @@ from .config import (
 )
 from .drain import Drain
 from .discovery import (
+    CLAUDE_DEFAULT_LOOKBACK_SECONDS,
     CLAUDE_BACKFILL_MAX_BYTES,
     CLAUDE_BACKFILL_MAX_FILES,
     CODEX_BACKFILL_MAX_BYTES,
@@ -30,13 +34,18 @@ from .rollout import RolloutCapturer
 from .spool import DurableSpool
 
 
+MAX_CLAUDE_REPLAY_RANGE_SECONDS = 31 * 24 * 60 * 60
+RFC3339_PATTERN = re.compile(
+    r"^(?P<second>\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2})"
+    r"(?P<fraction>\.\d{1,9})?(?P<zone>[Zz]|[+-]\d{2}:\d{2})$"
+)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="sherlock-collector")
     result.add_argument("--codex-home", type=Path)
     result.add_argument("--claude-home", type=Path)
-    result.add_argument(
-        "--provider", choices=("codex", "claude_code"), default="codex"
-    )
+    result.add_argument("--provider", choices=("codex", "claude_code"), default="codex")
     result.add_argument("--state-root", type=Path)
     result.add_argument("--config", type=Path)
     commands = result.add_subparsers(dest="command", required=True)
@@ -46,8 +55,10 @@ def parser() -> argparse.ArgumentParser:
     backfill.add_argument(
         "--lookback-seconds",
         type=int,
-        default=DEFAULT_LOOKBACK_SECONDS,
     )
+    backfill.add_argument("--session-id")
+    backfill.add_argument("--start")
+    backfill.add_argument("--end")
     hook = commands.add_parser("hook")
     hook.add_argument("event_name")
     commands.add_parser("drain")
@@ -70,16 +81,114 @@ def _payload_from_stdin() -> tuple[dict[str, object], bytes]:
     return (value if isinstance(value, dict) else {}), raw
 
 
+def _canonical_uuid(value: str) -> str | None:
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    canonical = str(parsed)
+    return canonical if value.lower() == canonical else None
+
+
+def _rfc3339_ns(value: str) -> int | None:
+    match = RFC3339_PATTERN.fullmatch(value)
+    if match is None:
+        return None
+    zone = match.group("zone")
+    normalized_zone = "+00:00" if zone in "Zz" else zone
+    try:
+        parsed = datetime.fromisoformat(match.group("second") + normalized_zone)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    normalized = parsed.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = normalized - epoch
+    whole_seconds_ns = (
+        delta.days * 24 * 60 * 60 + delta.seconds
+    ) * 1_000_000_000
+    fraction = match.group("fraction")
+    fractional_ns = int(fraction[1:].ljust(9, "0")) if fraction else 0
+    return whole_seconds_ns + fractional_ns
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    source_home = Path(
-        (args.claude_home or default_claude_home())
-        if args.provider == "claude_code"
-        else (args.codex_home or default_codex_home())
-    ).expanduser().resolve()
-    state_root = Path(
-        args.state_root or default_state_root(source_home)
-    ).expanduser().resolve()
+    source_home = (
+        Path(
+            (args.claude_home or default_claude_home())
+            if args.provider == "claude_code"
+            else (args.codex_home or default_codex_home())
+        )
+        .expanduser()
+        .resolve()
+    )
+    state_root = (
+        Path(args.state_root or default_state_root(source_home)).expanduser().resolve()
+    )
+    is_claude = args.provider == "claude_code"
+    selection_mode = "lookback"
+    lookback_seconds: int | None = None
+    replay_session_id: str | None = None
+    modified_after_ns: int | None = None
+    modified_before_ns: int | None = None
+    if args.command == "backfill":
+        has_range = args.start is not None or args.end is not None
+        has_replay_selector = args.session_id is not None or has_range
+        if not is_claude and has_replay_selector:
+            print(
+                "session and date-range replay require provider claude_code",
+                file=sys.stderr,
+            )
+            return 2
+        if args.session_id is not None and (
+            has_range or args.lookback_seconds is not None
+        ):
+            print("backfill selectors are mutually exclusive", file=sys.stderr)
+            return 2
+        if has_range and args.lookback_seconds is not None:
+            print("backfill selectors are mutually exclusive", file=sys.stderr)
+            return 2
+        if has_range and (args.start is None or args.end is None):
+            print("date-range replay requires both --start and --end", file=sys.stderr)
+            return 2
+        if args.session_id is not None:
+            replay_session_id = _canonical_uuid(args.session_id)
+            if replay_session_id is None:
+                print("--session-id must be a canonical UUID", file=sys.stderr)
+                return 2
+            selection_mode = "session_id"
+        elif has_range:
+            modified_after_ns = _rfc3339_ns(args.start)
+            modified_before_ns = _rfc3339_ns(args.end)
+            if modified_after_ns is None or modified_before_ns is None:
+                print(
+                    "--start and --end must be timezone-aware RFC3339 timestamps",
+                    file=sys.stderr,
+                )
+                return 2
+            duration_ns = modified_before_ns - modified_after_ns
+            if duration_ns <= 0:
+                print(
+                    "date-range replay must have an increasing range", file=sys.stderr
+                )
+                return 2
+            if duration_ns > MAX_CLAUDE_REPLAY_RANGE_SECONDS * 1_000_000_000:
+                print("date-range replay cannot exceed 31 days", file=sys.stderr)
+                return 2
+            selection_mode = "mtime_range"
+        else:
+            lookback_seconds = args.lookback_seconds
+            if lookback_seconds is None:
+                lookback_seconds = (
+                    CLAUDE_DEFAULT_LOOKBACK_SECONDS
+                    if is_claude
+                    else DEFAULT_LOOKBACK_SECONDS
+                )
+            if lookback_seconds < 1:
+                print("backfill requires a positive lookback", file=sys.stderr)
+                return 2
     spool = DurableSpool(state_root / "queue")
     source_root = str(Path(__file__).resolve().parents[1])
     environment = os.environ.copy()
@@ -92,26 +201,23 @@ def main(argv: list[str] | None = None) -> int:
                 else ""
             ),
             (
-                "CLAUDE_CONFIG_DIR"
-                if args.provider == "claude_code"
-                else "CODEX_HOME"
+                "CLAUDE_CONFIG_DIR" if args.provider == "claude_code" else "CODEX_HOME"
             ): str(source_home),
         }
     )
     if args.command == "backfill":
-        if args.lookback_seconds < 1:
-            print("backfill requires a positive lookback", file=sys.stderr)
-            return 2
-        is_claude = args.provider == "claude_code"
         discovery = (
             discover_claude_transcripts(
                 source_home,
-                lookback_seconds=args.lookback_seconds,
+                lookback_seconds=lookback_seconds,
+                replay_session_id=replay_session_id,
+                modified_after_ns=modified_after_ns,
+                modified_before_ns=modified_before_ns,
             )
             if is_claude
             else discover_rollouts(
                 source_home,
-                lookback_seconds=args.lookback_seconds,
+                lookback_seconds=lookback_seconds or DEFAULT_LOOKBACK_SECONDS,
                 scan_recent_files=True,
             )
         )
@@ -128,7 +234,9 @@ def main(argv: list[str] | None = None) -> int:
                     if is_claude
                     and not (source_home / "projects").is_symlink()
                     and (source_home / "projects").is_dir()
-                    else source_home if not is_claude else None
+                    else source_home
+                    if not is_claude
+                    else None
                 ),
             ),
             discovery.paths,
@@ -151,14 +259,10 @@ def main(argv: list[str] | None = None) -> int:
             drain_environment=environment,
             best_effort=True,
             max_files=(
-                CLAUDE_BACKFILL_MAX_FILES
-                if is_claude
-                else CODEX_BACKFILL_MAX_FILES
+                CLAUDE_BACKFILL_MAX_FILES if is_claude else CODEX_BACKFILL_MAX_FILES
             ),
             max_sync_bytes=(
-                CLAUDE_BACKFILL_MAX_BYTES
-                if is_claude
-                else CODEX_BACKFILL_MAX_BYTES
+                CLAUDE_BACKFILL_MAX_BYTES if is_claude else CODEX_BACKFILL_MAX_BYTES
             ),
             backlog_workload_class="backfill",
         )
@@ -174,11 +278,16 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "status": "partial" if partial else "complete",
-                    "lookback_seconds": args.lookback_seconds,
+                    "selection": selection_mode,
+                    "lookback_seconds": lookback_seconds,
+                    "session_id": replay_session_id,
+                    "start": args.start,
+                    "end": args.end,
                     "discovered": len(discovery.paths),
                     "selected_bytes": discovery.selected_bytes,
                     "invalid": discovery.invalid_count,
                     "omitted": discovery.omitted_count,
+                    "excluded_by_cutoff": discovery.excluded_by_cutoff,
                     "discovery_errors": len(discovery.errors),
                     **asdict(outcome),
                 },
@@ -205,9 +314,11 @@ def main(argv: list[str] | None = None) -> int:
                 sys.executable,
                 "-m",
                 "sherlock_collector.cli",
-                *(["--claude-home", str(source_home)]
+                *(
+                    ["--claude-home", str(source_home)]
                     if args.provider == "claude_code"
-                    else ["--codex-home", str(source_home)]),
+                    else ["--codex-home", str(source_home)]
+                ),
                 "--provider",
                 args.provider,
                 "--state-root",
@@ -233,9 +344,11 @@ def main(argv: list[str] | None = None) -> int:
                 sys.executable,
                 "-m",
                 "sherlock_collector.cli",
-                *(["--claude-home", str(source_home)]
+                *(
+                    ["--claude-home", str(source_home)]
                     if args.provider == "claude_code"
-                    else ["--codex-home", str(source_home)]),
+                    else ["--codex-home", str(source_home)]
+                ),
                 "--provider",
                 args.provider,
                 "--state-root",
@@ -259,7 +372,9 @@ def main(argv: list[str] | None = None) -> int:
         status = (
             "degraded"
             if dead_letter_batches
-            else "recovering" if processing_batches else "ok"
+            else "recovering"
+            if processing_batches
+            else "ok"
         )
         print(
             json.dumps(

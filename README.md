@@ -21,8 +21,10 @@ stops without writing collector state if neither CLI is usable. It copies only
 the client plugin marketplace to
 `$HOME/.sherlock/marketplace` by default, so removing the temporary checkout
 does not break either installation. It then reuses the provider-specific
-installers below, including Codex hook trust and each provider's 24-hour
-session backfill. Its final summary shows what was installed and skipped.
+installers below, including Codex hook trust, a 24-hour Codex backfill, and a
+72-hour Claude backfill. Its final summary shows what was installed and
+skipped. Use `--claude-backfill-hours HOURS` to configure the initial Claude
+window from 1 hour through 31 days.
 Start a new session in every installed agent so its hooks load.
 
 Use the same work email on every machine that should be linked to you. If an
@@ -44,9 +46,9 @@ cd sherlock
 
 The installer queues Codex rollout files modified during the preceding 24
 hours and reports whether that bounded pass completed. Reinstalling is
-idempotent, and later `SessionStart` hooks continue the backfill while
-prioritizing the current task. After installation, start a new Codex task so
-the hooks load.
+idempotent, and later `SessionStart` hooks continue the default 24-hour Codex
+backfill while prioritizing the current task. After installation, start a new
+Codex task so the hooks load.
 
 ## Install only for Claude Code
 
@@ -64,13 +66,35 @@ The installer validates the Claude plugin and marketplace, stores the runtime
 and owner-only config under `${CLAUDE_CONFIG_DIR:-~/.claude}/sherlock`, adds
 the local `sherlock` marketplace, and installs
 `sherlock-claude-code@sherlock`. It also queues newline-complete bytes from
-Claude primary and subagent transcripts modified during the preceding 24
-hours. Each pass uses a descriptor-verified point-in-time snapshot and reports
-any bounded or incomplete-record bytes as deferred. Reinstalling is
-idempotent, and later `SessionStart` hooks resume those byte ranges with a
-durable cursor before capturing the current session. Start a new Claude Code
+Claude primary and subagent transcripts modified during the preceding 72
+hours. Pass `--backfill-hours HOURS` to configure that initial window from 1
+hour through 31 days. The result reports filename-shaped regular transcript
+candidates older than the cutoff; these are candidates, not validated
+sessions, and may already have been captured by an earlier run. Each pass uses
+a descriptor-verified point-in-time snapshot and reports any bounded or
+incomplete-record bytes as deferred. Reinstalling is
+idempotent. Later `SessionStart` hooks resume byte ranges still inside the
+default 72-hour window with a durable cursor before capturing the current session.
+Start a new Claude Code
 session so its hooks load. The existing Codex plugin remains separate under
 `plugins/sherlock/`.
+
+The installer adds an owner-executable replay command at
+`${CLAUDE_CONFIG_DIR:-~/.claude}/sherlock/bin/replay-history`. Replay either one
+canonical session UUID or one file-modification-time range:
+
+```sh
+~/.claude/sherlock/bin/replay-history --session-id 11111111-1111-4111-8111-111111111111
+~/.claude/sherlock/bin/replay-history \
+  --start 2026-08-19T00:00:00Z \
+  --end 2026-08-20T00:00:00Z
+```
+
+Date ranges are timezone-aware RFC3339, half-open `[start, end)`, and limited
+to 31 days per command. Replay remains confined to regular files below
+Claude's non-symlink `projects/` root and is idempotent. Historical replay
+imports only transcript bytes; it cannot fabricate hook or lifecycle events
+that Sherlock did not observe.
 
 ## Verify
 

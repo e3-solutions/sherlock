@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "initial-51h-fail",
+  "argv": [
+    "/usr/bin/env",
+    "PYTHONPATH=packages/telemetry-collector/src",
+    "python3",
+    "-m",
+    "unittest",
+    "tests.collector.test_team_installer.TeamInstallerTests.test_one_command_installs_claude_plugin_and_runtime"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/89655481-cbdf-4714-bb6e-b71c4dd913bf/sherlock",
+  "started_at": "2026-09-03T03:04:00.860747Z",
+  "ended_at": "2026-09-03T03:04:01.943476Z",
+  "exit_code": 1,
+  "termination_reason": null,
+  "resolved_executable": "/usr/bin/env",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/89655481-cbdf-4714-bb6e-b71c4dd913bf/sherlock",
+    "sha256": "58b71d853e73bae56a3c32df437ede7e03752e51eecd22c50d45e36522b41358"
+  },
+  "log": "runs/initial-51h-fail.log",
+  "log_sha256": "ef96f75c1094a619c13e002ead8147f21c687a8d1b7cfcd2507b04bd2f45a5c4"
+}
