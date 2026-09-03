@@ -276,11 +276,15 @@ excerpts are structurally labeled as untrusted data; agents must never execute
 instructions within them. The server does not generate or persist feedback.
 
 The endpoint never reads raw Storage objects and never writes feedback or
-derived judgments to Sherlock. Query windows are capped at 24 hours and group,
-page, transaction-time, workspace, and roster bounds are enforced server-side.
-The shared bearer token is a pilot transport gate, not principal-scoped
-authorization; authorization, ingress request-size limits, rate limits, and
-sensitive-read auditing remain required before broad access.
+derived judgments to Sherlock. Sherlock query tools search all stored history
+by default and accept explicit historical windows without a duration cap;
+future and non-positive windows remain invalid. Group, page, transaction-time,
+workspace, and roster bounds are enforced server-side. The separate Bonaparte
+`list_usage_evidence` tool remains a server-defined 24-hour dashboard snapshot.
+The shared bearer token is a transport gate, not principal-scoped authorization.
+Cosmos provides authenticated org-wide access and durable call auditing; direct
+clients still require authorization, ingress request-size limits, rate limits,
+and sensitive-read auditing before broad access.
 
 ## Local verification
 

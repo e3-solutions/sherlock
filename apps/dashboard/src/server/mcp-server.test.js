@@ -71,6 +71,13 @@ describe("Bonaparte MCP tools", () => {
       scope: "one configured workspace",
     });
     expect(JSON.stringify(result)).toContain("No raw Storage");
+    expect(JSON.stringify(result)).toContain("search all stored history by default");
+    expect(JSON.stringify(result)).not.toContain("capped at 24 hours");
+    expect(JSON.stringify(result)).not.toContain("admin pilot gate");
+    for (const name of ["coverage", "list_sessions", "query_usage"]) {
+      expect(tools.get(name).config.description).toContain("any historical window");
+      expect(tools.get(name).config.description).toContain("all stored history");
+    }
   });
 
   it("returns usage facts as both text and validated structured content", async () => {

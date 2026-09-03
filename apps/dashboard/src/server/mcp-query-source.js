@@ -6,9 +6,10 @@ export const MCP_QUERY_SCHEMA_VERSION = "sherlock.query.v1";
 export const MCP_QUERY_DEFAULT_LIMIT = 20;
 export const MCP_QUERY_MAX_LIMIT = 100;
 export const MCP_QUERY_MAX_GROUPS = 200;
-export const MCP_QUERY_MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const MCP_QUERY_HISTORY_START = "1970-01-01T00:00:00.000Z";
 
 const SESSION_CURSOR_VERSION = "s1";
+const LEGACY_QUERY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_CURSOR_LENGTH = 512;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROVIDER_VERSIONS = Object.freeze([
@@ -70,10 +71,10 @@ export function queryWindow({ start, end } = {}, now = new Date()) {
   const read = asDate(now);
   const endAt = end === undefined ? read : asDate(end);
   const startAt = start === undefined
-    ? new Date(endAt.getTime() - MCP_QUERY_MAX_WINDOW_MS)
+    ? new Date(MCP_QUERY_HISTORY_START)
     : asDate(start);
   const duration = endAt.getTime() - startAt.getTime();
-  if (duration <= 0 || duration > MCP_QUERY_MAX_WINDOW_MS || endAt > read) {
+  if (duration <= 0 || endAt > read) {
     throw new FlameSourceError("flame_mcp_query_request_invalid");
   }
   return { startAt, endAt, readAt: read };
@@ -111,7 +112,7 @@ export function encodeSessionCursor({ readAt, createdAt, sessionId, fingerprint 
   return cursor;
 }
 
-export function decodeSessionCursor(cursor, fingerprint) {
+function parseSessionCursor(cursor) {
   if (cursor === undefined || cursor === null || cursor === "") return null;
   if (typeof cursor !== "string" || cursor.length > MAX_CURSOR_LENGTH) {
     throw new FlameSourceError("flame_mcp_query_cursor_invalid");
@@ -126,18 +127,29 @@ export function decodeSessionCursor(cursor, fingerprint) {
     }
     const value = JSON.parse(decoded);
     if (!Array.isArray(value) || value.length !== 4 ||
-        !UUID_PATTERN.test(value[2]) || value[3] !== fingerprint) {
+        !UUID_PATTERN.test(value[2]) || typeof value[3] !== "string") {
       throw new Error("invalid_cursor");
     }
     return {
       readAt: asDate(value[0], "flame_mcp_query_cursor_invalid"),
       createdAt: asDate(value[1], "flame_mcp_query_cursor_invalid"),
       sessionId: value[2],
+      fingerprint: value[3],
     };
   } catch (error) {
     if (error instanceof FlameSourceError) throw error;
     throw new FlameSourceError("flame_mcp_query_cursor_invalid");
   }
+}
+
+export function decodeSessionCursor(cursor, fingerprint) {
+  const decoded = parseSessionCursor(cursor);
+  if (decoded === null) return null;
+  if (decoded.fingerprint !== fingerprint) {
+    throw new FlameSourceError("flame_mcp_query_cursor_invalid");
+  }
+  const { fingerprint: _fingerprint, ...result } = decoded;
+  return result;
 }
 
 function providerFromVersion(version) {
@@ -726,17 +738,43 @@ export function createSherlockQuerySource(source) {
     async fetchSessions({
       start, end, personId, model, cursor, limit, signal, now,
     } = {}) {
-      const window = queryWindow({ start, end }, now);
+      const cursorPayload = parseSessionCursor(cursor);
+      const requestNow = asDate(now ?? new Date());
+      if (cursorPayload?.readAt > requestNow) {
+        throw new FlameSourceError("flame_mcp_query_cursor_invalid");
+      }
+      let window = queryWindow({ start, end }, cursorPayload?.readAt ?? requestNow);
       if (personId !== undefined && !UUID_PATTERN.test(personId)) {
         throw new FlameSourceError("flame_mcp_query_request_invalid");
       }
       const pageSize = parseLimit(limit);
-      const fingerprint = sessionFingerprint({
+      let fingerprint = sessionFingerprint({
         workspaceId: source.workspaceId,
         ...window,
         personId,
         model,
       });
+      // Cursors created before the all-history default used a trailing 24-hour
+      // window. Let those in-flight pages finish without restoring that legacy
+      // limit for new requests.
+      if (cursorPayload && cursorPayload.fingerprint !== fingerprint && start === undefined) {
+        const legacyEndAt = end === undefined ? cursorPayload.readAt : asDate(end);
+        const legacyStartAt = new Date(legacyEndAt.getTime() - LEGACY_QUERY_WINDOW_MS);
+        const legacyWindow = queryWindow({
+          start: legacyStartAt,
+          end: legacyEndAt,
+        }, cursorPayload.readAt);
+        const legacyFingerprint = sessionFingerprint({
+          workspaceId: source.workspaceId,
+          ...legacyWindow,
+          personId,
+          model,
+        });
+        if (cursorPayload.fingerprint === legacyFingerprint) {
+          window = legacyWindow;
+          fingerprint = legacyFingerprint;
+        }
+      }
       const decoded = decodeSessionCursor(cursor, fingerprint);
       const readAt = decoded?.readAt ?? window.readAt;
       const rows = await source.transaction(async (tx) => await runQuery(tx, LIST_SESSIONS_SQL, [
