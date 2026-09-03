@@ -6,11 +6,17 @@ drafted locally and reviewed by a person, but this package cannot publish them.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from typing import Any
 
+from .evidence import verify_evidence_provenance
+
 CARD_VERSION = "sherlock.learning-card.v1"
+REVIEW_VERSION = "sherlock.learning-card-review.v1"
 CARD_STATUSES = frozenset({"draft", "reviewed"})
+REVIEW_DECISIONS = frozenset({"approved", "rejected", "needs_evidence"})
 CONFIDENCE_LEVELS = frozenset({"low", "medium", "high"})
 ATTEMPT_RESULTS = frozenset({"worked", "did_not_work", "inconclusive"})
 EVIDENCE_KINDS = frozenset(
@@ -26,7 +32,6 @@ EVIDENCE_KINDS = frozenset(
     }
 )
 CLAIM_AREAS = frozenset({"problem", "learning", "outcome"})
-INDEPENDENT_VERIFIERS = frozenset({"ci_run", "human_review", "benchmark"})
 FORBIDDEN_FIELDS = frozenset(
     {
         "audio",
@@ -91,19 +96,23 @@ def validate_card(card: Mapping[str, Any]) -> list[str]:
         errors.append("confidence is unsupported")
 
     evidence_by_id = _validate_evidence(card.get("evidence"), errors)
+    provenance_check = verify_evidence_provenance(evidence_by_id.values())
+    if provenance_check["enriched_evidence_ids"]:
+        errors.extend(
+            f"evidence provenance: {reason}" for reason in provenance_check["errors"]
+        )
     supported_areas = {
         area for evidence in evidence_by_id.values() for area in evidence["supports"]
     }
     for area in CLAIM_AREAS:
         if area not in supported_areas:
             errors.append(f"evidence must support {area}")
-    if confidence == "high" and not any(
-        evidence["kind"] in INDEPENDENT_VERIFIERS
-        and evidence["verification"] == "direct"
-        and "outcome" in evidence["supports"]
-        for evidence in evidence_by_id.values()
+    if (
+        confidence == "high"
+        and not provenance_check["independent_outcome_evidence_ids"]
     ):
         errors.append("high confidence requires a direct independent outcome verifier")
+    _validate_review(card, errors)
     return errors
 
 
@@ -171,6 +180,60 @@ def _validate_evidence(value: Any, errors: list[str]) -> dict[str, Mapping[str, 
         if evidence.get("verification") not in {"direct", "contextual"}:
             errors.append(f"{prefix}.verification must be direct or contextual")
     return evidence_by_id
+
+
+def _validate_review(card: Mapping[str, Any], errors: list[str]) -> None:
+    """Keep approval a bounded, auditable local state transition."""
+
+    review = card.get("review")
+    if card.get("status") == "draft":
+        if review is not None:
+            errors.append("draft cards must not include a review receipt")
+        return
+    if not isinstance(review, Mapping):
+        errors.append("reviewed cards require a review receipt")
+        return
+    if review.get("review_version") != REVIEW_VERSION:
+        errors.append("review has an unsupported review_version")
+    if review.get("decision") != "approved":
+        errors.append("reviewed cards require an approved review")
+    if not _text(review.get("reviewer")):
+        errors.append("review.reviewer must be a non-empty string")
+    if not _text(review.get("rationale")):
+        errors.append("review.rationale must be a non-empty string")
+    if review.get("card_id") != card.get("card_id"):
+        errors.append("review.card_id must match card_id")
+    if not _text(review.get("card_sha256")):
+        errors.append("review.card_sha256 must be a non-empty string")
+    else:
+        try:
+            expected_sha256 = card_sha256(card)
+        except (TypeError, ValueError):
+            errors.append("card cannot be canonicalized for review binding")
+        else:
+            if review.get("card_sha256") != expected_sha256:
+                errors.append("review.card_sha256 does not bind this card")
+
+
+def card_sha256(card: Mapping[str, Any]) -> str:
+    """Hash card content independently of its local approval envelope.
+
+    A reviewed card is normalized to its pre-review draft form before hashing.
+    This lets a receipt prove that approval applies to the same claims and
+    evidence, without making the receipt hash itself circular.
+    """
+
+    normalized = dict(card)
+    normalized["status"] = "draft"
+    normalized.pop("review", None)
+    encoded = json.dumps(
+        normalized,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _has_forbidden_fields(value: Any) -> bool:

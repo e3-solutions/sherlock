@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Private, evidence-backed learning-card drafts"
 requires-python = ">=3.11"
 
+[project.scripts]
+learning-card = "sherlock_learning_cards.workflow:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

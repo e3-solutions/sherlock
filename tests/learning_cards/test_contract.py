@@ -10,7 +10,11 @@ PACKAGE_SOURCE = (
 if str(PACKAGE_SOURCE) not in sys.path:
     sys.path.insert(0, str(PACKAGE_SOURCE))
 
-from sherlock_learning_cards.contract import build_reviewer_brief, validate_card
+from sherlock_learning_cards.contract import (
+    build_reviewer_brief,
+    card_sha256,
+    validate_card,
+)
 
 
 def card() -> dict[str, object]:
@@ -53,6 +57,20 @@ def card() -> dict[str, object]:
     }
 
 
+def reviewed_card() -> dict[str, object]:
+    reviewed = card()
+    reviewed["status"] = "reviewed"
+    reviewed["review"] = {
+        "review_version": "sherlock.learning-card-review.v1",
+        "decision": "approved",
+        "reviewer": "private-reviewer-001",
+        "rationale": "The evidence is direct and the guidance is specific.",
+        "card_id": reviewed["card_id"],
+        "card_sha256": card_sha256(reviewed),
+    }
+    return reviewed
+
+
 class LearningCardContractTests(unittest.TestCase):
     def test_private_evidence_backed_draft_is_valid(self):
         self.assertEqual(validate_card(card()), [])
@@ -89,6 +107,27 @@ class LearningCardContractTests(unittest.TestCase):
         brief = build_reviewer_brief(card())
         self.assertEqual(brief["visibility"], "private")
         self.assertEqual(len(brief["review_questions"]), 3)
+
+    def test_reviewed_card_requires_a_bound_approval_receipt(self):
+        self.assertEqual(validate_card(reviewed_card()), [])
+
+    def test_reviewed_card_rejects_an_unbound_or_non_approval_receipt(self):
+        reviewed = reviewed_card()
+        reviewed["review"]["decision"] = "needs_changes"
+        reviewed["learning"] = "A changed claim invalidates the receipt binding."
+
+        errors = validate_card(reviewed)
+
+        self.assertIn("reviewed cards require an approved review", errors)
+        self.assertIn("review.card_sha256 does not bind this card", errors)
+
+    def test_draft_card_cannot_carry_a_review_receipt(self):
+        draft = card()
+        draft["review"] = reviewed_card()["review"]
+
+        self.assertIn(
+            "draft cards must not include a review receipt", validate_card(draft)
+        )
 
 
 if __name__ == "__main__":
