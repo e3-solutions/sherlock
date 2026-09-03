@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Privacy-preserving work-episode provenance contracts"
 requires-python = ">=3.11"
 
+[project.scripts]
+work-episode-candidate = "sherlock_work_episode.candidate:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
