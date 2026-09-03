@@ -93,6 +93,7 @@ def build_unknown_manifest(
                 "kind": "session",
                 "source_ref": f"codex-session:{resolved_session_id}",
                 "content_sha256": digest.hexdigest(),
+                "content_byte_count": opened.st_size,
             }
         ],
         "session_links": [

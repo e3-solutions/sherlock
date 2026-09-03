@@ -13,7 +13,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-CONTRACT_VERSION = "sherlock.work-episode.v1"
+CONTRACT_VERSION = "sherlock.work-episode.v2"
 SNAPSHOT_VERSION = "sherlock.work-episode-receipt.v1"
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -68,6 +68,10 @@ def _sha256(value: Mapping[str, Any]) -> str:
 
 def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _positive_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _has_forbidden_fields(value: Any) -> bool:
@@ -137,6 +141,12 @@ def validate_episode(manifest: Mapping[str, Any]) -> list[str]:
                 str(evidence.get("content_sha256", ""))
             ):
                 errors.append(f"{prefix}.content_sha256 must seal session evidence")
+            if evidence.get("kind") == "session" and not _positive_integer(
+                evidence.get("content_byte_count")
+            ):
+                errors.append(
+                    f"{prefix}.content_byte_count must seal the captured byte boundary"
+                )
 
     raw_links = manifest.get("session_links")
     if not isinstance(raw_links, list) or not raw_links:

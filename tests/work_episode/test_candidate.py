@@ -36,6 +36,9 @@ class CandidateTests(unittest.TestCase):
             manifest["evidence"][0]["content_sha256"],
             hashlib.sha256(source_bytes).hexdigest(),
         )
+        self.assertEqual(
+            manifest["evidence"][0]["content_byte_count"], len(source_bytes)
+        )
         self.assertNotIn(PRIVATE_SENTINEL, json.dumps(manifest, sort_keys=True))
         card = build_catalog_card(manifest, "retrieval")
         self.assertNotIn(PRIVATE_SENTINEL, json.dumps(card, sort_keys=True))

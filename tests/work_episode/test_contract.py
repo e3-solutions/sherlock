@@ -33,7 +33,7 @@ def valid_manifest() -> dict[str, object]:
     """Return the smallest verified, internal-only episode manifest."""
 
     return {
-        "contract_version": "sherlock.work-episode.v1",
+        "contract_version": "sherlock.work-episode.v2",
         "episode_id": "episode-private-001",
         "evidence": [
             {
@@ -41,6 +41,7 @@ def valid_manifest() -> dict[str, object]:
                 "kind": "session",
                 "source_ref": OPAQUE_SENTINEL,
                 "content_sha256": "a" * 64,
+                "content_byte_count": 100,
             },
             {
                 "evidence_id": "linear-intent",
@@ -100,7 +101,7 @@ class WorkEpisodeContractTests(unittest.TestCase):
         self.assertIn("receipt.manifest_sha256 does not match manifest", errors)
 
     def test_session_evidence_requires_both_source_reference_and_hash(self):
-        for missing_field in ("source_ref", "content_sha256"):
+        for missing_field in ("source_ref", "content_sha256", "content_byte_count"):
             with self.subTest(missing_field=missing_field):
                 manifest = valid_manifest()
                 manifest["evidence"][0].pop(missing_field)
