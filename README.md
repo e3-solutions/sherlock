@@ -68,7 +68,8 @@ the local `sherlock` marketplace, and installs
 `sherlock-claude-code@sherlock`. It also queues newline-complete bytes from
 Claude primary and subagent transcripts modified during the preceding 72
 hours. Pass `--backfill-hours HOURS` to configure that initial window from 1
-hour through 31 days. The result reports filename-shaped regular transcript
+hour through 31 days (decimal digits without leading zeroes, e.g. `60`, not
+`060`). Invalid or oversized values are rejected before installation. The result reports filename-shaped regular transcript
 candidates older than the cutoff; these are candidates, not validated
 sessions, and may already have been captured by an earlier run. Each pass uses
 a descriptor-verified point-in-time snapshot and reports any bounded or

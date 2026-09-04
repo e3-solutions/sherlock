@@ -95,6 +95,10 @@ def _rfc3339_ns(value: str) -> int | None:
     if match is None:
         return None
     zone = match.group("zone")
+    # datetime.fromisoformat normalizes malformed offsets such as +00:60.
+    # A replay selector must be valid RFC3339 before any state is created.
+    if zone not in "Zz" and (int(zone[1:3]) > 23 or int(zone[4:6]) > 59):
+        return None
     normalized_zone = "+00:00" if zone in "Zz" else zone
     try:
         parsed = datetime.fromisoformat(match.group("second") + normalized_zone)
@@ -102,7 +106,10 @@ def _rfc3339_ns(value: str) -> int | None:
         return None
     if parsed.tzinfo is None:
         return None
-    normalized = parsed.astimezone(timezone.utc)
+    try:
+        normalized = parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     delta = normalized - epoch
     whole_seconds_ns = (

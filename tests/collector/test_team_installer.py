@@ -174,6 +174,23 @@ raise SystemExit(2)
 
 
 class TeamInstallerTests(unittest.TestCase):
+    def test_unified_command_rejects_ambiguous_hours_before_writing(self):
+        for hours in ("060", "18446744073709551617"):
+            with self.subTest(hours=hours), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                completed = subprocess.run(
+                    ["sh", str(UNIFIED_INSTALLER), "--name", "Test User",
+                     "--github-id", "test-user", "--email", "test@e3group.ai",
+                     "--claude-backfill-hours", hours],
+                    cwd=ROOT, check=False, capture_output=True, text=True,
+                    env={**os.environ, "CODEX_HOME": str(root / "codex"),
+                         "CLAUDE_CONFIG_DIR": str(root / "claude"),
+                         "PYTHON_BIN": sys.executable},
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertFalse((root / "codex").exists())
+                self.assertFalse((root / "claude").exists())
+
     def test_unified_command_installs_codex_and_claude_with_same_identity(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1039,7 +1056,7 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
     def test_claude_installer_validates_backfill_hours_before_writing(self):
-        for value in ("0", "745", "not-a-number"):
+        for value in ("0", "745", "not-a-number", "18446744073709551617", "060"):
             with self.subTest(value=value), TemporaryDirectory() as temporary:
                 claude_home = Path(temporary) / "claude"
                 completed = subprocess.run(
