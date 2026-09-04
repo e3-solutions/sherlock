@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(146);
+select plan(148);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -23,6 +23,22 @@ select has_table(
 select has_table(
   'github', 'commit_pr_lookups',
   'GitHub commit lookup outcomes are auditable'
+);
+select has_column(
+  'github', 'commit_pr_lookups', 'error_code',
+  'GitHub lookup failures retain a normalized internal reason'
+);
+select ok(
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'github.commit_pr_lookups'::regclass
+       and conname = 'commit_pr_lookups_error_code_check'
+       and contype = 'c'
+       and pg_get_constraintdef(oid) like '%outcome = ''failed''%'
+       and pg_get_constraintdef(oid) like '%char_length(error_code) <= 128%'
+       and pg_get_constraintdef(oid) like '%error_code ~ ''^[a-z0-9_]+$''%'
+  ),
+  'GitHub lookup error codes exist only on failed observations'
 );
 select has_table('analytics', 'activity_spans', 'activity_spans table exists');
 select has_table(
@@ -1185,6 +1201,15 @@ begin
     to_regclass('telemetry.events') is not null and
     to_regclass('telemetry.session_scm') is not null and
     to_regclass('github.commit_pr_lookups') is not null and
+    exists (select 1 from pg_attribute
+      where attrelid = 'github.commit_pr_lookups'::regclass
+        and attname = 'error_code' and not attnotnull) and
+    exists (
+      select 1 from pg_constraint
+      where conrelid = 'github.commit_pr_lookups'::regclass
+        and conname = 'commit_pr_lookups_error_code_check'
+        and contype = 'c'
+    ) and
     exists (select 1 from pg_attribute
       where attrelid = 'processing.telemetry_jobs'::regclass
         and attname = 'scm_backfill_version' and not attnotnull) and
