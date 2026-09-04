@@ -51,6 +51,13 @@ projector: Claude transcript v1; Codex v2 at or after the recorded workspace
 cutover; and Codex v1 before cutover, with v2 used only for an individual source
 record that has no non-replay v1 projection. Replay rows and lower-priority
 canonical duplicates are excluded, including from the pre-window baseline.
+Canonical winners are selected against all visible active projections before
+window attribution, using the winner's timestamp. For example, an incremental
+provisional observation of 10 immediately before a boundary followed by its
+higher-priority correction of 30 immediately after it contributes 0 and 30 to
+the adjacent windows, not 10 and 30. A winning observation without a timestamp
+is not guessed into a window and does not revive its obsolete dated duplicate.
+An empty result therefore means no attributable observed usage, not proven absence.
 
 Claude message-scoped usage is incremental and is summed. Codex session-scoped
 usage is cumulative and is differenced within each independent usage stream.
@@ -61,6 +68,8 @@ window has an implicit zero baseline. A missing older baseline contributes only
 subsequent provable non-negative deltas. A cumulative stream that regresses is
 omitted from the token totals for that window. Both conditions force `partial`
 coverage; neither is silently represented as a complete zero-usage result.
+Regression coverage counts distinct streams across model groups: one stream
+spanning two models remains one regressed stream.
 
 Token fields are reported separately as `input`, `cachedInput`, `output`,
 `reasoning`, and provider-reported `total`. Callers must not assume the component
@@ -88,3 +97,21 @@ is scoped to one configured workspace and roster email domain. Its shared bearer
 is a transport gate, not principal-scoped authorization; Cosmos authorizes every
 authenticated org member to the shared measurement surface and disables blind
 health probing.
+
+## Remaining pilot limits
+
+- All-history metadata lookup is not full-transcript search. The existing GIN
+  search index covers `content_excerpt`, not immutable source bytes beyond it.
+- A native session can have multiple file streams and repeated identical
+  records. File identity alone cannot prove independent counters or distinguish
+  a copied transcript from a new lineage; never sum per-file totals as a repair.
+- Codex v1/v2 event models may inherit the final context in a transport batch;
+  the query can also fall back to session-level model metadata. Model-group
+  attribution is not yet invariant to batching. Correcting that requires a new
+  derivation version and validated reprocessing, not mutation of old facts.
+- Cross-system comparisons must align interval bounds, provider coverage,
+  identity mappings, component semantics, and exclusions. Neither source's
+  partial aggregate is a completeness oracle or a productivity ranking.
+- This patch changes read-time selection only. It does not recover uncollected
+  source files, reproject history, deploy collector upgrades, or grant content
+  search to the shared organization-wide MCP bearer.
