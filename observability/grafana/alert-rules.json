@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "folder_uid": "bonaparte",
+    "rule_group": "bonaparte-production",
+    "is_paused": true,
+    "interval": "1m",
+    "labels": {
+      "service": "bonaparte",
+      "environment": "production",
+      "owner": "bonaparte"
+    },
+    "annotations": {
+      "dashboard": "${GRAFANA_BONAPARTE_DASHBOARD_URL}",
+      "explore": "${GRAFANA_BONAPARTE_EXPLORE_URL}",
+      "runbook": "https://github.com/e3-solutions/sherlock/blob/main/observability/grafana/runbook.md"
+    }
+  },
+  "activation_gate": "Keep every rule paused until the contact point, exact routes, renderer cases, one controlled firing, and its resolved notification have all been verified.",
+  "rules": [
+    {
+      "uid": "bonaparte-dashboard-unavailable",
+      "title": "Bonaparte dashboard unavailable",
+      "component": "dashboard",
+      "severity": "critical",
+      "datasource_uid": "${GRAFANA_PROMETHEUS_DATASOURCE_UID}",
+      "expr": "(3 - sum(max by (probe) (probe_success{job=\"bonaparte-production-healthz\", instance=\"${BONAPARTE_PRODUCTION_URL}/healthz\"}))) >= bool 2",
+      "threshold": 1,
+      "evaluator": "gte",
+      "for": "2m",
+      "no_data_state": "OK",
+      "exec_err_state": "Error",
+      "summary": "At least two of three Bonaparte health probes are failing.",
+      "description": "The production dashboard is unavailable or its configuration and last-good timeline cache are not ready."
+    },
+    {
+      "uid": "bonaparte-pipeline-freshness",
+      "title": "Bonaparte pipeline freshness delayed",
+      "component": "pipeline",
+      "severity": "warning",
+      "datasource_uid": "${GRAFANA_PROMETHEUS_DATASOURCE_UID}",
+      "expr": "((3 - sum(max by (probe) (probe_success{job=\"bonaparte-production-freshness\", instance=\"${BONAPARTE_PRODUCTION_URL}/api/flame/freshness?refresh=wait\"}))) >= bool 2) * (sum(max by (probe) (probe_success{job=\"bonaparte-production-healthz\", instance=\"${BONAPARTE_PRODUCTION_URL}/healthz\"})) >= bool 2)",
+      "threshold": 1,
+      "evaluator": "gte",
+      "for": "5m",
+      "no_data_state": "OK",
+      "exec_err_state": "Error",
+      "summary": "At least two of three Bonaparte freshness probes are failing.",
+      "description": "The freshness receipt is delayed, cannot refresh, or is being served from the stale cache."
+    },
+    {
+      "uid": "bonaparte-synthetic-telemetry-missing",
+      "title": "Bonaparte synthetic telemetry missing",
+      "component": "observability",
+      "severity": "warning",
+      "datasource_uid": "${GRAFANA_PROMETHEUS_DATASOURCE_UID}",
+      "expr": "max(absent_over_time(probe_success{job=\"bonaparte-production-healthz\", instance=\"${BONAPARTE_PRODUCTION_URL}/healthz\"}[10m]) or absent_over_time(probe_success{job=\"bonaparte-production-freshness\", instance=\"${BONAPARTE_PRODUCTION_URL}/api/flame/freshness?refresh=wait\"}[10m]))",
+      "threshold": 1,
+      "evaluator": "gte",
+      "for": "0s",
+      "no_data_state": "OK",
+      "exec_err_state": "Error",
+      "summary": "A complete Bonaparte synthetic check has emitted no metrics for ten minutes.",
+      "description": "Production availability or freshness cannot be evaluated because a synthetic job or its datasource is missing."
+    },
+    {
+      "uid": "bonaparte-supabase-telemetry-missing",
+      "title": "Bonaparte Supabase telemetry missing",
+      "component": "database",
+      "severity": "warning",
+      "datasource_uid": "${GRAFANA_PROMETHEUS_DATASOURCE_UID}",
+      "expr": "max(absent_over_time(pg_up{supabase_project_ref=\"${BONAPARTE_SUPABASE_PROJECT_REF}\"}[5m]) or absent_over_time(pgbouncer_up{supabase_project_ref=\"${BONAPARTE_SUPABASE_PROJECT_REF}\"}[5m]) or absent_over_time(pgbouncer_pools_client_waiting_connections{supabase_project_ref=\"${BONAPARTE_SUPABASE_PROJECT_REF}\"}[5m]))",
+      "threshold": 1,
+      "evaluator": "gte",
+      "for": "0s",
+      "no_data_state": "OK",
+      "exec_err_state": "Error",
+      "summary": "Bonaparte Postgres, pooler, or waiting-client metrics have been absent for five minutes.",
+      "description": "Database headroom cannot be evaluated because the scoped Supabase metrics integration is disconnected or stale."
+    },
+    {
+      "uid": "bonaparte-supabase-pool-waiting",
+      "title": "Bonaparte Supabase connection pool queue sustained",
+      "component": "database",
+      "severity": "warning",
+      "datasource_uid": "${GRAFANA_PROMETHEUS_DATASOURCE_UID}",
+      "expr": "sum(pgbouncer_pools_client_waiting_connections{supabase_project_ref=\"${BONAPARTE_SUPABASE_PROJECT_REF}\"})",
+      "threshold": 5,
+      "evaluator": "gt",
+      "for": "10m",
+      "no_data_state": "OK",
+      "exec_err_state": "Error",
+      "summary": "More than five database clients have waited for a pooled connection continuously for ten minutes.",
+      "description": "Sustained connection pressure may delay dashboard refreshes and durable queue processing."
+    }
+  ]
+}

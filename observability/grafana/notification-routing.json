@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "template_only": true,
+  "activation_gate": "Create the Slack contact point with its secret managed in Grafana, validate all renderer fixtures, and observe one controlled firing and non-empty resolved notification before enabling production rules.",
+  "notification_templates": [
+    {
+      "name": "bonaparte-slack-minimal",
+      "file": "notification_templates/bonaparte_slack_message.tmpl"
+    }
+  ],
+  "contact_points": [
+    {
+      "name": "Bonaparte Production Slack",
+      "type": "slack",
+      "settings": {
+        "url_secret_ref": "BONAPARTE_SLACK_WEBHOOK_URL",
+        "title": "{{ template \"bonaparte.slack.title\" . }}",
+        "text": "{{ template \"bonaparte.slack.text\" . }}"
+      },
+      "disable_resolve_message": false
+    }
+  ],
+  "policy_subtree": {
+    "unmatched_behavior": "inherit_existing_default_receiver",
+    "matchers": [
+      "service = bonaparte",
+      "environment = production",
+      "owner = bonaparte"
+    ],
+    "group_by": [
+      "alertname",
+      "component"
+    ],
+    "routes": [
+      {
+        "matchers": [
+          "severity = critical"
+        ],
+        "receiver": "Bonaparte Production Slack",
+        "group_by": [
+          "alertname",
+          "component"
+        ],
+        "group_wait": "30s",
+        "group_interval": "5m",
+        "repeat_interval": "2h"
+      },
+      {
+        "matchers": [
+          "severity = warning"
+        ],
+        "receiver": "Bonaparte Production Slack",
+        "group_by": [
+          "alertname",
+          "component"
+        ],
+        "group_wait": "2m",
+        "group_interval": "10m",
+        "repeat_interval": "4h"
+      }
+    ]
+  }
+}
