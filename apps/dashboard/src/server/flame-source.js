@@ -1663,6 +1663,21 @@ async function runQuery(tx, text, params, signal) {
   }
 }
 
+// Postgres.js BEGIN can wait for a client connection before runQuery gets a
+// chance to observe cancellation. Reject that wait promptly; if BEGIN acquires
+// later, its first runQuery sees the aborted signal and rolls back without
+// invoking the caller. Keep observing the pending transaction's rejection.
+function waitForTransaction(transaction, signal) {
+  if (!signal) return transaction;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new FlameSourceError("flame_request_aborted"));
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+    transaction.then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
 function promptEvidenceFromRow(row) {
   const excerpt = row.content_excerpt === null || row.content_excerpt === undefined
     ? ""
@@ -1836,6 +1851,8 @@ export class DirectFlameSource {
   }
 
   async reserveCapacity() {
+    // Warm both client connections. With transaction pooling, a successful
+    // probe does not reserve PostgreSQL backends between transactions.
     const reservations = await Promise.allSettled([
       this.sql.reserve(),
       this.sql.reserve(),
@@ -1867,7 +1884,8 @@ export class DirectFlameSource {
     statementTimeoutMs = DEFAULT_STATEMENT_TIMEOUT_MS,
   } = {}) {
     try {
-      return await this.sql.begin(async (tx) => {
+      if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
+      const transaction = this.sql.begin(async (tx) => {
         await runQuery(tx, "set transaction isolation level repeatable read, read only", undefined, signal);
         await runQuery(
           tx,
@@ -1876,8 +1894,10 @@ export class DirectFlameSource {
           signal,
         );
         await runQuery(tx, `set local role ${DATABASE_ROLE}`, undefined, signal);
+        if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
         return await callback(tx);
       });
+      return await waitForTransaction(transaction, signal);
     } catch (error) {
       if (error instanceof FlameSourceError) throw error;
       if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");

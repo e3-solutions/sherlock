@@ -1,4 +1,6 @@
 import postgres from "postgres";
+import { readFileSync } from "node:fs";
+import { URL as FileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -142,6 +144,170 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       await sql.end({ timeout: 5 });
     }
   });
+
+  it("preserves original freshness receipts for visible activity and live normalization", async () => {
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const rollback = new Error("roll back the synthetic freshness fixture");
+    try {
+      await sql.begin(async (tx) => {
+        // Keep the original SECURITY DEFINER body and its planner settings as
+        // an independent oracle. Both calls share one transaction timestamp.
+        const original = readFileSync(new FileURL(
+          "../../../../supabase/migrations/20260821202758_add_dashboard_freshness.sql",
+          import.meta.url,
+        ), "utf8").split("$$;")[0] + "$$;";
+        await tx.unsafe(original.replace(
+          "analytics.read_dashboard_freshness", "pg_temp.original_dashboard_freshness",
+        ));
+        await tx.unsafe(`
+          alter function pg_temp.original_dashboard_freshness(uuid, text, text[], integer)
+            set enable_nestloop = off;
+          alter function pg_temp.original_dashboard_freshness(uuid, text, text[], integer)
+            set enable_seqscan = off;
+        `);
+        const [{ now }] = await tx.unsafe("select transaction_timestamp() as now");
+        const ago = (minutes) => new Date(now.getTime() - minutes * 60_000);
+        const workspaceId = crypto.randomUUID();
+        await tx.unsafe(
+          "insert into telemetry.workspaces (id, slug, name) values ($1, $2, 'Synthetic freshness')",
+          [workspaceId, `freshness-${workspaceId}`],
+        );
+        const people = {};
+        for (const [name, email, github] of [
+          ["visible", "visible@e3group.ai", "synthetic-visible"],
+          ["quiet", "quiet@e3group.ai", "synthetic-quiet"],
+          ["foreign", "foreign@sixtyfour.ai", "synthetic-foreign"],
+          ["smoke", "smoke@e3group.ai", "sherlock-smoke"],
+        ]) {
+          const personId = crypto.randomUUID();
+          const sessionId = crypto.randomUUID();
+          await tx.unsafe(
+            `insert into telemetry.people (id, workspace_id, identity_key, display_name, email, github_id)
+             values ($1, $2, $3, $3, $4, $5)`,
+            [personId, workspaceId, name, email, github],
+          );
+          await tx.unsafe(
+            `insert into telemetry.sessions (id, workspace_id, person_id, collector_key,
+               native_session_id, actor_role, role_version, started_at)
+             values ($1, $2, $3, 'synthetic', $4, 'primary', 'synthetic.v1', $5)`,
+            [sessionId, workspaceId, personId, sessionId, ago(180)],
+          );
+          people[name] = { personId, sessionId };
+        }
+
+        const batch = async (person, minutes, status = "succeeded", workload = "live") => {
+          const id = crypto.randomUUID();
+          await tx.unsafe(
+            `insert into telemetry.ingest_batches (
+               id, workspace_id, person_id, collector_key, source_kind, source_stream_key,
+               generation_key, generation_seq, start_offset, end_offset, source_byte_count,
+               source_sha256, storage_path, storage_encoding, stored_byte_count, stored_sha256,
+               record_count, contract_version, committed_at
+             ) values ($1, $2, $3, 'synthetic', 'rollout', $4, 'synthetic', 0, 0, 100, 100,
+                       repeat('a',64), $4, 'identity', 100, repeat('b',64), 100, 'synthetic.v1', $5)`,
+            [id, workspaceId, person.personId, `synthetic/${id}`, ago(minutes)],
+          );
+          const leased = status === "leased";
+          await tx.unsafe(
+            `update processing.telemetry_jobs
+                set status = $2, workload_class = $3, lease_token = $4, lease_owner = $5,
+                    lease_started_at = $6, lease_expires_at = $7, completed_at = $8
+              where workspace_id = $9 and batch_id = $1 and job_kind = 'normalize'`,
+            [id, status, workload, leased ? crypto.randomUUID() : null,
+              leased ? "synthetic-worker" : null, leased ? ago(1) : null,
+              leased ? ago(-1) : null, status === "succeeded" ? now : null, workspaceId],
+          );
+          return id;
+        };
+        const visibleBatch = await batch(people.visible, 12);
+        await batch(people.quiet, 1);
+        const foreignBatch = await batch(people.foreign, 0, "queued");
+        const smokeBatch = await batch(people.smoke, 0, "queued");
+        await batch(people.visible, 20, "queued");
+        await batch(people.visible, 10, "leased");
+        await batch(people.visible, 30, "queued", "backfill");
+        await batch(people.visible, 35, "succeeded");
+
+        let recordIndex = 0;
+        const event = async ({ person = people.visible, batchId = visibleBatch,
+          occurred = ago(5), received = ago(4), native = null, logical = null,
+          priority = 100, replay = false, actor = "primary", version = NORMALIZER_VERSION } = {}) => {
+          const index = recordIndex++;
+          const [record] = await tx.unsafe(
+            `insert into telemetry.native_records (
+               workspace_id, batch_id, record_index, source_start_offset, source_end_offset,
+               record_sha256, native_type, parse_status
+             ) values ($1, $2, $3::integer, $3::bigint, $3::bigint + 1, repeat('c',64), 'message', 'ok')
+             returning id`,
+            [workspaceId, batchId, index],
+          );
+          await tx.unsafe(
+            `insert into telemetry.events (
+               workspace_id, session_id, source_record_id, normalizer_version, projection_index,
+               canonical_scope_key, logical_event_key, source_priority, is_replay,
+               event_kind, event_subtype, actor_role, occurred_at, observed_at,
+               server_received_at, native_item_id
+             ) values ($1, $2, $3, $4, 0, 'synthetic', $5, $6, $7,
+                       'message', 'user_message', $8, $9, $9, $10, $11)`,
+            [workspaceId, person.sessionId, record.id, version, logical,
+              priority, replay, actor, occurred, received, native],
+          );
+        };
+        // Native UUIDv7 time takes precedence in both directions. Ranking must
+        // also exclude a newer low-priority duplicate from both watermarks.
+        await event({ native: nativeItemId(ago(5)), occurred: ago(120) });
+        await event({ native: nativeItemId(ago(120)), occurred: ago(1), received: ago(0) });
+        await event({ logical: "duplicate", occurred: ago(10), received: ago(9) });
+        await event({ logical: "duplicate", priority: 10, occurred: ago(2), received: ago(0) });
+        await event({ person: people.foreign, batchId: foreignBatch, occurred: ago(1), received: ago(0) });
+        await event({ person: people.smoke, batchId: smokeBatch, occurred: ago(1), received: ago(0) });
+        await event({ replay: true, occurred: ago(1), received: ago(0) });
+        await event({ actor: "automation", occurred: ago(1), received: ago(0) });
+        await event({ version: CLAUDE_NORMALIZER_VERSION, occurred: ago(1), received: ago(0) });
+
+        await tx.unsafe("set local role sherlock_reader");
+        for (const id of [workspaceId, crypto.randomUUID()]) {
+          const params = [id, "e3group.ai", [NORMALIZER_VERSION], 500];
+          const reference = await tx.unsafe(
+            "select * from pg_temp.original_dashboard_freshness($1, $2, $3, $4)", params,
+          );
+          const actual = await tx.unsafe(
+            "select * from analytics.read_dashboard_freshness($1, $2, $3, $4)", params,
+          );
+          expect([...actual]).toEqual([...reference]);
+          const globals = {
+            read_at: now,
+            raw_watermark: id === workspaceId ? ago(1) : null,
+            canonical_watermark: id === workspaceId ? ago(4) : null,
+            oldest_pending_normalize: id === workspaceId ? ago(20) : null,
+            pending_normalize_count: id === workspaceId ? "2" : "0",
+          };
+          const expected = id === workspaceId
+            ? [
+              { ...globals, person_id: people.visible.personId, latest_canonical_activity: ago(5) },
+              { ...globals, person_id: people.quiet.personId, latest_canonical_activity: null },
+            ].sort((a, b) => a.person_id.localeCompare(b.person_id))
+            : [{ ...globals, person_id: null, latest_canonical_activity: null }];
+          expect([...actual]).toEqual(expected);
+        }
+        for (const params of [
+          [workspaceId, "example.test", [NORMALIZER_VERSION], 500],
+          [workspaceId, "e3group.ai", [], 500],
+          [workspaceId, "e3group.ai", [NORMALIZER_VERSION], 1001],
+        ]) {
+          for (const functionName of ["pg_temp.original_dashboard_freshness", "analytics.read_dashboard_freshness"]) {
+            const rows = await tx.unsafe(`select * from ${functionName}($1, $2, $3, $4)`, params);
+            expect([...rows]).toEqual([]);
+          }
+        }
+        throw rollback;
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  }, 30_000);
 
   it("shows only the dashboard's expected email domain", async () => {
     const workspaceId = crypto.randomUUID();
@@ -1976,6 +2142,13 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       ],
       totals: [100, 80, 180], counts: [1, 2, 3],
     },
+    ...["canonical_scope_key", "logical_event_key"].map((collisionKey) => ({
+      name: `baseline preserves null ${collisionKey} separately from a literal event:id key`,
+      cumulative: true,
+      collisionKey,
+      rows: [["10:30:00", 100, 100], ["10:45:00", 100, 150], ["11:10:00", 100, 180, "Y"]],
+      totals: [30], counts: [1],
+    })),
   ])("selects canonical usage across windows: $name", async (fixture) => {
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
@@ -2023,6 +2196,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           fixture.cumulative ? "codex" : "claude_code",
           fixture.cumulative ? "rollout" : "transcript", fixture.rows.length],
       );
+      let firstEventId;
       for (const [index, [time, priority, total, logical = "message"]] of fixture.rows.entries()) {
         const at = time === null ? null : `2026-08-18T${time}.000Z`;
         const [record] = await sql.unsafe(
@@ -2034,7 +2208,12 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            returning id`,
           [workspaceId, batchId, index, at],
         );
-        await sql.unsafe(
+        const collisionValue = index === 0 ? null : `event:${firstEventId}`;
+        const scopeKey = fixture.collisionKey === "canonical_scope_key" && index < 2
+          ? collisionValue : "session:synthetic-claude-session";
+        const logicalKey = fixture.collisionKey && index < 2
+          ? collisionValue : logical;
+        const [event] = await sql.unsafe(
           `insert into telemetry.events (
              workspace_id, session_id, source_record_id, normalizer_version,
              projection_index, canonical_scope_key, logical_event_key,
@@ -2043,15 +2222,16 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
              usage_is_cumulative, input_tokens, cached_input_tokens,
              output_tokens, reasoning_tokens, total_tokens
            ) values (
-             $1, $2, $3, $4, 0, 'session:synthetic-claude-session',
+             $1, $2, $3, $4, 0, $11,
              $8, $5, 'usage', 'primary', $6, $6, $10,
              'synthetic-claude-model', 'session:synthetic-claude-session:message:synthetic-message',
              'message', $9, $7, 0, 0, 0, $7
-           )`,
+           ) returning id`,
           [workspaceId, sessionId, record.id,
             fixture.cumulative ? NORMALIZER_VERSION : CLAUDE_NORMALIZER_VERSION,
-            priority, at, total, logical, fixture.cumulative ?? false, end],
+            priority, at, total, logicalKey, fixture.cumulative ?? false, end, scopeKey],
         );
+        firstEventId ??= event.id;
       }
       source = new DirectFlameSource({
         databaseUrl: DATABASE_URL, workspaceId, expectedEmailDomain: "e3group.ai",
@@ -2059,7 +2239,9 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       const querySource = createSherlockQuerySource(source);
       const windows = [];
       const coverageEvents = [];
-      for (const [from, to] of [[start, boundary], [boundary, end], [start, end]]) {
+      const ranges = fixture.collisionKey
+        ? [[boundary, end]] : [[start, boundary], [boundary, end], [start, end]];
+      for (const [from, to] of ranges) {
         windows.push(await querySource.fetchUsage({ start: from, end: to, now: new Date(end) }));
         coverageEvents.push((await querySource.fetchCoverage({
           start: from, end: to, now: new Date(end),
@@ -2070,7 +2252,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       ));
 
       expect(totals).toEqual(fixture.totals);
-      expect(totals[0] + totals[1]).toBe(totals[2]);
+      if (!fixture.collisionKey) expect(totals[0] + totals[1]).toBe(totals[2]);
       expect(windows.map((result) => result.coverage.observedUsageEvents)).toEqual(fixture.counts);
       expect(coverageEvents).toEqual(fixture.counts);
       const [{ count }] = await sql.unsafe(
