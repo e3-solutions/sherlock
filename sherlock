@@ -94,7 +94,8 @@ if [ -z "$NAME" ] || [ -z "$GITHUB_ID" ] || [ -z "$EMAIL" ]; then
 fi
 
 case "$CLAUDE_BACKFILL_HOURS" in
-  ''|*[!0-9]*)
+  # Match install-claude.sh before either provider creates local state.
+  ''|0*|*[!0-9]*|????*)
     echo "--claude-backfill-hours must be an integer from 1 to 744." >&2
     exit 2
     ;;

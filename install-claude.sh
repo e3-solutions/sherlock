@@ -69,7 +69,9 @@ if [ -z "$NAME" ] || [ -z "$GITHUB_ID" ] || [ -z "$EMAIL" ]; then
 fi
 
 case "$BACKFILL_HOURS" in
-  ''|*[!0-9]*)
+  # Canonical decimal only: reject octal-looking values and overflow before
+  # either test(1) or shell arithmetic can interpret the input.
+  ''|0*|*[!0-9]*|????*)
     echo "--backfill-hours must be an integer from 1 to 744." >&2
     exit 2
     ;;

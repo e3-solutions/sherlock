@@ -7,6 +7,7 @@ import sys
 import textwrap
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -174,6 +175,23 @@ raise SystemExit(2)
 
 
 class TeamInstallerTests(unittest.TestCase):
+    def test_unified_command_rejects_ambiguous_hours_before_writing(self):
+        for hours in ("060", "18446744073709551617"):
+            with self.subTest(hours=hours), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                completed = subprocess.run(
+                    ["sh", str(UNIFIED_INSTALLER), "--name", "Test User",
+                     "--github-id", "test-user", "--email", "test@e3group.ai",
+                     "--claude-backfill-hours", hours],
+                    cwd=ROOT, check=False, capture_output=True, text=True,
+                    env={**os.environ, "CODEX_HOME": str(root / "codex"),
+                         "CLAUDE_CONFIG_DIR": str(root / "claude"),
+                         "PYTHON_BIN": sys.executable},
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertFalse((root / "codex").exists())
+                self.assertFalse((root / "claude").exists())
+
     def test_unified_command_installs_codex_and_claude_with_same_identity(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1015,6 +1033,58 @@ class TeamInstallerTests(unittest.TestCase):
                 )
                 self.assertEqual(rejected.returncode, 2)
                 self.assertEqual(state_path.read_bytes(), state_before_invalid_replay)
+
+            # Exercise the installed runtime, with no repository import path or
+            # usable upload endpoint, from outside the source checkout.
+            replay_environment = {
+                key: value for key, value in environment.items()
+                if key != "PYTHONPATH" and not key.startswith("SHERLOCK_")
+            }
+            replay_environment["SHERLOCK_CONFIG_PATH"] = str(root / "missing.json")
+            replay_environment["SHERLOCK_INGEST_URL"] = "disabled"
+            selected_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            range_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            excluded_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            range_start = int(datetime.fromisoformat("2025-06-16T00:00:00+00:00").timestamp())
+            historical_sources = {}
+            for native_id, modified_at in (
+                (selected_id, range_start - 1),
+                (range_id, range_start),
+                (excluded_id, range_start + 3600),
+            ):
+                path = transcript.parent / f"{native_id}.jsonl"
+                payload = (json.dumps({"type": "user", "sessionId": native_id}) + "\n").encode()
+                path.write_bytes(payload)
+                os.utime(path, (modified_at, modified_at))
+                historical_sources[path] = payload
+
+            outcomes = []
+            for selectors in (
+                ("--session-id", selected_id),
+                ("--session-id", selected_id),
+                ("--start", "2025-06-16T00:00:00Z", "--end", "2025-06-16T01:00:00Z"),
+            ):
+                result = subprocess.run(
+                    [str(replay), *selectors], cwd=root,
+                    check=False, capture_output=True, text=True,
+                    env=replay_environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outcomes.append(json.loads(result.stdout))
+            self.assertEqual([outcome["enqueued"] for outcome in outcomes], [1, 0, 1])
+            self.assertEqual(
+                [outcome["selection"] for outcome in outcomes],
+                ["session_id", "session_id", "mtime_range"],
+            )
+            replayed_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {stream["path"] for stream in replayed_state["streams"].values()},
+                {str(transcript.resolve()),
+                 str((transcript.parent / f"{selected_id}.jsonl").resolve()),
+                 str((transcript.parent / f"{range_id}.jsonl").resolve())},
+            )
+            for path, payload in historical_sources.items():
+                self.assertEqual(path.read_bytes(), payload)
             calls = [
                 json.loads(line)["argv"] for line in capture.read_text().splitlines()
             ]
@@ -1039,7 +1109,7 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
     def test_claude_installer_validates_backfill_hours_before_writing(self):
-        for value in ("0", "745", "not-a-number"):
+        for value in ("0", "745", "not-a-number", "18446744073709551617", "060"):
             with self.subTest(value=value), TemporaryDirectory() as temporary:
                 claude_home = Path(temporary) / "claude"
                 completed = subprocess.run(
