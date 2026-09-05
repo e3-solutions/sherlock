@@ -49,6 +49,34 @@ function activeNormalizerPredicate(event, session, batch, cutover) {
   )`;
 }
 
+// Resolve canonical identity against all visible projections, not only those
+// inside a reporting window. The partial canonical index bounds this lookup.
+function canonicalWinnerPredicate(event, session) {
+  return `not exists (
+    select 1 from telemetry.events winner
+    join telemetry.native_records winner_record
+      on winner_record.workspace_id = winner.workspace_id
+     and winner_record.id = winner.source_record_id
+    join telemetry.ingest_batches winner_batch
+      on winner_batch.workspace_id = winner_record.workspace_id
+     and winner_batch.id = winner_record.batch_id
+    left join analytics.normalizer_cutovers winner_cutover
+      on winner_cutover.workspace_id = winner.workspace_id
+     and winner_cutover.source_provider = winner_batch.source_provider
+     and winner_cutover.to_normalizer_version = '${FRAME_CODEX_VERSION}'
+    where winner.workspace_id = ${event}.workspace_id
+      and winner.session_id = ${event}.session_id
+      and winner.normalizer_version = ${event}.normalizer_version
+      and winner.canonical_scope_key = ${event}.canonical_scope_key
+      and winner.logical_event_key = ${event}.logical_event_key
+      and winner.event_kind = ${event}.event_kind and not winner.is_replay
+      and (winner.source_priority > ${event}.source_priority
+        or winner.source_priority = ${event}.source_priority
+          and (winner.occurred_at, winner.id) < (${event}.occurred_at, ${event}.id))
+      and ${activeNormalizerPredicate("winner", session, "winner_batch", "winner_cutover")}
+  )`;
+}
+
 function asDate(value, code = "flame_mcp_query_request_invalid") {
   const date = value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(date.getTime())) throw new FlameSourceError(code);
@@ -225,14 +253,14 @@ export function buildUsageResult(rows, receipt, { groupBy, startAt, endAt, readA
   const missingTokenComponents = new Set();
   let observedUsageEvents = 0;
   let missingBaselines = 0;
-  let regressions = 0;
+  const regressedStreams = new Set();
   for (const row of rows) {
     observedUsageEvents += safeCount(row.usage_event_count);
     for (const streamId of row.stream_ids ?? []) observedStreams.add(String(streamId));
     const rowMissingComponents = (row.missing_token_components ?? []).map(String);
     for (const component of rowMissingComponents) missingTokenComponents.add(component);
     missingBaselines += safeCount(row.missing_baseline_count);
-    regressions += safeCount(row.regression_count);
+    for (const streamId of row.regressed_stream_ids ?? []) regressedStreams.add(String(streamId));
     const key = usageKey(row, groupBy);
     const current = groups.get(key) ?? {
       ...(groupBy === "model" ? {} : {
@@ -286,7 +314,7 @@ export function buildUsageResult(rows, receipt, { groupBy, startAt, endAt, readA
       observedUsageEvents,
       streams: observedStreams.size,
       missingBaselines,
-      regressions,
+      regressions: regressedStreams.size,
       missingTokenComponents: [...missingTokenComponents].sort(),
     }),
   };
@@ -393,6 +421,7 @@ with p as materialized (
      and not e.is_replay and e.occurred_at >= p.start_at
      and e.occurred_at < p.end_at
      and ${activeNormalizerPredicate("e", "s", "ib", "c")}
+     and ${canonicalWinnerPredicate("e", "s")}
 ), window_events as materialized (
   select * from window_candidates where canonical_rank = 1
 ), streams as materialized (
@@ -440,6 +469,7 @@ with p as materialized (
              and e.usage_is_cumulative is not distinct from stream.usage_is_cumulative
              and e.occurred_at < p.start_at
              and ${activeNormalizerPredicate("e", "baseline_session", "ib", "c")}
+             and ${canonicalWinnerPredicate("e", "baseline_session")}
         ) candidate
        where candidate.canonical_rank = 1
        order by candidate.usage_at desc, candidate.id desc
@@ -544,8 +574,8 @@ select person_id::text, display_name, provider, model,
        array_agg(distinct session_id::text || ':' || usage_stream_key || ':' || usage_is_cumulative::text)
          stream_ids,
        count(*) filter (where missing_baseline)::bigint missing_baseline_count,
-       count(distinct (session_id, usage_stream_key, usage_is_cumulative))
-         filter (where regression)::bigint regression_count,
+       array_agg(distinct session_id::text || ':' || usage_stream_key || ':' || usage_is_cumulative::text)
+         filter (where regression) regressed_stream_ids,
        array_remove(array[
          case when bool_or(input_tokens is null or
            usage_is_cumulative and previous_id is not null and previous_input is null)
@@ -686,6 +716,7 @@ with roster as materialized (
      and e.occurred_at >= $2 and e.occurred_at < $3
      and e.normalizer_version = any($5::text[])
      and ${activeNormalizerPredicate("e", "s", "ib", "c")}
+     and ${canonicalWinnerPredicate("e", "s")}
 )
 select count(distinct session_id)::bigint observed_sessions,
        count(*)::bigint observed_usage_events

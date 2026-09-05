@@ -220,6 +220,42 @@ describe("Sherlock MCP query source", () => {
     });
   });
 
+  it("counts a regressed cumulative stream once across model groups", () => {
+    const streamId = `${SESSION_ID}:main:true`;
+    const result = buildUsageResult(["model-A", "model-B"].map((model) => ({
+      person_id: SESSION_ID,
+      display_name: "Ada",
+      provider: "codex",
+      model,
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_tokens: 0,
+      total_tokens: 0,
+      usage_event_count: 1,
+      session_ids: [SESSION_ID],
+      stream_ids: [streamId],
+      regressed_stream_ids: [streamId],
+      missing_baseline_count: 0,
+      regression_count: 1,
+      missing_token_components: [],
+    })), {}, {
+      groupBy: "person_model",
+      startAt: START,
+      endAt: NOW,
+      readAt: NOW,
+    });
+
+    expect(result.groups).toHaveLength(2);
+    expect(result.groups.every((group) => group.tokens.total === 0)).toBe(true);
+    expect(result.coverage).toMatchObject({
+      state: "partial",
+      streams: 1,
+      regressedCumulativeStreams: 1,
+    });
+    expect(result.coverage.reasons).toContain("cumulative_counter_regressed");
+  });
+
   it("returns a missing token component as null instead of observed zero", () => {
     const result = buildUsageResult([{
       person_id: SESSION_ID,

@@ -1939,6 +1939,217 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     }
   }, 30_000);
 
+  it.each([
+    {
+      name: "higher priority crosses the window edge",
+      rows: [["10:59:59", 100, 10], ["11:00:01", 110, 30]],
+      totals: [0, 30, 30], counts: [0, 1, 1],
+    },
+    {
+      name: "equal priority chooses earliest timestamp despite insertion order",
+      rows: [["11:00:01", 100, 30], ["10:59:59", 100, 10]],
+      totals: [10, 0, 10], counts: [1, 0, 1],
+    },
+    {
+      name: "equal priority and timestamp choose the lower event id",
+      rows: [["11:00:00", 100, 10], ["11:00:00", 100, 30]],
+      totals: [0, 10, 10], counts: [0, 1, 1],
+    },
+    {
+      name: "equal priority undated observation loses to dated observation",
+      rows: [[null, 100, 30], ["11:00:00", 100, 10]],
+      totals: [0, 10, 10], counts: [0, 1, 1],
+    },
+    {
+      name: "higher priority undated winner suppresses dated loser",
+      rows: [["11:00:00", 100, 10], [null, 110, 30]],
+      totals: [0, 0, 0], counts: [0, 0, 0],
+    },
+    {
+      name: "Codex cumulative baseline excludes a provisional row with an in-window winner",
+      cumulative: true,
+      rows: [
+        ["10:30:00", 100, 100, "baseline"],
+        ["10:59:00", 10, 120, "X"],
+        ["11:01:00", 100, 150, "X"],
+        ["11:10:00", 100, 180, "Y"],
+      ],
+      totals: [100, 80, 180], counts: [1, 2, 3],
+    },
+  ])("selects canonical usage across windows: $name", async (fixture) => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const start = "2026-08-18T10:00:00.000Z";
+    const boundary = "2026-08-18T11:00:00.000Z";
+    const end = "2026-08-18T12:00:00.000Z";
+    let source;
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Synthetic canonical window fixture')`,
+        [workspaceId, `canonical-window-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Synthetic User', 'synthetic@e3group.ai')`,
+        [personId, workspaceId, `canonical-person-${personId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, model, started_at
+         ) values ($1, $2, $3, 'synthetic-collector', 'synthetic-claude-session',
+                   'primary', 'synthetic-role.v1', 'synthetic-claude-model', $4)`,
+        [sessionId, workspaceId, personId, start],
+      );
+      await sql.unsafe(
+        `insert into telemetry.ingest_batches (
+           id, workspace_id, person_id, collector_key, source_provider,
+           source_kind, source_stream_key, generation_key, generation_seq,
+           start_offset, end_offset, source_byte_count, source_sha256,
+           storage_path, storage_encoding, stored_byte_count, stored_sha256,
+           record_count, contract_version, first_occurred_at, last_occurred_at
+         ) values (
+           $1, $2, $3, 'synthetic-collector', $7, $8,
+           'synthetic-stream', 'synthetic-generation', 0, 0, $9::integer, $9::integer,
+           repeat('a', 64), $4, 'identity', $9::integer, repeat('b', 64), $9::integer,
+           'sherlock.rollout-batch.v1', $5, $6
+         )`,
+        [batchId, workspaceId, personId, `synthetic/${batchId}.jsonl`, start, end,
+          fixture.cumulative ? "codex" : "claude_code",
+          fixture.cumulative ? "rollout" : "transcript", fixture.rows.length],
+      );
+      for (const [index, [time, priority, total, logical = "message"]] of fixture.rows.entries()) {
+        const at = time === null ? null : `2026-08-18T${time}.000Z`;
+        const [record] = await sql.unsafe(
+          `insert into telemetry.native_records (
+             workspace_id, batch_id, record_index, source_start_offset,
+             source_end_offset, record_sha256, native_type, occurred_at, parse_status
+           ) values ($1, $2, $3::integer, $3::bigint, $3::bigint + 1,
+                     repeat('c', 64), 'assistant', $4, 'ok')
+           returning id`,
+          [workspaceId, batchId, index, at],
+        );
+        await sql.unsafe(
+          `insert into telemetry.events (
+             workspace_id, session_id, source_record_id, normalizer_version,
+             projection_index, canonical_scope_key, logical_event_key,
+             source_priority, event_kind, actor_role, occurred_at, observed_at,
+             server_received_at, model, usage_stream_key, usage_scope,
+             usage_is_cumulative, input_tokens, cached_input_tokens,
+             output_tokens, reasoning_tokens, total_tokens
+           ) values (
+             $1, $2, $3, $4, 0, 'session:synthetic-claude-session',
+             $8, $5, 'usage', 'primary', $6, $6, $10,
+             'synthetic-claude-model', 'session:synthetic-claude-session:message:synthetic-message',
+             'message', $9, $7, 0, 0, 0, $7
+           )`,
+          [workspaceId, sessionId, record.id,
+            fixture.cumulative ? NORMALIZER_VERSION : CLAUDE_NORMALIZER_VERSION,
+            priority, at, total, logical, fixture.cumulative ?? false, end],
+        );
+      }
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL, workspaceId, expectedEmailDomain: "e3group.ai",
+      });
+      const querySource = createSherlockQuerySource(source);
+      const windows = [];
+      const coverageEvents = [];
+      for (const [from, to] of [[start, boundary], [boundary, end], [start, end]]) {
+        windows.push(await querySource.fetchUsage({ start: from, end: to, now: new Date(end) }));
+        coverageEvents.push((await querySource.fetchCoverage({
+          start: from, end: to, now: new Date(end),
+        })).observedUsageEvents);
+      }
+      const totals = windows.map((result) => result.groups.reduce(
+        (sum, group) => sum + group.tokens.total, 0,
+      ));
+
+      expect(totals).toEqual(fixture.totals);
+      expect(totals[0] + totals[1]).toBe(totals[2]);
+      expect(windows.map((result) => result.coverage.observedUsageEvents)).toEqual(fixture.counts);
+      expect(coverageEvents).toEqual(fixture.counts);
+      const [{ count }] = await sql.unsafe(
+        "select count(*)::int count from telemetry.events where workspace_id = $1",
+        [workspaceId],
+      );
+      expect(count).toBe(fixture.rows.length);
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
+  it("pages old session metadata at a fixed read time with tied creation timestamps", async () => {
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const sessionIds = Array.from({ length: 3 }, () => crypto.randomUUID()).sort().reverse();
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const now = new Date("2026-09-01T12:00:00.000Z");
+    const old = "2026-07-01T00:00:00.000Z";
+    let source;
+
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Synthetic historical pagination fixture')`,
+        [workspaceId, `old-pagination-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (id, workspace_id, identity_key, display_name, email)
+         values ($1, $2, $3, 'Synthetic User', 'synthetic@e3group.ai')`,
+        [personId, workspaceId, `pagination-person-${personId}`],
+      );
+      const insertSession = async (id, createdAt) => await sql.unsafe(
+        `insert into telemetry.sessions (
+           id, workspace_id, person_id, collector_key, native_session_id,
+           actor_role, role_version, started_at, created_at
+         ) values ($1::uuid, $2, $3, 'synthetic-collector', $1::text,
+                   'primary', 'synthetic-role.v1', $4, $5)`,
+        [id, workspaceId, personId, old, createdAt],
+      );
+      for (const id of sessionIds) await insertSession(id, old);
+      source = new DirectFlameSource({
+        databaseUrl: DATABASE_URL, workspaceId, expectedEmailDomain: "e3group.ai",
+      });
+      const querySource = createSherlockQuerySource(source);
+      const first = await querySource.fetchSessions({ limit: 1, now });
+      const lateSessionId = crypto.randomUUID();
+      await insertSession(lateSessionId, "2026-09-01T12:00:01.000Z");
+      const second = await querySource.fetchSessions({
+        limit: 1, cursor: first.nextCursor, now: new Date("2026-09-01T12:00:02.000Z"),
+      });
+      const third = await querySource.fetchSessions({
+        limit: 1, cursor: second.nextCursor, now: new Date("2026-09-01T12:00:03.000Z"),
+      });
+
+      expect([first, second, third].flatMap((page) => page.sessions.map(
+        (session) => session.sessionId,
+      ))).toEqual(sessionIds);
+      expect(first.nextCursor).not.toBeNull();
+      expect(second.nextCursor).not.toBeNull();
+      expect(third.nextCursor).toBeNull();
+      expect(second.window).toEqual(first.window);
+      expect(third.window).toEqual(first.window);
+      expect(first.sessions[0].startedAt).toBe(old);
+    } finally {
+      if (source) await source.close();
+      try {
+        await cleanup(sql, workspaceId);
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+    }
+  }, 30_000);
+
   it("queries canonical usage with projector parity and a canonical baseline", async () => {
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
@@ -2010,7 +2221,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       const insertUsage = async ({
         record, version = LEGACY_CODEX_NORMALIZER_VERSION, projection = 0,
         priority = 100, at, scope, logical, stream, cumulative, total,
-        output = 0,
+        output = 0, model = "gpt-5.6-sol",
       }) => await sql.unsafe(
         `insert into telemetry.events (
            workspace_id, session_id, source_record_id, normalizer_version,
@@ -2021,11 +2232,11 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            output_tokens, reasoning_tokens, total_tokens
          ) values (
            $1, $2, $3, $4, $5, $6, $7, $8, 'usage', 'primary', $9, $9, $9,
-           'gpt-5.6-sol', $10, 'session', $11, $12, 0, $13, 0, $12
+           $14, $10, 'session', $11, $12, 0, $13, 0, $12
          )`,
         [
           workspaceId, sessionId, recordId(record), version, projection,
-          scope, logical, priority, at, stream, cumulative, total, output,
+          scope, logical, priority, at, stream, cumulative, total, output, model,
         ],
       );
 
@@ -2078,6 +2289,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           record, at: `2026-08-18T11:${40 + (record - 5) * 5}:00.000Z`,
           scope: `regression-${record}`, logical: `regression-${record}`,
           stream: "regression", cumulative: true, total,
+          model: record === 5 ? "gpt-5.6-sol" : "model-B",
         });
       }
 
@@ -2104,13 +2316,18 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
       const session = await querySource.fetchSession({ sessionId });
 
-      expect(usage.groups).toHaveLength(1);
+      expect(usage.groups).toHaveLength(2);
       expect(usage.groups[0]).toMatchObject({
         personId,
         provider: "codex",
         model: "gpt-5.6-sol",
         tokens: { input: 87, cachedInput: 0, output: null, reasoning: 0, total: 87 },
-        usageEventCount: 7,
+        usageEventCount: 5,
+      });
+      expect(usage.groups[1]).toMatchObject({
+        model: "model-B",
+        tokens: { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 },
+        usageEventCount: 2,
       });
       expect(usage.coverage).toMatchObject({
         state: "partial",
