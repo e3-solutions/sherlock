@@ -1939,7 +1939,44 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     }
   }, 30_000);
 
-  it("selects one Claude canonical winner before splitting historical windows", async () => {
+  it.each([
+    {
+      name: "higher priority crosses the window edge",
+      rows: [["10:59:59", 100, 10], ["11:00:01", 110, 30]],
+      totals: [0, 30, 30], counts: [0, 1, 1],
+    },
+    {
+      name: "equal priority chooses earliest timestamp despite insertion order",
+      rows: [["11:00:01", 100, 30], ["10:59:59", 100, 10]],
+      totals: [10, 0, 10], counts: [1, 0, 1],
+    },
+    {
+      name: "equal priority and timestamp choose the lower event id",
+      rows: [["11:00:00", 100, 10], ["11:00:00", 100, 30]],
+      totals: [0, 10, 10], counts: [0, 1, 1],
+    },
+    {
+      name: "equal priority undated observation loses to dated observation",
+      rows: [[null, 100, 30], ["11:00:00", 100, 10]],
+      totals: [0, 10, 10], counts: [0, 1, 1],
+    },
+    {
+      name: "higher priority undated winner suppresses dated loser",
+      rows: [["11:00:00", 100, 10], [null, 110, 30]],
+      totals: [0, 0, 0], counts: [0, 0, 0],
+    },
+    {
+      name: "Codex cumulative baseline excludes a provisional row with an in-window winner",
+      cumulative: true,
+      rows: [
+        ["10:30:00", 100, 100, "baseline"],
+        ["10:59:00", 10, 120, "X"],
+        ["11:01:00", 100, 150, "X"],
+        ["11:10:00", 100, 180, "Y"],
+      ],
+      totals: [100, 80, 180], counts: [1, 2, 3],
+    },
+  ])("selects canonical usage across windows: $name", async (fixture) => {
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
     const sessionId = crypto.randomUUID();
@@ -1977,17 +2014,17 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
            storage_path, storage_encoding, stored_byte_count, stored_sha256,
            record_count, contract_version, first_occurred_at, last_occurred_at
          ) values (
-           $1, $2, $3, 'synthetic-collector', 'claude_code', 'transcript',
-           'synthetic-stream', 'synthetic-generation', 0, 0, 2, 2,
-           repeat('a', 64), $4, 'identity', 2, repeat('b', 64), 2,
+           $1, $2, $3, 'synthetic-collector', $7, $8,
+           'synthetic-stream', 'synthetic-generation', 0, 0, $9::integer, $9::integer,
+           repeat('a', 64), $4, 'identity', $9::integer, repeat('b', 64), $9::integer,
            'sherlock.rollout-batch.v1', $5, $6
          )`,
-        [batchId, workspaceId, personId, `synthetic/${batchId}.jsonl`, start, end],
+        [batchId, workspaceId, personId, `synthetic/${batchId}.jsonl`, start, end,
+          fixture.cumulative ? "codex" : "claude_code",
+          fixture.cumulative ? "rollout" : "transcript", fixture.rows.length],
       );
-      for (const [index, at, priority, total] of [
-        [0, "2026-08-18T10:59:59.000Z", 100, 10],
-        [1, "2026-08-18T11:00:01.000Z", 110, 30],
-      ]) {
+      for (const [index, [time, priority, total, logical = "message"]] of fixture.rows.entries()) {
+        const at = time === null ? null : `2026-08-18T${time}.000Z`;
         const [record] = await sql.unsafe(
           `insert into telemetry.native_records (
              workspace_id, batch_id, record_index, source_start_offset,
@@ -2007,11 +2044,13 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
              output_tokens, reasoning_tokens, total_tokens
            ) values (
              $1, $2, $3, $4, 0, 'session:synthetic-claude-session',
-             'claude:usage:synthetic-message', $5, 'usage', 'primary', $6, $6, $6,
+             $8, $5, 'usage', 'primary', $6, $6, $10,
              'synthetic-claude-model', 'session:synthetic-claude-session:message:synthetic-message',
-             'message', false, $7, 0, 0, 0, $7
+             'message', $9, $7, 0, 0, 0, $7
            )`,
-          [workspaceId, sessionId, record.id, CLAUDE_NORMALIZER_VERSION, priority, at, total],
+          [workspaceId, sessionId, record.id,
+            fixture.cumulative ? NORMALIZER_VERSION : CLAUDE_NORMALIZER_VERSION,
+            priority, at, total, logical, fixture.cumulative ?? false, end],
         );
       }
       source = new DirectFlameSource({
@@ -2030,17 +2069,15 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         (sum, group) => sum + group.tokens.total, 0,
       ));
 
-      // The provisional observation is not an additional usage fact merely
-      // because the final, higher-priority observation crosses a window edge.
-      expect(totals).toEqual([0, 30, 30]);
+      expect(totals).toEqual(fixture.totals);
       expect(totals[0] + totals[1]).toBe(totals[2]);
-      expect(windows.map((result) => result.coverage.observedUsageEvents)).toEqual([0, 1, 1]);
-      expect(coverageEvents).toEqual([0, 1, 1]);
+      expect(windows.map((result) => result.coverage.observedUsageEvents)).toEqual(fixture.counts);
+      expect(coverageEvents).toEqual(fixture.counts);
       const [{ count }] = await sql.unsafe(
         "select count(*)::int count from telemetry.events where workspace_id = $1",
         [workspaceId],
       );
-      expect(count).toBe(2);
+      expect(count).toBe(fixture.rows.length);
     } finally {
       if (source) await source.close();
       try {
