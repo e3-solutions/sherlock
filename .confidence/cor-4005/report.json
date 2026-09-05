@@ -1,0 +1,110 @@
+{
+  "version": 3,
+  "task_title": "COR-4005 Claude initial backfill coverage",
+  "mode": "critical",
+  "outcome": "Claude installation and SessionStart recovery now cover 72 hours by default, report cutoff exclusions, and install a selector-bounded historical replay command without changing Codex's 24-hour behavior.",
+  "changes": [
+    "Separated Claude's 72-hour default from the unchanged shared Codex 24-hour lookback and added a validated 1-to-744-hour Claude installer override.",
+    "Added auditable excluded_by_cutoff output and installer coverage warnings.",
+    "Installed replay-history for exactly one canonical session UUID or one timezone-aware RFC3339 mtime range of at most 31 days.",
+    "Preserved descriptor-bound projects-root confinement, immutable source bytes, durable checkpoints, and idempotent capture.",
+    "Documented coverage, retry, replay, half-open range, and local-transcript limitations."
+  ],
+  "evidence": [
+    {
+      "obligation_id": "P1",
+      "status": "pass",
+      "details": "The 51-hour installer regression fails against the old 24-hour behavior and passes with exact durable state under the new 72-hour default; the release collector suite also proves SessionStart behavior and the Codex 24-hour characterization.",
+      "artifacts": [
+        "tests/collector/test_team_installer.py",
+        "tests/collector/test_claude_plugin.py",
+        "tests/collector/test_plugin.py"
+      ],
+      "run_ids": ["collector-suite-final-release"],
+      "diagnostic_run_ids": ["initial-51h-fail"]
+    },
+    {
+      "obligation_id": "P2",
+      "status": "pass",
+      "details": "Installer coverage tests select a 47-hour transcript and report a 49-hour candidate at a configured 48-hour cutoff; invalid 0, over-limit, and nonnumeric values stop before installation state is written.",
+      "artifacts": [
+        "install-claude.sh",
+        "sherlock",
+        "packages/telemetry-collector/src/sherlock_collector/discovery.py"
+      ],
+      "run_ids": ["collector-suite-final-release"],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P3",
+      "status": "pass",
+      "details": "Tests prove exact primary-plus-associated-subagent UUID replay, reject an unrelated subagent ID collision, prove idempotent reruns, and enforce RFC3339 half-open mtime bounds to one-nanosecond precision with a 31-day maximum.",
+      "artifacts": [
+        "plugins/sherlock-claude-code/scripts/replay_history.py",
+        "packages/telemetry-collector/src/sherlock_collector/cli.py",
+        "tests/collector/test_claude_plugin.py"
+      ],
+      "run_ids": ["collector-suite-final-release"],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P4",
+      "status": "pass",
+      "details": "The release suite covers symlink rejection, invalid selectors before spool creation, exact byte checkpoints, race protections, and idempotency across all collector tests.",
+      "artifacts": [
+        "packages/telemetry-collector/src/sherlock_collector/discovery.py",
+        "tests/collector/test_claude_plugin.py"
+      ],
+      "run_ids": ["collector-suite-final-release", "compileall-final-release"],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P5",
+      "status": "pass",
+      "details": "The implementation uses the existing discovery/capture pipeline, adds one small installed wrapper, documents retry boundaries, and passed lint, shell syntax, whitespace, independent test design, and final adversarial review.",
+      "artifacts": [
+        "README.md",
+        "plugins/sherlock-claude-code/README.md",
+        ".confidence/cor-4005/contract.json"
+      ],
+      "run_ids": ["ruff-final-release", "shell-syntax-final-release", "diff-check-final-release"],
+      "diagnostic_run_ids": []
+    }
+  ],
+  "tests": {
+    "passed": [
+      "131 collector unit and integration tests",
+      "Ruff checks for collector source, tests, and replay wrapper",
+      "Python bytecode compilation",
+      "POSIX shell syntax for both installers",
+      "Git whitespace validation"
+    ],
+    "failed": [],
+    "not_run": []
+  },
+  "simplicity": {
+    "code_gate": "pass",
+    "test_gate": "pass",
+    "notes": "The change extends the existing bounded discovery and durable capture path instead of adding a second ingestion mechanism. Provider-specific defaults remain explicit, replay adds only selector validation, and counterexample tests cover the privacy and boundary risks."
+  },
+  "review": {
+    "required": true,
+    "reason": "Critical private-telemetry collection changes require independent proof design and adversarial boundary review.",
+    "roles": ["test_designer", "adversarial_reviewer"],
+    "findings": [
+      "Independent test design identified symlink confinement, invalid-before-mutation, UUID collision, and provider-default separation as the highest-risk counterexamples.",
+      "Adversarial review found and drove fixes for wrapper lookback escape, subagent UUID collision, loose ISO parsing, and nanosecond truncation.",
+      "Final adversarial re-review returned PASS with no release-blocking findings."
+    ]
+  },
+  "risks": [
+    "The reported historical session can only be recovered if its local Claude transcript still exists on the original machine.",
+    "The supplied session reference is not a canonical full UUID; replay intentionally requires the full UUID to avoid ambiguous collection.",
+    "Cutoff counts describe filename-shaped regular candidates, not validated missing sessions, and may include already checkpointed files."
+  ],
+  "rollback": "Revert the implementation commit, reinstall the prior Claude plugin runtime, and retain existing durable spool/checkpoint data; raw transcripts and queued telemetry are not rewritten by this change.",
+  "user_decisions": [
+    "The user requested a pull request using the Confidence Protocol.",
+    "The suggested minimum 72-hour Claude initial backfill was selected while leaving Codex at 24 hours."
+  ]
+}

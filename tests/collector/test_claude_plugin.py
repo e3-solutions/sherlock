@@ -21,6 +21,7 @@ from sherlock_collector.contract import FRAGMENT_BYTES, MAX_SOURCE_BYTES
 from sherlock_collector.discovery import (
     CLAUDE_BACKFILL_MAX_BYTES,
     CLAUDE_BACKFILL_MAX_FILES,
+    CLAUDE_DEFAULT_LOOKBACK_SECONDS,
     discover_claude_transcripts,
 )
 from sherlock_collector.hook import POST_TOOL_DEBOUNCE_SECONDS, run_hook
@@ -65,7 +66,9 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertEqual(handler["type"], "command", event)
             self.assertNotIn("async", handler, event)
             self.assertEqual(handler["timeout"], 2, event)
-            self.assertIn("${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py", handler["command"])
+            self.assertIn(
+                "${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py", handler["command"]
+            )
 
     def test_discovery_prioritizes_main_and_subagent_transcripts(self):
         with TemporaryDirectory() as temporary:
@@ -119,12 +122,7 @@ class ClaudePluginTests(unittest.TestCase):
             current = projects / "current.jsonl"
             primary_id = "11111111-1111-4111-8111-111111111111"
             primary = projects / f"{primary_id}.jsonl"
-            agent = (
-                projects
-                / primary_id
-                / "subagents"
-                / "agent-worker-456.jsonl"
-            )
+            agent = projects / primary_id / "subagents" / "agent-worker-456.jsonl"
             flat_agent = projects / "agent-deadbeef.jsonl"
             empty = projects / "33333333-3333-4333-8333-333333333333.jsonl"
             conflicting = projects / "44444444-4444-4444-8444-444444444444.jsonl"
@@ -364,7 +362,9 @@ class ClaudePluginTests(unittest.TestCase):
                 "11111111-1111-4111-8111-111111111111",
                 "22222222-2222-4222-8222-222222222222",
             )
-            transcripts = [project / f"{session_id}.jsonl" for session_id in session_ids]
+            transcripts = [
+                project / f"{session_id}.jsonl" for session_id in session_ids
+            ]
             initial = {}
             for transcript, session_id in zip(transcripts, session_ids, strict=True):
                 source = (
@@ -377,8 +377,7 @@ class ClaudePluginTests(unittest.TestCase):
                 lookback_seconds=24 * 60 * 60,
             )
             appended = (
-                json.dumps({"type": "assistant", "sessionId": session_ids[0]})
-                + "\n"
+                json.dumps({"type": "assistant", "sessionId": session_ids[0]}) + "\n"
             ).encode()
             with transcripts[0].open("ab") as handle:
                 handle.write(appended)
@@ -476,14 +475,14 @@ class ClaudePluginTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             claude_home = Path(temporary) / "claude"
             session_id = "77777777-7777-4777-8777-777777777777"
-            transcript = (
-                claude_home / "projects" / "repo" / f"{session_id}.jsonl"
-            )
+            transcript = claude_home / "projects" / "repo" / f"{session_id}.jsonl"
             transcript.parent.mkdir(parents=True)
             source = (
                 json.dumps({"type": "user", "sessionId": session_id}) + "\n"
             ).encode()
             transcript.write_bytes(source)
+            fifty_one_hours_ago = time.time() - 51 * 60 * 60
+            os.utime(transcript, (fifty_one_hours_ago, fifty_one_hours_ago))
             state_root = claude_home / "sherlock" / "telemetry"
 
             with patch("sherlock_collector.hook.subprocess.Popen") as popen:
@@ -517,6 +516,352 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertEqual(item["metadata"]["workload_class"], "backfill")
             self.assertEqual(popen.call_count, 2)
 
+    def test_default_claude_backfill_reports_cutoff_and_captures_51_hour_session(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            project = claude_home / "projects" / "repo"
+            included_id = "37ed37ed-158f-4a80-8a11-111111111111"
+            excluded_id = "37ed37ed-158f-4a80-8a11-222222222222"
+            included = project / f"{included_id}.jsonl"
+            excluded = project / f"{excluded_id}.jsonl"
+            for path, session_id in (
+                (included, included_id),
+                (excluded, excluded_id),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps({"type": "user", "sessionId": session_id}) + "\n",
+                    encoding="utf-8",
+                )
+            now = time.time()
+            os.utime(included, (now - 51 * 60 * 60,) * 2)
+            os.utime(excluded, (now - 73 * 60 * 60,) * 2)
+            state_root = root / "state"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sherlock_collector.cli",
+                    "--provider",
+                    "claude_code",
+                    "--claude-home",
+                    str(claude_home),
+                    "--state-root",
+                    str(state_root),
+                    "--config",
+                    str(root / "missing-config.json"),
+                    "backfill",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            outcome = json.loads(completed.stdout)
+            self.assertEqual(
+                outcome["lookback_seconds"], CLAUDE_DEFAULT_LOOKBACK_SECONDS
+            )
+            self.assertEqual(outcome["selection"], "lookback")
+            self.assertEqual(outcome["discovered"], 1)
+            self.assertEqual(outcome["excluded_by_cutoff"], 1)
+            state = json.loads(
+                (state_root / "claude-transcript-state.json").read_text()
+            )
+            self.assertEqual(
+                {stream["path"] for stream in state["streams"].values()},
+                {str(included.resolve())},
+            )
+
+    def test_claude_uuid_replay_is_exact_and_idempotent(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            project = claude_home / "projects" / "repo"
+            selected_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            other_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            associated_agent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            collision_parent_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+            selected = project / f"{selected_id}.jsonl"
+            other = project / f"{other_id}.jsonl"
+            for path, session_id in ((selected, selected_id), (other, other_id)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps({"type": "user", "sessionId": session_id}) + "\n",
+                    encoding="utf-8",
+                )
+                old = time.time() - 120 * 24 * 60 * 60
+                os.utime(path, (old, old))
+            associated = (
+                project
+                / selected_id
+                / "subagents"
+                / f"agent-{associated_agent_id}.jsonl"
+            )
+            collision = (
+                project
+                / collision_parent_id
+                / "subagents"
+                / f"agent-{selected_id}.jsonl"
+            )
+            for path, session_id, agent_id in (
+                (associated, selected_id, associated_agent_id),
+                (collision, collision_parent_id, selected_id),
+            ):
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": session_id,
+                            "agentId": agent_id,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            state_root = root / "state"
+            command = [
+                sys.executable,
+                "-m",
+                "sherlock_collector.cli",
+                "--provider",
+                "claude_code",
+                "--claude-home",
+                str(claude_home),
+                "--state-root",
+                str(state_root),
+                "--config",
+                str(root / "missing-config.json"),
+                "backfill",
+                "--session-id",
+                selected_id,
+            ]
+            environment = {**os.environ, "PYTHONPATH": str(SOURCE)}
+
+            first = subprocess.run(
+                command, check=False, capture_output=True, text=True, env=environment
+            )
+            second = subprocess.run(
+                command, check=False, capture_output=True, text=True, env=environment
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            first_outcome = json.loads(first.stdout)
+            second_outcome = json.loads(second.stdout)
+            self.assertEqual(first_outcome["selection"], "session_id")
+            self.assertEqual(first_outcome["session_id"], selected_id)
+            self.assertEqual(first_outcome["discovered"], 2)
+            self.assertEqual(first_outcome["enqueued"], 2)
+            self.assertEqual(second_outcome["enqueued"], 0)
+            state = json.loads(
+                (state_root / "claude-transcript-state.json").read_text()
+            )
+            self.assertEqual(
+                {stream["path"] for stream in state["streams"].values()},
+                {str(selected.resolve()), str(associated.resolve())},
+            )
+
+    def test_claude_mtime_range_replay_is_half_open_and_bounded(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            project = claude_home / "projects" / "repo"
+            start = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)
+            end = start + timedelta(hours=1)
+            times = (
+                ("11111111-1111-4111-8111-111111111111", start),
+                ("22222222-2222-4222-8222-222222222222", start + timedelta(minutes=30)),
+                ("33333333-3333-4333-8333-333333333333", end),
+                ("44444444-4444-4444-8444-444444444444", start - timedelta(seconds=1)),
+            )
+            expected: set[str] = set()
+            for session_id, modified_at in times:
+                path = project / f"{session_id}.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps({"type": "user", "sessionId": session_id}) + "\n",
+                    encoding="utf-8",
+                )
+                modified_ns = int(modified_at.timestamp()) * 1_000_000_000
+                os.utime(path, ns=(modified_ns, modified_ns))
+                if start <= modified_at < end:
+                    expected.add(str(path.resolve()))
+            nanosecond_id = "55555555-5555-4555-8555-555555555555"
+            nanosecond_boundary = project / f"{nanosecond_id}.jsonl"
+            nanosecond_boundary.write_text(
+                json.dumps({"type": "user", "sessionId": nanosecond_id}) + "\n",
+                encoding="utf-8",
+            )
+            start_ns = int(start.timestamp()) * 1_000_000_000
+            os.utime(nanosecond_boundary, ns=(start_ns + 1, start_ns + 1))
+            expected.discard(str((project / f"{times[0][0]}.jsonl").resolve()))
+            expected.add(str(nanosecond_boundary.resolve()))
+            state_root = root / "state"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sherlock_collector.cli",
+                    "--provider",
+                    "claude_code",
+                    "--claude-home",
+                    str(claude_home),
+                    "--state-root",
+                    str(state_root),
+                    "--config",
+                    str(root / "missing-config.json"),
+                    "backfill",
+                    "--start",
+                    start.isoformat().replace("+00:00", ".000000001Z"),
+                    "--end",
+                    end.isoformat().replace("+00:00", "Z"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            outcome = json.loads(completed.stdout)
+            self.assertEqual(outcome["selection"], "mtime_range")
+            self.assertEqual(outcome["discovered"], 2)
+            self.assertEqual(outcome["excluded_by_cutoff"], 2)
+            state = json.loads(
+                (state_root / "claude-transcript-state.json").read_text()
+            )
+            self.assertEqual(
+                {stream["path"] for stream in state["streams"].values()},
+                expected,
+            )
+
+    def test_invalid_claude_replay_selectors_write_no_state(self):
+        cases = (
+            ("--session-id", "not-a-full-uuid"),
+            ("--start", "2026-08-19T00:00:00+00:60", "--end", "2026-08-19T01:00:00Z"),
+            ("--start", "2026-08-19T00:00:00+01:99", "--end", "2026-08-19T01:00:00Z"),
+            ("--start", "0001-01-01T00:00:00+23:59", "--end", "2026-08-19T01:00:00Z"),
+            ("--start", "2026-08-19T00:00:00Z"),
+            (
+                "--start",
+                "2026-08-19 00:00:00Z",
+                "--end",
+                "2026-08-19T01:00:00Z",
+            ),
+            (
+                "--start",
+                "2026-08-19T00:00:00,5Z",
+                "--end",
+                "2026-08-19T01:00:00Z",
+            ),
+            (
+                "--start",
+                "2026-08-19T00:00:00.0000000001Z",
+                "--end",
+                "2026-08-19T01:00:00Z",
+            ),
+            (
+                "--start",
+                "2026-W34-3T00:00:00Z",
+                "--end",
+                "2026-08-19T01:00:00Z",
+            ),
+            (
+                "--start",
+                "2026-08-20T00:00:00Z",
+                "--end",
+                "2026-08-19T00:00:00Z",
+            ),
+            (
+                "--start",
+                "2026-01-01T00:00:00Z",
+                "--end",
+                "2026-03-01T00:00:00Z",
+            ),
+        )
+        for index, selector in enumerate(cases):
+            with self.subTest(selector=selector), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                claude_home = root / "claude"
+                state_root = root / f"state-{index}"
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "sherlock_collector.cli",
+                        "--provider",
+                        "claude_code",
+                        "--claude-home",
+                        str(claude_home),
+                        "--state-root",
+                        str(state_root),
+                        "backfill",
+                        *selector,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PYTHONPATH": str(SOURCE)},
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertFalse(state_root.exists())
+
+    def test_claude_uuid_replay_rejects_symlink_candidate(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            project = claude_home / "projects" / "repo"
+            session_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+            outside = root / "outside.jsonl"
+            outside.write_text(
+                json.dumps({"type": "user", "sessionId": session_id}) + "\n",
+                encoding="utf-8",
+            )
+            candidate = project / f"{session_id}.jsonl"
+            candidate.parent.mkdir(parents=True)
+            try:
+                candidate.symlink_to(outside)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+            state_root = root / "state"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sherlock_collector.cli",
+                    "--provider",
+                    "claude_code",
+                    "--claude-home",
+                    str(claude_home),
+                    "--state-root",
+                    str(state_root),
+                    "backfill",
+                    "--session-id",
+                    session_id,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            outcome = json.loads(completed.stdout)
+            self.assertEqual(outcome["invalid"], 1)
+            self.assertEqual(outcome["enqueued"], 0)
+            self.assertEqual(outcome["status"], "partial")
+            self.assertEqual(
+                list((state_root / "queue" / "pending").glob("*.json")), []
+            )
+
     def test_claude_post_tool_use_is_captured_then_debounced(self):
         with TemporaryDirectory() as temporary:
             claude_home = Path(temporary) / "claude"
@@ -539,8 +884,7 @@ class ClaudePluginTests(unittest.TestCase):
                     side_effect=[
                         first_ns,
                         first_ns + 1,
-                        first_ns
-                        + POST_TOOL_DEBOUNCE_SECONDS * 1_000_000_000,
+                        first_ns + POST_TOOL_DEBOUNCE_SECONDS * 1_000_000_000,
                     ],
                 ),
             ):
@@ -613,8 +957,7 @@ class ClaudePluginTests(unittest.TestCase):
                 for path in (state_root / "queue" / "pending").glob("*.json")
             ]
             by_session = {
-                item["manifest"]["observed_native_session_id"]: item
-                for item in items
+                item["manifest"]["observed_native_session_id"]: item for item in items
             }
             self.assertNotIn("workload_class", by_session[current_id]["metadata"])
             self.assertEqual(
@@ -657,9 +1000,7 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertEqual(manifest["source_provider"], "claude_code")
             self.assertEqual(manifest["source_kind"], "transcript")
             self.assertEqual(manifest["observed_native_session_id"], "session-123")
-            self.assertTrue(
-                (state_root / "claude-transcript-state.json").is_file()
-            )
+            self.assertTrue((state_root / "claude-transcript-state.json").is_file())
             popen.assert_called_once()
 
     def test_launcher_is_fail_open_when_runtime_is_missing(self):
@@ -736,9 +1077,7 @@ class ClaudePluginTests(unittest.TestCase):
             # Give that child a short quiet window after both durable cursors
             # appear so temporary-directory cleanup cannot race its final fsync.
             time.sleep(0.1)
-            items = [
-                json.loads(path.read_text(encoding="utf-8")) for path in paths
-            ]
+            items = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
             item = next(
                 value
                 for value in items
@@ -748,14 +1087,10 @@ class ClaudePluginTests(unittest.TestCase):
             stored = base64.b64decode(item["stored_payload_base64"], validate=True)
             self.assertEqual(gzip.decompress(stored), source)
             hook = next(
-                value
-                for value in items
-                if value["manifest"]["source_kind"] == "hook"
+                value for value in items if value["manifest"]["source_kind"] == "hook"
             )
             hook_source = gzip.decompress(
-                base64.b64decode(
-                    hook["stored_payload_base64"], validate=True
-                )
+                base64.b64decode(hook["stored_payload_base64"], validate=True)
             )
             observation = json.loads(hook_source)
             self.assertEqual(
@@ -804,9 +1139,7 @@ class ClaudePluginTests(unittest.TestCase):
                     break
                 time.sleep(0.02)
             self.assertEqual(len(paths), 2)
-            items = [
-                json.loads(path.read_text(encoding="utf-8")) for path in paths
-            ]
+            items = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
             item = next(
                 value
                 for value in items
@@ -890,32 +1223,20 @@ class ClaudePluginTests(unittest.TestCase):
             ]
             self.assertEqual(len(pending), 2)
             hook = next(
-                item
-                for item in pending
-                if item["manifest"]["source_kind"] == "hook"
+                item for item in pending if item["manifest"]["source_kind"] == "hook"
             )
-            self.assertEqual(
-                hook["manifest"]["observed_native_session_id"], session_id
-            )
-            self.assertIsNone(
-                hook["manifest"]["observed_parent_native_session_id"]
-            )
-            stored = base64.b64decode(
-                hook["stored_payload_base64"], validate=True
-            )
+            self.assertEqual(hook["manifest"]["observed_native_session_id"], session_id)
+            self.assertIsNone(hook["manifest"]["observed_parent_native_session_id"])
+            stored = base64.b64decode(hook["stored_payload_base64"], validate=True)
             observation = json.loads(gzip.decompress(stored))
             self.assertEqual(observation["type"], "claude_hook")
-            self.assertEqual(
-                observation["schema_version"], "sherlock.claude-hook.v1"
-            )
+            self.assertEqual(observation["schema_version"], "sherlock.claude-hook.v1")
             self.assertEqual(
                 base64.b64decode(observation["payload_base64"]), raw_payload
             )
             self.assertEqual(observation["native_session_id"], session_id)
             self.assertEqual(observation["turn_anchor_id"], prompt_uuid)
-            self.assertEqual(
-                observation["terminal_assistant_uuid"], assistant_uuid
-            )
+            self.assertEqual(observation["terminal_assistant_uuid"], assistant_uuid)
             self.assertEqual(observation["transcript_byte_count"], len(source))
             self.assertEqual(
                 observation["transcript_sha256"],
@@ -955,9 +1276,7 @@ class ClaudePluginTests(unittest.TestCase):
                 },
             ]
             source = b"".join(
-                (
-                    json.dumps(record, separators=(",", ":")) + "\n"
-                ).encode()
+                (json.dumps(record, separators=(",", ":")) + "\n").encode()
                 for record in records
             )
             transcript.write_bytes(source)
@@ -981,9 +1300,7 @@ class ClaudePluginTests(unittest.TestCase):
             observation = json.loads(path.read_text(encoding="utf-8"))
 
             self.assertEqual(observation["turn_anchor_id"], prompt_uuid)
-            self.assertEqual(
-                observation["terminal_assistant_uuid"], assistant_uuid
-            )
+            self.assertEqual(observation["terminal_assistant_uuid"], assistant_uuid)
             self.assertEqual(
                 base64.b64decode(observation["payload_base64"]), raw_payload
             )
@@ -1009,9 +1326,7 @@ class ClaudePluginTests(unittest.TestCase):
             )
             transcript.write_bytes(
                 b"".join(
-                    (
-                        json.dumps(record, separators=(",", ":")) + "\n"
-                    ).encode()
+                    (json.dumps(record, separators=(",", ":")) + "\n").encode()
                     for record in records
                 )
             )
@@ -1066,9 +1381,7 @@ class ClaudePluginTests(unittest.TestCase):
             root = Path(temporary)
             claude_home = root / "claude"
             session_id = "88888888-8888-4888-8888-888888888888"
-            transcript = (
-                claude_home / "projects" / "repo" / f"{session_id}.jsonl"
-            )
+            transcript = claude_home / "projects" / "repo" / f"{session_id}.jsonl"
             transcript.parent.mkdir(parents=True)
             source = (
                 json.dumps({"type": "user", "sessionId": session_id}) + "\n"
@@ -1132,9 +1445,7 @@ class ClaudePluginTests(unittest.TestCase):
             root = Path(temporary)
             claude_home = root / "claude"
             session_id = "99999999-9999-4999-8999-999999999999"
-            transcript = (
-                claude_home / "projects" / "repo" / f"{session_id}.jsonl"
-            )
+            transcript = claude_home / "projects" / "repo" / f"{session_id}.jsonl"
             transcript.parent.mkdir(parents=True)
             record = (
                 json.dumps(
@@ -1257,9 +1568,7 @@ class ClaudePluginTests(unittest.TestCase):
             partial = capturer.capture(
                 partial_discovery.paths,
                 native_session_ids=partial_discovery.native_session_ids,
-                parent_native_session_ids=(
-                    partial_discovery.parent_native_session_ids
-                ),
+                parent_native_session_ids=(partial_discovery.parent_native_session_ids),
                 source_snapshots=partial_discovery.source_snapshots,
                 max_sync_bytes=1024 * 1024,
                 backlog_workload_class="backfill",
@@ -1298,9 +1607,7 @@ class ClaudePluginTests(unittest.TestCase):
                 backlog_workload_class="backfill",
             )
             oversized = oversized_partial + b"\n"
-            expected_fragments = (
-                len(oversized) + FRAGMENT_BYTES - 1
-            ) // FRAGMENT_BYTES
+            expected_fragments = (len(oversized) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
             self.assertEqual(fragmented.enqueued, expected_fragments)
             self.assertEqual(fragmented.captured_bytes, len(oversized))
             self.assertEqual(fragmented.deferred_bytes, len(later))
@@ -1568,9 +1875,7 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertNotEqual(disabled.returncode, 0)
 
             settings.write_text(
-                json.dumps(
-                    {"enabledPlugins": {"sherlock-claude-code@sherlock": True}}
-                ),
+                json.dumps({"enabledPlugins": {"sherlock-claude-code@sherlock": True}}),
                 encoding="utf-8",
             )
             enabled = subprocess.run(
@@ -1581,7 +1886,9 @@ class ClaudePluginTests(unittest.TestCase):
                 env=environment,
             )
             self.assertEqual(enabled.returncode, 0, enabled.stderr)
-            self.assertEqual(json.loads(enabled.stdout)["check"], "local_plugin_enabled")
+            self.assertEqual(
+                json.loads(enabled.stdout)["check"], "local_plugin_enabled"
+            )
 
     def test_hook_defers_a_transcript_tail_until_the_record_is_complete(self):
         with TemporaryDirectory() as temporary:
@@ -1619,13 +1926,17 @@ class ClaudePluginTests(unittest.TestCase):
                 )
 
             self.assertEqual(initial.captured_bytes, len(first))
-            self.assertEqual(completed.captured_bytes, transcript.stat().st_size - len(first))
+            self.assertEqual(
+                completed.captured_bytes, transcript.stat().st_size - len(first)
+            )
             manifests = [
                 json.loads(path.read_text(encoding="utf-8"))["manifest"]
                 for path in (state_root / "queue" / "pending").glob("*.json")
             ]
             self.assertEqual(
-                sorted((item["start_offset"], item["end_offset"]) for item in manifests),
+                sorted(
+                    (item["start_offset"], item["end_offset"]) for item in manifests
+                ),
                 [(0, len(first)), (len(first), transcript.stat().st_size)],
             )
 

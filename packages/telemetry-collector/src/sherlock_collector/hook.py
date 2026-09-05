@@ -17,6 +17,7 @@ from .claude_hook import (
 )
 from .config import default_claude_home, default_codex_home, default_state_root
 from .discovery import (
+    CLAUDE_DEFAULT_LOOKBACK_SECONDS,
     DEFAULT_LOOKBACK_SECONDS,
     discover_claude_transcripts,
     discover_rollouts,
@@ -205,7 +206,9 @@ def _capture_hook(
             home,
             hook_payload=payload,
             lookback_seconds=(
-                DEFAULT_LOOKBACK_SECONDS if event_name == "SessionStart" else None
+                CLAUDE_DEFAULT_LOOKBACK_SECONDS
+                if event_name == "SessionStart"
+                else None
             ),
         )
         if provider == "claude_code"
