@@ -1,5 +1,5 @@
 import postgres from "postgres";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { DirectFlameSource } from "./flame-source.js";
 
@@ -105,6 +105,17 @@ describe("dashboard transaction checkout cancellation", () => {
 });
 
 describePostgres("dashboard transaction-pooling prerequisites", () => {
+  beforeAll(async () => {
+    // Supabase's postgres test login needs explicit membership. Establish it
+    // here rather than relying on another test file's concurrent setup.
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      await sql.unsafe("grant sherlock_reader to postgres");
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+
   it("abandons queued BEGIN work and lets the next borrower use the connection", async () => {
     const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
     const source = sourceUsing(sql);

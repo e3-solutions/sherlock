@@ -1824,6 +1824,13 @@ export function buildFreshnessPayload(rows, maxPeople) {
 export function dashboardDatabaseUrl(databaseUrl) {
   const url = new URL(databaseUrl);
   url.searchParams.delete("application_name");
+  // Dashboards use transaction-local state only. Route their inherited shared
+  // credential without changing the worker's session-affine connection URL.
+  const isSharedPooler = url.hostname === "pooler.supabase.com" ||
+    url.hostname.endsWith(".pooler.supabase.com");
+  if (isSharedPooler && (url.port === "" || url.port === "5432")) {
+    url.port = "6543";
+  }
   return url.toString();
 }
 

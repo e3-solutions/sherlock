@@ -283,6 +283,22 @@ describe("Sherlock Flame payload", () => {
     expect(cleaned.password).toBe("secret");
   });
 
+  it.each([
+    ["aws-0-us-east-1.pooler.supabase.com:5432", "6543"],
+    ["aws-0-us-east-1.pooler.supabase.com", "6543"],
+    ["aws-0-us-east-1.pooler.supabase.com:6543", "6543"],
+    ["db.example.supabase.co:5432", "5432"],
+    ["localhost:55432", "55432"],
+    ["pooler.supabase.com.example.invalid:5432", "5432"],
+  ])("routes only shared Supabase session endpoints to transaction mode: %s", (host, port) => {
+    const url = new URL(dashboardDatabaseUrl(`postgresql://reader:secret@${host}/postgres?sslmode=require`));
+    expect(url.port).toBe(port);
+    expect(url.username).toBe("reader");
+    expect(url.password).toBe("secret");
+    expect(url.pathname).toBe("/postgres");
+    expect(url.searchParams.get("sslmode")).toBe("require");
+  });
+
   it("configures default source transactions before pinning the read-only role", async () => {
     const unsafe = vi.fn().mockResolvedValue([]);
     const source = Object.create(DirectFlameSource.prototype);

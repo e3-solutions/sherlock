@@ -232,8 +232,11 @@ server connection; every dashboard transaction explicitly assumes the restricted
 exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
 the additive frame-projection migration or when stopping new v2 token minting.
 
-For shared Supavisor connections, use transaction mode on port `6543` for the
-dashboards. Named prepared statements are disabled, and role, read-only mode,
+For shared Supavisor connections, the dashboard routes session endpoints (port
+`5432` or an omitted port) to transaction mode on port `6543`. This also works
+when `SUPABASE_DB_URL` inherits a shared Railway variable: the reference and
+credential rotation remain intact. Explicit transaction endpoints and direct or
+local PostgreSQL URLs are unchanged. Named prepared statements are disabled, and role, read-only mode,
 repeatable-read isolation, and statement timeout are set inside each transaction.
 Do not change the telemetry worker's session-mode connection: it uses session
 advisory locks.
