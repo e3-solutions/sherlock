@@ -744,6 +744,8 @@ class ClaudePluginTests(unittest.TestCase):
     def test_invalid_claude_replay_selectors_write_no_state(self):
         cases = (
             ("--session-id", "not-a-full-uuid"),
+            ("--start", "2026-08-19T00:00:00.١Z", "--end", "2026-08-19T01:00:00Z"),
+            ("--start", "2026-08-19T00:00:00.１Z", "--end", "2026-08-19T01:00:00Z"),
             ("--start", "2026-08-19T00:00:00+00:60", "--end", "2026-08-19T01:00:00Z"),
             ("--start", "2026-08-19T00:00:00+01:99", "--end", "2026-08-19T01:00:00Z"),
             ("--start", "0001-01-01T00:00:00+23:59", "--end", "2026-08-19T01:00:00Z"),

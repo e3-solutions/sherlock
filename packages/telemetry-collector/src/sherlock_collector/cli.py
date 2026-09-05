@@ -37,7 +37,8 @@ from .spool import DurableSpool
 MAX_CLAUDE_REPLAY_RANGE_SECONDS = 31 * 24 * 60 * 60
 RFC3339_PATTERN = re.compile(
     r"^(?P<second>\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2})"
-    r"(?P<fraction>\.\d{1,9})?(?P<zone>[Zz]|[+-]\d{2}:\d{2})$"
+    r"(?P<fraction>\.\d{1,9})?(?P<zone>[Zz]|[+-]\d{2}:\d{2})$",
+    re.ASCII,
 )
 
 
