@@ -226,18 +226,31 @@ contains no job IDs, leases, errors, raw payloads, hashes, or storage paths.
 SUPABASE_DB_URL, SHERLOCK_WORKSPACE_ID, and SHERLOCK_DASHBOARD_EMAIL_DOMAIN are
 required. The email domain must be exactly `e3group.ai` or `sixtyfour.ai`; it
 filters every roster, detail, and MCP evidence read for that one-workspace
-service. SUPABASE_DB_URL reuses
-the existing Sherlock worker login contract, which can assume
-sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
+service. SUPABASE_DB_URL reuses the existing Sherlock worker login for the
+server connection; every dashboard transaction explicitly assumes the restricted
+`sherlock_reader` role. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
 exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
 the additive frame-projection migration or when stopping new v2 token minting.
 
-Each dashboard opens and retains its two labeled database sessions before the
-HTTP server starts. Startup fails closed if both cannot be acquired. The worker
-accounts for these owned sessions in its admission budget and preserves missing
-slots for both live dashboards and a simultaneous replacement generation. A
-database URL `application_name` parameter is discarded so deployment
-configuration cannot override the capacity labels.
+For shared Supavisor connections, the dashboard routes session endpoints (port
+`5432` or an omitted port) to transaction mode on port `6543`. This also works
+when `SUPABASE_DB_URL` inherits a shared Railway variable: the reference and
+credential rotation remain intact. Explicit transaction endpoints and direct or
+local PostgreSQL URLs are unchanged. Named prepared statements are disabled, and role, read-only mode,
+repeatable-read isolation, and statement timeout are set inside each transaction.
+Do not change the telemetry worker's session-mode connection: it uses session
+advisory locks.
+
+Each dashboard warms two client connections before the HTTP server starts.
+In transaction mode these clients release their backend after each transaction;
+warm-up is not a reservation of two PostgreSQL backends. This lets old and new
+dashboard generations share the bounded backend pool during deployment. Direct
+and session connections still retain their two backends. The worker's admission
+check observes PostgreSQL connection counts, not the separate Supavisor pool
+limit; validate replacement overlap against the real pooler before changing pool
+configuration. Supavisor may label backend sessions `Supavisor` instead of
+forwarding the client's application name. A URL `application_name` parameter is
+discarded so it cannot override the dashboard's client label.
 
 ## Sherlock / Bonaparte MCP
 
@@ -292,7 +305,9 @@ Run corepack pnpm install --frozen-lockfile, then pnpm check, pnpm test, and
 pnpm build. The test suite includes an official MCP client discovering and
 calling the Streamable HTTP tools. With the repository's isolated Supabase
 database running, set `SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to
-execute the dashboard SQL integration fixture.
+execute the dashboard SQL and transaction-isolation/cancellation fixtures. These
+local tests do not replace an actual transaction-pool overlap and cancellation
+probe before a pooling configuration change.
 
 ## Railway deployment
 

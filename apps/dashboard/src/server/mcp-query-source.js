@@ -434,45 +434,34 @@ with p as materialized (
          baseline.output_tokens, baseline.reasoning_tokens, baseline.total_tokens
     from streams stream cross join p
     left join lateral (
-      select candidate.id, candidate.normalizer_version, candidate.usage_at,
-             candidate.input_tokens,
-             candidate.cached_input_tokens, candidate.output_tokens,
-             candidate.reasoning_tokens, candidate.total_tokens
-        from (
-          select e.id, e.normalizer_version, e.occurred_at usage_at, e.input_tokens,
-                 e.cached_input_tokens, e.output_tokens,
-                 e.reasoning_tokens, e.total_tokens,
-                 row_number() over (
-                   partition by e.session_id, e.normalizer_version,
-                     coalesce(e.canonical_scope_key, 'event:' || e.id::text),
-                     coalesce(e.logical_event_key, 'event:' || e.id::text),
-                     e.event_kind
-                   order by e.source_priority desc, e.occurred_at, e.id
-                 ) canonical_rank
-            from telemetry.events e
-            join telemetry.sessions baseline_session
-              on baseline_session.workspace_id = e.workspace_id
-             and baseline_session.id = e.session_id
-            join telemetry.native_records nr
-              on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
-            join telemetry.ingest_batches ib
-              on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
-            left join analytics.normalizer_cutovers c
-              on c.workspace_id = e.workspace_id
-             and c.source_provider = ib.source_provider
-             and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
-           where stream.usage_is_cumulative
-             and e.workspace_id = p.workspace_id
-             and e.session_id = stream.session_id and e.event_kind = 'usage'
-             and not e.is_replay
-             and e.usage_stream_key = stream.usage_stream_key
-             and e.usage_is_cumulative is not distinct from stream.usage_is_cumulative
-             and e.occurred_at < p.start_at
-             and ${activeNormalizerPredicate("e", "baseline_session", "ib", "c")}
-             and ${canonicalWinnerPredicate("e", "baseline_session")}
-        ) candidate
-       where candidate.canonical_rank = 1
-       order by candidate.usage_at desc, candidate.id desc
+      -- The global winner predicate already resolves keyed duplicates. Sorting
+      -- and ranking all history here prevents the time index from early-stopping
+      -- and can conflate an unkeyed event with a literal event:<id> key.
+      select e.id, e.normalizer_version, e.occurred_at usage_at, e.input_tokens,
+             e.cached_input_tokens, e.output_tokens,
+             e.reasoning_tokens, e.total_tokens
+        from telemetry.events e
+        join telemetry.sessions baseline_session
+          on baseline_session.workspace_id = e.workspace_id
+         and baseline_session.id = e.session_id
+        join telemetry.native_records nr
+          on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
+        join telemetry.ingest_batches ib
+          on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
+        left join analytics.normalizer_cutovers c
+          on c.workspace_id = e.workspace_id
+         and c.source_provider = ib.source_provider
+         and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
+       where stream.usage_is_cumulative
+         and e.workspace_id = p.workspace_id
+         and e.session_id = stream.session_id and e.event_kind = 'usage'
+         and not e.is_replay
+         and e.usage_stream_key = stream.usage_stream_key
+         and e.usage_is_cumulative is not distinct from stream.usage_is_cumulative
+         and e.occurred_at < p.start_at
+         and ${activeNormalizerPredicate("e", "baseline_session", "ib", "c")}
+         and ${canonicalWinnerPredicate("e", "baseline_session")}
+       order by e.occurred_at desc, e.id desc
        limit 1
     ) baseline on true
 ), timeline as materialized (
