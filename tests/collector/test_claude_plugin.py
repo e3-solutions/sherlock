@@ -5,8 +5,10 @@ import base64
 import gzip
 import hashlib
 import os
+import select
 import subprocess
 import sys
+import textwrap
 import time
 import unittest
 import uuid
@@ -1100,7 +1102,7 @@ class ClaudePluginTests(unittest.TestCase):
                 hook_input.encode(),
             )
 
-    def test_terminal_launcher_waits_for_asynchronous_transcript_tail(self):
+    def test_terminal_capture_waits_for_asynchronous_transcript_tail(self):
         with TemporaryDirectory() as temporary:
             claude_home = Path(temporary) / "claude"
             transcript = claude_home / "projects" / "repo" / "session.jsonl"
@@ -1113,33 +1115,67 @@ class ClaudePluginTests(unittest.TestCase):
                 **os.environ,
                 "CLAUDE_CONFIG_DIR": str(claude_home),
                 "SHERLOCK_COLLECTOR_SOURCE": str(SOURCE),
+                "PYTHONPATH": str(SOURCE),
             }
-            launched = subprocess.run(
-                [sys.executable, str(LAUNCHER), "SessionEnd"],
-                input=json.dumps(
-                    {
-                        "session_id": "session-late",
-                        "transcript_path": str(transcript),
-                    }
-                ),
-                check=False,
-                capture_output=True,
+            # Track the real capture process; queue publication precedes its
+            # final state writes. Network drain is outside this test's scope.
+            capture = subprocess.Popen(
+                [sys.executable, "-c", textwrap.dedent("""
+                    import io, runpy, sys
+                    from unittest.mock import patch
+
+                    control = sys.stdin
+                    sys.stdin = io.StringIO(control.readline())
+                    sys.argv = sys.argv[1:]
+                    launcher = runpy.run_path(sys.argv[0])
+                    wait_globals = launcher['_wait_for_terminal_transcripts'].__globals__
+                    original_signatures = wait_globals['_path_signatures']
+                    ready = False
+
+                    def signatures(paths):
+                        global ready
+                        result = original_signatures(paths)
+                        if not ready:
+                            ready = True
+                            print('snapshot-ready', flush=True)
+                            assert control.readline().strip() == 'tail-written'
+                        return result
+
+                    with patch.dict(wait_globals, {'_path_signatures': signatures}), \\
+                         patch('sherlock_collector.hook._spawn_drain'):
+                        raise SystemExit(launcher['main']())
+                 """),
+                 str(LAUNCHER), "--capture", "SessionEnd"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env=environment,
             )
-
-            self.assertEqual(launched.returncode, 0)
-            with transcript.open("ab") as handle:
-                handle.write(completed_tail)
+            try:
+                capture.stdin.write(json.dumps({
+                    "session_id": "session-late",
+                    "transcript_path": str(transcript),
+                }) + "\n")
+                capture.stdin.flush()
+                self.assertTrue(
+                    select.select([capture.stdout], [], [], 5)[0],
+                    "capture did not enter the real terminal wait",
+                )
+                self.assertEqual(capture.stdout.readline(), "snapshot-ready\n")
+                # The child already observed the partial file. Hold it at that
+                # snapshot until the append completes, then resume real polling.
+                with transcript.open("ab") as handle:
+                    handle.write(completed_tail)
+                _, stderr = capture.communicate(input="tail-written\n", timeout=5)
+                self.assertEqual(capture.returncode, 0, stderr)
+            finally:
+                if capture.poll() is None:
+                    capture.kill()
+                capture.communicate()
 
             pending = claude_home / "sherlock" / "telemetry" / "queue" / "pending"
-            deadline = time.monotonic() + 3
-            paths = []
-            while time.monotonic() < deadline:
-                paths = list(pending.glob("*.json")) if pending.is_dir() else []
-                if len(paths) >= 2:
-                    break
-                time.sleep(0.02)
+            paths = list(pending.glob("*.json"))
             self.assertEqual(len(paths), 2)
             items = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
             item = next(
