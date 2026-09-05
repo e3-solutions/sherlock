@@ -531,6 +531,7 @@ class ConfigurationTests(unittest.TestCase):
                 text=True,
             )
 
+            self.assertEqual(completed.returncode, 0, completed.stderr)
             config = codex_home / "sherlock" / "collector.json"
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertTrue(
@@ -1090,6 +1091,37 @@ class HookIntegrationTests(unittest.TestCase):
             self.assertEqual(item["metadata"]["workload_class"], "backfill")
             self.assertEqual(item["manifest"]["source_provider"], "codex")
             self.assertEqual(item["manifest"]["source_kind"], "rollout")
+
+    def test_manual_codex_backfill_default_remains_24_hours(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            state_root = root / "state"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sherlock_collector.cli",
+                    "--provider",
+                    "codex",
+                    "--codex-home",
+                    str(codex_home),
+                    "--state-root",
+                    str(state_root),
+                    "backfill",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            outcome = json.loads(completed.stdout)
+            self.assertEqual(outcome["lookback_seconds"], 24 * 60 * 60)
+            self.assertEqual(outcome["selection"], "lookback")
 
     def test_exact_launcher_is_fail_open_when_local_state_is_corrupt(self):
         with TemporaryDirectory() as temporary:

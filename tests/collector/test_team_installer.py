@@ -5,7 +5,9 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,7 +18,7 @@ CLAUDE_INSTALLER = ROOT / "install-claude.sh"
 UNIFIED_INSTALLER = ROOT / "sherlock"
 
 
-FAKE_CODEX = r'''#!/usr/bin/env python3
+FAKE_CODEX = r"""#!/usr/bin/env python3
 import json
 import os
 import shutil
@@ -125,10 +127,10 @@ for line in sys.stdin:
     else:
         raise SystemExit(3)
     print(json.dumps({"id": request_id, "result": result}), flush=True)
-'''
+"""
 
 
-FAKE_CLAUDE = r'''#!/usr/bin/env python3
+FAKE_CLAUDE = r"""#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -169,10 +171,27 @@ if sys.argv[1:3] == ["plugin", "install"]:
     }), encoding="utf-8")
     raise SystemExit(0)
 raise SystemExit(2)
-'''
+"""
 
 
 class TeamInstallerTests(unittest.TestCase):
+    def test_unified_command_rejects_ambiguous_hours_before_writing(self):
+        for hours in ("060", "18446744073709551617"):
+            with self.subTest(hours=hours), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                completed = subprocess.run(
+                    ["sh", str(UNIFIED_INSTALLER), "--name", "Test User",
+                     "--github-id", "test-user", "--email", "test@e3group.ai",
+                     "--claude-backfill-hours", hours],
+                    cwd=ROOT, check=False, capture_output=True, text=True,
+                    env={**os.environ, "CODEX_HOME": str(root / "codex"),
+                         "CLAUDE_CONFIG_DIR": str(root / "claude"),
+                         "PYTHON_BIN": sys.executable},
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertFalse((root / "codex").exists())
+                self.assertFalse((root / "claude").exists())
+
     def test_unified_command_installs_codex_and_claude_with_same_identity(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -242,10 +261,7 @@ class TeamInstallerTests(unittest.TestCase):
             )
             self.assertTrue(
                 (
-                    marketplace_root
-                    / "plugins"
-                    / "sherlock-claude-code"
-                    / "hooks"
+                    marketplace_root / "plugins" / "sherlock-claude-code" / "hooks"
                 ).is_dir()
             )
             marketplace_adds = [
@@ -264,10 +280,7 @@ class TeamInstallerTests(unittest.TestCase):
                 any(call.get("argv", [])[:2] == ["plugin", "add"] for call in calls)
             )
             self.assertTrue(
-                any(
-                    call.get("argv", [])[:2] == ["plugin", "install"]
-                    for call in calls
-                )
+                any(call.get("argv", [])[:2] == ["plugin", "install"] for call in calls)
             )
 
     def test_unified_command_preserves_multicall_codex_launcher_name(self):
@@ -329,9 +342,7 @@ class TeamInstallerTests(unittest.TestCase):
                     for call in calls
                 )
             )
-            self.assertTrue(
-                any(call.get("batchWrite") is not None for call in calls)
-            )
+            self.assertTrue(any(call.get("batchWrite") is not None for call in calls))
 
     def test_unified_command_rejects_unapproved_domain_without_mutation(self):
         with TemporaryDirectory() as temporary:
@@ -729,7 +740,9 @@ class TeamInstallerTests(unittest.TestCase):
                 completed.stdout,
             )
             self.assertIn("Claude Code: installed", completed.stdout)
-            calls = [json.loads(line)["argv"] for line in capture.read_text().splitlines()]
+            calls = [
+                json.loads(line)["argv"] for line in capture.read_text().splitlines()
+            ]
             self.assertFalse(any(call[:2] == ["plugin", "add"] for call in calls))
             self.assertTrue(any(call[:2] == ["plugin", "install"] for call in calls))
 
@@ -855,12 +868,7 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertIn('"status": "complete"', completed.stdout)
             self.assertIn("Trusted 7 Sherlock hooks", completed.stdout)
             self.assertTrue(
-                (
-                    codex_home
-                    / "sherlock"
-                    / "telemetry"
-                    / "rollout-state.json"
-                ).is_file()
+                (codex_home / "sherlock" / "telemetry" / "rollout-state.json").is_file()
             )
             calls = [json.loads(line) for line in capture.read_text().splitlines()]
             self.assertEqual(
@@ -916,6 +924,15 @@ class TeamInstallerTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             claude_home = root / "claude"
+            session_id = "37ed37ed-158f-4a80-8a11-111111111111"
+            transcript = claude_home / "projects" / "repo" / f"{session_id}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            source = (
+                json.dumps({"type": "user", "sessionId": session_id}) + "\n"
+            ).encode()
+            transcript.write_bytes(source)
+            fifty_one_hours_ago = time.time() - 51 * 60 * 60
+            os.utime(transcript, (fifty_one_hours_ago, fifty_one_hours_ago))
             fake_claude = root / "fake-claude"
             capture = root / "claude-calls.jsonl"
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
@@ -960,7 +977,7 @@ class TeamInstallerTests(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(repeated.returncode, 0, repeated.stderr)
-            self.assertIn("Claude Code 24-hour backfill", completed.stdout)
+            self.assertIn("Claude Code 72-hour backfill", completed.stdout)
             self.assertIn('"status": "complete"', completed.stdout)
             config = claude_home / "sherlock" / "collector.json"
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
@@ -975,15 +992,102 @@ class TeamInstallerTests(unittest.TestCase):
                     / "cli.py"
                 ).is_file()
             )
-            self.assertTrue(
+            state = json.loads(
                 (
                     claude_home
                     / "sherlock"
                     / "telemetry"
                     / "claude-transcript-state.json"
-                ).is_file()
+                ).read_text(encoding="utf-8")
             )
-            calls = [json.loads(line)["argv"] for line in capture.read_text().splitlines()]
+            stream = next(iter(state["streams"].values()))
+            self.assertEqual(stream["path"], str(transcript.resolve()))
+            self.assertEqual(stream["offset"], len(source))
+            replay = claude_home / "sherlock" / "bin" / "replay-history"
+            self.assertTrue(replay.is_file())
+            self.assertEqual(replay.stat().st_mode & 0o777, 0o700)
+            help_result = subprocess.run(
+                [str(replay), "--help"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+            self.assertIn("--session-id", help_result.stdout)
+            self.assertIn("--start", help_result.stdout)
+            state_path = (
+                claude_home
+                / "sherlock"
+                / "telemetry"
+                / "claude-transcript-state.json"
+            )
+            state_before_invalid_replay = state_path.read_bytes()
+            for replay_args in ((), ("--lookback-seconds", "999999999999")):
+                rejected = subprocess.run(
+                    [str(replay), *replay_args],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                self.assertEqual(rejected.returncode, 2)
+                self.assertEqual(state_path.read_bytes(), state_before_invalid_replay)
+
+            # Exercise the installed runtime, with no repository import path or
+            # usable upload endpoint, from outside the source checkout.
+            replay_environment = {
+                key: value for key, value in environment.items()
+                if key != "PYTHONPATH" and not key.startswith("SHERLOCK_")
+            }
+            replay_environment["SHERLOCK_CONFIG_PATH"] = str(root / "missing.json")
+            replay_environment["SHERLOCK_INGEST_URL"] = "disabled"
+            selected_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            range_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            excluded_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            range_start = int(datetime.fromisoformat("2025-06-16T00:00:00+00:00").timestamp())
+            historical_sources = {}
+            for native_id, modified_at in (
+                (selected_id, range_start - 1),
+                (range_id, range_start),
+                (excluded_id, range_start + 3600),
+            ):
+                path = transcript.parent / f"{native_id}.jsonl"
+                payload = (json.dumps({"type": "user", "sessionId": native_id}) + "\n").encode()
+                path.write_bytes(payload)
+                os.utime(path, (modified_at, modified_at))
+                historical_sources[path] = payload
+
+            outcomes = []
+            for selectors in (
+                ("--session-id", selected_id),
+                ("--session-id", selected_id),
+                ("--start", "2025-06-16T00:00:00Z", "--end", "2025-06-16T01:00:00Z"),
+            ):
+                result = subprocess.run(
+                    [str(replay), *selectors], cwd=root,
+                    check=False, capture_output=True, text=True,
+                    env=replay_environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outcomes.append(json.loads(result.stdout))
+            self.assertEqual([outcome["enqueued"] for outcome in outcomes], [1, 0, 1])
+            self.assertEqual(
+                [outcome["selection"] for outcome in outcomes],
+                ["session_id", "session_id", "mtime_range"],
+            )
+            replayed_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {stream["path"] for stream in replayed_state["streams"].values()},
+                {str(transcript.resolve()),
+                 str((transcript.parent / f"{selected_id}.jsonl").resolve()),
+                 str((transcript.parent / f"{range_id}.jsonl").resolve())},
+            )
+            for path, payload in historical_sources.items():
+                self.assertEqual(path.read_bytes(), payload)
+            calls = [
+                json.loads(line)["argv"] for line in capture.read_text().splitlines()
+            ]
             self.assertEqual(calls[0][:2], ["plugin", "validate"])
             self.assertEqual(calls[1][:2], ["plugin", "validate"])
             self.assertEqual(calls[2][:3], ["plugin", "marketplace", "remove"])
@@ -1002,6 +1106,109 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertEqual(
                 sum(call[:2] == ["plugin", "install"] for call in calls),
                 2,
+            )
+
+    def test_claude_installer_validates_backfill_hours_before_writing(self):
+        for value in ("0", "745", "not-a-number", "18446744073709551617", "060"):
+            with self.subTest(value=value), TemporaryDirectory() as temporary:
+                claude_home = Path(temporary) / "claude"
+                completed = subprocess.run(
+                    [
+                        "sh",
+                        str(CLAUDE_INSTALLER),
+                        "--name",
+                        "Test User",
+                        "--github-id",
+                        "test-user",
+                        "--email",
+                        "test@e3group.ai",
+                        "--backfill-hours",
+                        value,
+                    ],
+                    cwd=ROOT,
+                    env={
+                        **os.environ,
+                        "CLAUDE_CONFIG_DIR": str(claude_home),
+                        "PYTHON_BIN": sys.executable,
+                    },
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("--backfill-hours", completed.stderr)
+                self.assertFalse((claude_home / "sherlock").exists())
+
+    def test_claude_installer_applies_configured_backfill_hours(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            project = claude_home / "projects" / "repo"
+            included_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            excluded_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            included = project / f"{included_id}.jsonl"
+            excluded = project / f"{excluded_id}.jsonl"
+            for path, session_id in (
+                (included, included_id),
+                (excluded, excluded_id),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps({"type": "user", "sessionId": session_id}) + "\n",
+                    encoding="utf-8",
+                )
+            now = time.time()
+            os.utime(included, (now - 47 * 60 * 60,) * 2)
+            os.utime(excluded, (now - 49 * 60 * 60,) * 2)
+            fake_claude = root / "fake-claude"
+            capture = root / "claude-calls.jsonl"
+            fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
+            fake_claude.chmod(0o755)
+            environment = {
+                **os.environ,
+                "CLAUDE_BIN": str(fake_claude),
+                "CLAUDE_CONFIG_DIR": str(claude_home),
+                "PYTHON_BIN": sys.executable,
+                "SHERLOCK_FAKE_CAPTURE": str(capture),
+                "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+            }
+
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(CLAUDE_INSTALLER),
+                    "--name",
+                    "Test User",
+                    "--github-id",
+                    "test-user",
+                    "--email",
+                    "test@e3group.ai",
+                    "--backfill-hours",
+                    "48",
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("Claude Code 48-hour backfill", completed.stdout)
+            self.assertIn('"excluded_by_cutoff": 1', completed.stdout)
+            self.assertIn("Coverage note", completed.stderr)
+            state = json.loads(
+                (
+                    claude_home
+                    / "sherlock"
+                    / "telemetry"
+                    / "claude-transcript-state.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                {stream["path"] for stream in state["streams"].values()},
+                {str(included.resolve())},
             )
 
 
