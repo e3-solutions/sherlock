@@ -126,3 +126,4 @@ For implementation and operations details, see:
 - [Telemetry processing](docs/telemetry-processing.md)
 - [CodeActivity dashboard](apps/dashboard/README.md)
 - [Bonaparte MCP v1 evidence contract](docs/bonaparte-mcp-v1.md)
+- [Private learning-card pilot](docs/private-learning-card-pilot.md)
