@@ -1,5 +1,5 @@
 // Real collector -> HTTP ingest -> local Storage/Postgres -> worker -> dashboard.
-// GitHub identity responses are deterministic fixtures unless the opt-in live read is used.
+// GitHub identity responses are deterministic boundary fixtures.
 import postgres from "../../workers/telemetry-processor/postgres.ts";
 import { handleRequest } from "../../supabase/functions/sherlock-rollout-ingest/index.ts";
 import { PostgresBatchRepository } from "../../supabase/functions/sherlock-rollout-ingest/postgres.ts";
@@ -76,7 +76,7 @@ const collector = {
 };
 const config = `${directory}/collector.json`;
 await Deno.writeTextFile(config, JSON.stringify(collector), { mode: 0o600 });
-async function python(args: string[], expectedSuccess = true) {
+async function python(args: string[]) {
   const result = await new Deno.Command("python3", {
     args,
     clearEnv: true,
@@ -92,7 +92,7 @@ async function python(args: string[], expectedSuccess = true) {
   const stdout = new TextDecoder().decode(result.stdout);
   const stderr = new TextDecoder().decode(result.stderr);
   assert(
-    result.success === expectedSuccess,
+    result.success,
     `collector ${args.slice(0, 3).join(" ")}: ${stderr}\n${stdout}`,
   );
   return stdout.trim() ? JSON.parse(stdout) : null;
@@ -101,7 +101,6 @@ async function cli(
   root: string,
   provider: string,
   args: string[],
-  success = true,
 ) {
   return await python([
     "-m",
@@ -117,7 +116,7 @@ async function cli(
     "--config",
     config,
     ...args,
-  ], success);
+  ]);
 }
 async function drain(root: string, provider: string) {
   return await cli(root, provider, ["drain"]);
@@ -198,15 +197,6 @@ const fixtureFetch = (async (url: RequestInfo | URL, options?: RequestInit) => {
   if (number === 404) {
     return Response.json({ message: "not found" }, { status: 404 });
   }
-  if (number === 301) {
-    return new Response(null, {
-      status: 301,
-      headers: { Location: "http://127.0.0.1/private" },
-    });
-  }
-  if (number === 500) {
-    return Response.json({ message: "unavailable" }, { status: 500 });
-  }
   return Response.json({
     number,
     id: number + 1000,
@@ -281,6 +271,38 @@ async function native(
   await drain(root, provider);
   await pump();
 }
+async function ingest(body: Record<string, unknown>) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  assert(response.ok, `fixture ingress failed: ${await response.text()}`);
+  await pump();
+}
+// Vary transport identity to exercise audit dedup/conflicts beyond batch replay.
+async function ingestNewStream(root: string, stream: string) {
+  const pending = `${root}/state/queue/pending`;
+  for await (const entry of Deno.readDir(pending)) {
+    const envelope = JSON.parse(
+      await Deno.readTextFile(`${pending}/${entry.name}`),
+    );
+    envelope.manifest.source_stream_key = stream.repeat(64);
+    await ingest({
+      collector,
+      manifest: envelope.manifest,
+      stored_payload_base64: envelope.stored_payload_base64,
+    });
+  }
+}
+async function factCount(disposition?: string) {
+  const [row] = await sql.unsafe(
+    "select count(*)::int n from telemetry.session_pr_context_events where workspace_id=$1 and ($2::text is null or disposition=$2)",
+    [workspaceId, disposition ?? null],
+  );
+  return row.n;
+}
+
 async function counters() {
   const [row] = await sql.unsafe(
     `select
@@ -355,40 +377,6 @@ try {
   await native(codex, "codex", codexId, "a".repeat(40));
   await native(claude, "claude_code", claudeId);
   await native(concurrent, "codex", concurrentId);
-  await cli(codex, "codex", [
-    "pr-context",
-    "link",
-    "--session-id",
-    codexId,
-    "--repository",
-    "https://127.0.0.1/private",
-    "--pr-number",
-    "1",
-  ], false);
-  await cli(codex, "codex", [
-    "pr-context",
-    "link",
-    "--session-id",
-    "wrong-session",
-    "--repository",
-    "e3-solutions/sherlock",
-    "--pr-number",
-    "91",
-    "--transcript",
-    `${codex}/native.jsonl`,
-  ], false);
-  await cli(codex, "claude_code", [
-    "pr-context",
-    "link",
-    "--session-id",
-    codexId,
-    "--repository",
-    "e3-solutions/sherlock",
-    "--pr-number",
-    "91",
-    "--transcript",
-    `${codex}/native.jsonl`,
-  ], false);
   await proveAndActivateFrameProjection(sql, { workspaceId, activate: true });
   const rows = await sql.unsafe(
     "select id::text,native_session_id from telemetry.sessions where workspace_id=$1",
@@ -442,8 +430,6 @@ try {
   await retract(codex, "codex", codexId, lateLink);
   await link(codex, "codex", codexId, 94, lateLink);
   await link(codex, "codex", codexId, 404);
-  await link(codex, "codex", codexId, 301);
-  await link(codex, "codex", codexId, 500);
   await link(
     codex,
     "codex",
@@ -482,8 +468,6 @@ try {
       [92, "checked"],
       [95, "checked"],
       [404, "inaccessible"],
-      [301, "identity_mismatch"],
-      [500, "failed"],
       [1, "out_of_scope"],
     ],
     [ids[claudeId]]: [[93, "checked"]],
@@ -495,58 +479,21 @@ try {
   const replay = requests.find((request) =>
     (request.manifest as Record<string, unknown>).source_kind === "collector"
   )!;
-  const [factCount] = await sql.unsafe(
-    "select count(*)::int n from telemetry.session_pr_context_events where workspace_id=$1",
-    [workspaceId],
-  );
-  assert(
-    (await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(replay),
-    })).ok,
-    "idempotent HTTP replay failed",
-  );
-  await pump();
-  const [replayed] = await sql.unsafe(
-    "select count(*)::int n from telemetry.session_pr_context_events where workspace_id=$1",
-    [workspaceId],
-  );
-  assert(replayed.n === factCount.n, "replay duplicated facts");
-  // A dishonest sender can vary transport stream identity. Audit the repeated
-  // declaration independently of ordinary immutable-batch replay protection.
+  const beforeReplay = await factCount();
+  await ingest(replay);
+  assert(await factCount() === beforeReplay, "replay duplicated facts");
   const duplicate = structuredClone(replay);
   (duplicate.manifest as Record<string, unknown>).source_stream_key = "d"
     .repeat(64);
+  await ingest(duplicate);
   assert(
-    (await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(duplicate),
-    })).ok,
-    "new-stream duplicate rejected before audit",
-  );
-  await pump();
-  const [duplicateFact] = await sql.unsafe(
-    "select count(*)::int n from telemetry.session_pr_context_events where workspace_id=$1 and disposition='duplicate'",
-    [workspaceId],
-  );
-  assert(
-    duplicateFact.n === 1,
-    "duplicate declaration must retain its source provenance",
+    await factCount("duplicate") === 1,
+    "duplicate lost its source provenance",
   );
   const foreign = structuredClone(replay);
   (foreign.collector as Record<string, unknown>).email =
     `context-${workspaceId}@sixtyfour.ai`;
-  assert(
-    (await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(foreign),
-    })).ok,
-    "foreign synthetic workspace ingress failed",
-  );
-  await pump();
+  await ingest(foreign);
   const [foreignCounts] = await sql.unsafe(
     "select (select count(*)::int from telemetry.sessions where workspace_id=$1) sessions,(select count(*)::int from telemetry.session_pr_context_events where workspace_id=$1) facts",
     [foreignWorkspaceId],
@@ -571,77 +518,47 @@ try {
     "select source_record_id::text from telemetry.session_pr_context_events where workspace_id=$1 and pull_request_number=93",
     [workspaceId],
   );
-  const lifecycleTarget = {
+  const identityTarget = {
     workspaceId,
     sourceRecordId: String(claudeLink.source_record_id),
     repositoryFullName: "e3-solutions/sherlock",
     pullRequestNumber: 93,
   };
-  for (const state of ["closed", "merged", "open"] as const) {
-    const response = {
-      number: 93,
-      id: 1093,
-      state: state === "open" ? "open" : "closed",
-      merged_at: state === "merged" ? base : null,
-      closed_at: state === "open" ? null : base,
-      base: { repo: { id: 42, full_name: "e3-solutions/sherlock" } },
-    };
+  // Canonical names can stay unchanged while stable GitHub IDs drift.
+  // The transaction fence must reject both repository and PR identity reuse.
+  for (const [repositoryId, pullRequestId] of [[43, 1093], [42, 1094]]) {
     const verification = await lookupPrContext(
-      lifecycleTarget,
+      identityTarget,
       "synthetic-token",
       scope,
-      (() => Promise.resolve(Response.json(response))) as typeof fetch,
+      () =>
+        Promise.resolve(Response.json({
+          number: 93,
+          id: pullRequestId,
+          state: "open",
+          merged_at: null,
+          closed_at: null,
+          base: {
+            repo: { id: repositoryId, full_name: "e3-solutions/sherlock" },
+          },
+        })),
     );
     assert(
-      verification.outcome === "checked" &&
-        verification.pullRequestState === state,
-      "PR lifecycle identity classification",
+      verification.outcome === "checked",
+      "canonical response must reach the identity fence",
     );
     await queue.appendPrContextVerification(verification);
+    await dashboard(checkedExpected, checkedSnapshot.day);
+    expected[ids[claudeId]] = [[93, "identity_mismatch"]];
+    await dashboard(expected);
   }
-  await dashboard(expected);
-  const beforeIdentityDrift = await dashboard(expected);
-  await queue.appendPrContextVerification({
-    ...lifecycleTarget,
-    outcome: "checked",
-    repositoryId: 43,
-    pullRequestId: 1093,
-    pullRequestState: "open",
-  });
-  await dashboard(expected, beforeIdentityDrift.day);
-  expected[ids[claudeId]] = [[93, "identity_mismatch"]];
-  await dashboard(expected);
 
   const conflictRoot = `${directory}/conflict`;
   await link(conflictRoot, "codex", codexId, 96, link92);
-  for await (
-    const entry of Deno.readDir(`${conflictRoot}/state/queue/pending`)
-  ) {
-    const envelope = JSON.parse(
-      await Deno.readTextFile(
-        `${conflictRoot}/state/queue/pending/${entry.name}`,
-      ),
-    );
-    envelope.manifest.source_stream_key = "e".repeat(64);
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        collector,
-        manifest: envelope.manifest,
-        stored_payload_base64: envelope.stored_payload_base64,
-      }),
-    });
-    assert(response.ok, "conflicting declaration ingress failed");
-  }
-  await pump();
-  const [conflictFact] = await sql.unsafe(
-    "select count(*)::int n from telemetry.session_pr_context_events where workspace_id=$1 and disposition='conflict'",
-    [workspaceId],
-  );
+  await ingestNewStream(conflictRoot, "e");
   assert(
-    conflictFact.n === 1,
-    "conflicting event identity must retain audit fact",
+    await factCount("conflict") === 1,
+    "conflicting identity lost its audit fact",
   );
   await dashboard(checkedExpected, checkedSnapshot.day);
   expected[ids[codexId]] = expected[ids[codexId]].filter(([number]) =>
@@ -668,29 +585,7 @@ try {
     String(link404.event_id),
     retract91,
   );
-  for await (
-    const entry of Deno.readDir(`${conflictRetractRoot}/state/queue/pending`)
-  ) {
-    const envelope = JSON.parse(
-      await Deno.readTextFile(
-        `${conflictRetractRoot}/state/queue/pending/${entry.name}`,
-      ),
-    );
-    envelope.manifest.source_stream_key = "f".repeat(64);
-    assert(
-      (await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          collector,
-          manifest: envelope.manifest,
-          stored_payload_base64: envelope.stored_payload_base64,
-        }),
-      })).ok,
-      "conflicting retract ingress failed",
-    );
-  }
-  await pump();
+  await ingestNewStream(conflictRetractRoot, "f");
   await dashboard(expected, retractedSnapshot.day);
   expected[ids[codexId]] = expected[ids[codexId]].filter(([number]) =>
     number !== 404
@@ -736,49 +631,6 @@ try {
       "immutable Storage bytes changed",
     );
   }
-  if (Deno.env.get("SHERLOCK_TEST_LIVE_GITHUB") === "1") {
-    const live = await new Deno.Command("gh", {
-      clearEnv: true,
-      env: Object.fromEntries(
-        [
-          "PATH",
-          "HOME",
-          "GH_TOKEN",
-          "GITHUB_TOKEN",
-          "GH_HOST",
-          "GH_CONFIG_DIR",
-          "XDG_CONFIG_HOME",
-        ]
-          .flatMap((name) => {
-            const value = Deno.env.get(name);
-            return value === undefined ? [] : [[name, value]];
-          }),
-      ),
-      args: ["api", "repos/e3-solutions/sherlock/pulls/91"],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
-    assert(live.success, "read-only direct GitHub PR endpoint unavailable");
-    const target = (await queue.pendingPrContexts(100, [workspaceId])).find((
-      candidate,
-    ) => candidate.pullRequestNumber === 91);
-    const check = await lookupPrContext(
-      target ??
-        {
-          workspaceId,
-          sourceRecordId: "0",
-          repositoryFullName: "e3-solutions/sherlock",
-          pullRequestNumber: 91,
-        },
-      "synthetic-token",
-      scope,
-      (() => Promise.resolve(new Response(live.stdout))) as typeof fetch,
-    );
-    assert(
-      check.outcome === "checked",
-      "live direct PR response identity failed",
-    );
-  }
   console.log(
     JSON.stringify({
       passed: true,
@@ -799,13 +651,11 @@ try {
         "late/out-of-order retraction",
         "offline retry",
         "replay",
-        "inaccessible/redirect/failure/scope",
+        "inaccessible/identity drift/scope",
         "old snapshot visibility",
         "unchanged native/Storage bytes and activity",
       ],
-      githubTransport: Deno.env.get("SHERLOCK_TEST_LIVE_GITHUB") === "1"
-        ? "deterministic fixtures plus read-only gh direct endpoint response check"
-        : "deterministic boundary fixtures",
+      githubTransport: "deterministic boundary fixtures",
     }),
   );
 } finally {

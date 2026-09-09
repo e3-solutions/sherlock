@@ -10,8 +10,6 @@ export interface PrContextTarget {
   sourceRecordId: string;
   repositoryFullName: string;
   pullRequestNumber: number;
-  expectedRepositoryId?: number | null;
-  expectedPullRequestId?: number | null;
 }
 export interface PrContextVerification extends PrContextTarget {
   outcome:
@@ -135,10 +133,6 @@ export async function lookupPrContext(
   if (
     typeof repo?.full_name !== "string" ||
     repo.full_name.toLowerCase() !== target.repositoryFullName ||
-    (target.expectedRepositoryId != null &&
-      target.expectedRepositoryId !== repo?.id) ||
-    (target.expectedPullRequestId != null &&
-      target.expectedPullRequestId !== pull?.id) ||
     pull?.number !== target.pullRequestNumber ||
     !Number.isSafeInteger(pull?.id) || Number(pull?.id) < 1 ||
     !Number.isSafeInteger(repo.id) || Number(repo.id) < 1 ||

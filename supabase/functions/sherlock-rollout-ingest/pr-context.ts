@@ -44,90 +44,93 @@ export async function projectPrContextBatch(
     !SESSION.test(manifest.observed_native_session_id) ||
     manifest.observed_parent_native_session_id !== null
   ) invalid();
-  const facts: PrContextFact[] = [];
-  for (const locator of manifest.records) {
+  const locator = manifest.records[0];
+  if (
+    locator.parse_status !== "ok" ||
+    locator.native_type !== PR_CONTEXT_VERSION ||
+    locator.native_payload_type !== null
+  ) invalid();
+  let raw: unknown;
+  try {
+    raw = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(source.subarray(
+        locator.source_start_offset - manifest.start_offset,
+        locator.source_end_offset - manifest.start_offset,
+      )),
+    );
+  } catch {
+    invalid();
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) invalid();
+  const value = raw as Record<string, unknown>;
+  const {
+    type,
+    event_id,
+    operation,
+    provider,
+    native_session_id,
+    occurred_at,
+  } = value;
+  if (
+    type !== PR_CONTEXT_VERSION || typeof event_id !== "string" ||
+    !UUID.test(event_id) ||
+    (operation !== "link" && operation !== "retract") ||
+    provider !== manifest.source_provider ||
+    native_session_id !== manifest.observed_native_session_id ||
+    typeof occurred_at !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/
+      .test(occurred_at) ||
+    !Number.isFinite(Date.parse(occurred_at))
+  ) invalid();
+  const allowed = new Set([
+    "type",
+    "event_id",
+    "operation",
+    "provider",
+    "native_session_id",
+    "occurred_at",
+    ...(operation === "link"
+      ? ["repository", "pull_request_number"]
+      : ["link_event_id"]),
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) invalid();
+  let repository: string | null = null;
+  let pull_request_number: number | null = null;
+  let link_event_id: string | null = null;
+  if (operation === "link") {
+    if (typeof value.repository !== "string") invalid();
+    repository = value.repository.toLowerCase();
     if (
-      locator.parse_status !== "ok" ||
-      locator.native_type !== PR_CONTEXT_VERSION ||
-      locator.native_payload_type !== null
+      !REPOSITORY.test(repository) ||
+      [".", ".."].includes(repository.split("/")[1]) ||
+      !Number.isSafeInteger(value.pull_request_number) ||
+      Number(value.pull_request_number) < 1 ||
+      Number(value.pull_request_number) > 2147483647
     ) invalid();
-    let raw: unknown;
-    try {
-      raw = JSON.parse(
-        new TextDecoder("utf-8", { fatal: true }).decode(source.subarray(
-          locator.source_start_offset - manifest.start_offset,
-          locator.source_end_offset - manifest.start_offset,
-        )),
-      );
-    } catch {
-      invalid();
-    }
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) invalid();
-    const value = raw as Record<string, unknown>;
-    const {
-      type,
-      event_id,
-      operation,
-      provider,
-      native_session_id,
-      occurred_at,
-    } = value;
+    pull_request_number = Number(value.pull_request_number);
+  } else {
     if (
-      type !== PR_CONTEXT_VERSION || typeof event_id !== "string" ||
-      !UUID.test(event_id) ||
-      (operation !== "link" && operation !== "retract") ||
-      provider !== manifest.source_provider ||
-      native_session_id !== manifest.observed_native_session_id ||
-      typeof occurred_at !== "string" ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/
-        .test(occurred_at) ||
-      !Number.isFinite(Date.parse(occurred_at))
+      typeof value.link_event_id !== "string" ||
+      !UUID.test(value.link_event_id) ||
+      value.link_event_id === event_id
     ) invalid();
-    const allowed = new Set([
-      "type",
-      "event_id",
-      "operation",
-      "provider",
-      "native_session_id",
-      "occurred_at",
-      ...(operation === "link"
-        ? ["repository", "pull_request_number"]
-        : ["link_event_id"]),
-    ]);
-    if (Object.keys(value).some((key) => !allowed.has(key))) invalid();
-    let repository: string | null = null;
-    let pull_request_number: number | null = null;
-    let link_event_id: string | null = null;
-    if (operation === "link") {
-      if (typeof value.repository !== "string") invalid();
-      repository = value.repository.toLowerCase();
-      if (
-        !REPOSITORY.test(repository) ||
-        [".", ".."].includes(repository.split("/")[1]) ||
-        !Number.isSafeInteger(value.pull_request_number) ||
-        Number(value.pull_request_number) < 1 ||
-        Number(value.pull_request_number) > 2147483647
-      ) invalid();
-      pull_request_number = Number(value.pull_request_number);
-    } else {
-      if (
-        typeof value.link_event_id !== "string" ||
-        !UUID.test(value.link_event_id) ||
-        value.link_event_id === event_id
-      ) invalid();
-      link_event_id = value.link_event_id;
-    }
-    const fact: Omit<PrContextFact, "record_index" | "payload_sha256"> = {
-      event_id,
-      operation,
-      provider: manifest.source_provider,
-      native_session_id: manifest.observed_native_session_id,
-      occurred_at: nullableTimestamp(occurred_at, "occurred_at")!,
-      repository,
-      pull_request_number,
-      link_event_id,
-    };
-    facts.push({
+    link_event_id = value.link_event_id;
+  }
+  const fact: Omit<PrContextFact, "record_index" | "payload_sha256"> = {
+    event_id,
+    operation,
+    provider: manifest.source_provider,
+    native_session_id: manifest.observed_native_session_id,
+    occurred_at: nullableTimestamp(occurred_at, "occurred_at")!,
+    repository,
+    pull_request_number,
+    link_event_id,
+  };
+  return {
+    session: null,
+    events: [],
+    session_scm: null,
+    pr_context: {
       ...fact,
       record_index: locator.record_index,
       payload_sha256: await sha256Hex(
@@ -138,7 +141,6 @@ export async function projectPrContextBatch(
           }),
         ),
       ),
-    });
-  }
-  return { session: null, events: [], session_scm: null, pr_context: facts };
+    },
+  };
 }

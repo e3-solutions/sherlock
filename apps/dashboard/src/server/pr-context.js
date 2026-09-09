@@ -74,21 +74,21 @@ export function linkedPrsBySession(rows, fromRow, invalid) {
   const bySession = new Map();
   for (const row of rows) {
     const sessionId = String(row.session_id);
-    const links = bySession.get(sessionId) ?? [];
-    if (links.length === 50) {
-      links.truncated = true;
+    const context = bySession.get(sessionId) ?? { links: [], truncated: false };
+    if (context.links.length === 50) {
+      context.truncated = true;
       continue;
     }
     if (![
       "pending", "checked", "inaccessible", "failed", "identity_mismatch", "out_of_scope",
     ].includes(row.status)) throw invalid();
     const pr = fromRow(row);
-    links.push({
+    context.links.push({
       number: pr.number, repository: String(row.repository_full_name),
       url: row.status === "checked" ? pr.url : null, status: row.status,
       checkedAt: row.checked_at === null ? null : new Date(row.checked_at).toISOString(),
     });
-    bySession.set(sessionId, links);
+    bySession.set(sessionId, context);
   }
   return bySession;
 }

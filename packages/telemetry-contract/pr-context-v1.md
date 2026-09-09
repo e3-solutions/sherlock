@@ -46,14 +46,6 @@ From a checkout, replace the runtime path with `packages/telemetry-collector/src
 Use that same module invocation for `create`, `retract`, and `drain` below.
 
 ```sh
-sherlock-collector --provider codex pr-context link \
-  --session-id 00000000-0000-4000-8000-000000000004 \
-  --repository owner/repo --pr-number 91 --drain
-
-sherlock-collector --provider claude_code pr-context link \
-  --session-id 00000000-0000-4000-8000-000000000004 \
-  --repository owner/repo --pr-number 92 --drain
-
 sherlock-collector --provider codex pr-context retract \
   --session-id 00000000-0000-4000-8000-000000000004 \
   --link-event-id 00000000-0000-4000-8000-000000000006 --drain
@@ -92,4 +84,6 @@ Deploy the append-only schema and compatible ingest/worker handling before enabl
 PYTHONPATH=packages/telemetry-collector/src python3 -m unittest discover -s tests/collector
 ```
 
-The PR-context test module checks both providers, native identity and immutable bytes, simultaneous sessions and multiple PRs, duplicate/conflicting/concurrent retries, retraction before link, offline retry/acknowledgement, destination binding, strict versioning, failed and successful creation integration, explicit CLI provider/session requirements, and subagent identity without inheritance. Local producer tests do not establish live GitHub verification, production authorization, or dashboard behavior; use the repository end-to-end harness for the complete local pipeline and an explicitly authorized canary for production evidence.
+See [the local end-to-end workflow](../../tests/end-to-end/README.md) for
+collector-to-dashboard acceptance coverage. Unit tests and local integration
+results do not establish production behavior.

@@ -1199,19 +1199,10 @@ export default function FlameGraph({
     });
   };
 
-  const selectedWorkPullRequest = drawerView.screen === "work" &&
+  const selectedWork = drawerView.screen === "work" &&
       intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot
     ? intervalEvidence.work.find((work) => work.id === drawerView.workId)
-      ?.pullRequest ?? null
     : null;
-
-  const selectedLinkedPrs = drawerView.screen === "work" &&
-      intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot
-    ? intervalEvidence.work.find((work) => work.id === drawerView.workId)?.linkedPrs ?? []
-    : [];
-  const selectedLinkedPrsTruncated = drawerView.screen === "work" &&
-    intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot &&
-    intervalEvidence.work.find((work) => work.id === drawerView.workId)?.linkedPrsTruncated === true;
 
   const backToOverview = () => {
     setDrawerView({ screen: "overview", transition: "back" });
@@ -1347,9 +1338,9 @@ export default function FlameGraph({
           {drawerView.screen === "work" ? (
             <WorkDetail
               work={drawerView}
-              pullRequest={selectedWorkPullRequest}
-              linkedPrs={selectedLinkedPrs}
-              linkedPrsTruncated={selectedLinkedPrsTruncated}
+              pullRequest={selectedWork?.pullRequest ?? null}
+              linkedPrs={selectedWork?.linkedPrs ?? []}
+              linkedPrsTruncated={selectedWork?.linkedPrsTruncated === true}
               evidence={workEvidence}
               stale={stale}
               closing={detailClosing}

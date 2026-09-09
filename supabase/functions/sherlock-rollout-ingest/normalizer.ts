@@ -130,7 +130,7 @@ export interface BatchProjection {
   session: SessionProjection | null;
   events: EventProjection[];
   session_scm: SessionScmFact | null;
-  pr_context?: PrContextFact[];
+  pr_context?: PrContextFact;
 }
 
 interface ParsedRecord {

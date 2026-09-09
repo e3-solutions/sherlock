@@ -225,9 +225,11 @@ class PRContextTests(unittest.TestCase):
         self.assertEqual(validate_session("claude_code", SESSION, self.root), "native-file-checked")
         with self.assertRaises(ContractError):
             validate_session("claude_code", OTHER, self.root, path)
-        path.write_text(json.dumps({"sessionId": OTHER}) + "\n")
-        with self.assertRaises(ContractError):
-            validate_session("claude_code", SESSION, self.root)
+        for records in ([], [{"type": "user"}], [{"sessionId": f" {SESSION} "}],
+                        [{"sessionId": OTHER}], [{"sessionId": SESSION}, {"sessionId": OTHER}]):
+            path.write_text("".join(json.dumps(record) + "\n" for record in records))
+            with self.subTest(records=records), self.assertRaises(ContractError):
+                validate_session("claude_code", SESSION, self.root)
         subagent = root / SESSION / "subagents" / "agent-agent123.jsonl"
         subagent.parent.mkdir(parents=True)
         subagent.write_text(json.dumps({"sessionId": SESSION, "agentId": "agent123"}) + "\n")

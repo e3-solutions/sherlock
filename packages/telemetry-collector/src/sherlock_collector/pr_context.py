@@ -57,29 +57,13 @@ def validate_session(provider: str, session_id: str, source_home: Path,
                 identity = _codex_rollout_identity(handle)
             else:
                 parent = path.parent.parent.name if path.parent.name == "subagents" else None
-                identity = _claude_transcript_identity(handle, path.name, (session_id, parent))
+                identity = _claude_transcript_identity(
+                    handle, path.name, (session_id, parent), require_declaration=True,
+                )
                 # Explicitly selecting another session's filename is never valid.
                 expected_name = (f"agent-{session_id}.jsonl" if parent or path.name.startswith("agent-")
                                  else f"{session_id}.jsonl")
                 if path.name != expected_name:
-                    identity = None
-                # The general discovery reader tolerates prefixes without identity.
-                # Explicit linking fails closed instead of accepting a renamed Codex
-                # file (or empty JSONL) as a Claude transcript by filename alone.
-                handle.seek(0)
-                prefix = handle.read(256 * 1024)
-                declared = False
-                for line in prefix.splitlines()[:64]:
-                    try:
-                        record = json.loads(line)
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        continue
-                    if isinstance(record, dict) and (
-                        record.get("sessionId", record.get("session_id")) == (parent or session_id)
-                        or record.get("agentId", record.get("agent_id")) == session_id
-                    ):
-                        declared = True
-                if not declared:
                     identity = None
             if identity is None or identity[0] != session_id:
                 raise ContractError("transcript does not match the exact provider/session identity")

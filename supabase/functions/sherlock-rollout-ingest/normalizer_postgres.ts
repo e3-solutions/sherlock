@@ -165,55 +165,54 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
       // Sidecars have their own append-only projection and cannot create/update
       // sessions or enter the activity/event reducer.
       if (projection.pr_context) {
-        for (const fact of projection.pr_context) {
-          await tx.unsafe(
-            "select pg_advisory_xact_lock(hashtextextended($1, 0))",
-            [
-              JSON.stringify([
-                receipt.workspace_id,
-                receipt.collector_key,
-                fact.event_id,
-              ]),
-            ],
-          );
-          const prior = await tx.unsafe(
-            `select payload_sha256, person_id from telemetry.session_pr_context_events
-              where workspace_id = $1 and collector_key = $2 and event_id = $3
-                and disposition = 'accepted'`,
-            [receipt.workspace_id, receipt.collector_key, fact.event_id],
-          );
-          const disposition = prior.length === 0
-            ? "accepted"
-            : prior[0].payload_sha256 === fact.payload_sha256 &&
-                String(prior[0].person_id) === receipt.person_id
-            ? "duplicate"
-            : "conflict";
-          await tx.unsafe(
-            `insert into telemetry.session_pr_context_events (
-              source_record_id, workspace_id, person_id, collector_key, source_provider,
-              native_session_id, event_id, operation, link_event_id, repository_full_name,
-              pull_request_number, occurred_at, payload_sha256, disposition, server_received_at
-            ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-            on conflict (source_record_id) do nothing`,
-            [
-              sourceRecords[fact.record_index].id,
+        const fact = projection.pr_context;
+        await tx.unsafe(
+          "select pg_advisory_xact_lock(hashtextextended($1, 0))",
+          [
+            JSON.stringify([
               receipt.workspace_id,
-              receipt.person_id,
               receipt.collector_key,
-              fact.provider,
-              fact.native_session_id,
               fact.event_id,
-              fact.operation,
-              fact.link_event_id,
-              fact.repository,
-              fact.pull_request_number,
-              fact.occurred_at,
-              fact.payload_sha256,
-              disposition,
-              receipt.committed_at,
-            ],
-          );
-        }
+            ]),
+          ],
+        );
+        const prior = await tx.unsafe(
+          `select payload_sha256, person_id from telemetry.session_pr_context_events
+            where workspace_id = $1 and collector_key = $2 and event_id = $3
+              and disposition = 'accepted'`,
+          [receipt.workspace_id, receipt.collector_key, fact.event_id],
+        );
+        const disposition = prior.length === 0
+          ? "accepted"
+          : prior[0].payload_sha256 === fact.payload_sha256 &&
+              String(prior[0].person_id) === receipt.person_id
+          ? "duplicate"
+          : "conflict";
+        await tx.unsafe(
+          `insert into telemetry.session_pr_context_events (
+            source_record_id, workspace_id, person_id, collector_key, source_provider,
+            native_session_id, event_id, operation, link_event_id, repository_full_name,
+            pull_request_number, occurred_at, payload_sha256, disposition, server_received_at
+          ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          on conflict (source_record_id) do nothing`,
+          [
+            sourceRecords[fact.record_index].id,
+            receipt.workspace_id,
+            receipt.person_id,
+            receipt.collector_key,
+            fact.provider,
+            fact.native_session_id,
+            fact.event_id,
+            fact.operation,
+            fact.link_event_id,
+            fact.repository,
+            fact.pull_request_number,
+            fact.occurred_at,
+            fact.payload_sha256,
+            disposition,
+            receipt.committed_at,
+          ],
+        );
         return { session_ids: [], normalizer_version: normalizerVersion };
       }
 

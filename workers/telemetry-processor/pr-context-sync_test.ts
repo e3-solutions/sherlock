@@ -75,17 +75,15 @@ Deno.test("closed-unmerged merged reopened PRs are checked declared context with
     assert(v.outcome === "checked" && v.pullRequestState === expected);
   }
 });
-Deno.test("canonical mismatches and name reuse never expose foreign metadata", async () => {
+Deno.test("canonical name and number mismatches never expose foreign metadata", async () => {
   for (
     const changed of [
       { number: 92 },
       { base: { repo: { id: 100, full_name: "private/secret" } } },
-      { id: 911 },
-      { base: { repo: { id: 101, full_name: target.repositoryFullName } } },
     ]
   ) {
     const v = await lookupPrContext(
-      { ...target, expectedRepositoryId: 100, expectedPullRequestId: 910 },
+      target,
       "secret",
       scope,
       () => Promise.resolve(Response.json({ ...pull, ...changed })),

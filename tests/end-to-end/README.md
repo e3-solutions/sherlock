@@ -23,26 +23,22 @@ Optional environment variables:
   Supabase project's config, if different from this checkout.
 - `DOCKER_HOST`: explicit dedicated Docker socket, where needed; this avoids
   changing the user's default Docker context.
-- `SHERLOCK_TEST_LIVE_GITHUB=1`: additionally fetch PR #91 through the read-only
-  direct GitHub PR endpoint using existing `gh` authentication, then pass its
-  response to the production identity validator. No token is printed or copied.
-  This checks the authenticated CLI's access, not production-worker credentials.
 
 The workflow uses the real Python native capturer and PR-context CLI producer,
 durable spool and HTTP drain, ingestion handler over TCP, local Supabase Storage,
 Postgres roles and tables, worker queue/normalizer/reducer, frame activation, and
-the actual dashboard HTTP day/interval routes. GitHub failure and lifecycle
-responses are deterministic fixtures at the external API boundary, explicitly
-not live GitHub mutations. Replay/conflict cases act as untrusted clients by
-varying collector envelopes; they do not rewrite native transcripts.
+the actual dashboard HTTP day/interval routes. GitHub responses are deterministic
+fixtures at the external API boundary; worker units cover the HTTP error and PR
+lifecycle response matrix. Replay/conflict cases vary collector envelopes as
+untrusted clients; they do not rewrite native transcripts.
 
 The assertions cover Codex and Claude, review without commits, links before
 native normalization and after work starts, starting SHA A while declaring B,
 multiple PRs, shared checkout isolation, wrong provider/session/workspace,
 offline retry, duplicate and conflicting declarations, late and out-of-order
-retraction, inaccessible and failed lookups, redirect/scope rejection, closed,
-merged and reopened observations, old dashboard snapshot visibility, and
-unchanged native/Storage bytes, activity, and session metadata.
+retraction, inaccessible lookups, scope rejection, stable GitHub identity drift,
+old dashboard snapshot visibility, and unchanged native/Storage bytes, activity,
+and session metadata.
 
 Local success establishes implementation behavior with synthetic data. It does
 not establish production identity authentication, token permissions, capacity,

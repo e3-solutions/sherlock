@@ -14,7 +14,7 @@ for (const value of [local.DB_URL, local.API_URL]) {
 }
 const result = spawnSync(deno, [
   "run", "--config", "workers/telemetry-processor/deno.json", "--allow-env",
-  "--allow-net=127.0.0.1", "--allow-read", "--allow-write", "--allow-run=python3,node,gh",
+  "--allow-net=127.0.0.1", "--allow-read", "--allow-write", "--allow-run=python3,node",
   "tests/end-to-end/pr-context.ts",
 ], {
   stdio: "inherit",

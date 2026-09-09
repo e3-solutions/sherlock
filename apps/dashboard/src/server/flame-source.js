@@ -1599,7 +1599,7 @@ export function dashboardWorkSummary(value) {
   return summary;
 }
 
-function workFromRow(row, pullRequest = null, linkedPrs = []) {
+function workFromRow(row, pullRequest = null, { links = [], truncated = false } = {}) {
   const role = String(row.semantic_role);
   const sessionId = String(row.session_id);
   const summary = dashboardWorkSummary(row.summary);
@@ -1612,8 +1612,8 @@ function workFromRow(row, pullRequest = null, linkedPrs = []) {
     eventCount: count(row.event_count),
     summary,
     ...(pullRequest === null ? {} : { pullRequest }),
-    linkedPrs,
-    linkedPrsTruncated: linkedPrs.truncated === true,
+    linkedPrs: links,
+    linkedPrsTruncated: truncated,
   };
 }
 
@@ -2129,7 +2129,7 @@ export class DirectFlameSource {
         work: work.map((row) => workFromRow(
           row,
           pullRequestBySession.get(String(row.session_id)) ?? null,
-          linkedBySession.get(String(row.session_id)) ?? [],
+          linkedBySession.get(String(row.session_id)),
         )),
         prompts: prompts.map(promptFromRow),
       };

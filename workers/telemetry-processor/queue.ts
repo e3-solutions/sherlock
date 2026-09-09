@@ -249,14 +249,8 @@ export class PostgresJobQueue {
       ]);
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
-        `select link.workspace_id, link.source_record_id, link.repository_full_name, link.pull_request_number,
-                 identity.repository_id, identity.pull_request_id
+        `select link.workspace_id, link.source_record_id, link.repository_full_name, link.pull_request_number
           from telemetry.session_pr_context_events link
-          left join lateral (
-            select v.repository_id, v.pull_request_id from github.pr_context_verifications v
-             where v.workspace_id = link.workspace_id and v.link_source_record_id = link.source_record_id
-               and v.outcome = 'checked' order by v.id limit 1
-          ) identity on true
           left join lateral (
             select v.outcome, v.created_at from github.pr_context_verifications v
              where v.workspace_id = link.workspace_id and v.link_source_record_id = link.source_record_id
@@ -286,12 +280,6 @@ export class PostgresJobQueue {
         sourceRecordId: String(row.source_record_id),
         repositoryFullName: String(row.repository_full_name),
         pullRequestNumber: Number(row.pull_request_number),
-        expectedRepositoryId: row.repository_id == null
-          ? null
-          : Number(row.repository_id),
-        expectedPullRequestId: row.pull_request_id == null
-          ? null
-          : Number(row.pull_request_id),
       }));
     });
   }
@@ -316,20 +304,12 @@ export class PostgresJobQueue {
           order by id limit 1`,
         [result.workspaceId, result.sourceRecordId],
       );
-      if (
-        result.outcome === "checked" && prior.length &&
-        (Number(prior[0].repository_id) !== result.repositoryId ||
-          Number(prior[0].pull_request_id) !== result.pullRequestId)
-      ) {
-        result = {
-          ...result,
-          outcome: "identity_mismatch",
-          repositoryId: null,
-          pullRequestId: null,
-          pullRequestState: null,
-        };
-      }
-      const checked = result.outcome === "checked";
+      const outcome = result.outcome === "checked" && prior.length &&
+          (Number(prior[0].repository_id) !== result.repositoryId ||
+            Number(prior[0].pull_request_id) !== result.pullRequestId)
+        ? "identity_mismatch"
+        : result.outcome;
+      const checked = outcome === "checked";
       await tx.unsafe(
         `insert into github.pr_context_verifications (workspace_id, link_source_record_id, outcome,
           repository_full_name, repository_id, pull_request_number, pull_request_id, pull_request_state)
@@ -337,12 +317,12 @@ export class PostgresJobQueue {
         [
           result.workspaceId,
           result.sourceRecordId,
-          result.outcome,
+          outcome,
           checked ? result.repositoryFullName : null,
-          result.repositoryId,
+          checked ? result.repositoryId : null,
           checked ? result.pullRequestNumber : null,
-          result.pullRequestId,
-          result.pullRequestState,
+          checked ? result.pullRequestId : null,
+          checked ? result.pullRequestState : null,
         ],
       );
     });

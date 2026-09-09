@@ -91,8 +91,8 @@ for (const provider of ["codex", "claude_code"] as const) {
     assert(
       p.session === null && p.events.length === 0 && p.session_scm === null,
     );
-    assert(p.pr_context?.length === 1 && p.pr_context[0].provider === provider);
-    assert(p.pr_context[0].occurred_at.endsWith("000001Z"));
+    assert(p.pr_context?.provider === provider);
+    assert(p.pr_context.occurred_at.endsWith("000001Z"));
     assert(raw.every((v, i) => v === f.source[i]));
     const encoded = btoa(String.fromCharCode(...f.stored));
     assert(
@@ -187,8 +187,8 @@ Deno.test("retractions refer to link IDs even before link arrives and carry no t
   const f = await fixture(retract);
   const p = await projectBatch(f.manifest, f.source);
   assert(
-    p.pr_context?.[0].link_event_id === event.event_id &&
-      p.pr_context[0].repository === null,
+    p.pr_context?.link_event_id === event.event_id &&
+      p.pr_context.repository === null,
   );
   const invalid = await fixture({
     ...retract,
@@ -212,7 +212,7 @@ Deno.test("semantic dedup hashes canonical repository/time but preserve microsec
     const f = await fixture(value);
     f.manifest.observed_native_session_id = value.native_session_id;
     hashes.push(
-      (await projectBatch(f.manifest, f.source)).pr_context![0].payload_sha256,
+      (await projectBatch(f.manifest, f.source)).pr_context!.payload_sha256,
     );
   }
   assert(
