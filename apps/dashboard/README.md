@@ -16,8 +16,9 @@ for one person and one ten-minute bucket. Message content is limited to
 `telemetry.events.content_excerpt`; the dashboard never reads full raw Storage
 objects.
 
-Session evidence shows zero or more **Linked PRs**, independently of the older
-SHA-derived **Commit association**. The interval response adds `linkedPrs`
+Session evidence shows compact **PR #number** links. Hover text distinguishes
+explicit session context from SHA-derived commit associations; unchecked PRs
+remain muted text without links. The interval response adds `linkedPrs`
 (`repository`, `number`, nullable `url`, `status`, nullable `checkedAt`) and
 `linkedPrsTruncated`. Only a GitHub-checked identity has a URL. Display is bounded
 to 50 distinct PRs per session with an overflow notice; audit facts remain

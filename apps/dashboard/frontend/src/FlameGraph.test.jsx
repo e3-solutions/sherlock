@@ -780,7 +780,7 @@ describe("FlameGraph", () => {
     );
   });
 
-  it("shows multiple declared Linked PRs separately from commit associations and carries them into session detail", async () => {
+  it("shows compact PR links with source details on hover and keeps unchecked PRs non-clickable", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
     vi.mocked(fetch).mockImplementation(async (url, options) => {
       const response = await defaultFetch(url, options);
@@ -799,15 +799,18 @@ describe("FlameGraph", () => {
       x: 0, y: 0, toJSON: () => ({}),
     });
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    await screen.findByText("Linked PRs");
-    expect(screen.getByText(/Collector-reported session context/)).toBeInTheDocument();
-    expect(screen.getByText(/Commit association · PR #55/)).toBeInTheDocument();
+    await screen.findByText("PR #91");
+    expect(screen.queryByText("Linked PRs")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Collector-reported session context/)).not.toBeInTheDocument();
+    expect(screen.getByText("PR #55")).toHaveAttribute("title", "Commit association");
+    expect(screen.getByText("PR #91")).toHaveAttribute("title", "e3-solutions/sherlock · Linked to this session");
     expect(screen.getByRole("link", { name: "Open PR #91 on GitHub" })).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Open PR #92 on GitHub" })).not.toBeInTheDocument();
-    expect(screen.getByText("Identity check pending")).toBeInTheDocument();
+    expect(screen.getByText("PR #92")).toHaveAttribute("title", "e3-solutions/sherlock · Identity check pending");
     fireEvent.click(screen.getByRole("button", { name: /Subagent session/ }));
     await screen.findByText("Conversation");
-    expect(screen.getByText("Linked PRs")).toBeInTheDocument();
+    expect(screen.queryByText("Linked PRs")).not.toBeInTheDocument();
+    expect(screen.getByText("PR #92")).toHaveAttribute("title", "e3-solutions/sherlock · Identity check pending");
     expect(screen.getByRole("link", { name: "Open PR #91 on GitHub" })).toBeInTheDocument();
   });
 

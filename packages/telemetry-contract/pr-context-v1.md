@@ -2,7 +2,7 @@
 
 A link declares that a specific native session concerns a GitHub PR. It is **collector-reported PR context with GitHub identity checked**, not proof of authorship, uploader authentication, or attribution of all session events, time, tokens, or cost. The current collector endpoint accepts declared collector identity. Checking GitHub identity does not authenticate the claimed person/session relationship.
 
-A session can have zero, one, or multiple linked PRs. Ending work does not retract a link. Use a retraction only to correct a particular erroneous link event; link/retract history and raw inputs remain available for audit. Starting SHA/commit associations remain a separately labeled mechanism and never establish explicit intent.
+A session can have zero, one, or multiple linked PRs. Ending work does not retract a link. Use a retraction only to correct a particular erroneous link event; link/retract history and raw inputs remain available for audit. Starting SHA/commit associations remain separate from explicit intent. The compact UI shows PR numbers; hover text identifies each association source.
 
 ## Sidecar and envelope
 

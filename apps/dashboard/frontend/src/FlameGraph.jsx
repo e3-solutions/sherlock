@@ -420,8 +420,9 @@ function PullRequestLink({ pullRequest, explicit = false }) {
       target="_blank"
       rel="noopener noreferrer"
       aria-label={`Open PR #${pullRequest.number} on GitHub`}
+      title={explicit ? `${pullRequest.repository} · Linked to this session` : "Commit association"}
     >
-      {explicit ? pullRequest.repository : "Commit association"} · PR #{pullRequest.number}
+      PR #{pullRequest.number}
       <svg aria-hidden="true" focusable="false" viewBox="0 0 16 16">
         <path d="M5 11 11 5M6 5h5v5" />
       </svg>
@@ -429,29 +430,27 @@ function PullRequestLink({ pullRequest, explicit = false }) {
   );
 }
 
-function LinkedPrs({ links = [], truncated = false }) {
-  if (links.length === 0) return null;
+function SessionPrLinks({ pullRequest, links = [], truncated = false }) {
+  if (!pullRequest && links.length === 0) return null;
   const labels = {
     pending: "Identity check pending",
-    checked: "GitHub identity checked",
     inaccessible: "Identity unavailable",
     failed: "Identity check failed; retry pending",
     identity_mismatch: "Identity mismatch",
     out_of_scope: "Repository outside permitted scope",
   };
   return (
-    <div className="flame-detail__linked-prs">
-      <strong>Linked PRs</strong>
-      <p>Collector-reported session context. Does not attribute every event or minute.</p>
-      {links.map((pr) => (
-        <div key={`${pr.repository}#${pr.number}`}>
-          {pr.status === "checked" ? <PullRequestLink pullRequest={pr} explicit /> : (
-            <span>{pr.repository} · PR #{pr.number}</span>
-          )}
-          <small>{labels[pr.status]}{pr.checkedAt && ` · ${new Date(pr.checkedAt).toLocaleString()}`}</small>
-        </div>
+    <div className="flame-detail__pr-links" aria-label="Pull requests">
+      {pullRequest && <PullRequestLink pullRequest={pullRequest} />}
+      {links.map((pr) => pr.status === "checked" ? (
+        <PullRequestLink key={`${pr.repository}#${pr.number}`} pullRequest={pr} explicit />
+      ) : (
+        <span key={`${pr.repository}#${pr.number}`} className="flame-detail__pr-unavailable"
+          title={`${pr.repository} · ${labels[pr.status]}`}>
+          PR #{pr.number}
+        </span>
       ))}
-      {truncated && <p>Showing the first 50 linked PRs for this session. More declarations are retained in the audit history.</p>}
+      {truncated && <span title="Showing the first 50 linked PRs">…</span>}
     </div>
   );
 }
@@ -504,10 +503,7 @@ function IntervalOverview({
     return (
       <li key={work.id}>
         <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
-        {work.pullRequest && (
-          <PullRequestLink pullRequest={work.pullRequest} />
-        )}
-        <LinkedPrs links={work.linkedPrs} truncated={work.linkedPrsTruncated} />
+        <SessionPrLinks pullRequest={work.pullRequest} links={work.linkedPrs} truncated={work.linkedPrsTruncated} />
       </li>
     );
   }
@@ -646,9 +642,8 @@ function WorkDetail({
             <span aria-hidden="true"> · </span>
             {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
           </p>
-          {pullRequest && <PullRequestLink pullRequest={pullRequest} />}
         </div>
-        <LinkedPrs links={linkedPrs} truncated={linkedPrsTruncated} />
+        <SessionPrLinks pullRequest={pullRequest} links={linkedPrs} truncated={linkedPrsTruncated} />
         {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
       </div>
 
