@@ -1,4 +1,9 @@
 import {
+  prContextRepositoryScope,
+  type PrContextScope,
+  syncPrContexts,
+} from "./pr-context-sync.ts";
+import {
   type ReductionTarget,
   SupabaseRawStorage,
   TelemetryProcessor,
@@ -47,6 +52,7 @@ export interface WorkerConfig {
   overloadExitSeconds: number;
   handoffKey: string;
   githubToken: string | null;
+  prContextScope: PrContextScope;
   githubWorkspaceIds: string[];
   githubConnections: number;
 }
@@ -188,6 +194,9 @@ export function loadConfig(
       env.RAILWAY_SERVICE_ID ?? "local",
     ]),
     githubToken,
+    prContextScope: prContextRepositoryScope(
+      env.SHERLOCK_GITHUB_PR_CONTEXT_REPOSITORIES,
+    ),
     githubWorkspaceIds: githubWorkspaces,
     githubConnections,
   };
@@ -656,7 +665,23 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
                 error_code: errorCode(error),
               }),
           },
-        ).then((result) => {
+        ).then(async (result) => {
+          if (!result.pause) {
+            const explicit = await syncPrContexts(
+              githubQueue,
+              config.githubToken!,
+              config.githubWorkspaceIds,
+              config.prContextScope,
+              { signal: shutdown.signal },
+            );
+            result = {
+              attempted: result.attempted + explicit.attempted,
+              failed: result.failed + explicit.failed,
+              backlogRemaining: result.backlogRemaining ||
+                explicit.backlogRemaining,
+              pause: explicit.pause,
+            };
+          }
           githubFailureAttempts = 0;
           const pause = result.pause;
           if (pause?.status === 401) {

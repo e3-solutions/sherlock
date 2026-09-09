@@ -46,7 +46,7 @@ export interface GithubSyncSummary {
   pause: GithubSyncPause | null;
 }
 
-class GitHubSyncError extends Error {
+export class GitHubSyncError extends Error {
   constructor(
     readonly code: string,
     readonly pause: GithubSyncPause | null = null,
@@ -85,7 +85,7 @@ function timestamp(value: unknown): string | null {
   return date.toISOString();
 }
 
-async function githubPause(
+export async function githubPause(
   response: Response,
   nowMs: number,
 ): Promise<GithubSyncPause | null> {

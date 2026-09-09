@@ -353,6 +353,14 @@ describe("interval and work evidence adapters", () => {
         firstAt: new Date(startMs + 1000).toISOString(),
         lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
         summary: "Investigate the cursor",
+        linkedPrs: [{
+          repository: "e3-solutions/sherlock",
+          number: 91, url: "https://github.com/e3-solutions/sherlock/pull/91",
+          status: "checked", checkedAt: new Date(startMs).toISOString(),
+        }, {
+          repository: "e3-solutions/sherlock", number: 92, url: null,
+          status: "pending", checkedAt: null,
+        }],
         pullRequest: {
           number: 54,
           url: "https://github.com/e3-solutions/sherlock/pull/54",
@@ -376,6 +384,16 @@ describe("interval and work evidence adapters", () => {
     expect(result.prompts).toEqual([expect.objectContaining({
       id: "native:msg-1", content: "Investigate the cursor",
     })]);
+    expect(result.work[0].linkedPrs).toEqual(value.work[0].linkedPrs);
+    const originalLinks = value.work[0].linkedPrs;
+    value.work[0].linkedPrs = [...originalLinks, originalLinks[0]];
+    expect(() => adaptIntervalEvidence(value, expected)).toThrow(FlameDataError);
+    value.work[0].linkedPrs = [{ ...originalLinks[0], status: "authorship_proven" }];
+    expect(() => adaptIntervalEvidence(value, expected)).toThrow(FlameDataError);
+    value.work[0].linkedPrs = [{ ...originalLinks[0], url: "https://evil.example/pull/91" }];
+    expect(() => adaptIntervalEvidence(value, expected)).toThrow(FlameDataError);
+    delete value.work[0].linkedPrs;
+    expect(adaptIntervalEvidence(value, expected).work[0].linkedPrs).toEqual([]);
     value.work[0].pullRequest.url = "https://github.com/../sherlock/pull/54";
     expect(() => adaptIntervalEvidence(value, expected)).toThrow(FlameDataError);
   });

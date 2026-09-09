@@ -252,7 +252,7 @@ export class TelemetryProcessor {
       const row = batches[0] as Record<string, unknown>;
       if (
         row.contract_version !== CONTRACT_VERSION ||
-        !(["rollout", "transcript", "hook"] as unknown[]).includes(
+        !(["rollout", "transcript", "hook", "collector"] as unknown[]).includes(
           row.source_kind,
         ) ||
         row.storage_encoding !== "gzip"

@@ -1,3 +1,7 @@
+import type {
+  PrContextTarget,
+  PrContextVerification,
+} from "./pr-context-sync.ts";
 import {
   createPostgresPool,
   isReservedConnectionLost,
@@ -233,6 +237,115 @@ export class PostgresJobQueue {
       dashboardReservedConnections,
       workerConnectionBudget,
     );
+  }
+
+  async pendingPrContexts(
+    limit: number,
+    workspaceIds: readonly string[],
+  ): Promise<PrContextTarget[]> {
+    return await this.sql.begin(async (tx) => {
+      await tx.unsafe("select set_config('statement_timeout', $1, true)", [
+        String(GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS),
+      ]);
+      await tx.unsafe("set local role sherlock_processor");
+      const rows = await tx.unsafe(
+        `select link.workspace_id, link.source_record_id, link.repository_full_name, link.pull_request_number,
+                 identity.repository_id, identity.pull_request_id
+          from telemetry.session_pr_context_events link
+          left join lateral (
+            select v.repository_id, v.pull_request_id from github.pr_context_verifications v
+             where v.workspace_id = link.workspace_id and v.link_source_record_id = link.source_record_id
+               and v.outcome = 'checked' order by v.id limit 1
+          ) identity on true
+          left join lateral (
+            select v.outcome, v.created_at from github.pr_context_verifications v
+             where v.workspace_id = link.workspace_id and v.link_source_record_id = link.source_record_id
+             order by v.id desc limit 1
+          ) latest on true
+         where link.workspace_id = any($2::uuid[]) and link.operation = 'link' and link.disposition = 'accepted'
+           and not exists (
+             select 1 from telemetry.session_pr_context_events conflict
+              where conflict.workspace_id = link.workspace_id and conflict.collector_key = link.collector_key
+                and conflict.event_id = link.event_id and conflict.disposition = 'conflict'
+           )
+           and not exists (
+             select 1 from telemetry.session_pr_context_events retract
+              where retract.workspace_id = link.workspace_id and retract.collector_key = link.collector_key
+                and retract.person_id = link.person_id and retract.source_provider = link.source_provider
+                and retract.native_session_id = link.native_session_id and retract.link_event_id = link.event_id
+                and retract.operation = 'retract' and retract.disposition in ('accepted', 'conflict')
+           )
+           and (latest.created_at is null or latest.created_at < now() - case
+             when latest.outcome in ('checked', 'out_of_scope', 'identity_mismatch') then interval '6 hours'
+             else interval '10 minutes' end)
+         order by latest.created_at asc nulls first, link.source_record_id limit $1`,
+        [limit, workspaceIds],
+      );
+      return rows.map((row) => ({
+        workspaceId: String(row.workspace_id),
+        sourceRecordId: String(row.source_record_id),
+        repositoryFullName: String(row.repository_full_name),
+        pullRequestNumber: Number(row.pull_request_number),
+        expectedRepositoryId: row.repository_id == null
+          ? null
+          : Number(row.repository_id),
+        expectedPullRequestId: row.pull_request_id == null
+          ? null
+          : Number(row.pull_request_id),
+      }));
+    });
+  }
+
+  async appendPrContextVerification(
+    result: PrContextVerification,
+  ): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      await tx.unsafe("set local role sherlock_processor");
+      // Fence concurrent workers and pin the first successful canonical IDs.
+      // Pending selection alone cannot enforce this when two workers race.
+      await tx.unsafe("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        JSON.stringify([
+          "pr-context-verification",
+          result.workspaceId,
+          result.sourceRecordId,
+        ]),
+      ]);
+      const prior = await tx.unsafe(
+        `select repository_id, pull_request_id from github.pr_context_verifications
+          where workspace_id = $1 and link_source_record_id = $2 and outcome = 'checked'
+          order by id limit 1`,
+        [result.workspaceId, result.sourceRecordId],
+      );
+      if (
+        result.outcome === "checked" && prior.length &&
+        (Number(prior[0].repository_id) !== result.repositoryId ||
+          Number(prior[0].pull_request_id) !== result.pullRequestId)
+      ) {
+        result = {
+          ...result,
+          outcome: "identity_mismatch",
+          repositoryId: null,
+          pullRequestId: null,
+          pullRequestState: null,
+        };
+      }
+      const checked = result.outcome === "checked";
+      await tx.unsafe(
+        `insert into github.pr_context_verifications (workspace_id, link_source_record_id, outcome,
+          repository_full_name, repository_id, pull_request_number, pull_request_id, pull_request_state)
+         values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          result.workspaceId,
+          result.sourceRecordId,
+          result.outcome,
+          checked ? result.repositoryFullName : null,
+          result.repositoryId,
+          checked ? result.pullRequestNumber : null,
+          result.pullRequestId,
+          result.pullRequestState,
+        ],
+      );
+    });
   }
 
   async pendingGithubCommitPairs(

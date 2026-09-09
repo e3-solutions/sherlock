@@ -270,6 +270,11 @@ Deno.test("activation proves only the session-selected normalization version", (
   assert(MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.events"));
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes(
+      "batch.source_kind <> 'collector'",
+    ),
+  );
+  assert(
+    MISSING_NORMALIZATION_BATCHES_SQL.includes(
       "session.started_at",
     ),
   );

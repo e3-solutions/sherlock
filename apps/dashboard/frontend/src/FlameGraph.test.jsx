@@ -780,6 +780,37 @@ describe("FlameGraph", () => {
     );
   });
 
+  it("shows multiple declared Linked PRs separately from commit associations and carries them into session detail", async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation(async (url, options) => {
+      const response = await defaultFetch(url, options);
+      if (!String(url).includes("/api/flame/interval?")) return response;
+      const payload = await response.json();
+      payload.work[1].linkedPrs = [
+        { repository: "e3-solutions/sherlock", number: 91, url: "https://github.com/e3-solutions/sherlock/pull/91", status: "checked", checkedAt: "2026-08-17T12:00:00.000Z" },
+        { repository: "e3-solutions/sherlock", number: 92, url: null, status: "pending", checkedAt: null },
+      ];
+      return { ok: true, json: async () => payload };
+    });
+    const { container } = render(<FlameGraph data={model()} chartWidth={1008} />);
+    const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+    vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue({
+      bottom: 82, height: 82, left: 0, right: 1008, top: 0, width: 1008,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+    await screen.findByText("Linked PRs");
+    expect(screen.getByText(/Collector-reported session context/)).toBeInTheDocument();
+    expect(screen.getByText(/Commit association · PR #55/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open PR #91 on GitHub" })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Open PR #92 on GitHub" })).not.toBeInTheDocument();
+    expect(screen.getByText("Identity check pending")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Subagent session/ }));
+    await screen.findByText("Conversation");
+    expect(screen.getByText("Linked PRs")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open PR #91 on GitHub" })).toBeInTheDocument();
+  });
+
   it("removes a session PR link while refreshed snapshot evidence is pending or unmatched", async () => {
     const defaultFetch = vi.mocked(fetch).getMockImplementation();
     let refreshedInterval;

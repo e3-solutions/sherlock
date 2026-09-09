@@ -27,6 +27,7 @@ with recent_sessions as materialized (
      and job.workspace_id = any($5::uuid[])
      and job.id > $1 and job.id <= $2
      and batch.source_provider = 'codex'
+     and batch.source_kind = 'rollout'
      and exists (
        select 1
          from telemetry.native_records record

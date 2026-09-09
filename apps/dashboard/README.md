@@ -16,6 +16,20 @@ for one person and one ten-minute bucket. Message content is limited to
 `telemetry.events.content_excerpt`; the dashboard never reads full raw Storage
 objects.
 
+Session evidence shows zero or more **Linked PRs**, independently of the older
+SHA-derived **Commit association**. The interval response adds `linkedPrs`
+(`repository`, `number`, nullable `url`, `status`, nullable `checkedAt`) and
+`linkedPrsTruncated`. Only a GitHub-checked identity has a URL. Display is bounded
+to 50 distinct PRs per session with an overflow notice; audit facts remain
+complete. Link/retract/conflict/check visibility is pinned to the timeline's
+PostgreSQL snapshot. These are collector-reported declarations, not authenticated
+authorship or time allocation. Apply the explicit-context migration before this
+dashboard code. See [the rollout plan](../../docs/explicit-pr-context-rollout.md).
+
+For loopback-only local testing, set `HOST=127.0.0.1`; its default remains
+`0.0.0.0`. `PORT=0` selects an available local port and the startup log reports
+the actual bound port.
+
 ## Data contract
 
 - `telemetry.people` is the roster, so real people with zero activity remain

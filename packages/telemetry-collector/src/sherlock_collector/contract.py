@@ -26,8 +26,8 @@ MAX_STORED_BYTES = 17 * 1024 * 1024
 FRAGMENT_BYTES = 4 * 1024 * 1024
 MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024
 SOURCE_KINDS = {
-    "codex": frozenset({"rollout"}),
-    "claude_code": frozenset({"transcript", "hook"}),
+    "codex": frozenset({"rollout", "collector"}),
+    "claude_code": frozenset({"transcript", "hook", "collector"}),
 }
 
 
@@ -253,6 +253,14 @@ class BatchManifest:
             raise ContractError("source_provider is unsupported")
         if self.source_kind not in SOURCE_KINDS[self.source_provider]:
             raise ContractError("source_kind does not match source_provider")
+        if self.source_kind == "collector" and (
+            self.source_version != "sherlock.pr-context.v1"
+            or self.record_count != 1 or len(self.records) != 1
+            or not self.observed_native_session_id
+            or self.observed_parent_native_session_id is not None
+            or any(record.native_type != "sherlock.pr-context.v1" for record in self.records)
+        ):
+            raise ContractError("collector source requires exact PR context v1 session metadata")
         if self.storage_encoding != "gzip":
             raise ContractError("the stable rollout encoding must be gzip")
         if self.end_offset <= self.start_offset:

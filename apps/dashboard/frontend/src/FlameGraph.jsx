@@ -412,7 +412,7 @@ function DrawerCloseButton({ closing, onClose }) {
   );
 }
 
-function PullRequestLink({ pullRequest }) {
+function PullRequestLink({ pullRequest, explicit = false }) {
   return (
     <a
       className="flame-detail__pull-request"
@@ -421,11 +421,38 @@ function PullRequestLink({ pullRequest }) {
       rel="noopener noreferrer"
       aria-label={`Open PR #${pullRequest.number} on GitHub`}
     >
-      PR #{pullRequest.number}
+      {explicit ? pullRequest.repository : "Commit association"} · PR #{pullRequest.number}
       <svg aria-hidden="true" focusable="false" viewBox="0 0 16 16">
         <path d="M5 11 11 5M6 5h5v5" />
       </svg>
     </a>
+  );
+}
+
+function LinkedPrs({ links = [], truncated = false }) {
+  if (links.length === 0) return null;
+  const labels = {
+    pending: "Identity check pending",
+    checked: "GitHub identity checked",
+    inaccessible: "Identity unavailable",
+    failed: "Identity check failed; retry pending",
+    identity_mismatch: "Identity mismatch",
+    out_of_scope: "Repository outside permitted scope",
+  };
+  return (
+    <div className="flame-detail__linked-prs">
+      <strong>Linked PRs</strong>
+      <p>Collector-reported session context. Does not attribute every event or minute.</p>
+      {links.map((pr) => (
+        <div key={`${pr.repository}#${pr.number}`}>
+          {pr.status === "checked" ? <PullRequestLink pullRequest={pr} explicit /> : (
+            <span>{pr.repository} · PR #{pr.number}</span>
+          )}
+          <small>{labels[pr.status]}{pr.checkedAt && ` · ${new Date(pr.checkedAt).toLocaleString()}`}</small>
+        </div>
+      ))}
+      {truncated && <p>Showing the first 50 linked PRs for this session. More declarations are retained in the audit history.</p>}
+    </div>
   );
 }
 
@@ -444,11 +471,11 @@ function IntervalOverview({
   closing,
 }) {
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const primaryWork = evidence.work.filter(({ summary, pullRequest }) =>
-    summary !== null || pullRequest !== null
+  const primaryWork = evidence.work.filter(({ summary, pullRequest, linkedPrs }) =>
+    summary !== null || pullRequest !== null || linkedPrs.length > 0
   );
-  const additionalWork = evidence.work.filter(({ summary, pullRequest }) =>
-    summary === null && pullRequest === null
+  const additionalWork = evidence.work.filter(({ summary, pullRequest, linkedPrs }) =>
+    summary === null && pullRequest === null && linkedPrs.length === 0
   );
   const visibleWork = showAdditionalWork
     ? [...primaryWork, ...additionalWork]
@@ -480,6 +507,7 @@ function IntervalOverview({
         {work.pullRequest && (
           <PullRequestLink pullRequest={work.pullRequest} />
         )}
+        <LinkedPrs links={work.linkedPrs} truncated={work.linkedPrsTruncated} />
       </li>
     );
   }
@@ -580,6 +608,8 @@ function IntervalOverview({
 function WorkDetail({
   work,
   pullRequest,
+  linkedPrs,
+  linkedPrsTruncated,
   evidence,
   onBack,
   onClose,
@@ -618,6 +648,7 @@ function WorkDetail({
           </p>
           {pullRequest && <PullRequestLink pullRequest={pullRequest} />}
         </div>
+        <LinkedPrs links={linkedPrs} truncated={linkedPrsTruncated} />
         {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
       </div>
 
@@ -1174,6 +1205,14 @@ export default function FlameGraph({
       ?.pullRequest ?? null
     : null;
 
+  const selectedLinkedPrs = drawerView.screen === "work" &&
+      intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot
+    ? intervalEvidence.work.find((work) => work.id === drawerView.workId)?.linkedPrs ?? []
+    : [];
+  const selectedLinkedPrsTruncated = drawerView.screen === "work" &&
+    intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot &&
+    intervalEvidence.work.find((work) => work.id === drawerView.workId)?.linkedPrsTruncated === true;
+
   const backToOverview = () => {
     setDrawerView({ screen: "overview", transition: "back" });
   };
@@ -1309,6 +1348,8 @@ export default function FlameGraph({
             <WorkDetail
               work={drawerView}
               pullRequest={selectedWorkPullRequest}
+              linkedPrs={selectedLinkedPrs}
+              linkedPrsTruncated={selectedLinkedPrsTruncated}
               evidence={workEvidence}
               stale={stale}
               closing={detailClosing}

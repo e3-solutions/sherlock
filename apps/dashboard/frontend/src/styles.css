@@ -1020,6 +1020,25 @@ input { font: inherit; }
   margin: 0 0 0 auto;
 }
 
+.flame-detail__linked-prs {
+  grid-column: 1 / -1;
+  padding: 8px 12px 12px;
+  color: var(--flame-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.flame-detail__linked-prs > strong { color: var(--flame-ink); }
+.flame-detail__linked-prs > p { margin: 3px 0 7px; }
+.flame-detail__linked-prs > div { display: grid; gap: 2px; margin-top: 6px; }
+.flame-detail__linked-prs .flame-detail__pull-request {
+  justify-self: start;
+  margin: 0;
+  white-space: normal;
+  line-height: 1.5;
+}
+
 .flame-detail__work-expander {
   width: 100%;
   margin-top: 8px;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import stat
@@ -34,6 +35,12 @@ class CollectorIdentity:
 class CollectorConfig:
     endpoint: str
     identity: CollectorIdentity
+
+
+def collector_destination_binding(endpoint: str, identity: CollectorIdentity) -> str:
+    """Accident-prevention identity binding, not an authentication credential."""
+    return hashlib.sha256(json.dumps({"endpoint": endpoint, "email": identity.email,
+        "installation_id": identity.installation_id}, sort_keys=True).encode()).hexdigest()
 
 
 GITHUB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
