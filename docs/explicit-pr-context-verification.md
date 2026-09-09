@@ -92,6 +92,14 @@ by this test.
 
 ## Findings resolved during real integration
 
+The first Ubuntu CI attempt passed the existing suites but exposed inherited
+`LD_LIBRARY_PATH` from Python setup when Deno started the dashboard subprocess.
+Deno correctly rejects loader-variable inheritance with its bounded executable
+allowlist. The dashboard and optional GitHub child now receive explicit minimal
+environments, as the Python child already did. A focused subprocess check with
+an injected library path passed without broadening run permissions; the final
+PR checks provide the independent clean-stack CI result.
+
 The first complete pipeline attempt exposed an activation-proof assumption:
 `backfill-frame-evidence.ts` expected every source record to yield a native
 activity event. Correctly normalized context sidecars therefore blocked frame

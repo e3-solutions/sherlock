@@ -296,6 +296,12 @@ async function dashboard(
   frozenDay?: unknown,
 ) {
   const result = await new Deno.Command("node", {
+    clearEnv: true,
+    env: {
+      PATH: Deno.env.get("PATH") ?? "",
+      HOME: Deno.env.get("HOME") ?? "",
+      SHERLOCK_TEST_DATABASE_URL: databaseUrl,
+    },
     args: [
       "tests/end-to-end/pr-context-dashboard.mjs",
       workspaceId,
@@ -732,6 +738,22 @@ try {
   }
   if (Deno.env.get("SHERLOCK_TEST_LIVE_GITHUB") === "1") {
     const live = await new Deno.Command("gh", {
+      clearEnv: true,
+      env: Object.fromEntries(
+        [
+          "PATH",
+          "HOME",
+          "GH_TOKEN",
+          "GITHUB_TOKEN",
+          "GH_HOST",
+          "GH_CONFIG_DIR",
+          "XDG_CONFIG_HOME",
+        ]
+          .flatMap((name) => {
+            const value = Deno.env.get(name);
+            return value === undefined ? [] : [[name, value]];
+          }),
+      ),
       args: ["api", "repos/e3-solutions/sherlock/pulls/91"],
       stdout: "piped",
       stderr: "piped",
