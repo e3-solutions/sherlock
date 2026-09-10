@@ -412,7 +412,7 @@ function DrawerCloseButton({ closing, onClose }) {
   );
 }
 
-function PullRequestLink({ pullRequest }) {
+function PullRequestLink({ pullRequest, explicit = false }) {
   return (
     <a
       className="flame-detail__pull-request"
@@ -420,12 +420,38 @@ function PullRequestLink({ pullRequest }) {
       target="_blank"
       rel="noopener noreferrer"
       aria-label={`Open PR #${pullRequest.number} on GitHub`}
+      title={explicit ? `${pullRequest.repository} · Linked to this session` : "Commit association"}
     >
       PR #{pullRequest.number}
       <svg aria-hidden="true" focusable="false" viewBox="0 0 16 16">
         <path d="M5 11 11 5M6 5h5v5" />
       </svg>
     </a>
+  );
+}
+
+function SessionPrLinks({ pullRequest, links = [], truncated = false }) {
+  if (!pullRequest && links.length === 0) return null;
+  const labels = {
+    pending: "Identity check pending",
+    inaccessible: "Identity unavailable",
+    failed: "Identity check failed; retry pending",
+    identity_mismatch: "Identity mismatch",
+    out_of_scope: "Repository outside permitted scope",
+  };
+  return (
+    <div className="flame-detail__pr-links" aria-label="Pull requests">
+      {pullRequest && <PullRequestLink pullRequest={pullRequest} />}
+      {links.map((pr) => pr.status === "checked" ? (
+        <PullRequestLink key={`${pr.repository}#${pr.number}`} pullRequest={pr} explicit />
+      ) : (
+        <span key={`${pr.repository}#${pr.number}`} className="flame-detail__pr-unavailable"
+          title={`${pr.repository} · ${labels[pr.status]}`}>
+          PR #{pr.number}
+        </span>
+      ))}
+      {truncated && <span title="Showing the first 50 linked PRs">…</span>}
+    </div>
   );
 }
 
@@ -444,11 +470,11 @@ function IntervalOverview({
   closing,
 }) {
   const headingId = `flame-detail-${person.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const primaryWork = evidence.work.filter(({ summary, pullRequest }) =>
-    summary !== null || pullRequest !== null
+  const primaryWork = evidence.work.filter(({ summary, pullRequest, linkedPrs }) =>
+    summary !== null || pullRequest !== null || linkedPrs.length > 0
   );
-  const additionalWork = evidence.work.filter(({ summary, pullRequest }) =>
-    summary === null && pullRequest === null
+  const additionalWork = evidence.work.filter(({ summary, pullRequest, linkedPrs }) =>
+    summary === null && pullRequest === null && linkedPrs.length === 0
   );
   const visibleWork = showAdditionalWork
     ? [...primaryWork, ...additionalWork]
@@ -477,9 +503,7 @@ function IntervalOverview({
     return (
       <li key={work.id}>
         <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
-        {work.pullRequest && (
-          <PullRequestLink pullRequest={work.pullRequest} />
-        )}
+        <SessionPrLinks pullRequest={work.pullRequest} links={work.linkedPrs} truncated={work.linkedPrsTruncated} />
       </li>
     );
   }
@@ -580,6 +604,8 @@ function IntervalOverview({
 function WorkDetail({
   work,
   pullRequest,
+  linkedPrs,
+  linkedPrsTruncated,
   evidence,
   onBack,
   onClose,
@@ -616,8 +642,8 @@ function WorkDetail({
             <span aria-hidden="true"> · </span>
             {work.eventCount} observed {work.eventCount === 1 ? "event" : "events"}
           </p>
-          {pullRequest && <PullRequestLink pullRequest={pullRequest} />}
         </div>
+        <SessionPrLinks pullRequest={pullRequest} links={linkedPrs} truncated={linkedPrsTruncated} />
         {stale && <p className="flame-detail__stale">Showing the last successful timeline read.</p>}
       </div>
 
@@ -1168,10 +1194,9 @@ export default function FlameGraph({
     });
   };
 
-  const selectedWorkPullRequest = drawerView.screen === "work" &&
+  const selectedWork = drawerView.screen === "work" &&
       intervalEvidence.state === "ready" && intervalEvidence.snapshot === data.snapshot
     ? intervalEvidence.work.find((work) => work.id === drawerView.workId)
-      ?.pullRequest ?? null
     : null;
 
   const backToOverview = () => {
@@ -1308,7 +1333,9 @@ export default function FlameGraph({
           {drawerView.screen === "work" ? (
             <WorkDetail
               work={drawerView}
-              pullRequest={selectedWorkPullRequest}
+              pullRequest={selectedWork?.pullRequest ?? null}
+              linkedPrs={selectedWork?.linkedPrs ?? []}
+              linkedPrsTruncated={selectedWork?.linkedPrsTruncated === true}
               evidence={workEvidence}
               stale={stale}
               closing={detailClosing}

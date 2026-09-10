@@ -66,6 +66,7 @@ jobs:
           deno check scripts/backfill-frame-evidence.ts
           deno check scripts/backfill-session-scm.ts
           deno check --config workers/telemetry-processor/deno.json workers/telemetry-processor/frame-projector.ts
+          deno check --config workers/telemetry-processor/deno.json tests/end-to-end/pr-context.ts
 
       - name: Run collector tests
         env:
@@ -92,7 +93,7 @@ jobs:
           realtime,imgproxy,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
 
       - name: Run database schema tests
-        run: supabase test db --local supabase/tests/database/schema.test.sql
+        run: supabase test db --local supabase/tests/database/schema.test.sql supabase/tests/database/pr_context.test.sql
 
       - name: Run dashboard database integration test
         working-directory: apps/dashboard
@@ -144,6 +145,9 @@ jobs:
           SHERLOCK_TEST_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY" \
           deno test --config workers/telemetry-processor/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run=python3,node \
             workers/telemetry-processor/oversized_rollout_e2e_test.ts
+
+      - name: Run explicit PR context HTTP end-to-end workflow
+        run: node tests/end-to-end/run-pr-context.mjs
 
       - name: Stop isolated Supabase database
         if: always()

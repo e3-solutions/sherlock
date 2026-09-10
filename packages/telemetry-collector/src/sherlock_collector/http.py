@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from typing import Mapping
 
-from .config import CollectorIdentity
+from .config import CollectorIdentity, collector_destination_binding
 from .drain import PermanentUploadError, TransientUploadError
 from .spool import SpoolItem
 
@@ -25,6 +25,10 @@ class HttpTransport:
         self.timeout_seconds = timeout_seconds
 
     def upload(self, item: SpoolItem) -> Mapping[str, object]:
+        if item.manifest.source_kind == "collector" and item.metadata.get("collector_binding") != collector_destination_binding(self.endpoint, self.identity):
+            # Every drain path uses this check, including background delivery.
+            # The drain retains readable rejected items for the original config.
+            raise PermanentUploadError("PR context collector/destination mismatch; restore the original configuration before retrying")
         body = json.dumps(
             {
                 "collector": self.identity.to_dict(),

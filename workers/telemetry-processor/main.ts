@@ -1,4 +1,10 @@
 import {
+  prContextRepositoryScope,
+  type PrContextScope,
+  type PrContextStore,
+  syncPrContexts,
+} from "./pr-context-sync.ts";
+import {
   type ReductionTarget,
   SupabaseRawStorage,
   TelemetryProcessor,
@@ -10,7 +16,11 @@ import {
   type TelemetryJob,
   type WorkloadClass,
 } from "./queue.ts";
-import { githubWorkspaceIds, syncPending } from "./github-sync.ts";
+import {
+  type GithubSyncSummary,
+  githubWorkspaceIds,
+  syncPending,
+} from "./github-sync.ts";
 import { isReservedConnectionLost } from "./database.ts";
 
 const OVERLOAD_SAMPLE_MILLISECONDS = 10_000;
@@ -47,6 +57,7 @@ export interface WorkerConfig {
   overloadExitSeconds: number;
   handoffKey: string;
   githubToken: string | null;
+  prContextScope: PrContextScope;
   githubWorkspaceIds: string[];
   githubConnections: number;
 }
@@ -188,6 +199,9 @@ export function loadConfig(
       env.RAILWAY_SERVICE_ID ?? "local",
     ]),
     githubToken,
+    prContextScope: prContextRepositoryScope(
+      env.SHERLOCK_GITHUB_PR_CONTEXT_REPOSITORIES,
+    ),
     githubWorkspaceIds: githubWorkspaces,
     githubConnections,
   };
@@ -489,6 +503,43 @@ export function retryDelaySeconds(
   return Math.min(maximumSeconds, baseSeconds * 2 ** Math.max(0, attempt - 1));
 }
 
+// An optional verification failure must not back off successful commit matching.
+// Token rejection and rate limits still pause both consumers of the same token.
+export async function syncPrContextsAfterCommits(
+  result: GithubSyncSummary,
+  store: PrContextStore,
+  token: string,
+  workspaceIds: readonly string[],
+  scope: PrContextScope,
+  options: {
+    signal?: AbortSignal;
+    fetcher?: typeof fetch;
+    onError?: (error: unknown) => void;
+  } = {},
+): Promise<GithubSyncSummary> {
+  options.signal?.throwIfAborted();
+  if (result.pause) return result;
+  try {
+    const explicit = await syncPrContexts(
+      store,
+      token,
+      workspaceIds,
+      scope,
+      options,
+    );
+    return {
+      attempted: result.attempted + explicit.attempted,
+      failed: result.failed + explicit.failed,
+      backlogRemaining: result.backlogRemaining || explicit.backlogRemaining,
+      pause: explicit.pause,
+    };
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    options.onError?.(error);
+    return result;
+  }
+}
+
 export async function stopGithubSync(
   queue: Pick<PostgresJobQueue, "close"> | null,
   task: Promise<void> | null,
@@ -656,7 +707,21 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
                 error_code: errorCode(error),
               }),
           },
-        ).then((result) => {
+        ).then(async (result) => {
+          result = await syncPrContextsAfterCommits(
+            result,
+            githubQueue,
+            config.githubToken!,
+            config.githubWorkspaceIds,
+            config.prContextScope,
+            {
+              signal: shutdown.signal,
+              onError: (error) =>
+                log("github_pr_context_sync_failed", {
+                  error_code: errorCode(error),
+                }),
+            },
+          );
           githubFailureAttempts = 0;
           const pause = result.pause;
           if (pause?.status === 401) {

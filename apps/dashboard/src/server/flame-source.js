@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { INTERVAL_LINKED_PRS_SQL, linkedPrsBySession } from "./pr-context.js";
 
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
@@ -1598,7 +1599,7 @@ export function dashboardWorkSummary(value) {
   return summary;
 }
 
-function workFromRow(row, pullRequest = null) {
+function workFromRow(row, pullRequest = null, { links = [], truncated = false } = {}) {
   const role = String(row.semantic_role);
   const sessionId = String(row.session_id);
   const summary = dashboardWorkSummary(row.summary);
@@ -1611,6 +1612,8 @@ function workFromRow(row, pullRequest = null) {
     eventCount: count(row.event_count),
     summary,
     ...(pullRequest === null ? {} : { pullRequest }),
+    linkedPrs: links,
+    linkedPrsTruncated: truncated,
   };
 }
 
@@ -2113,6 +2116,12 @@ export class DirectFlameSource {
       if (prompts.length === promptLimit) {
         throw new FlameSourceError("flame_interval_prompt_result_too_large");
       }
+      const linkedRows = work.length === 0 ? [] : await runQuery(tx, INTERVAL_LINKED_PRS_SQL, [
+        this.workspaceId, snapshotReceipt.snapshot,
+        tx.array([...new Set(work.map((row) => String(row.session_id)))]),
+      ], signal);
+      const linkedBySession = linkedPrsBySession(linkedRows, pullRequestFromRow,
+        () => new FlameSourceError("flame_interval_linked_prs_invalid"));
       return {
         personId,
         start: startAt.toISOString(),
@@ -2120,6 +2129,7 @@ export class DirectFlameSource {
         work: work.map((row) => workFromRow(
           row,
           pullRequestBySession.get(String(row.session_id)) ?? null,
+          linkedBySession.get(String(row.session_id)),
         )),
         prompts: prompts.map(promptFromRow),
       };

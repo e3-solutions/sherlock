@@ -1,4 +1,9 @@
 import {
+  PR_CONTEXT_VERSION,
+  type PrContextFact,
+  projectPrContextBatch,
+} from "./pr-context.ts";
+import {
   type BatchManifest,
   decodeBase64Bytes,
   type RecordLocator,
@@ -125,6 +130,7 @@ export interface BatchProjection {
   session: SessionProjection | null;
   events: EventProjection[];
   session_scm: SessionScmFact | null;
+  pr_context?: PrContextFact;
 }
 
 interface ParsedRecord {
@@ -144,6 +150,9 @@ export async function projectBatch(
     Object.assign(error, { code: "unsupported_normalizer_version" });
     throw error;
   }
+  if (manifest.source_kind === "collector") {
+    return await projectPrContextBatch(manifest, source);
+  }
   return manifest.source_provider === "claude_code"
     ? manifest.source_kind === "hook"
       ? await projectClaudeHookBatch(manifest, source)
@@ -152,6 +161,7 @@ export async function projectBatch(
 }
 
 export function normalizerVersionFor(manifest: BatchManifest): string {
+  if (manifest.source_kind === "collector") return PR_CONTEXT_VERSION;
   return manifest.source_provider === "claude_code"
     ? CLAUDE_NORMALIZER_VERSION
     : NORMALIZER_VERSION;
@@ -183,12 +193,14 @@ function githubRepositoryFullName(value: unknown): string | null {
 }
 
 export function legacyNormalizerVersionFor(manifest: BatchManifest): string {
+  if (manifest.source_kind === "collector") return PR_CONTEXT_VERSION;
   return manifest.source_provider === "claude_code"
     ? CLAUDE_NORMALIZER_VERSION
     : LEGACY_CODEX_NORMALIZER_VERSION;
 }
 
 export function normalizerVersionsFor(manifest: BatchManifest): string[] {
+  if (manifest.source_kind === "collector") return [PR_CONTEXT_VERSION];
   return manifest.source_provider === "claude_code"
     ? [CLAUDE_NORMALIZER_VERSION]
     : [NORMALIZER_VERSION, LEGACY_CODEX_NORMALIZER_VERSION];

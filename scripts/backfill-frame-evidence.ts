@@ -92,6 +92,8 @@ select batch.id::text batch_id
    and cutover.source_provider = batch.source_provider
    and cutover.to_normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
  where batch.workspace_id = $1
+   -- Context sidecars have a separate fact projection and intentionally no events.
+   and batch.source_kind <> 'collector'
    and coalesce(batch.last_occurred_at, batch.committed_at)
        >= $2::timestamptz - make_interval(secs => $3)
    and exists (

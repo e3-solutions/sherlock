@@ -1195,6 +1195,10 @@ describe("Sherlock Flame payload", () => {
         observed_at: new Date("2026-08-16T12:00:10.000Z"),
         content_byte_size: 17,
         content_excerpt: "Inspect the query",
+      }])
+      .mockResolvedValueOnce([{
+        session_id: sessionId, repository_full_name: "e3-solutions/sherlock",
+        pull_request_number: 91, status: "checked", checked_at: READ,
       }]);
     source.transaction = (callback) => callback({
       unsafe,
@@ -1226,6 +1230,11 @@ describe("Sherlock Flame payload", () => {
           number: 54,
           url: "https://github.com/e3-solutions/sherlock/pull/54",
         },
+        linkedPrs: [{
+          repository: "e3-solutions/sherlock",
+          number: 91, url: "https://github.com/e3-solutions/sherlock/pull/91",
+          status: "checked", checkedAt: READ.toISOString(),
+        }],
       }],
       prompts: [{
         id: "native:msg_1",
