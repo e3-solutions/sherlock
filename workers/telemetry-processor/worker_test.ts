@@ -17,6 +17,7 @@ import {
   startWorkerProgressWatchdog,
   stopGithubSync,
   superviseWorker,
+  syncPrContextsAfterCommits,
   updateOverloadState,
   type WorkerConfig,
   workerConnectionBudget,
@@ -1019,4 +1020,128 @@ Deno.test("targeted scheduling has no fifty-session ceiling", async () => {
     },
   );
   assert(reduced === 75 && result.session_count === 75);
+});
+
+Deno.test("explicit database failures preserve successful commit scheduling across repeated passes", async () => {
+  const workspace = "00000000-0000-4000-8000-000000000001";
+  const scope = new Map([[workspace, new Set(["e3-solutions/sherlock"])]]);
+  let errors = 0;
+  for (const backlogRemaining of [false, true]) {
+    const commits = { attempted: 25, failed: 0, backlogRemaining, pause: null };
+    for (let attempt = 0; attempt < 6; attempt++) {
+      for (const stage of ["pending", "append"]) {
+        const result = await syncPrContextsAfterCommits(
+          commits,
+          {
+            pendingPrContexts: () => {
+              if (stage === "pending") throw new Error("statement timeout");
+              return Promise.resolve([{
+                workspaceId: workspace,
+                sourceRecordId: "1",
+                repositoryFullName: "e3-solutions/sherlock",
+                pullRequestNumber: 91,
+              }]);
+            },
+            appendPrContextVerification: () => {
+              throw new Error("verification lock timeout");
+            },
+          },
+          "secret",
+          [workspace],
+          scope,
+          {
+            fetcher: () => Promise.resolve(new Response("", { status: 404 })),
+            onError: () => {
+              errors++;
+            },
+          },
+        );
+        assert(
+          result === commits,
+          "successful commit pass must not become a global failure/backoff",
+        );
+      }
+    }
+  }
+  assert(errors === 24);
+});
+
+Deno.test("explicit auth and rate pauses remain shared while shutdown propagates", async () => {
+  const workspace = "00000000-0000-4000-8000-000000000001";
+  const scope = new Map([[workspace, new Set(["e3-solutions/sherlock"])]]);
+  const commits = {
+    attempted: 1,
+    failed: 0,
+    backlogRemaining: false,
+    pause: null,
+  };
+  let writes = 0;
+  const store = {
+    pendingPrContexts: () =>
+      Promise.resolve([{
+        workspaceId: workspace,
+        sourceRecordId: "1",
+        repositoryFullName: "e3-solutions/sherlock",
+        pullRequestNumber: 91,
+      }]),
+    appendPrContextVerification: () => {
+      writes++;
+      return Promise.resolve();
+    },
+  };
+  for (const status of [401, 429]) {
+    const result = await syncPrContextsAfterCommits(
+      commits,
+      store,
+      "secret",
+      [workspace],
+      scope,
+      { fetcher: () => Promise.resolve(new Response("", { status })) },
+    );
+    assert(result.pause?.status === status && result.backlogRemaining);
+  }
+  assert(writes === 0);
+  const paused = {
+    ...commits,
+    pause: { status: 401 as const, retryAtMs: null },
+  };
+  assert(
+    await syncPrContextsAfterCommits(
+      paused,
+      {
+        ...store,
+        pendingPrContexts: () => {
+          throw new Error("must not scan");
+        },
+      },
+      "secret",
+      [workspace],
+      scope,
+    ) === paused,
+  );
+  const shutdown = new AbortController();
+  const reason = new Error("shutdown");
+  let thrown: unknown;
+  try {
+    await syncPrContextsAfterCommits(
+      commits,
+      {
+        ...store,
+        pendingPrContexts: () => {
+          shutdown.abort(reason);
+          throw reason;
+        },
+      },
+      "secret",
+      [workspace],
+      scope,
+      { signal: shutdown.signal },
+    );
+  } catch (error) {
+    thrown = error;
+  }
+  assert(
+    thrown === reason,
+    "shutdown must not be swallowed as optional verification failure",
+  );
 });

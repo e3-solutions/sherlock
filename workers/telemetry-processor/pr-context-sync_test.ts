@@ -183,3 +183,60 @@ Deno.test("explicit sync propagates persistence failures without inventing faile
   }
   assert(failed && writes === 1);
 });
+
+Deno.test("explicit pass budget yields slow batches without inventing failed observations", async () => {
+  let now = 0, requests = 0;
+  const written: PrContextVerification[] = [];
+  const summary = await syncPrContexts(
+    {
+      pendingPrContexts: () =>
+        Promise.resolve([
+          target,
+          { ...target, sourceRecordId: "2" },
+        ]),
+      appendPrContextVerification: (v) => {
+        written.push(v);
+        return Promise.resolve();
+      },
+    },
+    "secret",
+    [workspace],
+    scope,
+    {
+      now: () => now,
+      fetcher: () => {
+        requests++;
+        now += 30_000;
+        return Promise.resolve(Response.json(pull));
+      },
+    },
+  );
+  assert(
+    summary.attempted === 1 && summary.failed === 0 && summary.backlogRemaining,
+  );
+  assert(
+    requests === 1 && written.length === 1 && written[0].outcome === "checked",
+  );
+});
+
+Deno.test("pending selection consumes explicit pass budget before starting HTTP", async () => {
+  let now = 0;
+  const summary = await syncPrContexts(
+    {
+      pendingPrContexts: () => {
+        now = 30_000;
+        return Promise.resolve([target]);
+      },
+      appendPrContextVerification: () => {
+        throw new Error("must not write");
+      },
+    },
+    "secret",
+    [workspace],
+    scope,
+    { now: () => now, fetcher: forbiddenFetch },
+  );
+  assert(
+    summary.attempted === 0 && summary.failed === 0 && summary.backlogRemaining,
+  );
+});

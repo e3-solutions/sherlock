@@ -158,7 +158,11 @@ export async function syncPrContexts(
   token: string,
   workspaceIds: readonly string[],
   scope: PrContextScope,
-  options: { fetcher?: typeof fetch; signal?: AbortSignal } = {},
+  options: {
+    fetcher?: typeof fetch;
+    signal?: AbortSignal;
+    now?: () => number;
+  } = {},
 ): Promise<GithubSyncSummary> {
   const summary: GithubSyncSummary = {
     attempted: 0,
@@ -170,10 +174,18 @@ export async function syncPrContexts(
     scope.has(workspace)
   );
   if (!enabledWorkspaces.length) return summary;
+  const now = options.now ?? (() => performance.now());
+  const startedAt = now();
   const pending = await store.pendingPrContexts(26, enabledWorkspaces);
   summary.backlogRemaining = pending.length > 25;
   for (const target of pending.slice(0, 25)) {
     options.signal?.throwIfAborted();
+    // Yield to commit matching between targets; the current request and write
+    // retain their own timeouts if they cross this pass budget.
+    if (now() - startedAt >= 30_000) {
+      summary.backlogRemaining = true;
+      break;
+    }
     summary.attempted++;
     let verification: PrContextVerification;
     try {

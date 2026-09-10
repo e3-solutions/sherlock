@@ -70,10 +70,14 @@ Only workspaces also present in `SHERLOCK_GITHUB_WORKSPACE_IDS` are processed.
 An empty value disables explicit verification without affecting commit lookup.
 The scope comes from operator configuration, never collector metadata. Prefer a
 fine-grained GitHub token limited to these repositories. Each cycle handles at
-most 25 declared links after commit sync, using the same one-connection pool,
-20-second query timeout, auth/rate-limit pause, and shutdown signal. Successful
-checks and scope/identity failures are reconsidered after six hours; other
-failures after ten minutes. All checks append observations.
+most 25 declared links after commit sync and stops starting targets after 30
+seconds. In-flight requests and writes retain their own timeouts. Both paths
+share the one-connection pool, auth/rate-limit pause, and shutdown signal.
+Work-selection queries and explicit verification writes have a 20-second SQL
+timeout. Explicit database failures are logged separately and do not increase
+commit-matching backoff. Successful checks and scope/identity failures are
+reconsidered after six hours; other failures after ten minutes. All checks
+append observations.
 
 The verifier uses only `api.github.com/repos/{owner}/{repo}/pulls/{number}` and
 refuses redirects. A rename therefore requires an operator-approved scope update
