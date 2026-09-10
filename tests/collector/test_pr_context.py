@@ -22,7 +22,7 @@ from sherlock_collector.pr_context import (
     enqueue_context, validate_session, create_pull_request,
 )
 from sherlock_collector.spool import DurableSpool
-from test_collector import receipt
+from test_collector import batch, receipt
 
 SESSION = "00000000-0000-4000-8000-000000000004"
 OTHER = "00000000-0000-4000-8000-000000000005"
@@ -129,6 +129,34 @@ class PRContextTests(unittest.TestCase):
         self.enqueue()
         with self.assertRaises(ContractError):
             self.enqueue(configuration=CollectorConfig("https://elsewhere.example", CONFIG.identity))
+
+    def test_interrupted_enqueue_replays_persisted_bytes(self):
+        with patch.object(DurableSpool, "enqueue", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.enqueue()
+        path = self.root / "state" / "pr-context" / "events" / f"{EVENT}.jsonl"
+        original = path.read_bytes()
+        with patch("sherlock_collector.pr_context.utc_now", return_value="2026-09-11T00:00:00Z"):
+            self.enqueue()
+        spool = DurableSpool(self.root / "state" / "queue")
+        self.assertEqual(len(spool.list_pending()), 1)
+        self.assertEqual(gzip.decompress(spool.load(spool.list_pending()[0]).stored_payload), original)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_context_destination_drift_does_not_block_native_upload(self):
+        result = self.enqueue()
+        spool = DurableSpool(self.root / "state" / "queue")
+        manifest, stored = batch("native-stream")
+        spool.enqueue(manifest, stored)
+        changed_endpoint = "http://127.0.0.1:1/other"
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps(receipt(manifest)).encode())) as request:
+            outcome = Drain(spool, HttpTransport(changed_endpoint, CONFIG.identity)).run()
+        self.assertEqual((outcome.uploaded, outcome.requeued, outcome.dead_lettered), (1, 1, 0))
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(json.loads(request.call_args.args[0].data)["manifest"]["source_kind"], "rollout")
+        self.assertEqual(len(spool.list_pending()), 1)
+        self.assertEqual(spool.load(spool.list_pending()[0]).manifest.source_kind, "collector")
+        self.assertTrue(Path(result["sidecar"]).exists())
 
     def test_all_http_drains_retain_context_on_collector_or_destination_drift(self):
         result = self.enqueue()

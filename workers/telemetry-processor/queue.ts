@@ -288,6 +288,9 @@ export class PostgresJobQueue {
     result: PrContextVerification,
   ): Promise<void> {
     await this.sql.begin(async (tx) => {
+      await tx.unsafe("select set_config('statement_timeout', $1, true)", [
+        String(GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS),
+      ]);
       await tx.unsafe("set local role sherlock_processor");
       // Fence concurrent workers and pin the first successful canonical IDs.
       // Pending selection alone cannot enforce this when two workers race.

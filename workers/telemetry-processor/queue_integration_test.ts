@@ -1291,6 +1291,71 @@ Deno.test({
 
 Deno.test({
   name:
+    "blocked explicit verification releases the shared GitHub pool on timeout",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const blocker = postgres(databaseUrl!, { prepare: false, max: 1 });
+    const queue = PostgresJobQueue.connect(databaseUrl!, 1);
+    const workspaceId = crypto.randomUUID();
+    const lockKey = JSON.stringify([
+      "pr-context-verification",
+      workspaceId,
+      "1",
+    ]);
+    let releaseLock!: () => void;
+    let lockAcquired!: () => void;
+    const holdLock = new Promise<void>((resolve) => releaseLock = resolve);
+    const lockReady = new Promise<void>((resolve) => lockAcquired = resolve);
+    const transaction = blocker.begin(async (tx) => {
+      await tx.unsafe("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        lockKey,
+      ]);
+      lockAcquired();
+      await holdLock;
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([lockReady, transaction]);
+      const error = await Promise.race([
+        queue.appendPrContextVerification({
+          workspaceId,
+          sourceRecordId: "1",
+          repositoryFullName: "e3-solutions/sherlock",
+          pullRequestNumber: 91,
+          outcome: "checked",
+          repositoryId: 1,
+          pullRequestId: 91,
+          pullRequestState: "open",
+        }).then(() => null, (error: unknown) => error),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(
+            () => resolve(null),
+            GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS + 5_000,
+          );
+        }),
+      ]);
+      assert(
+        error instanceof Error && "code" in error && error.code === "57014",
+        "the blocked identity fence must be canceled by PostgreSQL before it stalls commit sync",
+      );
+      assert(
+        (await queue.pendingGithubCommitPairs(1, [workspaceId])).length === 0,
+        "commit lookups must reuse the same connection while the explicit lock remains held",
+      );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      releaseLock();
+      await transaction.catch(() => undefined);
+      await queue.close();
+      await blocker.end({ timeout: 1 });
+    }
+  },
+});
+
+Deno.test({
+  name:
     "blocked GitHub SQL leaves control leases available and closes within the drain window",
   ignore: !databaseUrl,
   sanitizeOps: false,
