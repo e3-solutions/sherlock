@@ -13,6 +13,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from collector_test_support import wait_for_failed_drain
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "plugins" / "sherlock" / "scripts"
@@ -202,7 +203,10 @@ class WindowsInstallerTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 backfill(provider, claude_hours=configured)
             self.assertEqual(transcript.read_bytes(), source)
-            return json.loads(output.getvalue().split(": ", 1)[1])
+            result = json.loads(output.getvalue().split(": ", 1)[1])
+            if result["enqueued"]:
+                wait_for_failed_drain(home / "sherlock/telemetry/queue")
+            return result
 
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

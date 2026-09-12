@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from collector_test_support import wait_for_failed_drain
+
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "install.sh"
@@ -1171,7 +1173,7 @@ class TeamInstallerTests(unittest.TestCase):
                 "CLAUDE_CONFIG_DIR": str(claude_home),
                 "PYTHON_BIN": sys.executable,
                 "SHERLOCK_FAKE_CAPTURE": str(capture),
-                "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+                "SHERLOCK_INGEST_URL": "http://127.0.0.1:9/ingest",
             }
 
             completed = subprocess.run(
@@ -1195,6 +1197,7 @@ class TeamInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
+            wait_for_failed_drain(claude_home / "sherlock/telemetry/queue")
             self.assertIn("Claude Code 48-hour backfill", completed.stdout)
             self.assertIn('"excluded_by_cutoff": 1', completed.stdout)
             self.assertIn("Coverage note", completed.stderr)
