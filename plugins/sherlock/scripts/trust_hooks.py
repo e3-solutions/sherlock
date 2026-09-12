@@ -157,9 +157,13 @@ def sherlock_hooks(result: Any, codex_home: Path) -> list[dict[str, Any]]:
             if os.name == "nt":
                 try:
                     definition = json.loads(source_path.read_text(encoding="utf-8"))
+                    # The app-server uses camelCase event names; hooks.json uses
+                    # PascalCase (for example sessionStart vs SessionStart).
+                    event_name = hook["eventName"]
+                    event_name = event_name[:1].upper() + event_name[1:]
                     commands = {
                         handler["commandWindows"]
-                        for group in definition["hooks"][hook["eventName"]]
+                        for group in definition["hooks"][event_name]
                         for handler in group["hooks"]
                         if "commandWindows" in handler
                     }

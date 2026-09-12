@@ -74,7 +74,7 @@ class TrustTransportTests(unittest.TestCase):
             hook = {'pluginId':'sherlock@sherlock', 'source':'plugin',
                     'sourcePath':str(root / 'plugins/cache/sherlock/hooks/hooks.json'),
                     'key':'sherlock@sherlock:Stop', 'currentHash':'sha256:abc',
-                    'eventName':'Stop', 'command':'python Stop'}
+                    'eventName':'stop', 'command':'python Stop'}
             manifest = Path(hook['sourcePath'])
             manifest.parent.mkdir(parents=True)
             manifest.write_text(json.dumps({'hooks':{'Stop':[{'hooks':[

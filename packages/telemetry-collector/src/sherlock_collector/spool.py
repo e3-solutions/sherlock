@@ -15,7 +15,7 @@ from .contract import (
     SPOOL_VERSION,
     validate_stored_payload,
 )
-from .platform import durable_replace, secure_directory, secure_path
+from .platform import durable_replace, is_owner_only, secure_directory, secure_path
 
 
 def utc_now() -> str:
@@ -43,7 +43,8 @@ def secure_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     secure_directory(path.parent)
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    secure_path(path, directory=False)
+    if not is_owner_only(path):
+        secure_path(path, directory=False)
     return os.fdopen(descriptor, "a+b")
 
 
