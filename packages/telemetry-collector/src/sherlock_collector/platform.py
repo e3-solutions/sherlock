@@ -88,11 +88,27 @@ def secure_path(path: Path | str, *, directory: bool) -> None:
         ctypes.POINTER(wintypes.LPVOID),
         ctypes.POINTER(wintypes.DWORD),
     )
-    advapi32.SetFileSecurityW.argtypes = (
-        wintypes.LPCWSTR,
+    advapi32.GetSecurityDescriptorOwner.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    advapi32.GetSecurityDescriptorDacl.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    advapi32.SetNamedSecurityInfoW.argtypes = (
+        wintypes.LPWSTR,
+        ctypes.c_int,
         wintypes.DWORD,
         ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
     )
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
     kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
     kernel32.LocalFree.restype = ctypes.c_void_p
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -100,8 +116,35 @@ def secure_path(path: Path | str, *, directory: bool) -> None:
     ):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        if not advapi32.SetFileSecurityW(str(target), 0x80000005, descriptor):
+        owner = ctypes.c_void_p()
+        owner_defaulted = wintypes.BOOL()
+        dacl_present = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        dacl_defaulted = wintypes.BOOL()
+        if not advapi32.GetSecurityDescriptorOwner(
+            descriptor, ctypes.byref(owner), ctypes.byref(owner_defaulted)
+        ):
             raise ctypes.WinError(ctypes.get_last_error())
+        if not advapi32.GetSecurityDescriptorDacl(
+            descriptor,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not dacl_present:
+            raise OSError("collector security descriptor has no DACL")
+        error = advapi32.SetNamedSecurityInfoW(
+            ctypes.create_unicode_buffer(str(target)),
+            1,
+            0x80000005,
+            owner,
+            None,
+            dacl,
+            None,
+        )
+        if error:
+            raise ctypes.WinError(error)
     finally:
         kernel32.LocalFree(descriptor)
 
@@ -113,15 +156,14 @@ def secure_directory(path: Path | str) -> Path:
     return target
 
 
-def is_owner_only(path: Path | str) -> bool:
-    """Validate the native permission boundary used for collector secrets."""
-    target = Path(path)
+def windows_security_descriptor(path: Path | str) -> str:
+    """Return owner and DACL SDDL for native Windows security diagnostics."""
     if not WINDOWS:
-        return not (stat.S_IMODE(target.stat().st_mode) & 0o077)
-
+        raise OSError("Windows security descriptors are unavailable")
     import ctypes
     from ctypes import wintypes
 
+    target = Path(path)
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32.GetFileSecurityW.argtypes = (
@@ -154,9 +196,18 @@ def is_owner_only(path: Path | str) -> bool:
     ):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        sddl = rendered.value
+        return rendered.value
     finally:
         kernel32.LocalFree(rendered)
+
+
+def is_owner_only(path: Path | str) -> bool:
+    """Validate the native permission boundary used for collector secrets."""
+    target = Path(path)
+    if not WINDOWS:
+        return not (stat.S_IMODE(target.stat().st_mode) & 0o077)
+
+    sddl = windows_security_descriptor(target)
     current_sid = _current_user_sid()
     owner = re.search(r"O:(.*?)(?=[GDS]:|$)", sddl)
     dacl = sddl[sddl.find("D:") :] if "D:" in sddl else ""
@@ -164,7 +215,9 @@ def is_owner_only(path: Path | str) -> bool:
     allowed = {
         fields[5]
         for fields in aces
-        if len(fields) == 6 and fields[0] == "A" and fields[2] == "FA"
+        if len(fields) == 6
+        and fields[0] == "A"
+        and fields[2].lower() in {"fa", "0x1f01ff"}
     }
     return bool(
         owner

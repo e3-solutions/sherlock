@@ -8,6 +8,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      collector_only:
+        description: Run only collector platform checks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,6 +26,7 @@ jobs:
     uses: ./.github/workflows/collector-platforms.yml
 
   test:
+    if: ${{ !inputs.collector_only }}
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 25

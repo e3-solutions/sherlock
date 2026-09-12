@@ -15,7 +15,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sherlock_collector.contract import build_rollout_batch
-from sherlock_collector.platform import is_owner_only, secure_path
+from sherlock_collector.platform import (
+    is_owner_only,
+    secure_path,
+    windows_security_descriptor,
+)
 from sherlock_collector.rollout import RolloutCapturer, StreamState
 from sherlock_collector.spool import DurableSpool, _atomic_json
 
@@ -127,7 +131,7 @@ class PortableRuntimeTests(unittest.TestCase):
             # for identity-bearing configuration.
             self.assertFalse(is_owner_only(path))
             secure_path(path, directory=False)
-            self.assertTrue(is_owner_only(path))
+            self.assertTrue(is_owner_only(path), windows_security_descriptor(path))
 
     @unittest.skipUnless(os.name == "nt", "native Windows replacement boundary")
     def test_windows_failed_replace_leaves_valid_original(self):
@@ -317,11 +321,7 @@ class PortableRuntimeTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 text=True,
             )
-            self.assertTrue(
-                server.started.wait(5),
-                f"stdout={hook.stdout!r} stderr={hook.stderr!r} "
-                f"pending={list((state_root / 'queue' / 'pending').glob('*.json'))}",
-            )
+            self.assertTrue(server.started.wait(5))
             owner.kill()
             owner.wait(timeout=5)
             owner.stdout.close()
@@ -376,6 +376,53 @@ class PortableRuntimeTests(unittest.TestCase):
                 state, Path("source"), ZeroInode(), 4, "prefix", 9, 42
             )
         )
+
+    def test_append_then_same_size_replacement_creates_new_exact_generation(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "sessions" / "rollout.jsonl"
+            source_path.parent.mkdir()
+            first = b'{"type":"first"}\n'
+            appended = b'{"type":"append"}\n'
+            replacement_line = b'{"type":"other"}\n'
+            replacement_bytes = (
+                replacement_line.rstrip(b"\n")
+                + b" " * (len(first + appended) - len(replacement_line))
+                + b"\n"
+            )
+            source_path.write_bytes(first)
+            spool = DurableSpool(root / "queue")
+            capturer = RolloutCapturer(
+                root / "state", spool, allowed_root=source_path.parent
+            )
+            self.assertEqual(capturer.capture([source_path]).enqueued, 1)
+            with source_path.open("ab") as handle:
+                handle.write(appended)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.assertEqual(capturer.capture([source_path]).enqueued, 1)
+            replacement = source_path.with_name("replacement.jsonl")
+            replacement.write_bytes(replacement_bytes)
+            os.replace(replacement, source_path)
+            self.assertEqual(capturer.capture([source_path]).enqueued, 1)
+            items = [spool.load(path) for path in spool.list_pending()]
+            self.assertEqual(
+                sorted(item.manifest.generation_seq for item in items), [0, 0, 1]
+            )
+            generation_zero = b"".join(
+                gzip.decompress(item.stored_payload)
+                for item in sorted(
+                    (item for item in items if item.manifest.generation_seq == 0),
+                    key=lambda item: item.manifest.start_offset,
+                )
+            )
+            generation_one = b"".join(
+                gzip.decompress(item.stored_payload)
+                for item in items
+                if item.manifest.generation_seq == 1
+            )
+            self.assertEqual(generation_zero, first + appended)
+            self.assertEqual(generation_one, replacement_bytes)
 
     def test_detached_child_survives_launcher_exit(self):
         with TemporaryDirectory() as temporary:
@@ -442,7 +489,7 @@ class PortableRuntimeTests(unittest.TestCase):
                     "--config",
                     str(config),
                     "hook",
-                    "SessionEnd",
+                    "Stop",
                 ],
                 input=json.dumps({"transcript_path": str(rollout)}),
                 env=child_environment(),
@@ -451,7 +498,11 @@ class PortableRuntimeTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(hook.returncode, 0, hook.stderr)
-            self.assertTrue(server.started.wait(5))
+            self.assertTrue(
+                server.started.wait(5),
+                f"stdout={hook.stdout!r} stderr={hook.stderr!r} "
+                f"pending={list((state_root / 'queue' / 'pending').glob('*.json'))}",
+            )
             self.assertTrue(list((state_root / "queue" / "processing").glob("*.json")))
             server.release.set()
             deadline = time.monotonic() + 10
