@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  collector-platforms:
+    uses: ./.github/workflows/collector-platforms.yml
+
   test:
     name: Test
     runs-on: ubuntu-latest
