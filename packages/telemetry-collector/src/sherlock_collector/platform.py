@@ -476,8 +476,12 @@ def open_regular_under(root: Path, candidate: Path) -> BinaryIO:
         wintypes.DWORD,
     )
     kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
-    kernel32.GetFileAttributesW.argtypes = (wintypes.LPCWSTR,)
-    kernel32.GetFileAttributesW.restype = wintypes.DWORD
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     native = kernel32.CreateFileW(
         str(candidate),
@@ -501,9 +505,19 @@ def open_regular_under(root: Path, candidate: Path) -> BinaryIO:
             final_path.relative_to(resolved_root)
         except ValueError as error:
             raise ValueError("capture path is outside allowed_root") from error
-        attributes = kernel32.GetFileAttributesW(str(candidate))
-        if attributes == 0xFFFFFFFF or attributes & 0x400:
+
+        class AttributeTagInformation(ctypes.Structure):
+            _fields_ = [("attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+        attributes = AttributeTagInformation()
+        if not kernel32.GetFileInformationByHandleEx(
+            native, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.attributes & 0x400:
             raise OSError("capture path is a reparse point")
+        if attributes.attributes & 0x10:
+            raise OSError("capture path is not a regular file")
         descriptor = msvcrt.open_osfhandle(native, os.O_RDONLY | os.O_BINARY)
         native = None
         return os.fdopen(descriptor, "rb")
