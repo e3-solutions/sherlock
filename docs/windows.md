@@ -18,6 +18,11 @@ For one provider, substitute `install.ps1` or `install-claude.ps1`, omit `instal
 and use the same identity arguments. Re-run the command to update installation.
 Start a new provider session after installing so it loads the updated hooks.
 
+Claude initially backfills 72 hours, matching the Unix installer. Use
+`-ClaudeBackfillHours 48` with `sherlock.ps1`, or `-BackfillHours 48` with
+`install-claude.ps1`, to choose a whole number of hours from 1 to 744.
+Codex's initial backfill remains 24 hours.
+
 ## Paths and configuration
 
 Defaults are `%USERPROFILE%\.sherlock\marketplace`, `%USERPROFILE%\.codex`, and

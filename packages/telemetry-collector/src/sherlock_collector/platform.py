@@ -156,51 +156,6 @@ def secure_directory(path: Path | str) -> Path:
     return target
 
 
-def windows_security_descriptor(path: Path | str) -> str:
-    """Return owner and DACL SDDL for native Windows security diagnostics."""
-    if not WINDOWS:
-        raise OSError("Windows security descriptors are unavailable")
-    import ctypes
-    from ctypes import wintypes
-
-    target = Path(path)
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.GetFileSecurityW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    )
-    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = (
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.LPWSTR),
-        ctypes.POINTER(wintypes.DWORD),
-    )
-    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    information = 0x00000001 | 0x00000004
-    needed = wintypes.DWORD()
-    advapi32.GetFileSecurityW(str(target), information, None, 0, ctypes.byref(needed))
-    buffer = ctypes.create_string_buffer(needed.value)
-    if not advapi32.GetFileSecurityW(
-        str(target), information, buffer, needed, ctypes.byref(needed)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    rendered = wintypes.LPWSTR()
-    if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-        buffer, 1, information, ctypes.byref(rendered), None
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        return rendered.value
-    finally:
-        kernel32.LocalFree(rendered)
-
-
 def is_owner_only(path: Path | str) -> bool:
     """Validate the native permission boundary used for collector secrets."""
     target = Path(path)
@@ -441,19 +396,8 @@ def spawn_detached(
 
 
 def open_regular_under(root: Path, candidate: Path) -> BinaryIO:
+    """Open a confined Windows file; Unix uses the directory-fd walk in rollout."""
     resolved_root = root.resolve(strict=True)
-    if not WINDOWS:
-        resolved_candidate = candidate.resolve(strict=True)
-        try:
-            resolved_candidate.relative_to(resolved_root)
-        except ValueError as error:
-            raise ValueError("capture path is outside allowed_root") from error
-        descriptor = os.open(resolved_candidate, os.O_RDONLY)
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
-            raise OSError("capture path is not a regular file")
-        return os.fdopen(descriptor, "rb")
-
     import ctypes
     import msvcrt
     from ctypes import wintypes

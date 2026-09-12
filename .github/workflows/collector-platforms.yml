@@ -60,10 +60,15 @@ jobs:
           $env:SHERLOCK_INGEST_URL = 'http://127.0.0.1:9/ingest'
           $env:CODEX_BIN = (Get-Command codex.cmd).Source
           $env:CLAUDE_BIN = (Get-Command claude.cmd).Source
-          & .\sherlock.ps1 install -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai'
+          & .\sherlock.ps1 install -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai' | Tee-Object -Variable installOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\sherlock.ps1 install -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai'
+          if (-not ($installOutput -match '^Claude Code 72-hour backfill:')) { throw 'Expected Claude 72-hour backfill' }
+          & .\sherlock.ps1 install -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai' -ClaudeBackfillHours 48 | Tee-Object -Variable installOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($installOutput -match '^Claude Code 48-hour backfill:')) { throw 'Expected Claude 48-hour backfill' }
+          & .\install-claude.ps1 -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai' -BackfillHours 48 | Tee-Object -Variable installOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($installOutput -match '^Claude Code 48-hour backfill:')) { throw 'Expected Claude 48-hour backfill' }
           python tests/collector/windows_provider_smoke.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Unix regression suite

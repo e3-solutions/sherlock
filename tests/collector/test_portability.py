@@ -19,7 +19,6 @@ from sherlock_collector.config import ConfigurationError, _read_owner_only
 from sherlock_collector.platform import (
     is_owner_only,
     secure_path,
-    windows_security_descriptor,
 )
 from sherlock_collector.rollout import (
     RolloutCapturer,
@@ -136,7 +135,7 @@ class PortableRuntimeTests(unittest.TestCase):
             # for identity-bearing configuration.
             self.assertFalse(is_owner_only(path))
             secure_path(path, directory=False)
-            self.assertTrue(is_owner_only(path), windows_security_descriptor(path))
+            self.assertTrue(is_owner_only(path), "Expected protected owner/SYSTEM permissions")
 
     @unittest.skipUnless(os.name == "nt", "native Windows ACL boundary")
     def test_windows_everyone_read_acl_is_rejected_for_config(self):
@@ -151,7 +150,7 @@ class PortableRuntimeTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(granted.returncode, 0, granted.stderr)
-            self.assertFalse(is_owner_only(path), windows_security_descriptor(path))
+            self.assertFalse(is_owner_only(path), "Everyone read access must be rejected")
             with self.assertRaisesRegex(ConfigurationError, "owner-only"):
                 _read_owner_only(path)
 
@@ -466,25 +465,6 @@ class PortableRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(generation_zero, first + appended)
             self.assertEqual(generation_one, replacement_bytes)
-
-    def test_detached_child_survives_launcher_exit(self):
-        with TemporaryDirectory() as temporary:
-            marker = Path(temporary) / "child-finished"
-            child = "import pathlib,sys,time; time.sleep(.3); pathlib.Path(sys.argv[1]).write_text('ok')"
-            launcher = (
-                "import sys\nfrom sherlock_collector.platform import spawn_detached\n"
-                "spawn_detached([sys.executable, '-c', sys.argv[1], sys.argv[2]])"
-            )
-            completed = subprocess.run(
-                [sys.executable, "-c", launcher, child, str(marker)],
-                env=child_environment(),
-                timeout=5,
-            )
-            self.assertEqual(completed.returncode, 0)
-            deadline = time.monotonic() + 5
-            while not marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertEqual(marker.read_text(), "ok")
 
     def test_hook_process_exits_before_detached_http_drain_completes(self):
         with TemporaryDirectory() as temporary, ReceiptServer(

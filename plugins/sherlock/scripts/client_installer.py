@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,12 +14,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from install import atomic_json, existing_installation_id, install_runtime
-from install_marketplace import is_sherlock_marketplace, run_codex
+from install_marketplace import register_codex_marketplace, run_codex
 from process_command import executable_command
 from stage_marketplace import copy_marketplace
 
 
 DEFAULT_ENDPOINT = "https://psmuyotyyojrkojycyzz.supabase.co/functions/v1/sherlock-rollout-ingest"
+
+
+def backfill_hours(value: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", value):
+        raise argparse.ArgumentTypeError("must be a canonical integer from 1 through 744")
+    hours = int(value)
+    if not 1 <= hours <= 744:
+        raise argparse.ArgumentTypeError("must be from 1 through 744")
+    return hours
 
 
 @dataclass(frozen=True)
@@ -41,6 +51,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--codex-home", type=Path)
     parser.add_argument("--claude-home", type=Path)
     parser.add_argument("--endpoint", default=os.environ.get("SHERLOCK_INGEST_URL", DEFAULT_ENDPOINT))
+    parser.add_argument("--claude-backfill-hours", type=backfill_hours, default=72)
     return parser.parse_args()
 
 
@@ -114,41 +125,54 @@ def install_provider_runtime(repo_root: Path, provider: Provider, endpoint: str)
     atomic_json(root / "collector.json", {"endpoint": endpoint, **provider.identity})
 
 
-def backfill(provider: Provider) -> None:
+def backfill(provider: Provider, *, claude_hours: int) -> None:
     runtime = provider.home / "sherlock" / "runtime"
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(filter(None, (str(runtime), environment.get("PYTHONPATH"))))
     home_flag = "--codex-home" if provider.name == "codex" else "--claude-home"
+    hours = 24 if provider.name == "codex" else claude_hours
     completed = subprocess.run(
         [sys.executable, "-m", "sherlock_collector.cli", "--provider", provider.name,
          home_flag, str(provider.home), "--state-root", str(provider.home / "sherlock" / "telemetry"),
          "--config", str(provider.home / "sherlock" / "collector.json"),
-         "backfill", "--lookback-seconds", "86400"],
+         "backfill", "--lookback-seconds", str(hours * 60 * 60)],
         check=False, capture_output=True, text=True, env=environment,
     )
     label = "Codex" if provider.name == "codex" else "Claude Code"
+    retry = (
+        "a later SessionStart hook will resume it"
+        if provider.name == "codex"
+        else f"rerun sherlock.ps1 with -ClaudeBackfillHours {hours} "
+             f"(or install-claude.ps1 with -BackfillHours {hours})"
+    )
     if completed.returncode:
-        print(f"Warning: {label} backfill could not start; a later hook will retry it.", file=sys.stderr)
-    else:
-        print(f"{label} 24-hour backfill: {completed.stdout.strip()}")
+        print(f"Warning: {label} backfill could not start; {retry}.", file=sys.stderr)
+        return
+    print(f"{label} {hours}-hour backfill: {completed.stdout.strip()}")
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        result = None
+    if (
+        provider.name == "claude_code"
+        and isinstance(result, dict)
+        and isinstance(result.get("excluded_by_cutoff"), int)
+        and result["excluded_by_cutoff"] > 0
+    ):
+        print(
+            "Coverage note: Claude transcript candidates older than the configured "
+            "cutoff were not selected.",
+            file=sys.stderr,
+        )
+    if not isinstance(result, dict) or result.get("status") != "complete":
+        print(
+            f"Warning: {label} backfill was partial; {retry}.",
+            file=sys.stderr,
+        )
 
 
 def install_codex(provider: Provider, marketplace: Path, repo_root: Path) -> None:
-    raw = run_codex(provider.executable, "plugin", "marketplace", "list", "--json")
-    try:
-        matches = [item for item in json.loads(raw)["marketplaces"] if isinstance(item, dict) and item.get("name") == "sherlock"]
-    except (json.JSONDecodeError, KeyError, TypeError) as error:
-        raise SystemExit("Codex returned an invalid marketplace list") from error
-    if len(matches) > 1:
-        raise SystemExit("Codex reported more than one Sherlock marketplace")
-    if matches:
-        current = Path(str(matches[0].get("root", ""))).expanduser().resolve()
-        if current != marketplace and not is_sherlock_marketplace(current):
-            raise SystemExit("refusing to replace an existing unverified marketplace named sherlock")
-        if current != marketplace:
-            run_codex(provider.executable, "plugin", "marketplace", "remove", "sherlock", "--json")
-    if not matches or Path(str(matches[0].get("root", ""))).expanduser().resolve() != marketplace:
-        run_codex(provider.executable, "plugin", "marketplace", "add", str(marketplace), "--json")
+    register_codex_marketplace(provider.executable, marketplace)
     run_codex(provider.executable, "plugin", "add", "sherlock@sherlock", "--json")
     subprocess.run(
         [sys.executable, str(repo_root / "plugins/sherlock/scripts/trust_hooks.py"),
@@ -199,7 +223,7 @@ def main() -> int:
     )
     for provider in providers:
         install_provider_runtime(repo_root, provider, endpoint)
-        backfill(provider)
+        backfill(provider, claude_hours=args.claude_backfill_hours)
         if provider.name == "codex":
             install_codex(provider, marketplace, repo_root)
         else:

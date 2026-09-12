@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Name,
     [Parameter(Mandatory = $true)][string]$GithubId,
     [Parameter(Mandatory = $true)][string]$Email,
-    [Parameter(Mandatory = $true)][string]$RepoRoot
+    [Parameter(Mandatory = $true)][string]$RepoRoot,
+    [string]$ClaudeBackfillHours = "72"
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,10 +28,6 @@ function Find-SherlockPython {
 $python = @(Find-SherlockPython)
 $pythonExe = $python[0]
 $installer = Join-Path $RepoRoot "plugins\sherlock\scripts\client_installer.py"
-if ($python.Count -eq 1) {
-    & $pythonExe $installer --providers $Providers --repo-root $RepoRoot --name $Name --github-id $GithubId --email $Email
-} else {
-    $pythonPrefix = $python[1]
-    & $pythonExe $pythonPrefix $installer --providers $Providers --repo-root $RepoRoot --name $Name --github-id $GithubId --email $Email
-}
+$pythonPrefix = @($python | Select-Object -Skip 1)
+& $pythonExe @pythonPrefix $installer --providers $Providers --repo-root $RepoRoot --name $Name --github-id $GithubId --email $Email --claude-backfill-hours $ClaudeBackfillHours
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
