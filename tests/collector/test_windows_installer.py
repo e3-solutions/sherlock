@@ -67,6 +67,23 @@ class WindowsInstallerTests(unittest.TestCase):
                 [str(node), str(script.resolve())],
             )
 
+    def test_npm_native_executable_shim_resolves_without_a_shell(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shim = root / "claude.cmd"
+            binary = root / "node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("", encoding="utf-8")
+            shim.write_text(
+                '@"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                executable_command(shim, windows=True),
+                [str(binary.resolve())],
+            )
+
     def test_all_identity_preflight_happens_before_marketplace_or_home_write(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
