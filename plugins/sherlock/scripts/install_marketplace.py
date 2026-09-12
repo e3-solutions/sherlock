@@ -22,8 +22,14 @@ def arguments() -> argparse.Namespace:
 
 
 def run_codex(codex_bin: Path, *arguments: str) -> str:
+    from process_command import executable_command
+
+    try:
+        command = executable_command(codex_bin)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     completed = subprocess.run(
-        [str(codex_bin), *arguments],
+        [*command, *arguments],
         check=False,
         capture_output=True,
         text=True,
@@ -49,11 +55,10 @@ def is_sherlock_marketplace(root: Path) -> bool:
     )
 
 
-def main() -> int:
-    args = arguments()
-    # Preserve the launcher name for multicall binaries such as VP's codex symlink.
-    codex_bin = args.codex_bin.expanduser().absolute()
-    repo_root = args.repo_root.expanduser().resolve()
+def register_codex_marketplace(codex_bin: Path, repo_root: Path) -> None:
+    """Register a verified Sherlock marketplace, preserving an identical entry."""
+    codex_bin = codex_bin.expanduser().absolute()
+    repo_root = repo_root.expanduser().resolve()
     raw = run_codex(codex_bin, "plugin", "marketplace", "list", "--json")
     try:
         listing = json.loads(raw)
@@ -73,7 +78,7 @@ def main() -> int:
         current_root = Path(str(matches[0].get("root", ""))).expanduser().resolve()
         if current_root == repo_root:
             print("Sherlock marketplace already points at this checkout.")
-            return 0
+            return
         if not is_sherlock_marketplace(current_root):
             raise SystemExit(
                 "refusing to replace an existing unverified marketplace named sherlock"
@@ -96,6 +101,12 @@ def main() -> int:
         "--json",
     )
     print("Registered this checkout as the Sherlock marketplace.")
+
+
+def main() -> int:
+    args = arguments()
+    # Preserve the launcher name for multicall binaries such as VP's codex symlink.
+    register_codex_marketplace(args.codex_bin, args.repo_root)
     return 0
 
 

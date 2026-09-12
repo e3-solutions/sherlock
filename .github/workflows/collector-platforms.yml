@@ -1,0 +1,76 @@
+name: Collector platforms
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collector:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: source tree
+    env:
+      PYTHONPATH: packages/telemetry-collector/src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source tree
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Collector startup
+        run: python -m sherlock_collector.cli --help
+      - name: Portable process and durability tests
+        run: python -m unittest discover -s tests/collector -p test_portability.py -v
+      - name: Native trust pipe transport
+        if: ${{ !cancelled() }}
+        run: python -m unittest discover -s tests/collector -p test_trust_transport.py -v
+      - name: Windows PowerShell 5.1 installation and hooks
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Expected Windows PowerShell 5.1' }
+          python -m unittest discover -s tests/collector -p test_windows_installer.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install real Windows provider CLIs
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: powershell
+        run: |
+          npm install --global @openai/codex@0.154.0 @anthropic-ai/claude-code@2.1.269
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Real Windows provider registration and reinstall
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: powershell
+        run: |
+          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'Sherlock real providers\codex home'
+          $env:CLAUDE_CONFIG_DIR = Join-Path $env:RUNNER_TEMP 'Sherlock real providers\claude home'
+          $env:SHERLOCK_HOME = Join-Path $env:RUNNER_TEMP 'Sherlock real providers\marketplace home'
+          $env:SHERLOCK_INGEST_URL = 'http://127.0.0.1:9/ingest'
+          $env:CODEX_BIN = (Get-Command codex.cmd).Source
+          $env:CLAUDE_BIN = (Get-Command claude.cmd).Source
+          & .\sherlock.ps1 install -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai' | Tee-Object -Variable installOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($installOutput -match '^Claude Code 72-hour backfill:')) { throw 'Expected Claude 72-hour backfill' }
+          & .\sherlock.ps1 install -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai' -ClaudeBackfillHours 48 | Tee-Object -Variable installOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($installOutput -match '^Claude Code 48-hour backfill:')) { throw 'Expected Claude 48-hour backfill' }
+          & .\install-claude.ps1 -Name 'Windows CI' -Github 'windows-ci' -Email 'windows-ci@e3group.ai' -BackfillHours 48 | Tee-Object -Variable installOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($installOutput -match '^Claude Code 48-hour backfill:')) { throw 'Expected Claude 48-hour backfill' }
+          python tests/collector/windows_provider_smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Unix regression suite
+        if: runner.os != 'Windows'
+        run: python -m unittest discover -s tests/collector -v

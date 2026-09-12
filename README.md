@@ -7,13 +7,29 @@ immutable telemetry backend.
 
 ## Install for Codex and Claude Code
 
-You need macOS or Linux, Git, Python 3, and at least one of the Codex or Claude
-Code CLIs. Run this one command with the same team identity for every available
-provider:
+You need Git, Python 3.11 or later, and at least one of the Codex or Claude
+Code CLIs. Use the same team identity for every available provider.
+
+On macOS or Linux:
 
 ```sh
 workdir="$(mktemp -d)" && git clone --depth 1 --single-branch --branch main https://github.com/e3-solutions/sherlock.git "$workdir/sherlock" && "$workdir/sherlock/sherlock" install --name "<full name>" --github "<GitHub username>" --email "<work email>" && rm -rf "$workdir"
 ```
+
+On native Windows, run these commands in Windows PowerShell 5.1 or PowerShell 7.
+WSL is not required:
+
+```powershell
+git clone --depth 1 https://github.com/e3-solutions/sherlock.git
+if ($LASTEXITCODE -ne 0) { throw 'Sherlock download failed' }
+Set-Location .\sherlock
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\sherlock.ps1 install -Name "<full name>" -Github "<GitHub username>" -Email "<work email>"
+if ($LASTEXITCODE -ne 0) { throw 'Sherlock installation failed' }
+```
+
+The execution-policy override applies only to that installer process. See
+[Windows installation and verification](docs/windows.md) for prerequisites,
+provider versions, paths, and verification limits.
 
 The command detects both agent CLIs before changing either installation. It
 installs every usable provider, reports unavailable providers as skipped, and
@@ -52,8 +68,8 @@ Codex task so the hooks load.
 
 ## Install only for Claude Code
 
-You need macOS or Linux, Git, Python 3, and the Claude Code CLI. Native Windows
-is not currently supported. From the same checkout, run:
+You need Git, Python 3.11 or later, and the Claude Code CLI. On macOS or Linux,
+run from the same checkout:
 
 ```sh
 ./install-claude.sh \
@@ -61,6 +77,9 @@ is not currently supported. From the same checkout, run:
   --github-id "<GitHub username>" \
   --email "<work email>"
 ```
+
+On Windows, run `install-claude.ps1` through PowerShell with `-Name`, `-Github`,
+and `-Email`. Use `install.ps1` for Codex only.
 
 The installer validates the Claude plugin and marketplace, stores the runtime
 and owner-only config under `${CLAUDE_CONFIG_DIR:-~/.claude}/sherlock`, adds

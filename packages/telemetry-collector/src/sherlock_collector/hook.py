@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
-import subprocess
+import subprocess  # noqa: F401 - compatibility patch point for installed hooks
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +28,8 @@ from .rollout import (
     RolloutCapturer,
     SourceSnapshot,
 )
-from .spool import DurableSpool, _atomic_json, secure_lock
+from .spool import DurableSpool, _atomic_json
+from .platform import nonblocking_lock, spawn_detached
 
 
 CODEX_HOOK_EVENTS = {
@@ -113,19 +113,7 @@ def _spawn_drain(
     drain_environment: Mapping[str, str] | None,
 ) -> None:
     try:
-        subprocess.Popen(
-            list(drain_command),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-            env=(
-                dict(drain_environment)
-                if drain_environment is not None
-                else None
-            ),
-        )
+        spawn_detached(drain_command, drain_environment)
     except OSError:
         # Capture is already durable. A later hook is a recovery signal.
         pass
@@ -378,10 +366,8 @@ def run_hook(
 
     state_stem = f"{provider}-post-tool-capture"
     state_path = root / f"{state_stem}.json"
-    with secure_lock(root / f"{state_stem}.lock") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with nonblocking_lock(root / f"{state_stem}.lock") as acquired:
+        if not acquired:
             return HookResult(event_name, skipped="busy")
         now_ns = time.time_ns()
         if not _post_tool_capture_due(state_path, now_ns):
