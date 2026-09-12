@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .platform import is_owner_only
+
 
 class ConfigurationError(ValueError):
     """Collector configuration is missing or unsafe."""
@@ -194,10 +196,16 @@ def _read_owner_only(path: Path) -> dict[str, object]:
         return {}
     if not stat.S_ISREG(details.st_mode):
         raise ConfigurationError("the collector config must be a regular file")
-    if stat.S_IMODE(details.st_mode) & 0o077:
+    if not is_owner_only(path):
         raise ConfigurationError("the collector config must be owner-only (mode 0600)")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ConfigurationError("the collector config must be a regular file")
+            if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
+                raise ConfigurationError("the collector config changed while opening")
+            value = json.load(handle)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ConfigurationError("the collector config is unreadable") from error
     if not isinstance(value, dict):

@@ -4,12 +4,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import selectors
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, TextIO
+
+from process_command import executable_command
 
 
 PLUGIN_ID = "sherlock@sherlock"
@@ -42,7 +45,7 @@ class AppServer:
         environment["CODEX_HOME"] = str(codex_home)
         self._stderr = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
         self._process = subprocess.Popen(
-            [str(codex_bin), "app-server", "--stdio"],
+            [*executable_command(codex_bin), "app-server", "--stdio"],
             cwd=cwd,
             env=environment,
             stdin=subprocess.PIPE,
@@ -55,8 +58,18 @@ class AppServer:
             raise AppServerError("failed to open Codex app-server pipes")
         self._stdin: TextIO = self._process.stdin
         self._stdout: TextIO = self._process.stdout
-        self._selector = selectors.DefaultSelector()
-        self._selector.register(self._stdout, selectors.EVENT_READ)
+        # Windows selectors cannot watch anonymous subprocess pipes. One reader
+        # also handles multiple JSON lines already buffered by TextIO correctly.
+        self._messages: queue.Queue[str | None] = queue.Queue()
+        self._reader = threading.Thread(target=self._read_messages, daemon=True)
+        self._reader.start()
+
+    def _read_messages(self) -> None:
+        try:
+            for line in self._stdout:
+                self._messages.put(line)
+        finally:
+            self._messages.put(None)
 
     def request(self, request_id: int, method: str, params: dict[str, Any]) -> Any:
         self._send({"id": request_id, "method": method, "params": params})
@@ -67,9 +80,10 @@ class AppServer:
                 raise AppServerError(
                     f"timed out waiting for Codex {method}: {self._stderr_text()}"
                 )
-            if not self._selector.select(remaining):
+            try:
+                line = self._messages.get(timeout=remaining)
+            except queue.Empty:
                 continue
-            line = self._stdout.readline()
             if not line:
                 raise AppServerError(
                     f"Codex app-server exited during {method}: {self._stderr_text()}"
@@ -77,6 +91,8 @@ class AppServer:
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict):
                 continue
             if message.get("id") != request_id:
                 continue
@@ -91,13 +107,14 @@ class AppServer:
         self._send(message)
 
     def close(self) -> None:
-        self._selector.close()
         self._stdin.close()
         try:
             self._process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self._process.terminate()
             self._process.wait(timeout=5)
+        self._reader.join(timeout=5)
+        self._stdout.close()
         self._stderr.close()
 
     def _send(self, message: dict[str, Any]) -> None:
@@ -137,6 +154,21 @@ def sherlock_hooks(result: Any, codex_home: Path) -> list[dict[str, Any]]:
             current_hash = hook.get("currentHash")
             if not isinstance(current_hash, str) or not current_hash.startswith("sha256:"):
                 raise AppServerError("refusing to trust a hook without a Codex SHA-256 hash")
+            if os.name == "nt":
+                try:
+                    definition = json.loads(source_path.read_text(encoding="utf-8"))
+                    commands = {
+                        handler["commandWindows"]
+                        for group in definition["hooks"][hook["eventName"]]
+                        for handler in group["hooks"]
+                        if "commandWindows" in handler
+                    }
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    raise AppServerError("cannot verify the installed Windows hook command") from error
+                if hook.get("command") not in commands:
+                    raise AppServerError(
+                        "Codex did not select the installed commandWindows override; update Codex"
+                    )
             matches.append(hook)
     if not matches:
         raise AppServerError("Codex did not discover any installed Sherlock hooks")

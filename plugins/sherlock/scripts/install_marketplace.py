@@ -22,8 +22,14 @@ def arguments() -> argparse.Namespace:
 
 
 def run_codex(codex_bin: Path, *arguments: str) -> str:
+    from process_command import executable_command
+
+    try:
+        command = executable_command(codex_bin)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     completed = subprocess.run(
-        [str(codex_bin), *arguments],
+        [*command, *arguments],
         check=False,
         capture_output=True,
         text=True,

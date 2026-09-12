@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "task": {
+    "title": "Native Windows Sherlock support",
+    "mode": "critical",
+    "type": "feature"
+  },
+  "intent": {
+    "goal": "Install and run Sherlock natively on Windows with no WSL requirement while preserving Unix collection and telemetry durability.",
+    "must_happen": [
+      "PowerShell 5.1 installation/reinstallation preserves installation identity and queued telemetry.",
+      "Installed Codex and Claude hooks execute native commands and launch durable background capture/drain.",
+      "Real subprocess locks exclude competing collectors and recover after terminated owners.",
+      "Run Windows CI and distinguish provider-interface fixtures from authenticated provider sessions."
+    ],
+    "must_not_happen": [
+      "Never mutate source telemetry or database facts.",
+      "Never weaken Unix owner-only permissions or trust unrelated hooks.",
+      "Do not merge or deploy without authorization."
+    ],
+    "constraints": [
+      "Python >=3.11; shared collector logic with a small platform layer.",
+      "Preserve existing macOS/Linux installation and hook behavior."
+    ],
+    "non_goals": [
+      "WSL troubleshooting",
+      "Database or product projection changes"
+    ],
+    "open_questions": [
+      "Actual Windows provider CLI availability and hook execution compatibility.",
+      "Windows filesystem ACL, open-handle replacement and detached process behavior."
+    ],
+    "assumptions": [
+      "Current official Codex commandWindows and Claude exec-form hook APIs can be capability-checked and tested."
+    ]
+  },
+  "proof_obligations": [
+    {
+      "id": "P1",
+      "claim": "Collector imports and CLI startup work on native Windows.",
+      "verification": "Windows CI imports and CLI smoke."
+    },
+    {
+      "id": "P2",
+      "claim": "Real process locks exclude competitors and recover after owner death.",
+      "verification": "Subprocess contention and terminated-owner recovery on Windows and Unix."
+    },
+    {
+      "id": "P3",
+      "claim": "Atomic state/spool writes and reinstall retain valid durable files with Windows open-handle semantics.",
+      "verification": "Existing-destination/open-reader replacement and crash/recovery tests."
+    },
+    {
+      "id": "P4",
+      "claim": "Append/replacement generation identity captures bytes without gaps.",
+      "verification": "Generation tests including unavailable/reused inode and same-size replacement."
+    },
+    {
+      "id": "P5",
+      "claim": "Crash recovery preserves exact source bytes and durable queue.",
+      "verification": "Capture/drain recovery tests and immutable source byte assertions."
+    },
+    {
+      "id": "P6",
+      "claim": "Detached drain survives the hook parent.",
+      "verification": "Real hook exits and local HTTP endpoint observes eventual upload."
+    },
+    {
+      "id": "P7",
+      "claim": "PowerShell 5.1 installs and reinstalls preserving identity and queues.",
+      "verification": "Native Windows installation tests from paths with spaces and invalid identity preflight."
+    },
+    {
+      "id": "P8",
+      "claim": "Exact installed native provider hook commands execute correctly.",
+      "verification": "Native manifest command execution and official provider capability checks."
+    },
+    {
+      "id": "P9",
+      "claim": "Codex app-server pipe transport and trust verification work portably.",
+      "verification": "Real subprocess JSON protocol, timeout/EOF tests and trust boundary rejection."
+    },
+    {
+      "id": "P10",
+      "claim": "Existing macOS/Linux collector and installer behavior remains intact.",
+      "verification": "Full collector suite on Unix; source-only diff and independent adversarial review."
+    }
+  ]
+}

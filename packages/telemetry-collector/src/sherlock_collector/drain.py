@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -8,7 +7,8 @@ from pathlib import Path
 from typing import Mapping, Protocol
 
 from .contract import ContractError, ReceiptMismatch, validate_committed_receipt
-from .spool import DurableSpool, SpoolItem, secure_lock
+from .platform import nonblocking_lock
+from .spool import DurableSpool, SpoolItem
 
 
 class TransientUploadError(RuntimeError):
@@ -47,10 +47,8 @@ class Drain:
         self.expected_attribution = expected_attribution
 
     def run(self) -> DrainResult:
-        with secure_lock(self.spool.lock_path) as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with nonblocking_lock(self.spool.lock_path) as acquired:
+            if not acquired:
                 return DrainResult(locked=True)
             recovered = self.spool.recover_processing()
             uploaded = requeued = dead_lettered = 0

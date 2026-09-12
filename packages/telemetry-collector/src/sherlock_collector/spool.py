@@ -15,6 +15,7 @@ from .contract import (
     SPOOL_VERSION,
     validate_stored_payload,
 )
+from .platform import durable_replace, secure_directory, secure_path
 
 
 def utc_now() -> str:
@@ -22,8 +23,7 @@ def utc_now() -> str:
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    secure_directory(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     encoded = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
     try:
@@ -32,21 +32,18 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        secure_path(temporary, directory=False)
+        durable_replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def secure_lock(path: Path):
+    """Compatibility helper returning a secured, unlocked lock-file handle."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    secure_directory(path.parent)
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.chmod(path, 0o600)
+    secure_path(path, directory=False)
     return os.fdopen(descriptor, "a+b")
 
 
@@ -91,14 +88,12 @@ class SpoolItem:
 class DurableSpool:
     def __init__(self, root: Path | str):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        secure_directory(self.root)
         self.pending = self.root / "pending"
         self.processing = self.root / "processing"
         self.dead_letter = self.root / "dead-letter"
         for directory in (self.pending, self.processing, self.dead_letter):
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(directory, 0o700)
+            secure_directory(directory)
 
     @property
     def lock_path(self) -> Path:
@@ -149,7 +144,7 @@ class DurableSpool:
     def claim(self, path: Path) -> Path | None:
         claimed = self.processing / path.name
         try:
-            os.replace(path, claimed)
+            durable_replace(path, claimed)
         except FileNotFoundError:
             return None
         return claimed
@@ -157,7 +152,7 @@ class DurableSpool:
     def recover_processing(self) -> int:
         recovered = 0
         for path in sorted(self.processing.glob("*.json")):
-            os.replace(path, self.pending / path.name)
+            durable_replace(path, self.pending / path.name)
             recovered += 1
         return recovered
 
@@ -171,7 +166,7 @@ class DurableSpool:
         )
         rewritten = SpoolItem(item.manifest, item.stored_payload, metadata)
         _atomic_json(path, rewritten.to_dict())
-        os.replace(path, self.pending / path.name)
+        durable_replace(path, self.pending / path.name)
 
     def quarantine(self, path: Path, item: SpoolItem | None, error: Exception) -> None:
         if item is None:
@@ -194,7 +189,7 @@ class DurableSpool:
                 path,
                 SpoolItem(item.manifest, item.stored_payload, metadata).to_dict(),
             )
-        os.replace(path, self.dead_letter / path.name)
+        durable_replace(path, self.dead_letter / path.name)
 
     def acknowledge(self, path: Path) -> None:
         path.unlink(missing_ok=True)

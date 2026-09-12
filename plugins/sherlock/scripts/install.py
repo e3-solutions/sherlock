@@ -24,7 +24,9 @@ def arguments() -> argparse.Namespace:
 
 def existing_installation_id(path: Path) -> str | None:
     try:
-        if path.stat().st_mode & 0o077:
+        from sherlock_collector.platform import is_owner_only
+
+        if not is_owner_only(path):
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -40,8 +42,9 @@ def existing_installation_id(path: Path) -> str | None:
 
 
 def atomic_json(path: Path, value: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    from sherlock_collector.platform import durable_replace, secure_directory, secure_path
+
+    secure_directory(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -50,8 +53,8 @@ def atomic_json(path: Path, value: dict[str, str]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        durable_replace(temporary, path)
+        secure_path(path, directory=False)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -59,14 +62,24 @@ def atomic_json(path: Path, value: dict[str, str]) -> None:
 def install_runtime(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     staging = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-    shutil.copytree(source, staging)
     backup = destination.with_name(f".{destination.name}.previous")
+    if backup.exists() and not destination.exists():
+        os.replace(backup, destination)
+    shutil.copytree(source, staging)
     if backup.exists():
         shutil.rmtree(backup)
-    if destination.exists():
-        os.replace(destination, backup)
-    os.replace(staging, destination)
-    if backup.exists():
+    try:
+        if destination.exists():
+            os.replace(destination, backup)
+        os.replace(staging, destination)
+    except BaseException:
+        if backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    if backup.exists() and destination.exists():
         shutil.rmtree(backup)
 
 

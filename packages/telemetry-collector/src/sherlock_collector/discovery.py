@@ -11,6 +11,7 @@ from uuid import UUID
 
 from .config import default_claude_home, default_codex_home
 from .rollout import SourceSnapshot, open_regular_under_root, source_prefix
+from .platform import file_identity
 
 
 DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
@@ -354,6 +355,7 @@ def _recent_codex_candidates(
                                     handle,
                                     details.st_size,
                                 )
+                                device, inode = file_identity(handle)
                         except (OSError, ValueError):
                             invalid_count += 1
                             continue
@@ -364,8 +366,8 @@ def _recent_codex_candidates(
                                 path=path,
                                 native_id=native_id,
                                 snapshot=SourceSnapshot(
-                                    device=details.st_dev,
-                                    inode=details.st_ino,
+                                    device=device,
+                                    inode=inode,
                                     end_offset=details.st_size,
                                     prefix_length=prefix_length,
                                     prefix_sha256=prefix_sha256,
@@ -491,6 +493,7 @@ def _append_recent_claude_candidate(
                 handle,
                 snapshot_details.st_size,
             )
+            device, inode = file_identity(handle)
     except (OSError, ValueError):
         return 1
     if identity is None:
@@ -502,8 +505,8 @@ def _append_recent_claude_candidate(
             native_id=identity[0],
             parent_id=identity[1],
             snapshot=SourceSnapshot(
-                device=snapshot_details.st_dev,
-                inode=snapshot_details.st_ino,
+                device=device,
+                inode=inode,
                 end_offset=snapshot_details.st_size,
                 prefix_length=prefix_length,
                 prefix_sha256=prefix_sha256,
