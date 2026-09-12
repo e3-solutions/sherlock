@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "id": "actual-codex-macos",
+  "argv": [
+    "python3",
+    "plugins/sherlock/scripts/client_installer.py",
+    "--providers",
+    "codex",
+    "--name",
+    "CI Fixture",
+    "--github",
+    "windows-ci",
+    "--email",
+    "windows-ci@e3group.ai"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/9c7f/sherlock",
+  "started_at": "2026-09-12T14:26:25.590594Z",
+  "ended_at": "2026-09-12T14:26:25.916839Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/opt/homebrew/bin/python3",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/9c7f/sherlock",
+    "sha256": "5d8cf409468749cd878e7e745b94b7328cd78f4d8575653a95b1a15c535b61e3"
+  },
+  "log": "runs/actual-codex-macos.log",
+  "log_sha256": "55696ac340df326453bdd9e2ff24fe02cb4cf799a2f1c43bafb01bade4ed55be"
+}

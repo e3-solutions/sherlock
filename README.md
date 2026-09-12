@@ -76,8 +76,8 @@ run from the same checkout:
   --email "<work email>"
 ```
 
-On Windows, use `install-claude.ps1` through PowerShell with the same arguments.
-Use `install.ps1` for Codex only.
+On Windows, run `install-claude.ps1` through PowerShell with `-Name`, `-Github`,
+and `-Email`. Use `install.ps1` for Codex only.
 
 The installer validates the Claude plugin and marketplace, stores the runtime
 and owner-only config under `${CLAUDE_CONFIG_DIR:-~/.claude}/sherlock`, adds

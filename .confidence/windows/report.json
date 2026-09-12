@@ -1,0 +1,209 @@
+{
+  "version": 3,
+  "task_title": "Native Windows Sherlock support",
+  "mode": "critical",
+  "outcome": "Complete: native Windows installation and collection verified, with a reviewable PR and no merge. Implementation commit b91e22b3499137b61c70a02971880ba1215f97fb passed full CI run 34699863776; subsequent changes only clarify documentation and record this evidence.",
+  "changes": [
+    "Added native PowerShell entrypoints with a shared Python installer, atomic identity preflight, durable runtime/marketplace updates and verified provider registration.",
+    "Added standard-library Windows locks, protected ACLs validated by binary SID/ACE structure, durable file replacement, held-handle containment and detached drains while preserving Unix behavior.",
+    "Added real Windows provider CLI, PowerShell 5.1, process/durability and Unix matrix CI; documented supported installation and verification limits."
+  ],
+  "evidence": [
+    {
+      "obligation_id": "P1",
+      "status": "pass",
+      "details": "Native Windows Python 3.11 collector startup and imports pass in the platform job.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P2",
+      "status": "pass",
+      "details": "Real subprocess contention admits one drain owner; terminating the owner releases the lock and permits recovery on Windows and Unix.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": [
+        "macos-final"
+      ]
+    },
+    {
+      "obligation_id": "P3",
+      "status": "pass",
+      "details": "Native Windows existing-destination writes and non-delete-sharing reader tests preserve valid old/new files; installer backup recovery and reinstall tests retain identity and queue bytes.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": [
+        "windows-acl-failed",
+        "macos-final"
+      ]
+    },
+    {
+      "obligation_id": "P4",
+      "status": "pass",
+      "details": "Append and same-size replacement tests preserve exact generation bytes, including unavailable inode fallback; native held-handle file identity is exercised on Windows.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": [
+        "macos-final"
+      ]
+    },
+    {
+      "obligation_id": "P5",
+      "status": "pass",
+      "details": "Killed-drain recovery and exact payload checks preserve queued bytes; installed provider smoke checks source bytes and modification time remain unchanged.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": [
+        "macos-final"
+      ]
+    },
+    {
+      "obligation_id": "P6",
+      "status": "pass",
+      "details": "Real hook parent exits before the detached drain uploads to a local HTTP server; subprocess proof runs on all three operating systems.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": [
+        "macos-final"
+      ]
+    },
+    {
+      "obligation_id": "P7",
+      "status": "pass",
+      "details": "Windows PowerShell 5.1 bootstrap and real provider install/reinstall run from a checkout with spaces and use provider homes with spaces. Invalid identity preflight writes no home/marketplace; runtime reinstall retains installation ID and queued bytes.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P8",
+      "status": "pass",
+      "details": "Real Codex 0.154.0 and Claude Code 2.1.269 register plugins on Windows, then exact installed native commands spool synthetic immutable UTF-8 source bytes. This is provider registration plus command execution, not an authenticated model turn.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P9",
+      "status": "pass",
+      "details": "Native pipe transport exercises buffered notifications, EOF and timeout handling; real Codex app-server trusts seven scoped hooks after selected-command validation.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": [
+        "actual-codex-macos"
+      ]
+    },
+    {
+      "obligation_id": "P10",
+      "status": "pass",
+      "details": "Full collector regressions run on macOS and Linux; full repository CI covers dashboard, Deno, database and oversized-provider integration. Independent review found no remaining code blocker.",
+      "artifacts": [
+        ".github/workflows/collector-platforms.yml",
+        "docs/windows.md",
+        ".confidence/windows/native-windows.md"
+      ],
+      "run_ids": [
+        "final-ci-remote"
+      ],
+      "diagnostic_run_ids": [
+        "macos-final"
+      ]
+    }
+  ],
+  "tests": {
+    "passed": [
+      "final-ci-remote: immutable GitHub run head, completion, all three platform jobs, required Windows steps and full repository Test job checked explicitly. Captured outside the local Git workspace; it verifies remote commit b91e22b, independent of this evidence-only commit.",
+      "Native Windows: 14 process/durability tests, 3 trust-transport tests and 8 installer tests; no skips in those suites.",
+      "Real Windows Codex 0.154.0 and Claude Code 2.1.269 installed and reinstalled from a spaced checkout; exact installed commands captured immutable UTF-8 bytes.",
+      "Final macOS matrix: 147 tests, five native-Windows skips; Linux matrix and full dashboard/Deno/database/end-to-end CI also passed.",
+      "macos-final: local 146-test regression before the final native-EXE shim addition, five platform skips; actual-codex-macos: seven hooks trusted through the real CLI."
+    ],
+    "failed": [],
+    "not_run": []
+  },
+  "simplicity": {
+    "code_gate": "pass",
+    "test_gate": "pass",
+    "notes": "Independent proof-design and adversarial-review roles approved the isolated OS boundary and focused behavior tests. No compatibility framework or third-party runtime dependency was added. Native process, byte, ACL and provider evidence checks external behavior; fixture shim tests complement real CLI execution."
+  },
+  "review": {
+    "required": true,
+    "reason": "Critical feature changes concurrency, filesystem permissions/durability and provider trust across operating systems.",
+    "roles": [
+      "test_designer",
+      "adversarial_reviewer"
+    ],
+    "findings": [
+      "Independent gpt-5.6-sol reviewer designed process/crash/provider boundary tests before implementation review.",
+      "Review found backup-only runtime recovery gap; fixed before native verification.",
+      "Review prompted held-handle reparse/directory attribute validation, removing the second path lookup.",
+      "Final launcher review found no code blocker and required real Claude verification; the subsequent native Windows install/reinstall and exact hook-command test passed, satisfying that condition."
+    ]
+  },
+  "risks": [
+    "Authenticated interactive provider/model sessions, production ingestion/dashboard arrival and specific VPN behavior were not exercised; CI uses isolated homes and synthetic loopback data.",
+    "Windows durability and ACL support is scoped to local NTFS storage; network shares and FAT/exFAT are outside the tested contract.",
+    "Provider interface compatibility is proven for pinned Codex 0.154.0 and Claude Code 2.1.269, not every prior/future release.",
+    "A non-delete-sharing Windows reader may cause safe replacement failure and require retry; no universal power-loss atomicity guarantee is claimed.",
+    "Confidence helper doctor reported a bundled manifest version mismatch; evidence runner and report validator are independently checked for successful execution. Historical failed runs are diagnostic only."
+  ],
+  "rollback": "Disable the Sherlock plugin in the affected provider and install a prior compatible release if needed. Preserve collector.json and sherlock/telemetry to retain installation identity and pending uploads. No database migration or raw-data rewrite is required.",
+  "user_decisions": [
+    "Prepare a reviewable PR without merging. No production deployment or authenticated user session was requested for this verification."
+  ]
+}

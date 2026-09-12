@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "id": "macos-final",
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests/collector",
+    "-q"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/9c7f/sherlock",
+  "started_at": "2026-09-12T14:34:55.114967Z",
+  "ended_at": "2026-09-12T14:35:13.707149Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/opt/homebrew/bin/python3",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/9c7f/sherlock",
+    "sha256": "191a8692d109645cc9c2b3e0b62d1d1f0506681b1148dcd8671ec8e2d84699b4"
+  },
+  "log": "runs/macos-final.log",
+  "log_sha256": "77d0c700644b9488275aa8c0ab7fb2fd2bedc6c09b3b0fee340354fa70cd4e8b"
+}

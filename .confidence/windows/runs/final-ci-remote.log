@@ -1,0 +1,320 @@
+{
+  "url": "https://github.com/e3-solutions/sherlock/actions/runs/34699863776",
+  "head": "b91e22b3499137b61c70a02971880ba1215f97fb",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "Test",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Check out repository",
+          "conclusion": "success"
+        },
+        {
+          "name": "Set up Python",
+          "conclusion": "success"
+        },
+        {
+          "name": "Set up Deno",
+          "conclusion": "success"
+        },
+        {
+          "name": "Set up Supabase CLI",
+          "conclusion": "success"
+        },
+        {
+          "name": "Set up pnpm",
+          "conclusion": "success"
+        },
+        {
+          "name": "Set up Node",
+          "conclusion": "success"
+        },
+        {
+          "name": "Check Deno formatting and lint",
+          "conclusion": "success"
+        },
+        {
+          "name": "Type-check Deno entrypoints",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run collector tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run Deno unit tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Verify dashboard",
+          "conclusion": "success"
+        },
+        {
+          "name": "Start isolated Supabase database and Storage",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run database schema tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run dashboard database integration test",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run activity reducer database integration test",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run rollout normalizer database integration test",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run queue database integration test",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run frame projector database integration test",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run oversized provider end-to-end tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Stop isolated Supabase database",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Set up Node",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Set up pnpm",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Set up Deno",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Set up Python",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Check out repository",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "collector-platforms / collector (macos-latest)",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-python@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-node@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Collector startup",
+          "conclusion": "success"
+        },
+        {
+          "name": "Portable process and durability tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Native trust pipe transport",
+          "conclusion": "success"
+        },
+        {
+          "name": "Windows PowerShell 5.1 installation and hooks",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Install real Windows provider CLIs",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Real Windows provider registration and reinstall",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Unix regression suite",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-node@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-python@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "collector-platforms / collector (windows-latest)",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-python@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-node@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Collector startup",
+          "conclusion": "success"
+        },
+        {
+          "name": "Portable process and durability tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Native trust pipe transport",
+          "conclusion": "success"
+        },
+        {
+          "name": "Windows PowerShell 5.1 installation and hooks",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install real Windows provider CLIs",
+          "conclusion": "success"
+        },
+        {
+          "name": "Real Windows provider registration and reinstall",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unix regression suite",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Post Run actions/setup-node@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-python@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "collector-platforms / collector (ubuntu-latest)",
+      "conclusion": "success",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-python@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-node@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Collector startup",
+          "conclusion": "success"
+        },
+        {
+          "name": "Portable process and durability tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Native trust pipe transport",
+          "conclusion": "success"
+        },
+        {
+          "name": "Windows PowerShell 5.1 installation and hooks",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Install real Windows provider CLIs",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Real Windows provider registration and reinstall",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Unix regression suite",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-node@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-python@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ]
+}
