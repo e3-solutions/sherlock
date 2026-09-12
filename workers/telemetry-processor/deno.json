@@ -1,0 +1,17 @@
+{
+  "imports": {
+    "npm:postgres@3.4.7": "npm:postgres@3.4.9",
+    "postgres-fixed": "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/index.js"
+  },
+  "scopes": {
+    "https://raw.githubusercontent.com/e3-solutions/postgres/a7bc76a441ce2e8acf81c226951e9c5e26570d7a/src/": {
+      "crypto": "node:crypto",
+      "fs": "node:fs",
+      "net": "node:net",
+      "os": "node:os",
+      "perf_hooks": "node:perf_hooks",
+      "stream": "node:stream",
+      "tls": "node:tls"
+    }
+  }
+}

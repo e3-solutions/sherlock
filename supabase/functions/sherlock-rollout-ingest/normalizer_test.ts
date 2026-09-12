@@ -285,6 +285,27 @@ Deno.test("normalizer projects sessions, messages, usage, and tools", async () =
   assert(tool?.tool_name === "functions.exec");
 });
 
+Deno.test("collector-discovered Codex subagent keeps worker topology", async () => {
+  const childId = "55555555-5555-4555-8555-555555555555";
+  const parentId = "66666666-6666-4666-8666-666666666666";
+  const { manifest, source } = await fixture([{
+    type: "session_meta",
+    payload: {
+      id: childId,
+      source: { subagent: { other: "worker" } },
+      parent_thread_id: parentId,
+      root_thread_id: parentId,
+    },
+  }]);
+  manifest.observed_native_session_id = childId;
+
+  const projection = await projectBatch(manifest, source);
+
+  assert(projection.session?.native_session_id === childId);
+  assert(projection.session?.parent_native_session_id === parentId);
+  assert(projection.session?.actor_role === "worker");
+});
+
 Deno.test("Codex v2 classifies the explicit runtime envelope contract", async () => {
   const machineMessages = [
     "<recommended_plugins>machine context</recommended_plugins>",

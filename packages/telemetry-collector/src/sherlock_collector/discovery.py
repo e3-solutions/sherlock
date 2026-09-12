@@ -15,10 +15,13 @@ from .platform import file_identity
 
 
 DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
+CLAUDE_DEFAULT_LOOKBACK_SECONDS = 72 * 60 * 60
 DEFAULT_DATABASE_LIMIT = 8
 DEFAULT_ROWS_PER_DATABASE = 128
 CLAUDE_IDENTITY_SCAN_BYTES = 256 * 1024
 CLAUDE_IDENTITY_SCAN_RECORDS = 64
+CODEX_IDENTITY_SCAN_BYTES = 256 * 1024
+CODEX_IDENTITY_SCAN_RECORDS = 64
 CODEX_BACKFILL_MAX_FILES = 4096
 CODEX_BACKFILL_MAX_BYTES = 512 * 1024 * 1024
 CLAUDE_BACKFILL_MAX_FILES = 4096
@@ -34,6 +37,7 @@ class DiscoveryResult:
     errors: tuple[str, ...] = ()
     invalid_count: int = 0
     omitted_count: int = 0
+    excluded_by_cutoff: int = 0
     selected_bytes: int = 0
     source_snapshots: Mapping[str, SourceSnapshot] = field(default_factory=dict)
 
@@ -52,6 +56,8 @@ class _CodexCandidate:
     mtime_ns: int
     path: Path
     native_id: str | None
+    parent_id: str | None
+    is_subagent: bool
     snapshot: SourceSnapshot
 
 
@@ -152,6 +158,9 @@ def discover_rollouts(
     lookback_seconds: int = DEFAULT_LOOKBACK_SECONDS,
     rows_per_database: int = DEFAULT_ROWS_PER_DATABASE,
     scan_recent_files: bool = False,
+    recent_file_parent_native_session_id: object | None = None,
+    recent_file_native_session_id: object | None = None,
+    only_matching_recent_files: bool = False,
 ) -> DiscoveryResult:
     home = Path(codex_home or default_codex_home()).expanduser().resolve()
     cutoff_ms = int(time.time() * 1000) - max(1, lookback_seconds) * 1000
@@ -161,6 +170,8 @@ def discover_rollouts(
     payload = hook_payload or {}
     payload_session = payload.get("session_id")
     payload_agent = payload.get("agent_id")
+    priority_parent = _native_session_id(recent_file_parent_native_session_id)
+    priority_native = _native_session_id(recent_file_native_session_id)
     source_snapshots: dict[str, SourceSnapshot] = {}
     invalid_count = 0
     selected_bytes = 0
@@ -205,11 +216,26 @@ def discover_rollouts(
     if scan_recent_files:
         cutoff_ns = cutoff_ms * 1_000_000
         try:
-            candidates, invalid_count = _recent_codex_candidates(home, cutoff_ns)
+            candidates, invalid_count = _recent_codex_candidates(
+                home,
+                cutoff_ns,
+                active_sessions_only=only_matching_recent_files,
+            )
         except OSError as error:
             errors.append(f"sessions discovery: {error}")
             candidates = []
         for candidate in candidates:
+            matches_priority = (
+                candidate.native_id == priority_native
+                if priority_native is not None
+                else (
+                    priority_parent is not None
+                    and candidate.is_subagent
+                    and candidate.parent_id == priority_parent
+                )
+            )
+            if only_matching_recent_files and not matches_priority:
+                continue
             previous = discovered.get(candidate.path)
             native_id = (
                 previous[1]
@@ -222,6 +248,8 @@ def discover_rollouts(
             )
             source_snapshots[str(candidate.path)] = candidate.snapshot
             selected_bytes += candidate.snapshot.end_offset
+            if matches_priority:
+                payload_paths.append(candidate.path)
     ordered = sorted(
         discovered,
         key=lambda item: (discovered[item][0], str(item)),
@@ -250,8 +278,28 @@ def discover_claude_transcripts(
     *,
     hook_payload: Mapping[str, object] | None = None,
     lookback_seconds: int | None = None,
+    replay_session_id: str | None = None,
+    modified_after_ns: int | None = None,
+    modified_before_ns: int | None = None,
 ) -> DiscoveryResult:
     """Resolve hook-supplied and, when requested, recently written transcripts."""
+    selectors = sum(
+        (
+            lookback_seconds is not None,
+            replay_session_id is not None,
+            modified_after_ns is not None or modified_before_ns is not None,
+        )
+    )
+    if selectors > 1:
+        raise ValueError("Claude transcript selectors are mutually exclusive")
+    if (modified_after_ns is None) != (modified_before_ns is None):
+        raise ValueError("Claude transcript date ranges require both bounds")
+    if (
+        modified_after_ns is not None
+        and modified_before_ns is not None
+        and modified_after_ns >= modified_before_ns
+    ):
+        raise ValueError("Claude transcript date range must be increasing")
     home = Path(claude_home or default_claude_home()).expanduser().resolve()
     payload = hook_payload or {}
     session_id = _text_identity(payload.get("session_id"))
@@ -280,12 +328,17 @@ def discover_claude_transcripts(
     errors: list[str] = []
     invalid_count = 0
     omitted_count = 0
+    excluded_by_cutoff = 0
     selected_bytes = 0
     source_snapshots: dict[str, SourceSnapshot] = {}
-    if lookback_seconds is not None:
-        cutoff_ns = time.time_ns() - max(1, lookback_seconds) * 1_000_000_000
+    if selectors:
+        cutoff_ns = (
+            time.time_ns() - max(1, lookback_seconds) * 1_000_000_000
+            if lookback_seconds is not None
+            else modified_after_ns or 0
+        )
         try:
-            candidates, invalid_count = _recent_claude_candidates(
+            candidates, invalid_count, excluded_by_cutoff = _recent_claude_candidates(
                 home,
                 cutoff_ns,
             )
@@ -293,6 +346,19 @@ def discover_claude_transcripts(
             errors.append(f"projects discovery: {error}")
             candidates = []
         for candidate in candidates:
+            if (
+                modified_before_ns is not None
+                and candidate.mtime_ns >= modified_before_ns
+            ):
+                continue
+            if replay_session_id is not None:
+                candidate_session_id = (
+                    candidate.parent_id
+                    if candidate.parent_id is not None
+                    else candidate.native_id
+                )
+                if replay_session_id != candidate_session_id:
+                    continue
             path = candidate.path
             source_snapshots[str(path)] = candidate.snapshot
             selected_bytes += candidate.snapshot.end_offset
@@ -313,6 +379,7 @@ def discover_claude_transcripts(
         errors=tuple(errors),
         invalid_count=invalid_count,
         omitted_count=omitted_count,
+        excluded_by_cutoff=excluded_by_cutoff,
         selected_bytes=selected_bytes,
         source_snapshots=source_snapshots,
     )
@@ -321,10 +388,17 @@ def discover_claude_transcripts(
 def _recent_codex_candidates(
     codex_home: Path,
     cutoff_ns: int,
+    *,
+    active_sessions_only: bool = False,
 ) -> tuple[list[_CodexCandidate], int]:
     candidates: list[_CodexCandidate] = []
     invalid_count = 0
-    for root in (codex_home / "sessions", codex_home / "archived_sessions"):
+    roots = (
+        _active_codex_session_roots(codex_home, cutoff_ns)
+        if active_sessions_only
+        else (codex_home / "sessions", codex_home / "archived_sessions")
+    )
+    for root in roots:
         if not root.exists():
             continue
         if root.is_symlink() or not root.is_dir():
@@ -356,15 +430,22 @@ def _recent_codex_candidates(
                                     details.st_size,
                                 )
                                 device, inode = file_identity(handle)
+                                identity = _codex_rollout_identity(handle)
                         except (OSError, ValueError):
                             invalid_count += 1
                             continue
-                        native_id = _native_session_id(path.stem[-36:])
+                        filename_id = _native_session_id(path.stem[-36:])
+                        # The session metadata is authoritative. Some Codex rollout
+                        # filenames contain more than one UUID, so the final UUID is
+                        # not always the session ID.
+                        native_id = identity[0] if identity else filename_id
                         candidates.append(
                             _CodexCandidate(
                                 mtime_ns=details.st_mtime_ns,
                                 path=path,
                                 native_id=native_id,
+                                parent_id=identity[1] if identity else None,
+                                is_subagent=identity[2] if identity else False,
                                 snapshot=SourceSnapshot(
                                     device=device,
                                     inode=inode,
@@ -380,22 +461,70 @@ def _recent_codex_candidates(
     return candidates, invalid_count
 
 
+def _active_codex_session_roots(
+    codex_home: Path,
+    cutoff_ns: int,
+) -> tuple[Path, ...]:
+    dates = {
+        time.strftime("%Y/%m/%d", time.gmtime(timestamp))
+        for timestamp in (cutoff_ns / 1_000_000_000, time.time())
+    }
+    return tuple(codex_home / "sessions" / value for value in sorted(dates))
+
+
+def _codex_rollout_identity(handle) -> tuple[str | None, str | None, bool] | None:
+    handle.seek(0)
+    remaining = CODEX_IDENTITY_SCAN_BYTES
+    for _ in range(CODEX_IDENTITY_SCAN_RECORDS):
+        if remaining <= 0:
+            break
+        line = handle.readline(remaining + 1)
+        if not line or len(line) > remaining:
+            break
+        remaining -= len(line)
+        try:
+            value = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or value.get("type") != "session_meta":
+            continue
+        payload = value.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        native_id = _native_session_id(payload.get("id"))
+        declared_id = _native_session_id(payload.get("session_id"))
+        parent_id = _native_session_id(payload.get("parent_thread_id"))
+        if parent_id is None and declared_id != native_id:
+            parent_id = declared_id
+        source = payload.get("source")
+        is_subagent = isinstance(source, dict) and isinstance(
+            source.get("subagent"), dict
+        )
+        return native_id, parent_id, is_subagent
+    return None
+
+
 def _recent_claude_candidates(
     claude_home: Path,
     cutoff_ns: int,
-) -> tuple[list[_ClaudeCandidate], int]:
+) -> tuple[list[_ClaudeCandidate], int, int]:
     projects = claude_home / "projects"
     if projects.is_symlink() or not projects.is_dir():
-        return [], 0
+        return [], 0, 0
     candidates: list[_ClaudeCandidate] = []
     invalid_count = 0
+    excluded_by_cutoff = 0
     with os.scandir(projects) as project_entries:
         for project_entry in project_entries:
             if not project_entry.is_dir(follow_symlinks=False):
                 continue
             project = Path(project_entry.path)
             try:
-                project_candidates, project_invalid = _scan_claude_project(
+                (
+                    project_candidates,
+                    project_invalid,
+                    project_excluded,
+                ) = _scan_claude_project(
                     projects,
                     project,
                     cutoff_ns,
@@ -405,30 +534,37 @@ def _recent_claude_candidates(
                 continue
             candidates.extend(project_candidates)
             invalid_count += project_invalid
+            excluded_by_cutoff += project_excluded
     candidates.sort(key=lambda item: (-item.mtime_ns, str(item.path)))
-    return candidates, invalid_count
+    return candidates, invalid_count, excluded_by_cutoff
 
 
 def _scan_claude_project(
     allowed_root: Path,
     project: Path,
     cutoff_ns: int,
-) -> tuple[list[_ClaudeCandidate], int]:
+) -> tuple[list[_ClaudeCandidate], int, int]:
     candidates: list[_ClaudeCandidate] = []
     invalid_count = 0
+    excluded_by_cutoff = 0
     with os.scandir(project) as entries:
         for entry in entries:
-            if entry.is_file(follow_symlinks=False) and entry.name.endswith(".jsonl"):
+            if entry.name.endswith(".jsonl"):
                 shape = _direct_claude_identity(entry.name)
                 if shape is None:
                     continue
-                invalid_count += _append_recent_claude_candidate(
+                if not entry.is_file(follow_symlinks=False):
+                    invalid_count += 1
+                    continue
+                invalid, excluded = _append_recent_claude_candidate(
                     candidates,
                     allowed_root,
                     entry,
                     cutoff_ns,
                     shape,
                 )
+                invalid_count += invalid
+                excluded_by_cutoff += excluded
                 continue
             parent_id = _native_session_id(entry.name)
             if parent_id is None or not entry.is_dir(follow_symlinks=False):
@@ -444,16 +580,18 @@ def _scan_claude_project(
                         agent_id = _agent_filename_identity(agent_entry.name)
                         if agent_id is None:
                             continue
-                        invalid_count += _append_recent_claude_candidate(
+                        invalid, excluded = _append_recent_claude_candidate(
                             candidates,
                             allowed_root,
                             agent_entry,
                             cutoff_ns,
                             (agent_id, parent_id),
                         )
+                        invalid_count += invalid
+                        excluded_by_cutoff += excluded
             except OSError:
                 invalid_count += 1
-    return candidates, invalid_count
+    return candidates, invalid_count, excluded_by_cutoff
 
 
 def _direct_claude_identity(name: str) -> tuple[str, str | None] | None:
@@ -476,13 +614,13 @@ def _append_recent_claude_candidate(
     entry: os.DirEntry[str],
     cutoff_ns: int,
     expected_identity: tuple[str, str | None],
-) -> int:
+) -> tuple[int, int]:
     try:
         path = Path(entry.path)
         with open_regular_under_root(allowed_root, path) as handle:
             details = os.fstat(handle.fileno())
             if details.st_mtime_ns < cutoff_ns:
-                return 0
+                return 0, 1
             identity = _claude_transcript_identity(
                 handle,
                 path.name,
@@ -495,9 +633,9 @@ def _append_recent_claude_candidate(
             )
             device, inode = file_identity(handle)
     except (OSError, ValueError):
-        return 1
+        return 1, 0
     if identity is None:
-        return 1
+        return 1, 0
     candidates.append(
         _ClaudeCandidate(
             mtime_ns=snapshot_details.st_mtime_ns,
@@ -513,7 +651,7 @@ def _append_recent_claude_candidate(
             ),
         )
     )
-    return 0
+    return 0, 0
 
 
 def _claude_transcript_identity(
@@ -582,11 +720,7 @@ def _text_identity(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip()
-    return (
-        normalized
-        if normalized and len(normalized.encode("utf-8")) <= 512
-        else None
-    )
+    return normalized if normalized and len(normalized.encode("utf-8")) <= 512 else None
 
 
 def _rollout_path(codex_home: Path, value: str) -> Path | None:

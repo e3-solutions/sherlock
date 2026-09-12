@@ -1,4 +1,4 @@
-import postgres from "npm:postgres@3.4.7";
+import postgres from "./postgres.ts";
 import { FRAME_VERSION } from "../../packages/frame-evidence/constants.js";
 import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
 import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";

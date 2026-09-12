@@ -24,7 +24,11 @@ Set `CLAUDE_CONFIG_DIR`, `CLAUDE_BIN`, `PYTHON_BIN`, or
 `SHERLOCK_INGEST_URL` to override their documented defaults.
 
 Installation immediately scans Claude's known primary and subagent transcript
-layouts for regular JSONL files modified during the preceding 24 hours. It
+layouts for regular JSONL files modified during the preceding 72 hours. Pass
+`--backfill-hours HOURS` to select 1 through 744 hours. The JSON result includes
+`excluded_by_cutoff`, the number of filename-shaped regular candidates older
+than the lower modification-time cutoff. Those candidates are not validated
+sessions and may already have been captured by an earlier run. It
 opens them by descriptor without following symlinks, validates their
 provider-native session identities, and records an inode, prefix digest, and
 point-in-time byte boundary before capture. Capture rejects a replaced source
@@ -39,11 +43,30 @@ fragments must become durable before its checkpoint advances. The durable
 cursor advances across every eligible transcript rather than repeatedly
 selecting only the newest files. JSON status reports `deferred_files` and
 `deferred_bytes` when a pass reaches a bound or observes an incomplete trailing
-record; a partial result prints a warning, and later `SessionStart` hooks resume
+record; a partial result prints a warning. Later `SessionStart` hooks resume
+transcripts still inside the default 72-hour window, while older configured
+windows should be retried with the installer or `replay-history`. Hooks resume
 the same checkpointed catch-up. Once Claude finishes the trailing record,
 Sherlock queues that exact remaining byte range once.
 Historical transcripts do not fabricate `Stop` or `SubagentStop` evidence that
 Sherlock never observed, so pre-install turns can remain provisionally open.
+
+Installation also creates
+`${CLAUDE_CONFIG_DIR:-~/.claude}/sherlock/bin/replay-history`. It can replay one
+canonical session UUID, including nested subagent transcripts associated with
+that session, or one explicit modification-time range:
+
+```sh
+~/.claude/sherlock/bin/replay-history --session-id 11111111-1111-4111-8111-111111111111
+~/.claude/sherlock/bin/replay-history \
+  --start 2026-08-19T00:00:00Z \
+  --end 2026-08-20T00:00:00Z
+```
+
+Ranges use timezone-aware RFC3339 values and half-open `[start, end)`
+filesystem-mtime semantics. Each range is limited to 31 days. The same
+descriptor-bound, projects-root confinement, immutable spool, and checkpoint
+rules apply, so rerunning an exact replay does not duplicate captured bytes.
 
 ## Verify
 

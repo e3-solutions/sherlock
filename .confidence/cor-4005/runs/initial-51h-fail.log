@@ -1,0 +1,14 @@
+F
+======================================================================
+FAIL: test_one_command_installs_claude_plugin_and_runtime (tests.collector.test_team_installer.TeamInstallerTests.test_one_command_installs_claude_plugin_and_runtime)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/aryagm/.codex/worktrees/89655481-cbdf-4714-bb6e-b71c4dd913bf/sherlock/tests/collector/test_team_installer.py", line 975, in test_one_command_installs_claude_plugin_and_runtime
+    self.assertIn("Claude Code 72-hour backfill", completed.stdout)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Claude Code 72-hour backfill' not found in 'Installed collector runtime under /private/var/folders/rs/x9dz0y214xz45k43cj_15hdm0000gq/T/tmpw22j0wl9/claude/sherlock\nStored the endpoint and identity in owner-only collector.json\nClaude Code 24-hour backfill: {"captured_bytes": 0, "deferred_bytes": 0, "deferred_files": 0, "discovered": 0, "discovery_errors": 0, "enqueued": 0, "errors": 0, "invalid": 0, "locked": false, "lookback_seconds": 86400, "omitted": 0, "selected_bytes": 0, "status": "complete"}\nValidation passed\nValidation passed\nSherlock for Claude Code is installed. Recent transcripts were queued for upload; start a new Claude Code session to load its hooks.\n'
+
+----------------------------------------------------------------------
+Ran 1 test in 1.004s
+
+FAILED (failures=1)

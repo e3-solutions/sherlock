@@ -62,9 +62,18 @@ export function pageCachedUsageEvidence(payload, cursor = "") {
   };
 }
 
-export function createCachedMcpSource({ cache, source }) {
+export function createCachedMcpSource({ cache, source, querySource }) {
   if (typeof cache?.read !== "function" || typeof source?.fetchPromptEvidence !== "function") {
     throw new TypeError("A timeline cache and prompt evidence source are required");
+  }
+  if (querySource !== undefined && [
+    "fetchDiagnostics",
+    "fetchCoverage",
+    "fetchSessions",
+    "fetchSession",
+    "fetchUsage",
+  ].some((method) => typeof querySource?.[method] !== "function")) {
+    throw new TypeError("A complete Sherlock query source is required");
   }
   return Object.freeze({
     async fetchUsageEvidence({ cursor = "", signal } = {}) {
@@ -74,5 +83,12 @@ export function createCachedMcpSource({ cache, source }) {
     async fetchPromptEvidence(request) {
       return await source.fetchPromptEvidence(request);
     },
+    ...(querySource === undefined ? {} : {
+      fetchDiagnostics: (request) => querySource.fetchDiagnostics(request),
+      fetchCoverage: (request) => querySource.fetchCoverage(request),
+      fetchSessions: (request) => querySource.fetchSessions(request),
+      fetchSession: (request) => querySource.fetchSession(request),
+      fetchUsage: (request) => querySource.fetchUsage(request),
+    }),
   });
 }

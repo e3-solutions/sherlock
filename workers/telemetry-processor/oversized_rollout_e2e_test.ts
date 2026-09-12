@@ -1,4 +1,4 @@
-import postgres from "npm:postgres@3.4.7";
+import postgres from "./postgres.ts";
 import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
 import { handler as ingestHandler } from "../../supabase/functions/sherlock-rollout-ingest/index.ts";
 import {

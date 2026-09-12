@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "task": {
+    "title": "Durable subagent freshness and worker progress recovery",
+    "mode": "standard",
+    "type": "bug"
+  },
+  "intent": {
+    "goal": "Make new Codex subagent activity visible promptly and make the telemetry worker recover automatically when its control loop stops advancing.",
+    "must_happen": [
+      "A SubagentStart hook discovers the new subagent rollout even when the hook payload has no agent transcript path and the Codex SQLite row is not visible yet.",
+      "A telemetry worker whose control loop stops making progress is detected within a bounded interval and terminates non-zero so Railway can replace it.",
+      "Existing primary-session discovery, immutable raw uploads, transient database recovery, and dedicated GitHub sync isolation remain intact."
+    ],
+    "must_not_happen": [
+      "Do not rewrite, delete, or mutate previously captured raw telemetry.",
+      "Do not create duplicate logical sessions or upload duplicate bytes merely because fallback discovery is enabled.",
+      "Do not restart a healthy worker during normal idle polling, active job processing, or GitHub synchronization.",
+      "Do not require additional database or compute capacity to recover from a wedged worker."
+    ],
+    "constraints": [
+      "Collector hooks must remain bounded under the existing 30-second plugin timeout.",
+      "The production topology remains one Railway telemetry-processor replica.",
+      "The fix must compose with PR #75 database recovery and PR #76 GitHub sync isolation."
+    ],
+    "non_goals": [
+      "Changing Supabase size or Railway compute allocation.",
+      "Redesigning dashboard product queries or canonical telemetry schemas.",
+      "Deploying, restarting, backfilling, or otherwise mutating production in this implementation step."
+    ],
+    "open_questions": [
+      "The exact current Codex SubagentStart payload shape is not persisted; the fix must tolerate both legacy payloads with agent_transcript_path and current payloads without it."
+    ],
+    "assumptions": [
+      "Codex writes subagent rollout files beneath ~/.codex/sessions with session_meta.id, session_meta.source, and parent/root identifiers; this was observed directly for Caleb's active subagent.",
+      "Railway restarts a one-replica service after a non-zero worker exit under its existing restart policy."
+    ]
+  },
+  "proof_obligations": [
+    {
+      "id": "P1",
+      "claim": "SubagentStart promptly discovers a newly written subagent rollout without depending on a transcript path in the hook payload or an already-visible SQLite thread row.",
+      "verification": "A regression fixture with a root payload, no agent_transcript_path, no matching SQLite row, and a recent subagent rollout fails before the change and passes afterward; existing discovery tests also pass."
+    },
+    {
+      "id": "P2",
+      "claim": "A worker with a stalled control loop invokes bounded fatal recovery, while a healthy loop remains running.",
+      "verification": "Deterministic unit tests with an injected clock/fatal callback prove stale progress triggers exactly once and fresh progress does not trigger."
+    },
+    {
+      "id": "P3",
+      "claim": "The fixes preserve raw immutability and the existing database-recovery and GitHub-isolation behavior.",
+      "verification": "Focused collector and worker suites plus the relevant broader package tests pass, and an independent integration review finds no boundary regression."
+    },
+    {
+      "id": "P4",
+      "claim": "The implementation stays operationally bounded and has an explicit rollback path.",
+      "verification": "Review confirms recent-file discovery retains existing age/count bounds, the watchdog threshold exceeds normal control-loop work, configuration is validated, and rollback is limited to reverting the code/config changes."
+    }
+  ]
+}

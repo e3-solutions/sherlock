@@ -1,4 +1,10 @@
-import { createPostgresPool, type ReservedSql, type Sql } from "./database.ts";
+import {
+  createPostgresPool,
+  isReservedConnectionLost,
+  releaseReservedConnection,
+  type ReservedSql,
+  type Sql,
+} from "./database.ts";
 import type { CommitPair, LookupResult } from "./github-sync.ts";
 
 export type WorkloadClass = "live" | "backfill";
@@ -62,6 +68,8 @@ select current_setting('max_connections')::integer as max_connections,
 from pg_stat_activity
 where backend_type = 'client backend'
 `;
+
+export const GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS = 20_000;
 
 export function admissionHeadroomAvailable(
   capacity: DatabaseConnectionCapacity,
@@ -147,13 +155,17 @@ export class PostgresJobQueue {
   }
 
   async close(): Promise<void> {
-    await this.releaseHandoff();
-    await this.sql.end({ timeout: 5 });
+    try {
+      await this.releaseHandoff();
+    } finally {
+      await this.sql.end({ timeout: 5 });
+    }
   }
 
   async tryAcquireHandoff(lockKey: string): Promise<boolean> {
     if (this.handoffConnection !== null) return true;
     const connection = await this.sql.reserve();
+    let failure: unknown;
     try {
       const rows = await connection.unsafe(
         "select pg_try_advisory_lock(hashtextextended($1, 0)) as acquired",
@@ -162,8 +174,13 @@ export class PostgresJobQueue {
       if (rows[0]?.acquired !== true) return false;
       this.handoffConnection = connection;
       return true;
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
-      if (this.handoffConnection !== connection) connection.release();
+      if (this.handoffConnection !== connection) {
+        releaseReservedConnection(connection, failure);
+      }
     }
   }
 
@@ -171,11 +188,19 @@ export class PostgresJobQueue {
     const connection = this.handoffConnection;
     if (connection === null) return;
     this.handoffConnection = null;
+    let failure: unknown;
     try {
       await connection.unsafe("select pg_advisory_unlock_all()");
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
-      connection.release();
+      releaseReservedConnection(connection, failure);
     }
+  }
+
+  hasHandoff(): boolean {
+    return this.handoffConnection !== null;
   }
 
   async hasAdmissionHeadroom(
@@ -185,7 +210,13 @@ export class PostgresJobQueue {
     if (this.handoffConnection === null) {
       throw new Error("database headroom requires the active handoff session");
     }
-    const rows = await this.handoffConnection.unsafe(ADMISSION_HEADROOM_SQL);
+    let rows;
+    try {
+      rows = await this.handoffConnection.unsafe(ADMISSION_HEADROOM_SQL);
+    } catch (error) {
+      if (isReservedConnectionLost(error)) this.handoffConnection = null;
+      throw error;
+    }
     if (rows.length !== 1) return false;
     const row = rows[0];
     return admissionHeadroomAvailable(
@@ -209,26 +240,32 @@ export class PostgresJobQueue {
     workspaceIds: readonly string[],
   ): Promise<CommitPair[]> {
     return await this.sql.begin(async (tx) => {
+      await tx.unsafe("select set_config('statement_timeout', $1, true)", [
+        String(GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS),
+      ]);
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
-        `with observed as (
-           select distinct scm.workspace_id, scm.repository_full_name,
-                  scm.commit_sha
+        `with recent_sessions as materialized (
+           select distinct recent.workspace_id, recent.session_id
+             from telemetry.events recent
+            where recent.workspace_id = any($2::uuid[])
+              and recent.server_received_at >= now() - interval '26 hours'
+              and recent.session_id is not null
+              and not recent.is_replay
+         ), observed as (
+           select scm.workspace_id, scm.repository_full_name, scm.commit_sha
              from telemetry.session_scm scm
             where scm.source_version = 'sherlock.github-scm.v1'
               and scm.workspace_id = any($2::uuid[])
-              and (
-                scm.created_at >= now() - interval '26 hours'
-                or exists (
-                  select 1
-                    from telemetry.events recent
-                   where recent.workspace_id = scm.workspace_id
-                     and recent.session_id = scm.session_id
-                     and recent.server_received_at >=
-                       now() - interval '26 hours'
-                     and not recent.is_replay
-                )
-              )
+              and scm.created_at >= now() - interval '26 hours'
+           union
+           select scm.workspace_id, scm.repository_full_name, scm.commit_sha
+             from recent_sessions recent
+             join telemetry.session_scm scm
+               on scm.workspace_id = recent.workspace_id
+              and scm.session_id = recent.session_id
+            where scm.source_version = 'sherlock.github-scm.v1'
+              and scm.workspace_id = any($2::uuid[])
          )
          select observed.*
            from observed

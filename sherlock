@@ -10,10 +10,11 @@ CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 NAME=""
 GITHUB_ID=""
 EMAIL=""
+CLAUDE_BACKFILL_HOURS=72
 
 usage() {
   cat <<'EOF'
-Usage: ./sherlock install --name NAME --github LOGIN --email EMAIL
+Usage: ./sherlock install --name NAME --github LOGIN --email EMAIL [--claude-backfill-hours HOURS]
 
 Installs Sherlock for each available Codex or Claude Code CLI with the same
 team identity. At least one usable agent CLI must already be installed.
@@ -29,6 +30,9 @@ Environment overrides:
   SHERLOCK_HOME         Durable client marketplace (default: ~/.sherlock)
   PYTHON_BIN            Python 3 executable (default: python3)
   SHERLOCK_INGEST_URL   Collector endpoint
+
+Options:
+  --claude-backfill-hours  Initial Claude transcript lookback (default: 72; max: 744)
 EOF
 }
 
@@ -68,6 +72,11 @@ while [ "$#" -gt 0 ]; do
       EMAIL=$2
       shift 2
       ;;
+    --claude-backfill-hours)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      CLAUDE_BACKFILL_HOURS=$2
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -81,6 +90,18 @@ done
 
 if [ -z "$NAME" ] || [ -z "$GITHUB_ID" ] || [ -z "$EMAIL" ]; then
   usage >&2
+  exit 2
+fi
+
+case "$CLAUDE_BACKFILL_HOURS" in
+  # Match install-claude.sh before either provider creates local state.
+  ''|0*|*[!0-9]*|????*)
+    echo "--claude-backfill-hours must be an integer from 1 to 744." >&2
+    exit 2
+    ;;
+esac
+if [ "$CLAUDE_BACKFILL_HOURS" -lt 1 ] || [ "$CLAUDE_BACKFILL_HOURS" -gt 744 ]; then
+  echo "--claude-backfill-hours must be an integer from 1 to 744." >&2
   exit 2
 fi
 
@@ -175,7 +196,8 @@ if [ -n "$RESOLVED_CLAUDE_BIN" ]; then
     CLAUDE_BIN=$RESOLVED_CLAUDE_BIN "$REPO_ROOT/install-claude.sh" \
     --name "$NAME" \
     --github-id "$GITHUB_ID" \
-    --email "$EMAIL"
+    --email "$EMAIL" \
+    --backfill-hours "$CLAUDE_BACKFILL_HOURS"
 fi
 
 echo "Sherlock installation summary:"

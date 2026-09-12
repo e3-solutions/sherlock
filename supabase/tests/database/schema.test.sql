@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(145);
+select plan(146);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -60,6 +60,18 @@ select has_table('processing', 'telemetry_jobs', 'durable telemetry queue exists
 select has_function(
   'analytics', 'read_dashboard_freshness', array['uuid', 'text', 'text[]', 'integer'],
   'dashboard freshness has an aggregate-only database contract'
+);
+select ok(
+  array['enable_nestloop=off', 'enable_seqscan=off']::text[] <@ coalesce(
+    (
+      select proconfig
+        from pg_proc
+       where oid =
+         'analytics.read_dashboard_freshness(uuid,text,text[],integer)'::regprocedure
+    ),
+    '{}'::text[]
+  ),
+  'dashboard freshness avoids misestimated full and nested event rescans'
 );
 select ok(
   has_function_privilege(
@@ -1194,6 +1206,16 @@ begin
         and i.indisvalid
         and pg_get_indexdef(i.indexrelid) like
           '%USING brin (server_received_at)%'
+    ) and
+    exists (
+      select 1 from pg_index i
+      where i.indexrelid =
+          to_regclass('telemetry.events_recent_sessions_idx')
+        and i.indisvalid and i.indisready
+        and pg_get_indexdef(i.indexrelid) like
+          '%(workspace_id, server_received_at DESC) INCLUDE (session_id)%'
+        and pg_get_expr(i.indpred, i.indrelid) =
+          '((session_id IS NOT NULL) AND (NOT is_replay))'
     ) and
     exists (
       select 1

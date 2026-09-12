@@ -531,6 +531,7 @@ class ConfigurationTests(unittest.TestCase):
                 text=True,
             )
 
+            self.assertEqual(completed.returncode, 0, completed.stderr)
             config = codex_home / "sherlock" / "collector.json"
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertTrue(
@@ -945,6 +946,85 @@ class HookIntegrationTests(unittest.TestCase):
                 "backfill",
             )
 
+    def test_subagent_start_captures_recent_child_before_sqlite_registration(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            child_id = "55555555-5555-4555-8555-555555555555"
+            parent_id = "66666666-6666-4666-8666-666666666666"
+            child = (
+                codex_home
+                / "sessions"
+                / Path(time.strftime("%Y/%m/%d", time.gmtime()))
+                / f"rollout-2026-08-28T17-00-00-{child_id}.jsonl"
+            )
+            child.parent.mkdir(parents=True)
+            source = (
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": child_id,
+                            "source": {"subagent": {"other": "worker"}},
+                            "parent_thread_id": parent_id,
+                            "root_thread_id": parent_id,
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
+            child.write_bytes(source)
+            competing_id = "88888888-8888-4888-8888-888888888888"
+            competing = child.with_name(
+                f"rollout-2026-08-28T17-00-01-{competing_id}.jsonl"
+            )
+            competing.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": competing_id,
+                            "source": "cli",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with competing.open("r+b") as handle:
+                handle.seek(65 * 1024 * 1024)
+                handle.write(b"\n")
+            newer_ns = time.time_ns() + 1_000_000_000
+            os.utime(competing, ns=(newer_ns, newer_ns))
+            stale = child.with_name(
+                "rollout-2026-08-28T16-00-00-77777777-7777-4777-8777-777777777777.jsonl"
+            )
+            stale.write_bytes(source)
+            stale_ns = time.time_ns() - 6 * 60 * 1_000_000_000
+            os.utime(stale, ns=(stale_ns, stale_ns))
+            state_root = codex_home / "sherlock" / "telemetry"
+
+            with patch("sherlock_collector.hook.subprocess.Popen") as popen:
+                result = run_hook(
+                    "SubagentStart",
+                    {"session_id": parent_id},
+                    codex_home=codex_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertEqual(result.discovered, 1)
+            self.assertEqual(result.enqueued, 1)
+            self.assertEqual(result.captured_bytes, len(source))
+            self.assertEqual(popen.call_count, 1)
+            pending = list((state_root / "queue" / "pending").glob("*.json"))
+            self.assertEqual(len(pending), 1)
+            item = json.loads(pending[0].read_text(encoding="utf-8"))
+            self.assertEqual(
+                item["manifest"]["observed_native_session_id"], child_id
+            )
+            self.assertNotIn("workload_class", item["metadata"])
+
     def test_manual_codex_backfill_is_idempotent(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1011,6 +1091,37 @@ class HookIntegrationTests(unittest.TestCase):
             self.assertEqual(item["metadata"]["workload_class"], "backfill")
             self.assertEqual(item["manifest"]["source_provider"], "codex")
             self.assertEqual(item["manifest"]["source_kind"], "rollout")
+
+    def test_manual_codex_backfill_default_remains_24_hours(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            state_root = root / "state"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sherlock_collector.cli",
+                    "--provider",
+                    "codex",
+                    "--codex-home",
+                    str(codex_home),
+                    "--state-root",
+                    str(state_root),
+                    "backfill",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            outcome = json.loads(completed.stdout)
+            self.assertEqual(outcome["lookback_seconds"], 24 * 60 * 60)
+            self.assertEqual(outcome["selection"], "lookback")
 
     def test_exact_launcher_is_fail_open_when_local_state_is_corrupt(self):
         with TemporaryDirectory() as temporary:

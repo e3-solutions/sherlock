@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "task": {
+    "title": "COR-4005 Claude initial backfill coverage",
+    "mode": "critical",
+    "type": "bug"
+  },
+  "intent": {
+    "goal": "Prevent Claude sessions up to 72 hours old from being silently skipped during collector installation or recovery, and provide bounded, auditable replay for older sessions.",
+    "must_happen": [
+      "Claude installation and SessionStart recovery use an exact 72-hour default without changing the Codex 24-hour default.",
+      "The Claude installer accepts a validated positive backfill-hours override and reports its effective bounded selection.",
+      "An installed replay-history command selects either one canonical Claude session UUID or a bounded RFC3339 file-mtime range and remains idempotent.",
+      "Backfill output reports filename-shaped regular transcript candidates excluded by its time cutoff."
+    ],
+    "must_not_happen": [
+      "Do not read outside the non-symlink Claude projects root or weaken descriptor-bound snapshot checks.",
+      "Do not mutate raw telemetry, duplicate already captured byte ranges, or fabricate hook/lifecycle evidence.",
+      "Do not broaden Codex discovery defaults or allow unbounded date-range replay.",
+      "Do not install or capture after an invalid installer lookback or replay selector."
+    ],
+    "constraints": [
+      "Raw telemetry remains immutable and product-specific interpretation remains downstream.",
+      "Replay date ranges use filesystem modification time, matching current discovery behavior, with half-open [start, end) endpoints.",
+      "The reported transcript can only be replayed on a machine where the local Claude file still exists."
+    ],
+    "non_goals": [
+      "Usage-counter stitching or CodeStat parity.",
+      "Importing the legacy Coding Sessions database.",
+      "Changing the Cosmos gateway."
+    ],
+    "open_questions": [
+      "Whether the original local transcript still exists is not observable from this repository."
+    ],
+    "assumptions": [
+      "Installing Sherlock is the existing consent boundary for the default bounded backfill; explicit replay is an additional operator action.",
+      "A filename-shaped regular candidate excluded before content validation must be reported as a candidate file, not as a validated session."
+    ]
+  },
+  "proof_obligations": [
+    {
+      "id": "P1",
+      "claim": "The reported 51-hour initial-rollout gap is removed while the Codex default remains unchanged.",
+      "verification": "Fail-before/pass-after tests prove the default Claude installer and SessionStart capture a 51-hour transcript with exact bytes and do not duplicate it; a Codex characterization retains 24 hours."
+    },
+    {
+      "id": "P2",
+      "claim": "Initial Claude backfill is configurable and cutoff exclusions are explicit.",
+      "verification": "Installer and CLI tests prove a valid hours override controls selection and output includes the effective lookback and excluded candidate count; invalid values fail before installation mutation."
+    },
+    {
+      "id": "P3",
+      "claim": "Operators can replay one canonical Claude session UUID or one bounded RFC3339 file-mtime range without duplicate capture.",
+      "verification": "CLI and installed-wrapper tests cover exact UUID selection, half-open range endpoints, invalid/unbounded selectors, and idempotent reruns."
+    },
+    {
+      "id": "P4",
+      "claim": "Replay preserves the existing private-data confinement and immutable capture boundary.",
+      "verification": "Negative tests prove symlinks/outside paths, malformed identities, and invalid selectors enqueue no bytes; existing race, exact-byte, and broader collector suites pass."
+    },
+    {
+      "id": "P5",
+      "claim": "The implementation is operable and no larger than the problem requires.",
+      "verification": "Documentation names mtime and cutoff semantics, the stable installed command, actual-session operational limits, rollback, and focused simplicity/adversarial review passes."
+    }
+  ]
+}

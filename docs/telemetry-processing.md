@@ -127,13 +127,17 @@ database host's IPv6-only DNS record. Store a current Supabase secret key in
 `SUPABASE_SERVICE_ROLE_KEY`; the variable name is retained for compatibility,
 but a legacy service-role JWT is not required.
 
-Each dashboard opens and retains two labeled database sessions before serving.
+Each dashboard warms two client connections before serving. Shared Supabase
+pooler URLs use transaction mode, so these clients do not retain two PostgreSQL
+backends while idle; worker connections remain in session mode.
 Before every claim, the worker uses its pinned handoff session to read
 PostgreSQL's usable limit plus live worker/dashboard client counts. It budgets
 the worker's full seven-session rolling envelope and an eight-session dashboard
 envelope covering both live dashboards plus simultaneous replacements, without
 double-reserving sessions the dashboards already own. Conflicting database URL
-`application_name` parameters are stripped so labels remain authoritative.
+`application_name` parameters are stripped. Supavisor may expose pooler-owned
+backend labels instead of client labels, so the envelope remains conservative;
+the global PostgreSQL budget is not proof of a Supavisor per-role pool limit.
 PostgreSQL connection-limit errors still open the jittered circuit while active
 jobs finish, and one half-open probe determines whether normal admission can
 resume.

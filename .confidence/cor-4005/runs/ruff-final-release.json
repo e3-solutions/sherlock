@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "id": "ruff-final-release",
+  "argv": [
+    "ruff",
+    "check",
+    "packages/telemetry-collector/src",
+    "tests/collector",
+    "plugins/sherlock-claude-code/scripts/replay_history.py"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/89655481-cbdf-4714-bb6e-b71c4dd913bf/sherlock",
+  "started_at": "2026-09-03T03:26:12.426944Z",
+  "ended_at": "2026-09-03T03:26:12.489497Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/Users/aryagm/miniforge3/bin/ruff",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/89655481-cbdf-4714-bb6e-b71c4dd913bf/sherlock",
+    "sha256": "66b7fec133b6a0512e4cfa7a31396afe88c19b05c0410bbb28ec4206ae87b8c7"
+  },
+  "log": "runs/ruff-final-release.log",
+  "log_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+}

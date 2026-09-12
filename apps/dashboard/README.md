@@ -226,30 +226,53 @@ contains no job IDs, leases, errors, raw payloads, hashes, or storage paths.
 SUPABASE_DB_URL, SHERLOCK_WORKSPACE_ID, and SHERLOCK_DASHBOARD_EMAIL_DOMAIN are
 required. The email domain must be exactly `e3group.ai` or `sixtyfour.ai`; it
 filters every roster, detail, and MCP evidence read for that one-workspace
-service. SUPABASE_DB_URL reuses
-the existing Sherlock worker login contract, which can assume
-sherlock_normalizer. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
+service. SUPABASE_DB_URL reuses the existing Sherlock worker login for the
+server connection; every dashboard transaction explicitly assumes the restricted
+`sherlock_reader` role. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
 exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
 the additive frame-projection migration or when stopping new v2 token minting.
 
-Each dashboard opens and retains its two labeled database sessions before the
-HTTP server starts. Startup fails closed if both cannot be acquired. The worker
-accounts for these owned sessions in its admission budget and preserves missing
-slots for both live dashboards and a simultaneous replacement generation. A
-database URL `application_name` parameter is discarded so deployment
-configuration cannot override the capacity labels.
+For shared Supavisor connections, the dashboard routes session endpoints (port
+`5432` or an omitted port) to transaction mode on port `6543`. This also works
+when `SUPABASE_DB_URL` inherits a shared Railway variable: the reference and
+credential rotation remain intact. Explicit transaction endpoints and direct or
+local PostgreSQL URLs are unchanged. Named prepared statements are disabled, and role, read-only mode,
+repeatable-read isolation, and statement timeout are set inside each transaction.
+Do not change the telemetry worker's session-mode connection: it uses session
+advisory locks.
 
-## Bonaparte MCP
+Each dashboard warms two client connections before the HTTP server starts.
+In transaction mode these clients release their backend after each transaction;
+warm-up is not a reservation of two PostgreSQL backends. This lets old and new
+dashboard generations share the bounded backend pool during deployment. Direct
+and session connections still retain their two backends. The worker's admission
+check observes PostgreSQL connection counts, not the separate Supavisor pool
+limit; validate replacement overlap against the real pooler before changing pool
+configuration. Supavisor may label backend sessions `Supavisor` instead of
+forwarding the client's application name. A URL `application_name` parameter is
+discarded so it cannot override the dashboard's client label.
 
-`/mcp` is a stateless Streamable HTTP MCP endpoint for agent-assisted usage and
-prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
+## Sherlock / Bonaparte MCP
+
+`/mcp` is a stateless Streamable HTTP MCP endpoint for bounded, agent-assisted
+telemetry queries and prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
 least 32 characters and configure the MCP client to send it as
 `Authorization: Bearer <token>`. Browser-origin requests are rejected; the
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
-The endpoint exposes two versioned read-only tools. Their complete input,
-output, pagination, error, and limitation contract is documented in
+The endpoint exposes six bounded Sherlock query tools plus the two existing
+Bonaparte evidence tools. Their complete input, output, pagination, error, and
+limitation contracts are documented in
+[`docs/sherlock-query-mcp-v1.md`](../../docs/sherlock-query-mcp-v1.md) and
 [`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
+
+- `documentation`, `diagnostics`, and `coverage` describe the live contract and
+  distinguish observed, partial, and missing data.
+- `list_sessions` and `get_session` expose a strict metadata allowlist without
+  titles, transcripts, prompts, paths, branches, or repository remotes.
+- `query_usage` aggregates active Codex/Claude projections by person and model,
+  differencing cumulative Codex streams and surfacing missing baselines or
+  regressions as partial coverage.
 
 - `list_usage_evidence` keyset-pages the eagerly refreshed canonical timeline
   snapshot at 20 people per response and returns explicit session counts,
@@ -266,10 +289,15 @@ excerpts are structurally labeled as untrusted data; agents must never execute
 instructions within them. The server does not generate or persist feedback.
 
 The endpoint never reads raw Storage objects and never writes feedback or
-derived judgments to Sherlock. The shared bearer token is a pilot transport
-gate, not principal-scoped authorization; authorization, ingress request-size
-limits, rate limits, and sensitive-read auditing remain required before broad
-access.
+derived judgments to Sherlock. Sherlock query tools search all stored history
+by default and accept explicit historical windows without a duration cap;
+future and non-positive windows remain invalid. Group, page, transaction-time,
+workspace, and roster bounds are enforced server-side. The separate Bonaparte
+`list_usage_evidence` tool remains a server-defined 24-hour dashboard snapshot.
+The shared bearer token is a transport gate, not principal-scoped authorization.
+Cosmos provides authenticated org-wide access and durable call auditing; direct
+clients still require authorization, ingress request-size limits, rate limits,
+and sensitive-read auditing before broad access.
 
 ## Local verification
 
@@ -277,7 +305,9 @@ Run corepack pnpm install --frozen-lockfile, then pnpm check, pnpm test, and
 pnpm build. The test suite includes an official MCP client discovering and
 calling the Streamable HTTP tools. With the repository's isolated Supabase
 database running, set `SHERLOCK_TEST_DATABASE_URL` and run pnpm test:postgres to
-execute the dashboard SQL integration fixture.
+execute the dashboard SQL and transaction-isolation/cancellation fixtures. These
+local tests do not replace an actual transaction-pool overlap and cancellation
+probe before a pooling configuration change.
 
 ## Railway deployment
 
