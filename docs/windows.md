@@ -42,6 +42,12 @@ Claude Code uses its documented native hook interface. Both launch the shared
 Python collector, which uses operating-system locks and detached background
 draining. No WSL runtime is involved.
 
+The copied runtime has no third-party Python dependencies. It uses `flock` on
+Unix and a one-byte `msvcrt` lock on Windows; both release locks when a process
+exits. This keeps source-copy installation self-contained. State replacement
+uses the native filesystem operation; a Windows reader that disallows deletion
+can make replacement fail safely, leaving the previous valid file for retry.
+
 Interface sources checked on 2026-09-12:
 
 - [Codex hooks](https://learn.chatgpt.com/docs/hooks)
@@ -59,6 +65,11 @@ Fixture CLIs exercise installer contracts without an account. Provider CLI
 smoke tests exercise real plugin registration and trust without issuing model
 requests. Neither proves an authenticated desktop session, a particular VPN,
 network delivery to production, or dashboard ingestion.
+
+The native provider smoke pins Codex 0.154.0 and Claude Code 2.1.269. Older
+versions are not covered by this evidence. Sherlock checks Codex's selected
+Windows command before trusting hooks instead of assuming that an unknown
+hook field was honored.
 
 Collector verification reports local state only. A successful install is not
 proof that the remote endpoint received or projected telemetry. Keep queued

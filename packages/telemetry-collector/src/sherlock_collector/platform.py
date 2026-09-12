@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import stat
 import subprocess
 from pathlib import Path
@@ -152,7 +151,8 @@ def secure_path(path: Path | str, *, directory: bool) -> None:
 def secure_directory(path: Path | str) -> Path:
     target = Path(path)
     target.mkdir(parents=True, exist_ok=True, mode=0o700)
-    secure_path(target, directory=True)
+    if not is_owner_only(target):
+        secure_path(target, directory=True)
     return target
 
 
@@ -207,24 +207,120 @@ def is_owner_only(path: Path | str) -> bool:
     if not WINDOWS:
         return not (stat.S_IMODE(target.stat().st_mode) & 0o077)
 
-    sddl = windows_security_descriptor(target)
-    current_sid = _current_user_sid()
-    owner = re.search(r"O:(.*?)(?=[GDS]:|$)", sddl)
-    dacl = sddl[sddl.find("D:") :] if "D:" in sddl else ""
-    aces = [ace.split(";") for ace in re.findall(r"\(([^)]*)\)", dacl)]
-    allowed = {
-        fields[5]
-        for fields in aces
-        if len(fields) == 6
-        and fields[0] == "A"
-        and fields[2].lower() in {"fa", "0x1f01ff"}
-    }
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    information = 0x00000001 | 0x00000004
+    advapi32.GetFileSecurityW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    needed = wintypes.DWORD()
+    advapi32.GetFileSecurityW(str(target), information, None, 0, ctypes.byref(needed))
+    descriptor = ctypes.create_string_buffer(needed.value)
+    if not advapi32.GetFileSecurityW(
+        str(target), information, descriptor, needed, ctypes.byref(needed)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    advapi32.GetSecurityDescriptorOwner.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    advapi32.GetSecurityDescriptorDacl.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    advapi32.GetSecurityDescriptorControl.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.GetAce.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    advapi32.ConvertSidToStringSidW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.LPWSTR),
+    )
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    def sid_string(pointer: ctypes.c_void_p) -> str:
+        rendered = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(pointer, ctypes.byref(rendered)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return rendered.value
+        finally:
+            kernel32.LocalFree(rendered)
+
+    owner = ctypes.c_void_p()
+    owner_defaulted = wintypes.BOOL()
+    present = wintypes.BOOL()
+    dacl = ctypes.c_void_p()
+    dacl_defaulted = wintypes.BOOL()
+    control = wintypes.WORD()
+    revision = wintypes.DWORD()
+    if not advapi32.GetSecurityDescriptorOwner(
+        descriptor, ctypes.byref(owner), ctypes.byref(owner_defaulted)
+    ) or not advapi32.GetSecurityDescriptorDacl(
+        descriptor,
+        ctypes.byref(present),
+        ctypes.byref(dacl),
+        ctypes.byref(dacl_defaulted),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not advapi32.GetSecurityDescriptorControl(
+        descriptor, ctypes.byref(control), ctypes.byref(revision)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not present or not dacl or not control.value & 0x1000:
+        return False
+
+    class Acl(ctypes.Structure):
+        _fields_ = [
+            ("revision", ctypes.c_ubyte),
+            ("reserved", ctypes.c_ubyte),
+            ("size", wintypes.WORD),
+            ("ace_count", wintypes.WORD),
+            ("reserved2", wintypes.WORD),
+        ]
+
+    class AllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_ubyte),
+            ("flags", ctypes.c_ubyte),
+            ("size", wintypes.WORD),
+            ("mask", wintypes.DWORD),
+            ("sid_start", wintypes.DWORD),
+        ]
+
+    allowed: set[str] = set()
+    acl = ctypes.cast(dacl, ctypes.POINTER(Acl)).contents
+    for index in range(acl.ace_count):
+        ace_pointer = ctypes.c_void_p()
+        if not advapi32.GetAce(dacl, index, ctypes.byref(ace_pointer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        ace = ctypes.cast(ace_pointer, ctypes.POINTER(AllowedAce)).contents
+        if ace.type != 0 or ace.mask != 0x1F01FF:
+            return False
+        sid_pointer = ctypes.c_void_p(ace_pointer.value + AllowedAce.sid_start.offset)
+        allowed.add(sid_string(sid_pointer))
     return bool(
-        owner
-        and owner.group(1) in {current_sid}
-        and dacl.startswith("D:P")
-        and len(aces) == 2
-        and allowed == {current_sid, "SY"}
+        acl.ace_count == 2
+        and sid_string(owner) == _current_user_sid()
+        and allowed == {_current_user_sid(), "S-1-5-18"}
     )
 
 
@@ -236,7 +332,8 @@ def nonblocking_lock(path: Path | str) -> Iterator[bool]:
     handle = os.fdopen(os.open(target, os.O_RDWR | os.O_CREAT, 0o600), "a+b")
     acquired = False
     try:
-        secure_path(target, directory=False)
+        if not is_owner_only(target):
+            secure_path(target, directory=False)
         if WINDOWS:
             import msvcrt
 

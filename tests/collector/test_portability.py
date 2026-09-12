@@ -15,12 +15,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sherlock_collector.contract import build_rollout_batch
+from sherlock_collector.config import ConfigurationError, _read_owner_only
 from sherlock_collector.platform import (
     is_owner_only,
     secure_path,
     windows_security_descriptor,
 )
-from sherlock_collector.rollout import RolloutCapturer, StreamState
+from sherlock_collector.rollout import (
+    RolloutCapturer,
+    StreamState,
+    open_regular_under_root,
+)
 from sherlock_collector.spool import DurableSpool, _atomic_json
 
 
@@ -132,6 +137,44 @@ class PortableRuntimeTests(unittest.TestCase):
             self.assertFalse(is_owner_only(path))
             secure_path(path, directory=False)
             self.assertTrue(is_owner_only(path), windows_security_descriptor(path))
+
+    @unittest.skipUnless(os.name == "nt", "native Windows ACL boundary")
+    def test_windows_everyone_read_acl_is_rejected_for_config(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "collector.json"
+            path.write_text("{}")
+            secure_path(path, directory=False)
+            granted = subprocess.run(
+                ["icacls", str(path), "/grant", "*S-1-1-0:R"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(granted.returncode, 0, granted.stderr)
+            self.assertFalse(is_owner_only(path), windows_security_descriptor(path))
+            with self.assertRaisesRegex(ConfigurationError, "owner-only"):
+                _read_owner_only(path)
+
+    @unittest.skipUnless(os.name == "nt", "native Windows junction boundary")
+    def test_windows_directory_junction_outside_root_is_rejected(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            allowed = base / "allowed"
+            outside = base / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            source = outside / "rollout.jsonl"
+            source.write_text('{"type":"event"}\n')
+            junction = allowed / "escape"
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            with self.assertRaisesRegex(ValueError, "outside allowed_root"):
+                open_regular_under_root(allowed, junction / source.name)
 
     @unittest.skipUnless(os.name == "nt", "native Windows replacement boundary")
     def test_windows_failed_replace_leaves_valid_original(self):
