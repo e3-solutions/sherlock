@@ -15,6 +15,21 @@ const START = new Date(MCP_QUERY_HISTORY_START);
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("Sherlock MCP query source", () => {
+  it("keeps a measured prefix separate from unknown totals after a discontinuity", () => {
+    const result = buildUsageResult([{
+      person_id: SESSION_ID, display_name: "Ada", provider: "codex", model: "model-A",
+      input_tokens: 20, cached_input_tokens: 0, output_tokens: 0,
+      reasoning_tokens: 0, total_tokens: 20, usage_event_count: 3,
+      session_ids: [SESSION_ID], stream_ids: ["stream"],
+      regressed_stream_ids: ["stream"], missing_baseline_count: 0,
+      excluded_usage_events: 2, missing_token_components: [],
+    }], {}, { groupBy: "person_model", startAt: START, endAt: NOW, readAt: NOW });
+    expect(result.groups[0]).toMatchObject({
+      tokens: { input: null, cachedInput: null, output: null, reasoning: null, total: null },
+      knownTokens: { input: 20, cachedInput: 0, output: 0, reasoning: 0, total: 20 },
+      coverage: { state: "partial", excludedUsageEvents: 2, regressedCumulativeStreams: 1 },
+    });
+  });
   it("defaults to all history, accepts longer windows, and rejects invalid bounds", () => {
     expect(queryWindow({}, NOW)).toMatchObject({ startAt: START, endAt: NOW, readAt: NOW });
     expect(queryWindow({
@@ -196,12 +211,14 @@ describe("Sherlock MCP query source", () => {
       readAt: NOW,
     });
 
-    expect(result.groups).toEqual([{
+    expect(result.groups).toMatchObject([{
       personId: SESSION_ID,
       displayName: "Ada",
       provider: "codex",
       model: "gpt-5.6-sol",
-      tokens: { input: 40, cachedInput: 0, output: 30, reasoning: 5, total: 75 },
+      tokens: { input: null, cachedInput: null, output: null, reasoning: null, total: null },
+      knownTokens: { input: 40, cachedInput: 0, output: 30, reasoning: 5, total: 75 },
+      coverage: { state: "partial", missingCumulativeBaselines: 1 },
       sessionCount: 1,
       usageEventCount: 3,
     }]);
@@ -247,7 +264,8 @@ describe("Sherlock MCP query source", () => {
     });
 
     expect(result.groups).toHaveLength(2);
-    expect(result.groups.every((group) => group.tokens.total === 0)).toBe(true);
+    expect(result.groups.every((group) => group.tokens.total === null)).toBe(true);
+    expect(result.groups.every((group) => group.knownTokens.total === 0)).toBe(true);
     expect(result.coverage).toMatchObject({
       state: "partial",
       streams: 1,

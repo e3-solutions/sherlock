@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { FlameSourceError } from "./flame-source.js";
 
 export const MCP_QUERY_SCHEMA_VERSION = "sherlock.query.v1";
+export const USAGE_DERIVATION_VERSION = "sherlock.usage-reconciliation.v1";
 export const MCP_QUERY_DEFAULT_LIMIT = 20;
 export const MCP_QUERY_MAX_LIMIT = 100;
 export const MCP_QUERY_MAX_GROUPS = 200;
@@ -273,6 +274,11 @@ export function buildUsageResult(rows, receipt, { groupBy, startAt, endAt, readA
       usageEventCount: 0,
       sessionIds: new Set(),
       missingTokenComponents: new Set(),
+      regressedStreams: new Set(),
+      missingBaselines: 0,
+      excludedUsageEvents: 0,
+      conflictingSourceEvents: 0,
+      missingModelObservations: 0,
     };
     current.tokens.input += safeCount(row.input_tokens);
     current.tokens.cachedInput += safeCount(row.cached_input_tokens);
@@ -284,6 +290,11 @@ export function buildUsageResult(rows, receipt, { groupBy, startAt, endAt, readA
       current.missingTokenComponents.add(component);
     }
     current.usageEventCount += safeCount(row.usage_event_count);
+    current.missingBaselines += safeCount(row.missing_baseline_count);
+    current.excludedUsageEvents += safeCount(row.excluded_usage_events);
+    current.conflictingSourceEvents += safeCount(row.conflicting_source_events);
+    current.missingModelObservations += safeCount(row.missing_model_observations);
+    for (const streamId of row.regressed_stream_ids ?? []) current.regressedStreams.add(String(streamId));
     groups.set(key, current);
   }
   if (groups.size > MCP_QUERY_MAX_GROUPS) {
@@ -291,6 +302,7 @@ export function buildUsageResult(rows, receipt, { groupBy, startAt, endAt, readA
   }
   return {
     schemaVersion: MCP_QUERY_SCHEMA_VERSION,
+    usageDerivationVersion: USAGE_DERIVATION_VERSION,
     window: {
       startInclusive: startAt.toISOString(),
       endExclusive: endAt.toISOString(),
@@ -298,18 +310,36 @@ export function buildUsageResult(rows, receipt, { groupBy, startAt, endAt, readA
     },
     groupBy,
     groups: [...groups.values()].map(({
-      sessionIds, missingTokenComponents: groupMissing, ...group
-    }) => ({
-      ...group,
-      tokens: {
-        input: groupMissing.has("input") ? null : group.tokens.input,
-        cachedInput: groupMissing.has("cachedInput") ? null : group.tokens.cachedInput,
-        output: groupMissing.has("output") ? null : group.tokens.output,
-        reasoning: groupMissing.has("reasoning") ? null : group.tokens.reasoning,
-        total: groupMissing.has("total") ? null : group.tokens.total,
-      },
-      sessionCount: sessionIds.size,
-    })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+      sessionIds, missingTokenComponents: groupMissing, regressedStreams: groupRegressions,
+      missingBaselines: groupBaselines, excludedUsageEvents, conflictingSourceEvents,
+      missingModelObservations, ...group
+    }) => {
+      const arithmeticIncomplete = groupBaselines > 0 || groupRegressions.size > 0 || conflictingSourceEvents > 0;
+      const reasons = [];
+      if (groupBaselines > 0) reasons.push("cumulative_baseline_missing");
+      if (groupRegressions.size > 0) reasons.push("cumulative_counter_regressed");
+      if (groupMissing.size > 0) reasons.push("token_component_missing");
+      if (conflictingSourceEvents > 0) reasons.push("source_record_conflict");
+      if (missingModelObservations > 0) reasons.push("model_context_missing");
+      return {
+        ...group,
+        tokens: Object.fromEntries(Object.entries(group.tokens).map(([component, value]) => [
+          component, arithmeticIncomplete || groupMissing.has(component) ? null : value,
+        ])),
+        knownTokens: { ...group.tokens },
+        sessionCount: sessionIds.size,
+        coverage: {
+          state: reasons.length > 0 ? "partial" : "complete",
+          reasons,
+          excludedUsageEvents,
+          missingCumulativeBaselines: groupBaselines,
+          regressedCumulativeStreams: groupRegressions.size,
+          missingTokenComponents: [...groupMissing].sort(),
+          conflictingSourceEvents,
+          missingModelObservations,
+        },
+      };
+    }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
     coverage: coverageReceipt(receipt, {
       observedUsageEvents,
       streams: observedStreams.size,
@@ -368,12 +398,13 @@ async function ensureRosterBound(tx, source, signal) {
   }
 }
 
-// The query selects the active append-only projection for each provider, removes
-// canonical duplicates, and differences cumulative streams from the last
-// pre-window observation. A stream that began inside the window has an implicit
-// zero baseline; an older stream without a baseline is reported as partial.
+// Reconcile the usage view from immutable native occurrences. History is scoped
+// to sessions touched by the window: a pre-window discontinuity must not become
+// an apparently valid baseline when the caller changes the reporting window.
+// Inline parameter bounds so PostgreSQL can use events_session_occurred_idx
+// when finding window-touched sessions instead of scanning their entire history.
 export const QUERY_USAGE_SQL = `
-with p as materialized (
+with p as not materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text expected_email_domain
 ), roster as materialized (
@@ -385,27 +416,27 @@ with p as materialized (
      and split_part(pe.email, '@', 2) = p.expected_email_domain
      and split_part(pe.email, '@', 3) = ''
 ), eligible_sessions as materialized (
-  select s.id session_id, s.person_id, r.display_name, s.started_at,
-         nullif(btrim(s.model), '') session_model
-    from telemetry.sessions s
-    join roster r on r.person_id = s.person_id
-    cross join p
+  select s.id session_id, s.person_id, r.display_name, s.started_at
+    from telemetry.sessions s join roster r on r.person_id = s.person_id cross join p
    where s.workspace_id = p.workspace_id and s.started_at < p.end_at
-), window_candidates as materialized (
+     and exists (
+       select 1 from telemetry.events w
+        where w.workspace_id = p.workspace_id and w.session_id = s.id
+          and w.event_kind = 'usage' and not w.is_replay
+          and w.occurred_at >= p.start_at and w.occurred_at < p.end_at
+     )
+), candidates as materialized (
   select e.id, e.session_id, s.person_id, s.display_name, s.started_at,
-         e.normalizer_version,
-         case when e.normalizer_version = 'sherlock.claude-code-transcript.v1'
-              then 'claude' else 'codex' end provider,
-         coalesce(nullif(btrim(e.model), ''), s.session_model, 'unknown') model,
-         e.usage_stream_key, e.usage_is_cumulative,
+         e.normalizer_version, e.event_kind, e.event_subtype, e.projection_index,
+         e.canonical_scope_key, e.logical_event_key, e.usage_stream_key, e.usage_is_cumulative,
+         e.model recorded_model, e.source_priority,
+         case when ib.source_provider = 'claude_code' then 'claude' else 'codex' end provider,
          e.input_tokens, e.cached_input_tokens, e.output_tokens,
          e.reasoning_tokens, e.total_tokens, e.occurred_at usage_at,
-         row_number() over (
-           partition by e.session_id, e.normalizer_version,
-             coalesce(e.canonical_scope_key, 'event:' || e.id::text),
-             coalesce(e.logical_event_key, 'event:' || e.id::text), e.event_kind
-           order by e.source_priority desc, e.occurred_at, e.id
-         ) canonical_rank
+         coalesce(nr.native_record_start_offset, nr.source_start_offset) native_start,
+         coalesce(nr.native_record_end_offset, nr.source_end_offset) native_end,
+         coalesce(nr.native_record_sha256, nr.record_sha256) native_hash,
+         (e.occurred_at >= p.start_at and e.occurred_at < p.end_at) in_window
     from eligible_sessions s
     join telemetry.events e on e.session_id = s.session_id
     join telemetry.native_records nr
@@ -413,73 +444,69 @@ with p as materialized (
     join telemetry.ingest_batches ib
       on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
     left join analytics.normalizer_cutovers c
-      on c.workspace_id = e.workspace_id
-     and c.source_provider = ib.source_provider
+      on c.workspace_id = e.workspace_id and c.source_provider = ib.source_provider
      and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
     cross join p
-   where e.workspace_id = p.workspace_id and e.event_kind = 'usage'
-     and not e.is_replay and e.occurred_at >= p.start_at
-     and e.occurred_at < p.end_at
+   where e.workspace_id = p.workspace_id and not e.is_replay
+     and (e.event_kind = 'usage' or
+          e.event_kind = 'lifecycle' and e.event_subtype = 'turn_context')
      and ${activeNormalizerPredicate("e", "s", "ib", "c")}
-     and ${canonicalWinnerPredicate("e", "s")}
-), window_events as materialized (
-  select * from window_candidates where canonical_rank = 1
-), streams as materialized (
-  select distinct session_id, usage_stream_key, usage_is_cumulative,
-         person_id, display_name, started_at
-    from window_events
-), baselines as materialized (
-  select stream.*, baseline.id, baseline.normalizer_version, baseline.usage_at,
-         baseline.input_tokens, baseline.cached_input_tokens,
-         baseline.output_tokens, baseline.reasoning_tokens, baseline.total_tokens
-    from streams stream cross join p
-    left join lateral (
-      -- The global winner predicate already resolves keyed duplicates. Sorting
-      -- and ranking all history here prevents the time index from early-stopping
-      -- and can conflate an unkeyed event with a literal event:<id> key.
-      select e.id, e.normalizer_version, e.occurred_at usage_at, e.input_tokens,
-             e.cached_input_tokens, e.output_tokens,
-             e.reasoning_tokens, e.total_tokens
-        from telemetry.events e
-        join telemetry.sessions baseline_session
-          on baseline_session.workspace_id = e.workspace_id
-         and baseline_session.id = e.session_id
-        join telemetry.native_records nr
-          on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
-        join telemetry.ingest_batches ib
-          on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
-        left join analytics.normalizer_cutovers c
-          on c.workspace_id = e.workspace_id
-         and c.source_provider = ib.source_provider
-         and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
-       where stream.usage_is_cumulative
-         and e.workspace_id = p.workspace_id
-         and e.session_id = stream.session_id and e.event_kind = 'usage'
-         and not e.is_replay
-         and e.usage_stream_key = stream.usage_stream_key
-         and e.usage_is_cumulative is not distinct from stream.usage_is_cumulative
-         and e.occurred_at < p.start_at
-         and ${activeNormalizerPredicate("e", "baseline_session", "ib", "c")}
-         and ${canonicalWinnerPredicate("e", "baseline_session")}
-       order by e.occurred_at desc, e.id desc
-       limit 1
-    ) baseline on true
-), timeline as materialized (
-  select session_id, person_id, display_name, started_at,
-         normalizer_version, provider, model, usage_stream_key,
-         usage_is_cumulative, id, usage_at, input_tokens,
-         cached_input_tokens, output_tokens, reasoning_tokens, total_tokens,
-         true in_window
-    from window_events
-  union all
-  select session_id, person_id, display_name, started_at,
-         normalizer_version,
-         case when normalizer_version = 'sherlock.claude-code-transcript.v1'
-              then 'claude' else 'codex' end provider,
-         'unknown' model, usage_stream_key, usage_is_cumulative, id, usage_at,
-         input_tokens, cached_input_tokens, output_tokens, reasoning_tokens,
-         total_tokens, false in_window
-    from baselines where id is not null
+), canonical_ranked as materialized (
+  select *, row_number() over (
+    partition by session_id, normalizer_version, canonical_scope_key, logical_event_key, event_kind
+    order by source_priority desc, usage_at, id
+  ) canonical_rank
+  from candidates
+), canonical_events as materialized (
+  select * from canonical_ranked
+   where canonical_rank = 1 or canonical_scope_key is null or logical_event_key is null
+), native_positions as materialized (
+  select session_id, provider, canonical_scope_key, native_start, native_end,
+         min(native_hash) <> max(native_hash) hash_conflict
+    from canonical_events
+   group by session_id, provider, canonical_scope_key, native_start, native_end
+), position_conflicts as materialized (
+  select *, hash_conflict
+    or coalesce(max(native_end) over (
+      partition by session_id, provider, canonical_scope_key
+      order by native_start, native_end rows between unbounded preceding and 1 preceding
+    ) > native_start, false)
+    or coalesce(lead(native_start) over (
+      partition by session_id, provider, canonical_scope_key
+      order by native_start, native_end
+    ) < native_end, false) source_conflict
+  from native_positions
+), ranked as materialized (
+  select ce.*, pc.source_conflict,
+         row_number() over (
+           partition by ce.session_id, ce.provider, ce.canonical_scope_key,
+             ce.native_start, ce.native_end, native_hash, event_kind, projection_index
+           order by source_priority desc, id
+         ) source_rank
+    from canonical_events ce
+    join position_conflicts pc on pc.session_id = ce.session_id and pc.provider = ce.provider
+      and pc.canonical_scope_key is not distinct from ce.canonical_scope_key
+      and pc.native_start = ce.native_start and pc.native_end = ce.native_end
+), native_events as materialized (
+  select * from ranked where source_rank = 1
+), contextualized as materialized (
+  select *,
+         count(*) filter (where event_subtype = 'turn_context') over source_order context_number,
+         bool_or(source_conflict) over source_order source_uncertain
+    from native_events
+  window source_order as (
+    partition by session_id, provider, canonical_scope_key
+    order by native_start, native_end, id rows unbounded preceding
+  )
+), attributed as materialized (
+  select *, case when provider = 'claude'
+                then coalesce(nullif(btrim(recorded_model), ''), 'unknown')
+                when source_uncertain then 'unknown'
+                else coalesce(max(nullif(btrim(recorded_model), '')) filter (
+                  where event_subtype = 'turn_context'
+                ) over (partition by session_id, provider, canonical_scope_key, context_number), 'unknown')
+           end model
+    from contextualized
 ), ordered as materialized (
   select *,
          lag(input_tokens) over stream_order previous_input,
@@ -488,10 +515,10 @@ with p as materialized (
          lag(reasoning_tokens) over stream_order previous_reasoning,
          lag(total_tokens) over stream_order previous_total,
          lag(id) over stream_order previous_id
-    from timeline
+    from attributed where event_kind = 'usage'
   window stream_order as (
-    partition by session_id, usage_stream_key, usage_is_cumulative
-    order by usage_at, id
+    partition by session_id, provider, usage_stream_key, usage_is_cumulative
+    order by native_start, native_end, id
   )
 ), assessed as materialized (
   select *, bool_or(
@@ -501,12 +528,15 @@ with p as materialized (
       or total_tokens < previous_total
     )
   ) over (
-    partition by session_id, usage_stream_key, usage_is_cumulative
-  ) stream_regressed
+    partition by session_id, provider, usage_stream_key, usage_is_cumulative
+    order by native_start, native_end, id rows unbounded preceding
+  ) stream_regressed,
+    (usage_is_cumulative and previous_id is null
+      and started_at < (select start_at from p)) missing_baseline
   from ordered
 ), contributions as materialized (
   select *,
-    case when stream_regressed then 0
+    case when stream_regressed or source_uncertain then 0
          when not usage_is_cumulative then coalesce(input_tokens, 0)
          when previous_id is not null and previous_input is null then 0
          when previous_id is null and started_at >= (select start_at from p)
@@ -514,7 +544,7 @@ with p as materialized (
          when previous_id is null then 0
          else greatest(coalesce(input_tokens, previous_input, 0) - coalesce(previous_input, 0), 0)
     end input_delta,
-    case when stream_regressed then 0
+    case when stream_regressed or source_uncertain then 0
          when not usage_is_cumulative then coalesce(cached_input_tokens, 0)
          when previous_id is not null and previous_cached is null then 0
          when previous_id is null and started_at >= (select start_at from p)
@@ -522,7 +552,7 @@ with p as materialized (
          when previous_id is null then 0
          else greatest(coalesce(cached_input_tokens, previous_cached, 0) - coalesce(previous_cached, 0), 0)
     end cached_delta,
-    case when stream_regressed then 0
+    case when stream_regressed or source_uncertain then 0
          when not usage_is_cumulative then coalesce(output_tokens, 0)
          when previous_id is not null and previous_output is null then 0
          when previous_id is null and started_at >= (select start_at from p)
@@ -530,7 +560,7 @@ with p as materialized (
          when previous_id is null then 0
          else greatest(coalesce(output_tokens, previous_output, 0) - coalesce(previous_output, 0), 0)
     end output_delta,
-    case when stream_regressed then 0
+    case when stream_regressed or source_uncertain then 0
          when not usage_is_cumulative then coalesce(reasoning_tokens, 0)
          when previous_id is not null and previous_reasoning is null then 0
          when previous_id is null and started_at >= (select start_at from p)
@@ -538,7 +568,7 @@ with p as materialized (
          when previous_id is null then 0
          else greatest(coalesce(reasoning_tokens, previous_reasoning, 0) - coalesce(previous_reasoning, 0), 0)
     end reasoning_delta,
-    case when stream_regressed then 0
+    case when stream_regressed or source_uncertain then 0
          when not usage_is_cumulative then coalesce(total_tokens, 0)
          when previous_id is not null and previous_total is null then 0
          when previous_id is null and started_at >= (select start_at from p)
@@ -546,8 +576,6 @@ with p as materialized (
          when previous_id is null then 0
          else greatest(coalesce(total_tokens, previous_total, 0) - coalesce(previous_total, 0), 0)
     end total_delta,
-    (usage_is_cumulative and previous_id is null
-      and started_at < (select start_at from p)) missing_baseline,
     stream_regressed regression
   from assessed where in_window
 )
@@ -560,27 +588,30 @@ select person_id::text, display_name, provider, model,
        count(distinct session_id)::bigint session_count,
        count(*)::bigint usage_event_count,
        array_agg(distinct session_id::text) session_ids,
-       array_agg(distinct session_id::text || ':' || usage_stream_key || ':' || usage_is_cumulative::text)
-         stream_ids,
+       array_agg(distinct session_id::text || ':' || usage_stream_key || ':' || usage_is_cumulative::text) stream_ids,
        count(*) filter (where missing_baseline)::bigint missing_baseline_count,
        array_agg(distinct session_id::text || ':' || usage_stream_key || ':' || usage_is_cumulative::text)
          filter (where regression) regressed_stream_ids,
+       count(*) filter (where regression or missing_baseline or source_uncertain
+         or input_tokens is null or cached_input_tokens is null or output_tokens is null
+         or reasoning_tokens is null or total_tokens is null
+         or usage_is_cumulative and previous_id is not null and (
+           previous_input is null or previous_cached is null or previous_output is null
+           or previous_reasoning is null or previous_total is null
+         ))::bigint excluded_usage_events,
+       count(*) filter (where source_uncertain)::bigint conflicting_source_events,
+       count(*) filter (where model = 'unknown')::bigint missing_model_observations,
        array_remove(array[
          case when bool_or(input_tokens is null or
-           usage_is_cumulative and previous_id is not null and previous_input is null)
-           then 'input' end,
+           usage_is_cumulative and previous_id is not null and previous_input is null) then 'input' end,
          case when bool_or(cached_input_tokens is null or
-           usage_is_cumulative and previous_id is not null and previous_cached is null)
-           then 'cachedInput' end,
+           usage_is_cumulative and previous_id is not null and previous_cached is null) then 'cachedInput' end,
          case when bool_or(output_tokens is null or
-           usage_is_cumulative and previous_id is not null and previous_output is null)
-           then 'output' end,
+           usage_is_cumulative and previous_id is not null and previous_output is null) then 'output' end,
          case when bool_or(reasoning_tokens is null or
-           usage_is_cumulative and previous_id is not null and previous_reasoning is null)
-           then 'reasoning' end,
+           usage_is_cumulative and previous_id is not null and previous_reasoning is null) then 'reasoning' end,
          case when bool_or(total_tokens is null or
-           usage_is_cumulative and previous_id is not null and previous_total is null)
-           then 'total' end
+           usage_is_cumulative and previous_id is not null and previous_total is null) then 'total' end
        ], null) missing_token_components
  from contributions
  group by person_id, display_name, provider, model
@@ -636,9 +667,10 @@ with selected as materialized (
 ), candidates as materialized (
   select e.event_kind, e.normalizer_version,
          row_number() over (
-           partition by e.session_id, e.normalizer_version,
-             coalesce(e.canonical_scope_key, 'event:' || e.id::text),
-             coalesce(e.logical_event_key, 'event:' || e.id::text), e.event_kind
+           partition by e.session_id, ib.source_provider, e.canonical_scope_key,
+             coalesce(nr.native_record_start_offset, nr.source_start_offset),
+             coalesce(nr.native_record_end_offset, nr.source_end_offset),
+             coalesce(nr.native_record_sha256, nr.record_sha256), e.event_kind, e.projection_index
            order by e.source_priority desc, e.occurred_at, e.id
          ) canonical_rank
     from selected s
@@ -654,6 +686,7 @@ with selected as materialized (
      and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
    where e.normalizer_version = any($4::text[])
      and ${activeNormalizerPredicate("e", "s", "ib", "c")}
+     and ${canonicalWinnerPredicate("e", "s")}
 ), facts as (
   select count(*) filter (
            where event_kind = 'message' and canonical_rank = 1
@@ -684,9 +717,10 @@ with roster as materialized (
 ), candidates as materialized (
   select e.id, e.session_id,
          row_number() over (
-           partition by e.session_id, e.normalizer_version,
-             coalesce(e.canonical_scope_key, 'event:' || e.id::text),
-             coalesce(e.logical_event_key, 'event:' || e.id::text), e.event_kind
+           partition by e.session_id, ib.source_provider, e.canonical_scope_key,
+             coalesce(nr.native_record_start_offset, nr.source_start_offset),
+             coalesce(nr.native_record_end_offset, nr.source_end_offset),
+             coalesce(nr.native_record_sha256, nr.record_sha256), e.event_kind, e.projection_index
            order by e.source_priority desc, e.occurred_at, e.id
          ) canonical_rank
     from telemetry.sessions s
