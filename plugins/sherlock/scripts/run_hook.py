@@ -28,6 +28,24 @@ def collector_source() -> Path | None:
 
 def main() -> int:
     event_name = sys.argv[1] if len(sys.argv) > 1 else ""
+    response = dict(CODEX_SUCCESS_RESPONSE)
+    if event_name == "SessionStart" and os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "1") == "1":
+        # Read once, then replay the identical bytes to telemetry. Emit guidance in
+        # the parent; collector stdout is deliberately suppressed below.
+        source_input = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = source_input.read()
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+        sys.stdin = io.TextIOWrapper(io.BytesIO(raw_bytes), encoding="utf-8")
+        try:
+            from collective_feedback import feedback_context
+
+            context = feedback_context(json.loads(raw_bytes), event_name=event_name, agent="codex")
+            if context:
+                response["hookSpecificOutput"] = {
+                    "hookEventName": "SessionStart", "additionalContext": context,
+                }
+        except Exception:
+            pass  # Optional guidance cannot prevent telemetry or session startup.
     try:
         source = collector_source()
         if source is not None:
@@ -45,7 +63,7 @@ def main() -> int:
             f"Sherlock telemetry capture failed ({type(error).__name__}): {error}",
             file=sys.stderr,
         )
-    print(json.dumps(CODEX_SUCCESS_RESPONSE, separators=(",", ":")))
+    print(json.dumps(response, separators=(",", ":")))
     return 0
 
 
