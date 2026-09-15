@@ -194,7 +194,9 @@ historical normalization replay is required.
    `SUPABASE_DB_URL` to project the current 26-hour window from **already normalized
    facts**. This is the existing projection handoff, not a raw-data replay or
    historical classification repair. Activation requires complete normalization
-   and matching projection receipts. Coordinate steps 1–2: v4 stops refreshing
+   and matching receipts covering 25 hours (the dashboard serves 24 hours).
+   The 26-hour projection leaves room for live receipts to advance during handoff.
+   Coordinate steps 1–2: v4 stops refreshing
    when the new worker starts and remains stale until activation completes.
 3. Apply `20260915154051_codex_v3_runtime_classification.sql`. It replaces routing
    in the existing trigger so each newly committed Codex batch gets one v3 job.

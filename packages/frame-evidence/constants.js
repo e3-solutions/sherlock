@@ -1,5 +1,6 @@
 export const FRAME_VERSION = "frame-evidence-v5";
-export const FRAME_CORRECTED_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v3";
+export const FRAME_CORRECTED_CODEX_NORMALIZER_VERSION =
+  "sherlock.codex-rollout.v3";
 
 export const FRAME_LEGACY_CODEX_NORMALIZER_VERSION =
   "sherlock.codex-rollout.v1";
@@ -14,5 +15,8 @@ export const FRAME_NORMALIZER_VERSIONS = Object.freeze([
 ]);
 
 export const FRAME_WINDOW_HOURS = 26;
+// Certify more than the 24-hour dashboard while allowing rolling worker receipts
+// to advance during the handoff without losing the required coverage.
+export const FRAME_ACTIVATION_WINDOW_HOURS = 25;
 
 export const FRAME_PAIRING_NEIGHBORHOOD_SECONDS = 6;

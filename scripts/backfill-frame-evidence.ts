@@ -2,6 +2,7 @@
 
 import postgres from "npm:postgres@3.4.7";
 import {
+  FRAME_ACTIVATION_WINDOW_HOURS,
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
   FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
@@ -145,7 +146,7 @@ export async function proveAndActivateFrameProjection(
   options: ActivationOptions,
 ): Promise<void> {
   const windowStart = options.windowStart ?? new Date(
-    Date.now() - FRAME_WINDOW_HOURS * 60 * 60 * 1_000,
+    Date.now() - FRAME_ACTIVATION_WINDOW_HOURS * 60 * 60 * 1_000,
   );
   await sql.begin("isolation level repeatable read", async (tx) => {
     await tx.unsafe("set local statement_timeout = '30s'");
@@ -268,7 +269,10 @@ if (import.meta.main) {
     await proveAndActivateFrameProjection(sql, {
       workspaceId: options.workspaceId,
       activate: options.activate,
-      windowStart: coveredFrom,
+      windowStart: new Date(
+        coveredThrough.getTime() -
+          FRAME_ACTIVATION_WINDOW_HOURS * 60 * 60 * 1_000,
+      ),
       windowEnd: coveredThrough,
     });
     console.log(JSON.stringify({

@@ -342,6 +342,19 @@ Deno.test({
         now,
       });
       await proveAndActivateFrameProjection(sql, proof);
+      // A rolling worker may publish a newer 26-hour receipt during the handoff.
+      // It still fully covers the required 25-hour activation window.
+      await projector.projectSession({
+        workspaceId,
+        sessionId,
+        requestGeneration: 3n,
+        now: new Date(now.getTime() + 60_000),
+      });
+      await proveAndActivateFrameProjection(sql, {
+        workspaceId,
+        activate: false,
+        windowEnd: now,
+      });
       const day = await dashboard.fetchDay({ now });
       assert(
         Object(decodeSnapshotToken(day.snapshot)).frameVersion ===
