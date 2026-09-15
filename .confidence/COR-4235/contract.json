@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "task": {
+    "title": "Sherlock usage source identity and cumulative coverage",
+    "mode": "standard",
+    "type": "bug"
+  },
+  "intent": {
+    "goal": "Correct historical and future usage query results without rewriting immutable telemetry.",
+    "must_happen": [
+      "Collapse repeated native source occurrences before differencing.",
+      "Attribute Codex usage using preceding native turn context.",
+      "Retain measured prefix and return null authoritative tokens with per-group coverage when cumulative arithmetic is uncertain.",
+      "Carry pre-window discontinuities into the requested window."
+    ],
+    "must_not_happen": [
+      "Count unexplained reset recovery as verified usage.",
+      "Infer billing or add token categories into a billed total.",
+      "Mutate existing raw records or versioned projections.",
+      "Cross workspace or roster boundaries."
+    ],
+    "constraints": [
+      "Query-side correction preserves current normalizer versions.",
+      "Source order uses native record coordinates, not upload order."
+    ],
+    "non_goals": [
+      "Production deployment or backfill",
+      "Inferring clean counter epochs without source evidence"
+    ],
+    "open_questions": [],
+    "assumptions": [
+      "Matching native session, range, and immutable full-record hash identify a repeated occurrence across uploads."
+    ]
+  },
+  "proof_obligations": [
+    {
+      "id": "P1",
+      "claim": "Native duplicates collapse while distinct positions remain distinct; model attribution follows preceding source context.",
+      "verification": "Real PostgreSQL fixtures with overlapping uploads, future context, and missing context."
+    },
+    {
+      "id": "P2",
+      "claim": "Discontinuities cannot masquerade as zero or inflate usage; known prefixes and group uncertainty survive windowing.",
+      "verification": "Fail-then-pass PostgreSQL tests for resets before and within the window, component regressions and missing baselines."
+    },
+    {
+      "id": "P3",
+      "claim": "MCP output schema, grouping, existing canonical precedence and scope safety remain compatible.",
+      "verification": "Unit, protocol, and PostgreSQL integration suites; independent Sol review."
+    }
+  ]
+}

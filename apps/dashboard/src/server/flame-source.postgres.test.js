@@ -2465,7 +2465,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         total: 999,
       });
 
-      // A regressed cumulative stream is entirely omitted, not clamped.
+      // This separate stream has no baseline before the window, then regresses;
+      // neither its first snapshot nor the ambiguous recovery can be counted.
       for (const [record, total] of [[5, 100], [6, 90], [7, 110]]) {
         await insertUsage({
           record, at: `2026-08-18T11:${40 + (record - 5) * 5}:00.000Z`,
@@ -2498,18 +2499,17 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
       const session = await querySource.fetchSession({ sessionId });
 
-      expect(usage.groups).toHaveLength(2);
+      // This fixture has no native turn_context; neither event nor session model
+      // hints are valid historical attribution evidence.
+      expect(usage.groups).toHaveLength(1);
       expect(usage.groups[0]).toMatchObject({
         personId,
         provider: "codex",
-        model: "gpt-5.6-sol",
-        tokens: { input: 87, cachedInput: 0, output: null, reasoning: 0, total: 87 },
-        usageEventCount: 5,
-      });
-      expect(usage.groups[1]).toMatchObject({
-        model: "model-B",
-        tokens: { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 },
-        usageEventCount: 2,
+        model: "unknown",
+        tokens: { input: null, cachedInput: null, output: null, reasoning: null, total: null },
+        knownTokens: { input: 87, cachedInput: 0, output: 0, reasoning: 0, total: 87 },
+        usageEventCount: 7,
+        coverage: { excludedUsageEvents: 4, missingCumulativeBaselines: 1, regressedCumulativeStreams: 1, missingModelObservations: 7 },
       });
       expect(usage.coverage).toMatchObject({
         state: "partial",

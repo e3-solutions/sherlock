@@ -1,0 +1,379 @@
+
+ RUN  v4.1.10 /Users/aryagm/.codex/worktrees/7c79/sherlock/apps/dashboard/frontend
+
+stdout | ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'role "postgres" has already been granted membership in role "sherlock_reader" by role "supabase_admin"',
+  file: 'user.c',
+  line: '1888',
+  routine: 'AddRoleMems'
+}
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js (9 tests | 9 failed) 486ms
+     × attributes cumulative deltas to the preceding turn context by native source order 69ms
+     × keeps pre-regression model usage exact and excludes the poisoned suffix 57ms
+     × carries a pre-window regression forward as unknown arithmetic 53ms
+     × taints the suffix when one component regresses despite a rising total 47ms
+     × deduplicates overlapping uploads by immutable native identity 49ms
+     × uses unknown when no turn context precedes Codex usage 44ms
+     × returns null tokens and an empty accepted prefix without a cumulative baseline 57ms
+     × nulls only a missing token component 48ms
+     × marks conflicting bytes at one native range unknown without mutating raw facts 47ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 9 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > attributes cumulative deltas to the preceding turn context by native source order
+AssertionError: expected [ { …(7) } ] to have a length of 2 but got 1
+
+- Expected
++ Received
+
+- 2
++ 1
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:270:29
+    268|       const groupB = groupFor(result, "ctx-B");
+    269|
+    270|       expect(result.groups).toHaveLength(2);
+       |                             ^
+    271|       expect(groupA).toMatchObject({
+    272|         tokens: { input: 100, cachedInput: 0, output: 0, reasoning: 0,…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > keeps pre-regression model usage exact and excludes the poisoned suffix
+TypeError: Cannot read properties of undefined (reading 'tokens')
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:322:21
+    320|       const groupA = groupFor(byModel, "ctx-A");
+    321|       const groupB = groupFor(byModel, "ctx-B");
+    322|       expect(groupA.tokens).toEqual({
+       |                     ^
+    323|         input: 20, cachedInput: 0, output: 0, reasoning: 0, total: 20,
+    324|       });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > carries a pre-window regression forward as unknown arithmetic
+AssertionError: expected undefined to match object { tokens: { input: null, …(4) }, …(3) }
+
+- Expected:
+{
+  "coverage": {
+    "excludedUsageEvents": 1,
+    "missingCumulativeBaselines": 0,
+    "reasons": [
+      "cumulative_counter_regressed",
+    ],
+    "regressedCumulativeStreams": 1,
+    "state": "partial",
+  },
+  "knownTokens": {
+    "cachedInput": 0,
+    "input": 0,
+    "output": 0,
+    "reasoning": 0,
+    "total": 0,
+  },
+  "tokens": {
+    "cachedInput": null,
+    "input": null,
+    "output": null,
+    "reasoning": null,
+    "total": null,
+  },
+  "usageEventCount": 1,
+}
+
++ Received:
+undefined
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:384:21
+    382|
+    383|       const group = groupFor(await fetchUsage(fixture.querySource), "c…
+    384|       expect(group).toMatchObject({
+       |                     ^
+    385|         tokens: { input: null, cachedInput: null, output: null, reason…
+    386|         knownTokens: ZERO_TOKENS,
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > taints the suffix when one component regresses despite a rising total
+AssertionError: expected undefined to match object { tokens: { input: null, …(4) }, …(3) }
+
+- Expected:
+{
+  "coverage": {
+    "conflictingSourceEvents": 0,
+    "excludedUsageEvents": 1,
+    "missingCumulativeBaselines": 0,
+    "missingModelObservations": 0,
+    "missingTokenComponents": [],
+    "reasons": [
+      "cumulative_counter_regressed",
+    ],
+    "regressedCumulativeStreams": 1,
+    "state": "partial",
+  },
+  "knownTokens": {
+    "cachedInput": 100,
+    "input": 100,
+    "output": 0,
+    "reasoning": 0,
+    "total": 200,
+  },
+  "tokens": {
+    "cachedInput": null,
+    "input": null,
+    "output": null,
+    "reasoning": null,
+    "total": null,
+  },
+  "usageEventCount": 2,
+}
+
++ Received:
+undefined
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:429:21
+    427|
+    428|       const group = groupFor(await fetchUsage(fixture.querySource), "c…
+    429|       expect(group).toMatchObject({
+       |                     ^
+    430|         tokens: { input: null, cachedInput: null, output: null, reason…
+    431|         knownTokens: {
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > deduplicates overlapping uploads by immutable native identity
+AssertionError: expected undefined to match object { tokens: { input: 100, …(4) }, …(2) }
+
+- Expected:
+{
+  "knownTokens": {
+    "cachedInput": 0,
+    "input": 100,
+    "output": 0,
+    "reasoning": 0,
+    "total": 100,
+  },
+  "tokens": {
+    "cachedInput": 0,
+    "input": 100,
+    "output": 0,
+    "reasoning": 0,
+    "total": 100,
+  },
+  "usageEventCount": 2,
+}
+
++ Received:
+undefined
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:489:21
+    487|       );
+    488|       const group = groupFor(await fetchUsage(fixture.querySource), "c…
+    489|       expect(group).toMatchObject({
+       |                     ^
+    490|         tokens: { input: 100, cachedInput: 0, output: 0, reasoning: 0,…
+    491|         knownTokens: { input: 100, cachedInput: 0, output: 0, reasonin…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > uses unknown when no turn context precedes Codex usage
+AssertionError: expected { …(7) } to match object { model: 'unknown', …(3) }
+(5 matching properties omitted from actual)
+
+- Expected
++ Received
+
+@@ -1,25 +1,7 @@
+  {
+-   "coverage": {
+-     "excludedUsageEvents": 0,
+-     "missingCumulativeBaselines": 0,
+-     "missingModelObservations": 1,
+-     "missingTokenComponents": [],
+-     "reasons": [
+-       "model_context_missing",
+-     ],
+-     "regressedCumulativeStreams": 0,
+-     "state": "partial",
+-   },
+-   "knownTokens": {
+-     "cachedInput": 0,
+-     "input": 25,
+-     "output": 0,
+-     "reasoning": 0,
+-     "total": 25,
+-   },
+-   "model": "unknown",
++   "model": "usage-event-model-must-not-win",
+    "tokens": {
+      "cachedInput": 0,
+      "input": 25,
+      "output": 0,
+      "reasoning": 0,
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:523:32
+    521|       const result = await fetchUsage(fixture.querySource);
+    522|       expect(result.groups).toHaveLength(1);
+    523|       expect(result.groups[0]).toMatchObject({
+       |                                ^
+    524|         model: "unknown",
+    525|         tokens: { input: 25, cachedInput: 0, output: 0, reasoning: 0, …
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > returns null tokens and an empty accepted prefix without a cumulative baseline
+AssertionError: expected undefined to match object { tokens: { input: null, …(4) }, …(2) }
+
+- Expected:
+{
+  "coverage": {
+    "excludedUsageEvents": 1,
+    "missingCumulativeBaselines": 1,
+    "missingModelObservations": 0,
+    "missingTokenComponents": [],
+    "reasons": [
+      "cumulative_baseline_missing",
+    ],
+    "regressedCumulativeStreams": 0,
+    "state": "partial",
+  },
+  "knownTokens": {
+    "cachedInput": 0,
+    "input": 0,
+    "output": 0,
+    "reasoning": 0,
+    "total": 0,
+  },
+  "tokens": {
+    "cachedInput": null,
+    "input": null,
+    "output": null,
+    "reasoning": null,
+    "total": null,
+  },
+}
+
++ Received:
+undefined
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:557:21
+    555|
+    556|       const group = groupFor(await fetchUsage(fixture.querySource), "c…
+    557|       expect(group).toMatchObject({
+       |                     ^
+    558|         tokens: { input: null, cachedInput: null, output: null, reason…
+    559|         knownTokens: ZERO_TOKENS,
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > nulls only a missing token component
+AssertionError: expected undefined to match object { tokens: { input: 10, …(4) }, …(2) }
+
+- Expected:
+{
+  "coverage": {
+    "excludedUsageEvents": 1,
+    "missingCumulativeBaselines": 0,
+    "missingModelObservations": 0,
+    "missingTokenComponents": [
+      "output",
+    ],
+    "reasons": [
+      "token_component_missing",
+    ],
+    "regressedCumulativeStreams": 0,
+    "state": "partial",
+  },
+  "knownTokens": {
+    "cachedInput": 0,
+    "input": 10,
+    "output": 0,
+    "reasoning": 0,
+    "total": 10,
+  },
+  "tokens": {
+    "cachedInput": 0,
+    "input": 10,
+    "output": null,
+    "reasoning": 0,
+    "total": 10,
+  },
+}
+
++ Received:
+undefined
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:590:21
+    588|
+    589|       const group = groupFor(await fetchUsage(fixture.querySource), "c…
+    590|       expect(group).toMatchObject({
+       |                     ^
+    591|         tokens: { input: 10, cachedInput: 0, output: null, reasoning: …
+    592|         knownTokens: { input: 10, cachedInput: 0, output: 0, reasoning…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/9]⎯
+
+ FAIL  ../src/server/usage-reconciliation-before.postgres.test.js > usage reconciliation PostgreSQL regressions > marks conflicting bytes at one native range unknown without mutating raw facts
+AssertionError: expected { …(7) } to match object { model: 'unknown', …(3) }
+(5 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+-   "coverage": {
+-     "conflictingSourceEvents": 2,
+-     "excludedUsageEvents": 2,
+-     "missingCumulativeBaselines": 0,
+-     "missingModelObservations": 2,
+-     "missingTokenComponents": [],
+-     "reasons": [
+-       "source_record_conflict",
+-       "model_context_missing",
+-     ],
+-     "regressedCumulativeStreams": 0,
+-     "state": "partial",
+-   },
+-   "knownTokens": {
++   "model": "usage-event-model-must-not-win",
++   "tokens": {
+      "cachedInput": 0,
+-     "input": 0,
++     "input": 120,
+      "output": 0,
+      "reasoning": 0,
+-     "total": 0,
+-   },
+-   "model": "unknown",
+-   "tokens": {
+-     "cachedInput": null,
+-     "input": null,
+-     "output": null,
+-     "reasoning": null,
+-     "total": null,
++     "total": 120,
+    },
+  }
+
+ ❯ ../src/server/usage-reconciliation-before.postgres.test.js:632:32
+    630|       const result = await fetchUsage(fixture.querySource);
+    631|       expect(result.groups).toHaveLength(1);
+    632|       expect(result.groups[0]).toMatchObject({
+       |                                ^
+    633|         model: "unknown",
+    634|         tokens: { input: null, cachedInput: null, output: null, reason…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/9]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  9 failed (9)
+   Start at  17:27:51
+   Duration  697ms (transform 44ms, setup 98ms, import 46ms, tests 486ms, environment 0ms)
+

@@ -1,0 +1,1 @@
+$ node --check server.mjs && node --check src/server/flame-source.js && node --check src/server/flame-cache.js && node --check src/server/freshness-cache.js && node --check src/server/mcp-http.js && node --check src/server/mcp-query-source.js && node --check src/server/mcp-server.js && node --check src/server/mcp-source.js && node --check src/server/mcp-tools.js
