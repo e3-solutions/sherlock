@@ -687,7 +687,8 @@ Deno.test({
       );
       const sibling = await queue.claim("backfill", "independent-version", 60);
       assert(
-        sibling?.job_kind === "normalize" && sibling.batch_id === independentId &&
+        sibling?.job_kind === "normalize" &&
+          sibling.batch_id === independentId &&
           sibling.normalizer_version !== independent.normalizer_version,
         "the second Codex version must be independently eligible",
       );
