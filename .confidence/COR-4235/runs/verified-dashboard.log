@@ -1,0 +1,9 @@
+
+ RUN  v4.1.10 /Users/aryagm/.codex/worktrees/7c79/sherlock/apps/dashboard/frontend
+
+
+ Test Files  19 passed (19)
+      Tests  309 passed (309)
+   Start at  17:36:30
+   Duration  3.17s (transform 1.98s, setup 3.60s, import 3.40s, tests 4.98s, environment 12.16s)
+

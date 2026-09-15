@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
 
+from .collection_receipt import scan_token_payload
 from .contract import ContractError, ReceiptMismatch, validate_committed_receipt
 from .spool import DurableSpool, SpoolItem, secure_lock
 
@@ -157,11 +158,17 @@ class Drain:
         item: SpoolItem | None = None
         try:
             item = self.spool.load(claimed)
+            token_payload = scan_token_payload(item.manifest, item.stored_payload)
             receipt = self.transport.upload(item)
-            validate_committed_receipt(
+            validated_receipt = validate_committed_receipt(
                 item.manifest,
                 receipt,
                 expected_attribution=self.expected_attribution,
+            )
+            self.spool.record_collection_receipt(
+                item,
+                validated_receipt,
+                token_payload,
             )
         except (TransientUploadError, ReceiptMismatch) as error:
             if item is None:

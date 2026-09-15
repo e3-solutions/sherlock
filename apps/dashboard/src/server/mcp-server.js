@@ -3,7 +3,7 @@ import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 
 import { FlameSourceError } from "./flame-source.js";
-import { MCP_QUERY_SCHEMA_VERSION } from "./mcp-query-source.js";
+import { MCP_QUERY_SCHEMA_VERSION, USAGE_DERIVATION_VERSION } from "./mcp-query-source.js";
 import {
   MCP_PROMPT_SCHEMA_VERSION,
   MCP_USAGE_SCHEMA_VERSION,
@@ -229,10 +229,33 @@ const usageGroupSchema = z.object({
   }).strict(),
   sessionCount: z.number().int().nonnegative(),
   usageEventCount: z.number().int().nonnegative(),
+  knownTokens: z.object({
+    input: z.number().int().nonnegative(),
+    cachedInput: z.number().int().nonnegative(),
+    output: z.number().int().nonnegative(),
+    reasoning: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  }).strict(),
+  coverage: z.object({
+    state: z.enum(["complete", "partial"]),
+    reasons: z.array(z.enum([
+      "cumulative_baseline_missing", "cumulative_counter_regressed", "token_component_missing",
+      "source_record_conflict", "model_context_missing",
+    ])).max(5),
+    excludedUsageEvents: z.number().int().nonnegative(),
+    missingCumulativeBaselines: z.number().int().nonnegative(),
+    regressedCumulativeStreams: z.number().int().nonnegative(),
+    missingTokenComponents: z.array(z.enum([
+      "input", "cachedInput", "output", "reasoning", "total",
+    ])).max(5),
+    conflictingSourceEvents: z.number().int().nonnegative(),
+    missingModelObservations: z.number().int().nonnegative(),
+  }).strict(),
 }).strict();
 
 const queryUsageOutputSchema = z.object({
   schemaVersion: z.literal(MCP_QUERY_SCHEMA_VERSION),
+  usageDerivationVersion: z.literal(USAGE_DERIVATION_VERSION),
   window: queryWindowOutputSchema,
   groupBy: z.enum(["person", "model", "person_model"]),
   groups: z.array(usageGroupSchema).max(200),
@@ -285,6 +308,8 @@ const QUERY_DOCUMENTATION = Object.freeze({
     "Call coverage before interpreting an empty or incomplete usage result.",
     "Query v1 currently reports observed data as partial because terminal normalization failures are not yet included in its freshness receipt.",
     "Use query_usage for token/model questions and list_sessions/get_session for metadata drill-down.",
+    "Usage groups carry arithmetic/model coverage. Null tokens mean the total is unknown; knownTokens retains only accepted contributions, and zero knownTokens is not proof of no usage. No post-regression recovery is counted without a verified counter epoch.",
+    "Codex model attribution follows preceding native turn context, not batch or session model hints. Missing context is grouped as unknown. Group coverage complete is not collector completeness or billing evidence.",
   ],
 });
 

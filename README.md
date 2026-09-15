@@ -99,6 +99,9 @@ that Sherlock did not observe.
 
 ## Verify
 
+For missing Codex sessions, see [collector inventory and receipt recovery](docs/collector-receipts.md).
+It distinguishes local capture from acknowledged delivery and records raw token-payload presence.
+
 ```sh
 codex plugin list --marketplace sherlock
 ```

@@ -1,0 +1,101 @@
+{
+  "version": 3,
+  "task_title": "Sherlock usage source identity and cumulative coverage",
+  "mode": "standard",
+  "outcome": "Implemented a versioned query-side usage reconciliation fix; verified on real PostgreSQL and through the MCP protocol. Ready for code review; not deployed.",
+  "changes": [
+    "Deduplicate immutable native occurrences across uploads before cumulative differencing.",
+    "Attribute Codex usage from preceding native turn context; conflicting native ranges and absent context remain unknown.",
+    "Preserve accepted prefixes in knownTokens and return null authoritative totals with explicit coverage for ambiguous suffixes or missing baselines/components.",
+    "Reconcile full touched-session history before half-open timestamp filtering; inline date parameters to restore the existing date index."
+  ],
+  "evidence": [
+    {
+      "obligation_id": "P1",
+      "status": "pass",
+      "details": "PostgreSQL fixtures cover duplicate uploads with different transport keys, equal bytes at distinct positions, historical/tied-time contexts, unknown models and partially overlapping source ranges. Original code failed the regression suite.",
+      "artifacts": [
+        "review.md"
+      ],
+      "run_ids": [
+        "verified-dashboard"
+      ],
+      "diagnostic_run_ids": [
+        "before-sql"
+      ]
+    },
+    {
+      "obligation_id": "P2",
+      "status": "pass",
+      "details": "Real SQL proves prefix preservation, no recovery overcounting after counter decreases, prior-window regression carryover, component regressions, missing baselines/components, and inverted timestamps with a measured zero baseline. Protocol round-trip proves null totals and known prefixes survive schema validation.",
+      "artifacts": [
+        "review.md"
+      ],
+      "run_ids": [
+        "verified-dashboard"
+      ],
+      "diagnostic_run_ids": [
+        "before-prefix",
+        "before-sql",
+        "sql-review-fixes"
+      ]
+    },
+    {
+      "obligation_id": "P3",
+      "status": "pass",
+      "details": "All 309 dashboard tests pass with the disposable PostgreSQL database enabled, including canonical precedence, roster/workspace scope, transaction pooling and MCP output contracts. Package syntax checks and frontend build passed. Read-only production EXPLAIN ANALYZE confirms the date index and 1145.386 ms execution for the incident day.",
+      "artifacts": [
+        "review.md"
+      ],
+      "run_ids": [
+        "verified-dashboard",
+        "final-package-check",
+        "verified-build"
+      ],
+      "diagnostic_run_ids": []
+    }
+  ],
+  "tests": {
+    "passed": [
+      "309 dashboard tests with PostgreSQL enabled (19 files), including 11 reconciliation regressions.",
+      "Package syntax checks.",
+      "Frontend production build (existing chunk-size warning).",
+      "Read-only incident-day production query and EXPLAIN ANALYZE."
+    ],
+    "failed": [],
+    "not_run": []
+  },
+  "simplicity": {
+    "code_gate": "pass",
+    "test_gate": "pass",
+    "notes": "Query-layer change follows the existing SQL/result-builder structure. No new dependency, normalizer version, raw rewrite, schema migration or epoch-recovery heuristic. Direct PostgreSQL fixtures exercise observable contracts instead of mocking SQL."
+  },
+  "review": {
+    "required": true,
+    "reason": "Usage arithmetic crosses a SQL/data boundary. User requested Sol subagents with Astra as implementation lead.",
+    "roles": [
+      "test_designer",
+      "critic"
+    ],
+    "findings": [
+      "Review rejected summing positive post-reset recovery because 100 -> 40 -> 110 can double-count previously observed usage; fixed by excluding the ambiguous suffix.",
+      "Review found end-bound filtering before native-order lag and incomplete interval-conflict detection; both fixed and covered by real PostgreSQL tests.",
+      "Initial cumulative values can be attributable in a window containing the session start but unknown in a narrower window; documented that knownTokens are not additive across changed baseline coverage.",
+      "Retained the straightforward canonical window; the measured production runtime does not justify additional unkeyed-partition optimization."
+    ]
+  },
+  "risks": [
+    "Counter resets, missing contexts, conflicting sources and collection gaps remain source uncertainty; the query now exposes them instead of inventing zero or recovered tokens.",
+    "Native source coordinates are assumed comparable within canonical session scope. Reuse without overlapping contradictory records cannot be detected from this evidence alone.",
+    "The 1.15 second production timing used a warm cache for one day; it is not a latency guarantee for arbitrary all-history queries.",
+    "Input/cached/output/reasoning/provider-total fields remain separate observed facts, not a billed sum.",
+    "The fix changes historical query results and introduces null totals for partial groups; consumers must use group coverage and must not substitute knownTokens as complete totals.",
+    "Outside scope and untested: Production deployment/end-to-end checks after release; no deployment was requested.",
+    "Outside scope and untested: Provider billing reconciliation: billing records and verified category-overlap semantics are unavailable."
+  ],
+  "rollback": "Revert this query/result-schema commit and redeploy the prior dashboard version. No database migration or raw-data rollback is needed.",
+  "user_decisions": [
+    "Implement the fix while preserving immutable raw telemetry.",
+    "Use Sol subagents and Astra as main agent."
+  ]
+}

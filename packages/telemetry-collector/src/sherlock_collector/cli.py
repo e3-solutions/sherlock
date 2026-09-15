@@ -60,6 +60,9 @@ def parser() -> argparse.ArgumentParser:
     backfill.add_argument("--session-id")
     backfill.add_argument("--start")
     backfill.add_argument("--end")
+    inventory = commands.add_parser("inventory")
+    inventory.add_argument("--session-id")
+    inventory.add_argument("--lookback-seconds", type=int, default=DEFAULT_LOOKBACK_SECONDS)
     hook = commands.add_parser("hook")
     hook.add_argument("event_name")
     commands.add_parser("drain")
@@ -141,12 +144,23 @@ def main(argv: list[str] | None = None) -> int:
     replay_session_id: str | None = None
     modified_after_ns: int | None = None
     modified_before_ns: int | None = None
+    if args.command == "inventory":
+        if is_claude:
+            print("inventory currently supports Codex native sessions", file=sys.stderr)
+            return 2
+        if args.lookback_seconds < 1 or (args.session_id is not None and _canonical_uuid(args.session_id) is None):
+            print("inventory requires a positive lookback and canonical session UUID", file=sys.stderr)
+            return 2
+        from .inventory import collection_inventory
+        result = collection_inventory(source_home, state_root, session_id=args.session_id,
+                                      lookback_seconds=args.lookback_seconds)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["status"] == "complete" else 1
     if args.command == "backfill":
         has_range = args.start is not None or args.end is not None
-        has_replay_selector = args.session_id is not None or has_range
-        if not is_claude and has_replay_selector:
+        if not is_claude and has_range:
             print(
-                "session and date-range replay require provider claude_code",
+                "date-range replay requires provider claude_code",
                 file=sys.stderr,
             )
             return 2
@@ -227,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_home,
                 lookback_seconds=lookback_seconds or DEFAULT_LOOKBACK_SECONDS,
                 scan_recent_files=True,
+                replay_session_id=replay_session_id,
             )
         )
         outcome = capture_and_spawn_drain(
@@ -292,6 +307,9 @@ def main(argv: list[str] | None = None) -> int:
                     "start": args.start,
                     "end": args.end,
                     "discovered": len(discovery.paths),
+                    "completion_basis": "local_capture_only",
+                    "delivery_status": "unverified",
+                    "source_issues": [entry for entry in discovery.source_statuses if entry["reason"]],
                     "selected_bytes": discovery.selected_bytes,
                     "invalid": discovery.invalid_count,
                     "omitted": discovery.omitted_count,

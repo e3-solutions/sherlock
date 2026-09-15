@@ -132,8 +132,38 @@ def _path_signatures(paths: list[Path]) -> tuple[tuple[str, int, int] | None, ..
     return tuple(signatures)
 
 
-def dispatch(event_name: str) -> int:
+def dispatch(event_name: str, payload_bytes: bytes | None = None) -> int:
     """Detach capture before returning so `claude -p` teardown cannot kill it."""
+    if payload_bytes is not None:
+        # These plugin launchers target POSIX (their manifest uses sh). Fork
+        # transfers already-read input in memory, without temporary disk or a
+        # blocking parent pipe write. A slow collector cannot truncate replay
+        # when the hook parent exits or reaches the host's timeout.
+        try:
+            child_pid = os.fork()
+        except (OSError, AttributeError):
+            return 0  # Process exhaustion cannot interrupt the user's session.
+        if child_pid:
+            return 0
+        try:
+            os.setsid()
+            null_fd = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null_fd, fd)
+            if null_fd > 2:
+                os.close(null_fd)
+            # Match Popen(close_fds=True): extra inherited copies of the host's
+            # output pipes must not keep hook completion waiting on this child.
+            import resource
+
+            descriptor_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+            if descriptor_limit == resource.RLIM_INFINITY:
+                descriptor_limit = max(65536, os.sysconf("SC_OPEN_MAX"))
+            os.closerange(3, descriptor_limit)
+            sys.stdin = io.TextIOWrapper(io.BytesIO(payload_bytes), encoding="utf-8")
+            capture(event_name)
+        finally:
+            os._exit(0)
     try:
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--capture", event_name],
@@ -153,6 +183,21 @@ def main() -> int:
     if len(sys.argv) >= 3 and sys.argv[1] == "--capture":
         return capture(sys.argv[2])
     event_name = sys.argv[1] if len(sys.argv) > 1 else ""
+    if event_name == "SessionStart" and os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "1") == "1":
+        source_input = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = source_input.read()
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+        try:
+            from collective_feedback import feedback_context
+
+            context = feedback_context(json.loads(raw_bytes), event_name=event_name, agent="claude")
+            if context:
+                print(context, flush=True)
+        except Exception:
+            pass
+        # Child stdout is discarded, so guidance is emitted above. Detached
+        # capture inherits bytes in memory, not a parent-owned replay resource.
+        return dispatch(event_name, payload_bytes=raw_bytes)
     return dispatch(event_name)
 
 

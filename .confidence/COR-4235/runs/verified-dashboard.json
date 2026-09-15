@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "id": "verified-dashboard",
+  "argv": [
+    "/Users/aryagm/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
+    "node_modules/vitest/vitest.mjs",
+    "run",
+    "--config",
+    "frontend/vitest.config.js"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/7c79/sherlock/apps/dashboard",
+  "started_at": "2026-09-14T21:36:30.340014Z",
+  "ended_at": "2026-09-14T21:36:33.879919Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/Users/aryagm/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/7c79/sherlock",
+    "sha256": "decca1f65d229cd778094aab33211f07227024dcbc8f9c36b44e873b39e08a55"
+  },
+  "log": "runs/verified-dashboard.log",
+  "log_sha256": "0d38b4a5f074ead3ea9674786eab2ca7e84fb4dfaaaf29a9319ba5bcff2faed5"
+}
