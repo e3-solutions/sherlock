@@ -5,11 +5,10 @@ export const BUCKET_MS = 10 * 60 * 1000;
 // Keep this immutable reader contract aligned with the worker's frame version.
 // The dashboard Docker build context is apps/dashboard, so it cannot import the
 // repository-level worker module at runtime.
-export const FRAME_VERSION = "frame-evidence-v4";
-// Prompt classification moved into Codex normalization v2. During the v3
-// backfill, continue serving work from the already-active immutable v2
-// projection so interval clicks never regress to raw activity scans. Frame v4
-// selects Codex v1/v2 per immutable workspace cutover and session start.
+export const FRAME_VERSION = "frame-evidence-v5";
+export const PREVIOUS_FRAME_VERSION = "frame-evidence-v4";
+// V5 consumes corrected Codex v3. Keep v4 (and older v2 work tokens)
+// readable while the explicitly gated v3 replay is in progress.
 export const COMPATIBLE_WORK_FRAME_VERSION = "frame-evidence-v2";
 export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
@@ -1413,7 +1412,7 @@ export function encodeSnapshotToken({ snapshot, read }) {
 }
 
 export function encodeProjectionSnapshotToken({ snapshot, read, frameVersion }) {
-  if (![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
+  if (![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
     throw new FlameSourceError("flame_snapshot_invalid");
   }
   const readAt = asDate(read).toISOString();
@@ -1453,7 +1452,7 @@ export function decodeSnapshotToken(token) {
     const receipt = { snapshot: parsePgSnapshot(snapshot), read };
     if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
       if (
-        ![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
+        ![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
           pinnedFrameVersion,
         )
       ) {
@@ -1956,13 +1955,17 @@ export class DirectFlameSource {
                     from analytics.frame_projection_activations activation
                    where activation.workspace_id = $1
                      and activation.frame_version = $3
-                ) compatible_work_projection_active`
+                ) compatible_work_projection_active,
+                exists (
+                  select 1 from analytics.frame_projection_activations activation
+                   where activation.workspace_id = $1 and activation.frame_version = $4
+                ) previous_frame_projection_active`
           : `select transaction_timestamp() as now,
                     pg_current_snapshot()::text as snapshot,
                     false as frame_projection_active,
                     false as compatible_work_projection_active`,
         projectionEnabled
-          ? [this.workspaceId, FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+          ? [this.workspaceId, FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION, PREVIOUS_FRAME_VERSION]
           : undefined,
         signal,
       ))[0];
@@ -1980,6 +1983,8 @@ export class DirectFlameSource {
       }
       const selectedFrameVersion = receipt.frame_projection_active === true
         ? FRAME_VERSION
+        : receipt.previous_frame_projection_active === true
+          ? PREVIOUS_FRAME_VERSION
         : receipt.compatible_work_projection_active === true
           ? COMPATIBLE_WORK_FRAME_VERSION
           : null;
@@ -2039,7 +2044,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
-      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = projected
@@ -2147,7 +2152,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
-      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
       const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
@@ -2233,7 +2238,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const rows = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [

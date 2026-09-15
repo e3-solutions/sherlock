@@ -1,3 +1,7 @@
+import {
+  COMPATIBLE_FRAME_VERSION,
+  FRAME_VERSION,
+} from "../../packages/frame-evidence/constants.js";
 import { PostgresActivityReducer } from "../../supabase/functions/sherlock-activity-reducer/postgres.ts";
 import { ACTIVITY_VERSION } from "../../supabase/functions/sherlock-activity-reducer/reducer.ts";
 import {
@@ -201,20 +205,21 @@ export class TelemetryProcessor {
         });
       },
     );
-    const remaining = remainingMilliseconds(deadlineAtMs);
-    const projected = await this.frameProjector.projectSession({
-      workspaceId: job.workspace_id,
-      sessionId: job.session_id,
-      requestGeneration: job.request_generation,
-      statementTimeoutMs: remaining,
-      deadlineAtMs,
-    });
-    return {
-      session_count: 1,
-      candidate_count: reduced.candidate_count + projected.candidate_count,
-      inserted_count: reduced.inserted_count + projected.inserted_count,
-      tombstone_count: reduced.tombstone_count + projected.tombstone_count,
-    };
+    // Keep the currently served v4 source fresh throughout the v5 replay.
+    for (const frameVersion of [COMPATIBLE_FRAME_VERSION, FRAME_VERSION]) {
+      const projected = await this.frameProjector.projectSession({
+        workspaceId: job.workspace_id,
+        sessionId: job.session_id,
+        frameVersion,
+        requestGeneration: job.request_generation,
+        statementTimeoutMs: remainingMilliseconds(deadlineAtMs),
+        deadlineAtMs,
+      });
+      reduced.candidate_count += projected.candidate_count;
+      reduced.inserted_count += projected.inserted_count;
+      reduced.tombstone_count += projected.tombstone_count;
+    }
+    return { session_count: 1, ...reduced };
   }
 
   private async loadBatch(

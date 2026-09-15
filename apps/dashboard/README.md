@@ -18,6 +18,15 @@ objects.
 
 ## Data contract
 
+The corrected `frame-evidence-v5` view uses Codex v3: reserved runtime envelopes,
+including automatic `codex_internal_context` goal continuations, are excluded
+from human-prompt counts and summaries in both native message representations.
+Runtime activity remains visible. Counts, interval evidence, and MCP prompt
+samples read the same selected frame. Before explicit v5 activation the service
+continues serving v4, with older v2 compatibility retained. Existing snapshot
+tokens keep their original interpretation. Deployment and bounded historical
+repair instructions are in `docs/telemetry-processing.md`.
+
 - `telemetry.people` is the roster, so real people with zero activity remain
   visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
   excluded; display names are never used as the filter.

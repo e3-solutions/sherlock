@@ -182,6 +182,69 @@ safe.
 
 ## Deploy and rollback order
 
+### Codex v3 prompt correction (COR-4262)
+
+This is a separate, explicitly bounded correction to the earlier v2 rollout
+below. It preserves raw batches and v1/v2 interpretations, and does not change
+token accounting. The reserved `codex_internal_context` envelope is classified
+from full message content in both Codex user-message representations. Quoted
+tags and mid-message mentions remain human content; unknown future runtime
+envelopes require another versioned classifier change.
+
+1. Deploy the v3-capable worker. It continues processing old-version jobs and
+   projects both v4 and v5 under the existing job deadline. Deploy the dashboard
+   reader, which prefers v5 only when an activation fact exists and otherwise
+   keeps serving v4. The older v2 compatibility path and issued tokens remain
+   supported.
+2. Apply `20260915154051_codex_v3_runtime_classification.sql`. The new trigger
+   schedules v3 alongside the existing v1/v2 target for new Codex batches.
+   It does not enqueue historical work or change the old cutover. Do not roll
+   the worker back to a build without v3 support while v3 jobs are pending.
+3. Preview the explicitly selected workspace and UTC interval. Start at least
+   26 hours plus 6 seconds before the frame rebuild time to cover the worker's
+   pairing neighborhood. The end bounds batch commit time; use a current end
+   and repeat if newly committed overlapping batches require replay.
+
+   ```sh
+   deno run --config workers/telemetry-processor/deno.json --allow-env --allow-net \
+     scripts/replay-codex-v3.ts --workspace WORKSPACE_UUID \
+     --start START_UTC --end END_UTC
+   ```
+
+   `SUPABASE_DB_URL` supplies an owner connection; no credential belongs in
+   command arguments. Review `candidates` and `missing_jobs`, then run the same
+   command with `--apply`. This only inserts missing jobs in the backfill lane.
+   It never resets leased, completed, or failed jobs. Resolve failed jobs through
+   the existing audited retry workflow. Overlapping batches, late uploads, and
+   old envelopes with in-window normalized native-item timestamps are included.
+4. After v3 normalization drains, rebuild and validate the current frame window:
+
+   ```sh
+   deno run --config workers/telemetry-processor/deno.json --allow-env --allow-net \
+     scripts/backfill-frame-evidence.ts --workspace WORKSPACE_UUID
+   ```
+
+   Rerun with `--activate` only after validation. Activation rechecks native
+   record coverage, source counts/cutoffs, session state, and receipt time
+   coverage in one repeatable-read transaction. Missing v3 events or stale
+   receipts block the switch. A concurrent source change may require another
+   replay/projection pass. The command repairs the dashboard's rolling 26-hour
+   evidence window; older v1/v2 history is retained, not silently rewritten.
+5. Verify the affected frame after activation: automatic continuations contribute
+   zero human prompts, genuine human input still counts, and interval/MCP
+   evidence agrees with the aggregate. Monitor normalization lag and job
+   deadlines: dual normalization/projection adds work. Local integration tests
+   establish correctness, not production throughput capacity.
+
+Rollback: use the preceding v4 dashboard reader while retaining the v3-capable
+worker and additive schema. Old snapshot tokens remain tied to their frame
+version; a reader without v5 support explicitly rejects those tokens rather
+than reinterpreting them. Do not delete activation facts, old/corrected events,
+raw records, receipts, or revisions. Retiring dual processing is separate work
+after old-reader requirements are removed.
+
+### Original v2 rollout
+
 1. Deploy the version-aware worker first. It treats legacy normalize jobs whose
    target version is still null as that provider's v1, so it is safe before and
    after the queue migration. Existing v1 events and raw batches stay immutable.

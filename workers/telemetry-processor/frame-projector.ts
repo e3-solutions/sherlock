@@ -7,8 +7,10 @@ import {
   throwIfReservedConnectionLost,
 } from "./database.ts";
 import {
+  COMPATIBLE_FRAME_VERSION,
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
+  FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
@@ -66,6 +68,7 @@ export function revisionInsertBatches<T>(values: readonly T[]): T[][] {
 export interface FrameProjectionOptions {
   workspaceId: string;
   sessionId: string;
+  frameVersion?: string;
   requestGeneration: bigint;
   statementTimeoutMs?: number;
   deadlineAtMs?: number;
@@ -171,7 +174,17 @@ export function frameSourceNormalizerPredicateSql(
   sessionAlias: string,
   batchAlias: string,
   cutoverAlias: string,
+  frameVersion = FRAME_VERSION,
 ): string {
+  if (frameVersion === FRAME_VERSION) {
+    return `(${batchAlias}.source_provider = 'codex'
+      and ${eventAlias}.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+      or ${batchAlias}.source_provider = 'claude_code'
+      and ${eventAlias}.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}')`;
+  }
+  if (frameVersion !== COMPATIBLE_FRAME_VERSION) {
+    throw new Error("unsupported frame version");
+  }
   return `(
     ${batchAlias}.source_provider = 'claude_code'
     and ${eventAlias}.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
@@ -196,7 +209,8 @@ export function frameSourceNormalizerPredicateSql(
   )`;
 }
 
-export const FRAME_SOURCE_EVENTS_SQL = `
+export function frameSourceEventsSql(frameVersion = FRAME_VERSION): string {
+  return `
 select e.id::text id, s.person_id::text person_id, e.session_id::text session_id,
        e.normalizer_version, e.canonical_scope_key, e.logical_event_key,
        e.source_priority, e.event_kind, e.event_subtype,
@@ -238,7 +252,9 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
     on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
   ${frameSourceCutoverJoinSql("s", "ib", "cutover")}
  where e.workspace_id = $1 and e.session_id = $2
-   and ${frameSourceNormalizerPredicateSql("e", "s", "ib", "cutover")}
+   and ${
+    frameSourceNormalizerPredicateSql("e", "s", "ib", "cutover", frameVersion)
+  }
    and e.id <= $3 and not e.is_replay
    and (
      (
@@ -279,6 +295,8 @@ select e.id::text id, s.person_id::text person_id, e.session_id::text session_id
    )
  order by e.id
 `;
+}
+export const FRAME_SOURCE_EVENTS_SQL = frameSourceEventsSql();
 
 const PREVIOUS_SQL = `
 select distinct on (evidence_kind, source_event_id)
@@ -297,7 +315,10 @@ select distinct on (evidence_kind, source_event_id)
  order by evidence_kind, source_event_id, id desc
 `;
 
-export const FRAME_SOURCE_COORDINATES_SQL = `
+export function frameSourceCoordinatesSql(
+  frameVersion = FRAME_VERSION,
+): string {
+  return `
 select max(e.id)::text through_event_id, count(*)::text source_event_count,
        max(e.id) filter (where
          coalesce(e.occurred_at, e.observed_at, e.server_received_at)
@@ -314,9 +335,13 @@ select max(e.id)::text through_event_id, count(*)::text source_event_count,
     on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
   ${frameSourceCutoverJoinSql("s", "ib", "cutover")}
  where e.workspace_id = $1 and e.session_id = $2
-   and ${frameSourceNormalizerPredicateSql("e", "s", "ib", "cutover")}
+   and ${
+    frameSourceNormalizerPredicateSql("e", "s", "ib", "cutover", frameVersion)
+  }
    and not e.is_replay
 `;
+}
+export const FRAME_SOURCE_COORDINATES_SQL = frameSourceCoordinatesSql();
 
 const REVISION_COLUMNS = [
   "receipt_id",
@@ -356,6 +381,7 @@ export class PostgresFrameEvidenceProjector {
   async projectSession(
     options: FrameProjectionOptions,
   ): Promise<FrameProjectionResult> {
+    const frameVersion = options.frameVersion ?? FRAME_VERSION;
     const coveredThrough = options.now ?? new Date();
     const coveredFrom = new Date(
       coveredThrough.getTime() - FRAME_WINDOW_HOURS * 60 * 60 * 1_000,
@@ -363,7 +389,7 @@ export class PostgresFrameEvidenceProjector {
     const lockKey = JSON.stringify([
       options.workspaceId,
       options.sessionId,
-      FRAME_VERSION,
+      frameVersion,
     ]);
     const connection = options.deadlineAtMs === undefined
       ? await this.sql.reserve()
@@ -418,12 +444,15 @@ export class PostgresFrameEvidenceProjector {
           const sessionStartedAt = dateString(sessions[0].started_at);
           const sessionUpdatedAt = String(sessions[0].session_updated_at);
           await refreshTransactionTimeout();
-          const coordinates = await tx.unsafe(FRAME_SOURCE_COORDINATES_SQL, [
-            options.workspaceId,
-            options.sessionId,
-            coveredThrough.toISOString(),
-            FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
-          ]);
+          const coordinates = await tx.unsafe(
+            frameSourceCoordinatesSql(frameVersion),
+            [
+              options.workspaceId,
+              options.sessionId,
+              coveredThrough.toISOString(),
+              FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
+            ],
+          );
           if (coordinates[0].future_event_id !== null) {
             throw new Error(
               `frame projection blocked by future event ${
@@ -438,7 +467,7 @@ export class PostgresFrameEvidenceProjector {
             String(coordinates[0].source_event_count),
           );
           await refreshTransactionTimeout();
-          const rows = await tx.unsafe(FRAME_SOURCE_EVENTS_SQL, [
+          const rows = await tx.unsafe(frameSourceEventsSql(frameVersion), [
             options.workspaceId,
             options.sessionId,
             throughEventId?.toString() ?? null,
@@ -457,7 +486,7 @@ export class PostgresFrameEvidenceProjector {
           const previousRows = await tx.unsafe(PREVIOUS_SQL, [
             options.workspaceId,
             options.sessionId,
-            FRAME_VERSION,
+            frameVersion,
             coveredFrom.toISOString(),
             coveredThrough.toISOString(),
             FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
@@ -477,16 +506,20 @@ export class PostgresFrameEvidenceProjector {
             and source_event_count = $5 and source_state_sha256 = $6
             and request_generation = $7
             and session_updated_at = $8::text::timestamptz
+            and covered_from <= $9::timestamptz
+            and covered_through >= $10::timestamptz
           order by id desc limit 1`,
             [
               options.workspaceId,
               options.sessionId,
-              FRAME_VERSION,
+              frameVersion,
               throughEventId?.toString() ?? null,
               sourceEventCount.toString(),
               sourceStateSha256,
               options.requestGeneration.toString(),
               sessionUpdatedAt,
+              coveredFrom.toISOString(),
+              coveredThrough.toISOString(),
             ],
           );
           if (exact.length > 0) {
@@ -509,7 +542,7 @@ export class PostgresFrameEvidenceProjector {
               options.workspaceId,
               options.sessionId,
               String(sessions[0].person_id),
-              FRAME_VERSION,
+              frameVersion,
               coveredFrom.toISOString(),
               coveredThrough.toISOString(),
               throughEventId?.toString() ?? null,
@@ -526,7 +559,7 @@ export class PostgresFrameEvidenceProjector {
               workspace_id: options.workspaceId,
               session_id: options.sessionId,
               person_id: String(sessions[0].person_id),
-              frame_version: FRAME_VERSION,
+              frame_version: frameVersion,
               evidence_kind: change.evidence_kind,
               source_event_id: change.source_event_id.toString(),
               anchor_observed_at: frameTimestampForWrite(

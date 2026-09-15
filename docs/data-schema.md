@@ -173,6 +173,12 @@ rows are retained beside v2 rows; v2 keeps the native `user` role but records
 machine-injected envelopes as `message_origin = 'runtime_context'` instead of
 rewriting them into human prompt facts.
 
+Codex v3 adds the reserved `codex_internal_context` envelope and applies the
+runtime classifier to both `event_msg/user_message` and
+`response_item/message` user records. V1/v2 outputs and the default v2
+normalization target remain frozen. The additive v3 queue trigger schedules a
+second interpretation, preserving the source versions used by existing readers.
+
 ### Activity spans are rebuildable
 
 Activity spans are append-only revisions of logical intervals. A later row
@@ -212,6 +218,15 @@ prompt identity; later frames prefer an existing envelope-backed source when bot
 representations are present. This stabilizes
 duplicate identity over time while keeping the semantic change versioned and
 auditable.
+
+`frame-evidence-v5` selects Codex v3 and the unchanged Claude v1 interpretation.
+It retains runtime activity but excludes it from human prompts and summary
+eligibility. The worker maintains v4 and v5 during rollout; dashboard precedence
+is activated v5, then activated v4, then the older v2 compatibility projection.
+V5 activation requires complete relevant native-record normalization and fresh
+projection receipts whose coverage contains the requested window. Explicit
+bounded v3 replay repairs existing evidence without changing old events or
+snapshot semantics. See the v3 rollout procedure in telemetry-processing.md.
 
 Corrections append tombstones or replacement revisions; application roles
 cannot update or delete history. Reads select the latest revision visible in

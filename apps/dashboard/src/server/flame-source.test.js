@@ -8,6 +8,7 @@ import {
   COMPATIBLE_WORK_FRAME_VERSION,
   DEFAULT_WORK_DETAIL_LIMIT,
   FRAME_VERSION,
+  PREVIOUS_FRAME_VERSION,
   FRESHNESS_NORMALIZER_VERSIONS,
   FRESHNESS_SQL,
   FLAME_SQL,
@@ -696,6 +697,7 @@ describe("Sherlock Flame payload", () => {
       source.workspaceId,
       FRAME_VERSION,
       COMPATIBLE_WORK_FRAME_VERSION,
+      PREVIOUS_FRAME_VERSION,
     ]);
     expect(unsafe.mock.calls[2][0]).toBe(expectedSql);
     const expectedSnapshot = {

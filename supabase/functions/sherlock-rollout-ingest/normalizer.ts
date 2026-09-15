@@ -7,6 +7,9 @@ import {
 
 export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
+// Explicit opt-in target. Keep the existing default and old outputs frozen
+// while v3 is replayed and the corrected dashboard projection is activated.
+export const CODEX_V3_NORMALIZER_VERSION = "sherlock.codex-rollout.v3";
 export const ROLE_VERSION = "sherlock.codex-role.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 export const CLAUDE_ROLE_VERSION = "sherlock.claude-code-role.v1";
@@ -191,10 +194,17 @@ export function legacyNormalizerVersionFor(manifest: BatchManifest): string {
 export function normalizerVersionsFor(manifest: BatchManifest): string[] {
   return manifest.source_provider === "claude_code"
     ? [CLAUDE_NORMALIZER_VERSION]
-    : [NORMALIZER_VERSION, LEGACY_CODEX_NORMALIZER_VERSION];
+    : [
+      CODEX_V3_NORMALIZER_VERSION,
+      NORMALIZER_VERSION,
+      LEGACY_CODEX_NORMALIZER_VERSION,
+    ];
 }
 
-export function isRuntimeContextMessage(content: string | null): boolean {
+export function isRuntimeContextMessage(
+  content: string | null,
+  normalizerVersion = NORMALIZER_VERSION,
+): boolean {
   if (content === null) return false;
   const trimmed = content.trimStart();
   if (
@@ -204,7 +214,10 @@ export function isRuntimeContextMessage(content: string | null): boolean {
   }
   const openingTag = /^<([a-z][a-z0-9_-]*)(?:\s[^>\r\n]*)?>/i.exec(trimmed);
   if (!openingTag) return false;
-  return RUNTIME_CONTEXT_ENVELOPE_NAMES.has(openingTag[1].toLowerCase());
+  const name = openingTag[1].toLowerCase();
+  return RUNTIME_CONTEXT_ENVELOPE_NAMES.has(name) ||
+    normalizerVersion === CODEX_V3_NORMALIZER_VERSION &&
+      name === "codex_internal_context";
 }
 
 async function projectClaudeHookBatch(
@@ -973,7 +986,12 @@ async function projectRecord(
     };
   }
   if (nativeType === "event_msg") {
-    return await projectEventMessage(base, payloadType, payload);
+    return await projectEventMessage(
+      base,
+      payloadType,
+      payload,
+      normalizerVersion,
+    );
   }
   if (nativeType === "response_item") {
     return await projectResponseItem(
@@ -990,6 +1008,7 @@ async function projectEventMessage(
   base: EventProjection,
   payloadType: string | null,
   payload: JsonObject | null,
+  normalizerVersion: string,
 ): Promise<EventProjection> {
   if (payloadType === "user_message" || payloadType === "agent_message") {
     const content = stringValue(payload?.message);
@@ -1001,7 +1020,10 @@ async function projectEventMessage(
       event_subtype: payloadType,
       message_role: role,
       message_origin: role === "user"
-        ? "human"
+        ? normalizerVersion === CODEX_V3_NORMALIZER_VERSION &&
+            isRuntimeContextMessage(content, normalizerVersion)
+          ? RUNTIME_CONTEXT_MESSAGE_ORIGIN
+          : "human"
         : assistantMessageOrigin(base.actor_role),
       logical_event_key: messageLogicalKey(base, role),
     };
@@ -1058,8 +1080,8 @@ async function projectResponseItem(
     }
     const content = messageText(payload?.content);
     const runtimeContext = role === "user" &&
-      normalizerVersion === NORMALIZER_VERSION &&
-      isRuntimeContextMessage(content);
+      normalizerVersion !== LEGACY_CODEX_NORMALIZER_VERSION &&
+      isRuntimeContextMessage(content, normalizerVersion);
     return {
       ...base,
       ...(await messageFields(content)),

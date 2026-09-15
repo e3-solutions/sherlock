@@ -3,6 +3,7 @@ import {
   diffEvidence,
   type EvidenceState,
   FRAME_SOURCE_EVENTS_SQL,
+  frameSourceEventsSql,
   PostgresFrameEvidenceProjector,
   revisionInsertBatches,
   type SourceEvent,
@@ -257,20 +258,22 @@ Deno.test("projector reads only bounded source metadata and never copies content
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $3"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("analytics.normalizer_cutovers"));
   assert(
-    FRAME_SOURCE_EVENTS_SQL.includes("s.started_at >= cutover.cutover_at"),
+    frameSourceEventsSql("frame-evidence-v4").includes(
+      "s.started_at >= cutover.cutover_at",
+    ),
   );
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v1"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v3"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v2"));
 });
 
-Deno.test("activation proves only the session-selected normalization version", () => {
+Deno.test("activation requires corrected normalization for every native record", () => {
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.native_records"),
   );
   assert(MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.events"));
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes(
-      "session.started_at",
+      "sherlock.codex-rollout.v3",
     ),
   );
   assert(
@@ -282,13 +285,17 @@ Deno.test("activation proves only the session-selected normalization version", (
     !MISSING_NORMALIZATION_BATCHES_SQL.includes("processing.telemetry_jobs"),
   );
   assert(
-    MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v1"),
+    !MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v1"),
   );
   assert(
-    MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v2"),
+    !MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v2"),
   );
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("not exists ("));
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("telemetry.events legacy"));
+  assert(frameSourceEventsSql("frame-evidence-v4").includes("not exists ("));
+  assert(
+    frameSourceEventsSql("frame-evidence-v4").includes(
+      "telemetry.events legacy",
+    ),
+  );
 });
 
 Deno.test("large revision writes are split below PostgreSQL's parameter limit", () => {

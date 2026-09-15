@@ -1,10 +1,10 @@
 #!/usr/bin/env -S deno run --allow-env --allow-net
 
 import postgres from "npm:postgres@3.4.7";
+import { relevantBatchSql } from "./codex-v3-coverage.ts";
 import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
-  FRAME_CODEX_NORMALIZER_VERSION,
-  FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
+  FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
@@ -29,6 +29,7 @@ interface ActivationOptions {
   workspaceId: string;
   activate: boolean;
   windowStart?: Date;
+  windowEnd?: Date;
 }
 
 const RELEVANT_EVENT_WINDOW_SQL = `(
@@ -64,7 +65,7 @@ with selected_events as materialized (
    group by e.session_id, e.session_updated_at
 ), latest_receipt as (
   select distinct on (session_id)
-         session_id, through_event_id, source_event_count, session_updated_at
+         session_id, through_event_id, source_event_count, session_updated_at, covered_from, covered_through
     from analytics.frame_projection_receipts
    where workspace_id = $1 and frame_version = $2
    order by session_id, id desc
@@ -76,6 +77,8 @@ select current_source.session_id::text session_id
     or latest_receipt.through_event_id is distinct from current_source.through_event_id
     or latest_receipt.source_event_count <> current_source.source_event_count
     or latest_receipt.session_updated_at <> current_source.session_updated_at
+    or latest_receipt.covered_from > $3::timestamptz
+    or latest_receipt.covered_through < $5::timestamptz
  order by current_source.session_id
  limit 20
 `;
@@ -83,17 +86,8 @@ select current_source.session_id::text session_id
 export const MISSING_NORMALIZATION_BATCHES_SQL = `
 select batch.id::text batch_id
   from telemetry.ingest_batches batch
-  left join telemetry.sessions session
-    on session.workspace_id = batch.workspace_id
-   and session.collector_key = batch.collector_key
-   and session.native_session_id = batch.observed_native_session_id
-  left join analytics.normalizer_cutovers cutover
-    on cutover.workspace_id = batch.workspace_id
-   and cutover.source_provider = batch.source_provider
-   and cutover.to_normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
  where batch.workspace_id = $1
-   and coalesce(batch.last_occurred_at, batch.committed_at)
-       >= $2::timestamptz - make_interval(secs => $3)
+   and ${relevantBatchSql("($2::timestamptz - make_interval(secs => $3))")}
    and exists (
      select 1
        from telemetry.native_records record
@@ -108,25 +102,7 @@ select batch.id::text batch_id
                batch.source_provider = 'claude_code'
                and event.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
                or batch.source_provider = 'codex'
-               and (
-                 cutover.cutover_at is null
-                 or coalesce(
-                   session.started_at,
-                   batch.first_occurred_at,
-                   batch.committed_at
-                 ) >= cutover.cutover_at
-               )
-               and event.normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
-               or batch.source_provider = 'codex'
-               and coalesce(
-                 session.started_at,
-                 batch.first_occurred_at,
-                 batch.committed_at
-               ) < cutover.cutover_at
-               and event.normalizer_version in (
-                 '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}',
-                 '${FRAME_CODEX_NORMALIZER_VERSION}'
-               )
+               and event.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
              )
         )
    )
@@ -161,6 +137,7 @@ export async function proveAndActivateFrameProjection(
       FRAME_VERSION,
       windowStart.toISOString(),
       FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
+      (options.windowEnd ?? new Date()).toISOString(),
     ]);
     if (missing.length > 0) {
       throw new Error(
@@ -262,6 +239,7 @@ if (import.meta.main) {
       workspaceId: options.workspaceId,
       activate: options.activate,
       windowStart: coveredFrom,
+      windowEnd: coveredThrough,
     });
     console.log(JSON.stringify({
       event: options.activate
