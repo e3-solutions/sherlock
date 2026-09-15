@@ -1,5 +1,4 @@
 export const FRAME_VERSION = "frame-evidence-v5";
-export const COMPATIBLE_FRAME_VERSION = "frame-evidence-v4";
 export const FRAME_CORRECTED_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v3";
 
 export const FRAME_LEGACY_CODEX_NORMALIZER_VERSION =

@@ -182,103 +182,34 @@ safe.
 
 ## Deploy and rollback order
 
-### Codex v3 prompt correction (COR-4262)
+The Codex v3 change is forward-only. New uploads are normalized once with v3,
+including uploads from existing sessions; existing jobs and facts are unchanged.
+Known runtime envelopes are excluded from human prompts. No collector update or
+historical normalization replay is required.
 
-This is a separate, explicitly bounded correction to the earlier v2 rollout
-below. It preserves raw batches and v1/v2 interpretations, and does not change
-token accounting. The reserved `codex_internal_context` envelope is classified
-from full message content in both Codex user-message representations. Quoted
-tags and mid-message mentions remain human content; unknown future runtime
-envelopes require another versioned classifier change.
+1. Deploy the v3-capable worker and dashboard together. The worker produces only
+   frame v5, selecting existing legacy facts alongside new v3 facts. The dashboard
+   retains old snapshot readers and serves v4 until v5 is activated.
+2. Run `scripts/backfill-frame-evidence.ts --workspace <uuid> --activate` with
+   `SUPABASE_DB_URL` to project the current 26-hour window from **already normalized
+   facts**. This is the existing projection handoff, not a raw-data replay or
+   historical classification repair. Activation requires complete normalization
+   and matching projection receipts. Coordinate steps 1–2: v4 stops refreshing
+   when the new worker starts and remains stale until activation completes.
+3. Apply `20260915154051_codex_v3_runtime_classification.sql`. It replaces routing
+   in the existing trigger so each newly committed Codex batch gets one v3 job.
+   Claude retains its existing normalizer. Existing v1/v2 jobs drain unchanged.
+4. Send a new human prompt and verify it appears once; verify a known runtime
+   continuation appears as activity but contributes zero new human prompts.
 
-1. Deploy the v3-capable worker. It continues processing old-version jobs and
-   projects both v4 and v5 under the existing job deadline. Deploy the dashboard
-   reader, which prefers v5 only when an activation fact exists and otherwise
-   keeps serving v4. The older v2 compatibility path and issued tokens remain
-   supported.
-2. Apply `20260915154051_codex_v3_runtime_classification.sql`. The new trigger
-   schedules v3 alongside the existing v1/v2 target for new Codex batches.
-   It does not enqueue historical work or change the old cutover. Do not roll
-   the worker back to a build without v3 support while v3 jobs are pending.
-3. Preview the explicitly selected workspace and UTC interval. Start at least
-   26 hours plus 6 seconds before the frame rebuild time to cover the worker's
-   pairing neighborhood. The end bounds batch commit time; use a current end
-   and repeat if newly committed overlapping batches require replay.
+Old false-positive counts remain as recorded. The normalizer keeps v1/v2 support
+for previously queued jobs and reproducibility; it does not continually produce
+those versions for new uploads.
 
-   ```sh
-   deno run --config workers/telemetry-processor/deno.json --allow-env --allow-net \
-     scripts/replay-codex-v3.ts --workspace WORKSPACE_UUID \
-     --start START_UTC --end END_UTC
-   ```
-
-   `SUPABASE_DB_URL` supplies an owner connection; no credential belongs in
-   command arguments. Review `candidates` and `missing_jobs`, then run the same
-   command with `--apply`. This only inserts missing jobs in the backfill lane.
-   It never resets leased, completed, or failed jobs. Resolve failed jobs through
-   the existing audited retry workflow. Overlapping batches, late uploads, and
-   old envelopes with in-window normalized native-item timestamps are included.
-4. After v3 normalization drains, rebuild and validate the current frame window:
-
-   ```sh
-   deno run --config workers/telemetry-processor/deno.json --allow-env --allow-net \
-     scripts/backfill-frame-evidence.ts --workspace WORKSPACE_UUID
-   ```
-
-   Rerun with `--activate` only after validation. Activation rechecks native
-   record coverage, source counts/cutoffs, session state, and receipt time
-   coverage in one repeatable-read transaction. Missing v3 events or stale
-   receipts block the switch. A concurrent source change may require another
-   replay/projection pass. The command repairs the dashboard's rolling 26-hour
-   evidence window; older v1/v2 history is retained, not silently rewritten.
-5. Verify the affected frame after activation: automatic continuations contribute
-   zero human prompts, genuine human input still counts, and interval/MCP
-   evidence agrees with the aggregate. Monitor normalization lag and job
-   deadlines: dual normalization/projection adds work. Local integration tests
-   establish correctness, not production throughput capacity.
-
-Rollback: use the preceding v4 dashboard reader while retaining the v3-capable
-worker and additive schema. Old snapshot tokens remain tied to their frame
-version; a reader without v5 support explicitly rejects those tokens rather
-than reinterpreting them. Do not delete activation facts, old/corrected events,
-raw records, receipts, or revisions. Retiring dual processing is separate work
-after old-reader requirements are removed.
-
-### Original v2 rollout
-
-1. Deploy the version-aware worker first. It treats legacy normalize jobs whose
-   target version is still null as that provider's v1, so it is safe before and
-   after the queue migration. Existing v1 events and raw batches stay immutable.
-2. Apply the additive queue and cutover migrations. Each workspace records the
-   first Codex v2 job time as its immutable session boundary. Do not enqueue
-   historical Codex batches: pre-cutover sessions remain on v1 and later
-   sessions use v2. During the already-started transition, a pre-cutover
-   session may use an existing v2 record only when no v1 fact exists for that
-   source record; this closes the live gap without replaying it.
-3. Project the current 26-hour window into frame v4. In one repeatable-read
-   owner transaction, prove
-   each latest receipt exactly matches the session's accepted-version event
-   maximum, event count, and `updated_at`, then insert the one
-   workspace/version activation fact. The worker cannot self-activate.
-4. Enable the dashboard's versioned projection path. Existing v1 snapshot
-   tokens continue on the raw path for their bounded lifetime.
-5. Upload a smoke batch and verify v2 normalized message origins, search,
-   activity spans, frame receipts, revisions, and indexed frame reads.
-
-For application rollback, stop minting projection-backed tokens before rolling
-the worker back, then let all queued or leased jobs drain and review or requeue
-terminal failures. An activation row is an immutable capability fact, not a
-mutable on/off flag: the reader checks whether the exact workspace/version row
-exists, and rollback does not delete it. A dashboard version that retains the v2
-reader must continue honoring already-issued v2 tokens until their normal
-25-hour expiry; a dashboard rollback that removes v2 support must reject those
-tokens explicitly instead of falling back to raw reads. Keep the migration,
-queue history, raw objects, normalized events, activity revisions, and frame
-projection history. Never delete frame receipts or revisions to roll back a
-reader. Because
-the old full-scan Cron remains disabled, stopping Railway also intentionally
-disables automatic activity reduction; this is a degraded emergency mode, not
-a steady state. Do not stop Railway with backlog present, delete queue/raw rows,
-or re-enable the full-workspace Cron as a permanent design.
+Rollback requires a coordinated worker/reader release that still accepts v3 facts
+and queued jobs. Do not deploy a v2-only worker after enabling v3 routing, delete
+activation facts, rewrite old events, or reactivate v4 as a live view of v3 data.
+Preserve issued snapshot support and all raw and derived history.
 
 ## Oversized native records
 

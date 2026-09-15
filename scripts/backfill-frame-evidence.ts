@@ -1,10 +1,11 @@
 #!/usr/bin/env -S deno run --allow-env --allow-net
 
 import postgres from "npm:postgres@3.4.7";
-import { relevantBatchSql } from "./codex-v3-coverage.ts";
 import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
+  FRAME_CODEX_NORMALIZER_VERSION,
   FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
+  FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
@@ -86,8 +87,17 @@ select current_source.session_id::text session_id
 export const MISSING_NORMALIZATION_BATCHES_SQL = `
 select batch.id::text batch_id
   from telemetry.ingest_batches batch
+  left join telemetry.sessions session
+    on session.workspace_id = batch.workspace_id
+   and session.collector_key = batch.collector_key
+   and session.native_session_id = batch.observed_native_session_id
+  left join analytics.normalizer_cutovers cutover
+    on cutover.workspace_id = batch.workspace_id
+   and cutover.source_provider = batch.source_provider
+   and cutover.to_normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
  where batch.workspace_id = $1
-   and ${relevantBatchSql("($2::timestamptz - make_interval(secs => $3))")}
+   and coalesce(batch.last_occurred_at, batch.committed_at)
+       >= $2::timestamptz - make_interval(secs => $3)
    and exists (
      select 1
        from telemetry.native_records record
@@ -102,7 +112,27 @@ select batch.id::text batch_id
                batch.source_provider = 'claude_code'
                and event.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
                or batch.source_provider = 'codex'
-               and event.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+               and (event.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+                 or (
+                 cutover.cutover_at is null
+                 or coalesce(
+                   session.started_at,
+                   batch.first_occurred_at,
+                   batch.committed_at
+                 ) >= cutover.cutover_at
+               )
+               and event.normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
+               or batch.source_provider = 'codex'
+               and coalesce(
+                 session.started_at,
+                 batch.first_occurred_at,
+                 batch.committed_at
+               ) < cutover.cutover_at
+               and event.normalizer_version in (
+                 '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}',
+                 '${FRAME_CODEX_NORMALIZER_VERSION}'
+               )
+               )
              )
         )
    )

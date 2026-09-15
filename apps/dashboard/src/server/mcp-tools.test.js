@@ -9,7 +9,7 @@ import {
 
 const START = "2026-08-18T03:30:00.000Z";
 const READ = "2026-08-19T03:30:08.000Z";
-const SNAPSHOT = "v1.snapshot";
+const SNAPSHOT = `v4.${Buffer.from(JSON.stringify(["100:100:", READ])).toString("base64url")}`;
 const ADA = "11111111-1111-4111-8111-111111111111";
 const GRACE = "22222222-2222-4222-8222-222222222222";
 
@@ -54,6 +54,12 @@ function dayPayload(people = null) {
 }
 
 describe("Bonaparte MCP usage evidence", () => {
+  it("reports the selected frame rather than a hardcoded normalizer", () => {
+    const payload = dayPayload();
+    payload.snapshot = `v2.${Buffer.from(JSON.stringify(["100:100:", READ, "frame-evidence-v5"])).toString("base64url")}`;
+    expect(listUsageEvidence(payload).provenance.projectionVersion).toBe("frame-evidence-v5");
+  });
+
   it("returns versioned explicit facts and only prompt-bearing buckets", () => {
     const result = listUsageEvidence(dayPayload());
 
@@ -65,7 +71,7 @@ describe("Bonaparte MCP usage evidence", () => {
         endExclusive: "2026-08-19T03:30:00.000Z",
         readAt: READ,
       },
-      provenance: { projectionVersion: "sherlock.codex-rollout.v2" },
+      provenance: { projectionVersion: "raw-snapshot-v4" },
       coverage: {
         state: "partial",
         basis: "observed_canonical_events",

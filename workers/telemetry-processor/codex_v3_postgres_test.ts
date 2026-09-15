@@ -10,14 +10,8 @@ import { PostgresBatchNormalizer } from "../../supabase/functions/sherlock-rollo
 import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";
 import { SupabaseRawStorage, TelemetryProcessor } from "./processor.ts";
 import { ACTIVITY_VERSION } from "../../supabase/functions/sherlock-activity-reducer/reducer.ts";
-import {
-  MISSING_NORMALIZATION_BATCHES_SQL,
-  proveAndActivateFrameProjection,
-} from "../../scripts/backfill-frame-evidence.ts";
-import {
-  parseReplayArgs,
-  replayCodexV3,
-} from "../../scripts/replay-codex-v3.ts";
+import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
+import { createSherlockQuerySource } from "../../apps/dashboard/src/server/mcp-query-source.js";
 import {
   decodeSnapshotToken,
   DirectFlameSource,
@@ -35,28 +29,6 @@ async function rejects(operation: () => Promise<unknown>, expected: string) {
   }
   throw new Error(`expected rejection: ${expected}`);
 }
-
-Deno.test("v3 replay requires an explicit finite workspace window", () => {
-  for (
-    const args of [[], ["--workspace", crypto.randomUUID()], [
-      "--workspace",
-      crypto.randomUUID(),
-      "--start",
-      "2026-09-15T00:00:00Z",
-      "--end",
-      "2026-09-14T00:00:00Z",
-    ]]
-  ) {
-    let failed = false;
-    try {
-      parseReplayArgs(args);
-    } catch {
-      failed = true;
-    }
-    assert(failed, "unbounded or reversed replay accepted");
-  }
-});
-
 const permission = await Deno.permissions.query({
   name: "env",
   variable: "SHERLOCK_TEST_DATABASE_URL",
@@ -64,10 +36,9 @@ const permission = await Deno.permissions.query({
 const databaseUrl = permission.state === "granted"
   ? Deno.env.get("SHERLOCK_TEST_DATABASE_URL")
   : undefined;
-
 Deno.test({
   name:
-    "v3 replay preserves source history, gates activation, and corrects dashboard counts and evidence",
+    "new uploads use one v3 interpretation in continuing sessions and retain old history",
   ignore: !databaseUrl,
   sanitizeOps: false,
   sanitizeResources: false,
@@ -96,107 +67,116 @@ Deno.test({
     const nativeId = `msg_${idHex.slice(0, 8)}-${
       idHex.slice(8)
     }-7000-8000-000000000001`;
-    const records = [
-      { type: "session_meta", payload: { id: nativeSessionId, source: "cli" } },
-      { type: "event_msg", payload: { type: "user_message", message: goal } },
-      {
-        type: "response_item",
-        payload: {
-          type: "message",
-          id: nativeId,
-          role: "user",
-          content: [{ type: "input_text", text: goal }],
-        },
-      },
-      { type: "event_msg", payload: { type: "user_message", message: human } },
-    ].map((record) => ({ ...record, timestamp: at.toISOString() }));
-    const parts = records.map((record) =>
-      new TextEncoder().encode(JSON.stringify(record) + "\n")
-    );
-    const source = new Uint8Array(
-      parts.reduce((size, part) => size + part.length, 0),
-    );
-    let offset = 0;
-    const locators: BatchManifest["records"] = [];
-    for (const [index, part] of parts.entries()) {
-      source.set(part, offset);
-      locators.push({
-        record_index: index,
-        source_start_offset: offset,
-        source_end_offset: offset + part.length,
-        record_sha256: await sha256Hex(part),
-        native_type: records[index].type,
-        native_payload_type: records[index].payload.type ?? null,
-        occurred_at: at.toISOString(),
-        parse_status: "ok",
-      });
-      offset += part.length;
-    }
-    const hash = await sha256Hex(source);
-    const manifest: BatchManifest = {
-      contract_version: CONTRACT_VERSION,
-      source_provider: "codex",
-      source_kind: "rollout",
-      source_stream_key: crypto.randomUUID(),
-      generation_key: crypto.randomUUID(),
-      generation_seq: 0,
-      start_offset: 0,
-      end_offset: source.length,
-      source_byte_count: source.length,
-      source_sha256: hash,
-      storage_encoding: "gzip",
-      stored_byte_count: source.length,
-      stored_sha256: hash,
-      record_count: records.length,
-      records: locators,
-      observed_native_session_id: nativeSessionId,
-      observed_parent_native_session_id: null,
-      first_occurred_at: at.toISOString(),
-      last_occurred_at: at.toISOString(),
-      codex_version: "test",
-      source_version: "test",
-      collector_version: "test",
-    };
-    const dashboard = new DirectFlameSource({
-      databaseUrl,
-      workspaceId,
-      expectedEmailDomain: "e3group.ai",
-    });
-    try {
-      await sql.unsafe(
-        "insert into telemetry.workspaces (id,slug,name,created_at) values ($1::uuid,$1::text,'V3 test',$2)",
-        [workspaceId, start],
+    async function upload(
+      messages: Array<{ type: string; payload: Record<string, unknown> }>,
+    ) {
+      const records = [{
+        type: "session_meta",
+        payload: { id: nativeSessionId, source: "cli" },
+      }, ...messages]
+        .map((record) => ({ ...record, timestamp: at.toISOString() }));
+      const parts = records.map((record) =>
+        new TextEncoder().encode(JSON.stringify(record) + "\n")
       );
-      await sql.unsafe(
-        "insert into telemetry.people (id,workspace_id,identity_key,display_name,email) values ($1::uuid,$2,$1::text,'V3 test','v3-test@e3group.ai')",
-        [personId, workspaceId],
+      const source = new Uint8Array(
+        parts.reduce((size, part) => size + part.length, 0),
       );
+      let offset = 0;
+      const locators: BatchManifest["records"] = [];
+      for (const [index, part] of parts.entries()) {
+        source.set(part, offset);
+        locators.push({
+          record_index: index,
+          source_start_offset: offset,
+          source_end_offset: offset + part.length,
+          record_sha256: await sha256Hex(part),
+          native_type: records[index].type,
+          native_payload_type: typeof records[index].payload.type === "string"
+            ? String(records[index].payload.type)
+            : null,
+          occurred_at: at.toISOString(),
+          parse_status: "ok",
+        });
+        offset += part.length;
+      }
+      const hash = await sha256Hex(source);
+      const manifest: BatchManifest = {
+        contract_version: CONTRACT_VERSION,
+        source_provider: "codex",
+        source_kind: "rollout",
+        source_stream_key: crypto.randomUUID(),
+        generation_key: crypto.randomUUID(),
+        generation_seq: 0,
+        start_offset: 0,
+        end_offset: source.length,
+        source_byte_count: source.length,
+        source_sha256: hash,
+        storage_encoding: "gzip",
+        stored_byte_count: source.length,
+        stored_sha256: hash,
+        record_count: records.length,
+        records: locators,
+        observed_native_session_id: nativeSessionId,
+        observed_parent_native_session_id: null,
+        first_occurred_at: at.toISOString(),
+        last_occurred_at: at.toISOString(),
+        codex_version: "test",
+        source_version: "test",
+        collector_version: "test",
+      };
       const receipt = await repository.commit(
         attribution,
         manifest,
         storagePath(attribution, manifest),
         null,
       );
-      const jobs = await sql.unsafe(
-        "select normalizer_version from processing.telemetry_jobs where workspace_id=$1 order by normalizer_version",
-        [workspaceId],
+      return { receipt, manifest, source };
+    }
+    const dashboard = new DirectFlameSource({
+      databaseUrl,
+      workspaceId,
+      expectedEmailDomain: "e3group.ai",
+    });
+    const rawDashboard = new DirectFlameSource({
+      databaseUrl,
+      workspaceId,
+      expectedEmailDomain: "e3group.ai",
+      projectionEnabled: false,
+    });
+    try {
+      await sql.unsafe(
+        "insert into telemetry.workspaces(id,slug,name,created_at) values ($1::uuid,$1::text,'Forward test',$2)",
+        [workspaceId, start],
       );
-      assert(
-        jobs.length === 2 &&
-          jobs.some((job) =>
-            job.normalizer_version === "sherlock.codex-rollout.v3"
-          ),
-        "new batch must enqueue legacy and v3 jobs",
+      await sql.unsafe(
+        "insert into telemetry.people(id,workspace_id,identity_key,display_name,email) values($1::uuid,$2,$1::text,'Forward test','forward@e3group.ai')",
+        [personId, workspaceId],
       );
-      const legacy = await normalizer.normalize(
-        receipt,
-        manifest,
-        source,
+      // Seed an existing immutable v2 batch, as if it completed before deployment.
+      const prior = await upload([{
+        type: "event_msg",
+        payload: { type: "user_message", message: "Historical human prompt" },
+      }, {
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "Cross-cutover human",
+          turn_id: "cross-turn",
+        },
+      }]);
+      await sql.unsafe(
+        "update processing.telemetry_jobs set normalizer_version='sherlock.codex-rollout.v2' where workspace_id=$1 and batch_id=$2",
+        [workspaceId, prior.receipt.batch_id],
+      );
+      const historical = await normalizer.normalize(
+        prior.receipt,
+        prior.manifest,
+        prior.source,
         undefined,
         undefined,
         "sherlock.codex-rollout.v2",
       );
-      const sessionId = legacy.session_ids[0];
+      const sessionId = historical.session_ids[0];
       const oldRows = await sql.unsafe(
         "select * from telemetry.events where workspace_id=$1 order by id",
         [workspaceId],
@@ -205,34 +185,62 @@ Deno.test({
         "select * from telemetry.native_records where workspace_id=$1 order by id",
         [workspaceId],
       );
-      const oldProject = await projector.projectSession({
-        workspaceId,
-        sessionId,
-        frameVersion: "frame-evidence-v4",
-        requestGeneration: 1n,
-        now,
-      });
-      assert(oldProject.inserted_count > 0, "v4 must remain projectable");
+      const pinnedRaw = await rawDashboard.fetchDay({ now });
+      const next = await upload([
+        { type: "event_msg", payload: { type: "user_message", message: goal } },
+        {
+          type: "response_item",
+          payload: {
+            type: "message",
+            id: nativeId,
+            role: "user",
+            content: [{ type: "input_text", text: goal }],
+          },
+        },
+        {
+          type: "event_msg",
+          payload: { type: "user_message", message: human },
+        },
+      ]);
+      // A native representation of the prior human submission arrives after cutover.
+      const cross = await upload([{
+        type: "response_item",
+        payload: {
+          type: "message",
+          id: nativeId.replace(/1$/, "2"),
+          turn_id: "cross-turn",
+          role: "user",
+          content: [{ type: "input_text", text: "Cross-cutover human" }],
+        },
+      }]);
+      const jobs = await sql.unsafe(
+        "select normalizer_version from processing.telemetry_jobs where workspace_id=$1 and batch_id=$2",
+        [workspaceId, next.receipt.batch_id],
+      );
+      assert(
+        jobs.length === 1 &&
+          jobs[0].normalizer_version === "sherlock.codex-rollout.v3",
+        "continuing session must enqueue exactly one corrected job",
+      );
+      // Even sessions predating the original v2 session cutover now route new uploads to v3.
       await sql.unsafe(
-        "insert into analytics.frame_projection_activations(workspace_id,frame_version) values ($1,'frame-evidence-v4')",
-        [workspaceId],
+        "update telemetry.sessions set started_at=$3 where workspace_id=$1 and id=$2",
+        [workspaceId, sessionId, new Date(start.getTime() - 3600000)],
       );
-      const before = await dashboard.fetchDay({ now });
-      assert(
-        Object(decodeSnapshotToken(before.snapshot)).frameVersion ===
-          "frame-evidence-v4",
-        "v4 fallback lost",
+      const continued = await upload([]);
+      const continuedJobs = await sql.unsafe(
+        "select normalizer_version from processing.telemetry_jobs where workspace_id=$1 and batch_id=$2",
+        [workspaceId, continued.receipt.batch_id],
       );
-      const beforePrompts = await dashboard.fetchPromptEvidence({
-        personId,
-        start: at.toISOString(),
-        snapshot: before.snapshot,
-        signal: undefined,
-        now,
-      });
       assert(
-        beforePrompts.eligiblePromptCount > 1,
-        "fixture must reproduce inflated old count",
+        continuedJobs.length === 1 &&
+          continuedJobs[0].normalizer_version === "sherlock.codex-rollout.v3",
+        "pre-cutover session received legacy or duplicate work",
+      );
+      // Restore the fixture's original source selection for its historical v2 fact.
+      await sql.unsafe(
+        "update telemetry.sessions set started_at=$3 where workspace_id=$1 and id=$2",
+        [workspaceId, sessionId, at],
       );
       const proof = {
         workspaceId,
@@ -244,68 +252,30 @@ Deno.test({
         () => proveAndActivateFrameProjection(sql, proof),
         "without current normalization",
       );
-      // A historical batch predating the v3 trigger has no v3 job. Removing this
-      // unprocessed test job emulates that state; no production replay deletes jobs.
-      await sql.unsafe(
-        "delete from processing.telemetry_jobs where workspace_id=$1 and normalizer_version='sherlock.codex-rollout.v3'",
-        [workspaceId],
-      );
-      const replay = {
-        workspaceId,
-        start: start.toISOString(),
-        end: new Date().toISOString(),
-        apply: false,
-      };
-      const preview = await replayCodexV3(sql, replay);
-      assert(
-        preview.missing_jobs === 1 && preview.enqueued === 0,
-        "replay preview must not enqueue",
-      );
-      const applied = await replayCodexV3(sql, { ...replay, apply: true });
-      assert(
-        applied.enqueued === 1,
-        "bounded replay must enqueue historical v3 job",
-      );
-      assert(
-        (await replayCodexV3(sql, { ...replay, apply: true })).enqueued === 0,
-        "replay enqueue is not idempotent",
-      );
-      assert(
-        (await replayCodexV3(sql, {
-          ...replay,
-          workspaceId: crypto.randomUUID(),
-          apply: true,
-        })).enqueued === 0,
-        "replay escaped workspace",
-      );
-      await normalizer.normalize(
-        receipt,
-        manifest,
-        source,
-        undefined,
-        undefined,
-        "sherlock.codex-rollout.v3",
-      );
-      await normalizer.normalize(
-        receipt,
-        manifest,
-        source,
-        undefined,
-        undefined,
-        "sherlock.codex-rollout.v3",
-      );
+      for (const batch of [next, next, continued, cross]) {
+        await normalizer.normalize(
+          batch.receipt,
+          batch.manifest,
+          batch.source,
+          undefined,
+          undefined,
+          "sherlock.codex-rollout.v3",
+        );
+      }
       const current = await sql.unsafe(
-        "select * from telemetry.events where workspace_id=$1 and normalizer_version='sherlock.codex-rollout.v3' order by id",
+        "select * from telemetry.events where workspace_id=$1 and normalizer_version='sherlock.codex-rollout.v3'",
         [workspaceId],
       );
       assert(
-        current.length === records.length,
-        "v3 repeated normalization duplicated events",
+        current.length ===
+          next.manifest.record_count + continued.manifest.record_count +
+            cross.manifest.record_count,
+        "repeated normalization duplicated facts",
       );
       assert(
-        current.filter((event) => event.message_origin === "runtime_context")
-          .length === 2,
-        "both runtime representations must persist as runtime",
+        current.filter((e) => e.message_origin === "runtime_context").length ===
+          2,
+        "both runtime formats must be classified",
       );
       assert(
         JSON.stringify(oldRows) ===
@@ -315,171 +285,121 @@ Deno.test({
               [workspaceId],
             ),
           ),
-        "old events changed",
+        "legacy facts changed",
       );
       assert(
         JSON.stringify(rawRows) ===
           JSON.stringify(
             await sql.unsafe(
-              "select * from telemetry.native_records where workspace_id=$1 order by id",
-              [workspaceId],
+              "select * from telemetry.native_records where workspace_id=$1 and batch_id=$2 order by id",
+              [workspaceId, prior.receipt.batch_id],
             ),
           ),
-        "native records changed",
+        "old raw records changed",
       );
       await rejects(
         () => proveAndActivateFrameProjection(sql, proof),
         "snapshot is stale",
-      );
-      await projector.projectSession({
-        workspaceId,
-        sessionId,
-        requestGeneration: 2n,
-        now: new Date(now.getTime() - 1000),
-      });
-      await rejects(
-        () => proveAndActivateFrameProjection(sql, proof),
-        "snapshot is stale",
-      );
-      await projector.projectSession({
-        workspaceId,
-        sessionId,
-        requestGeneration: 3n,
-        now,
-      });
-      await proveAndActivateFrameProjection(sql, proof);
-      const after = await dashboard.fetchDay({ now });
-      assert(
-        Object(decodeSnapshotToken(after.snapshot)).frameVersion ===
-          "frame-evidence-v5",
-        "complete v5 must take precedence",
-      );
-      const prompts = await dashboard.fetchPromptEvidence({
-        personId,
-        start: at.toISOString(),
-        snapshot: after.snapshot,
-        signal: undefined,
-        now,
-      });
-      assert(
-        prompts.eligiblePromptCount === 1 &&
-          prompts.prompts[0].excerpt === human,
-        "corrected evidence must contain only the human prompt",
-      );
-      assert(
-        after.people[0].buckets.reduce(
-          (sum: number, bucket: number[]) => sum + bucket[3],
-          0,
-        ) === 1,
-        "dashboard aggregate disagrees with evidence",
-      );
-      const interval = await dashboard.fetchInterval({
-        personId,
-        start: at.toISOString(),
-        snapshot: after.snapshot,
-        signal: undefined,
-        now,
-      });
-      assert(
-        interval.prompts.length === 1,
-        "interval summary includes runtime prompt",
-      );
-      const runtimeActivity = await sql.unsafe(
-        "select count(*)::int n from analytics.frame_evidence_revisions where workspace_id=$1 and frame_version='frame-evidence-v5' and evidence_kind='activity' and message_origin='runtime_context'",
-        [workspaceId],
-      );
-      assert(runtimeActivity[0].n > 0, "runtime activity must remain visible");
-      const pinned = await dashboard.fetchPromptEvidence({
-        personId,
-        start: at.toISOString(),
-        snapshot: before.snapshot,
-        signal: undefined,
-        now,
-      });
-      assert(
-        pinned.eligiblePromptCount === beforePrompts.eligiblePromptCount,
-        "v4 snapshot was reinterpreted",
       );
       const processor = new TelemetryProcessor(
         databaseUrl!,
         new SupabaseRawStorage("http://unused.invalid", "unused"),
       );
-      try {
-        await processor.reduce({
-          id: 1n,
+      await processor.reduce(
+        {
+          id: 0n,
           workspace_id: workspaceId,
-          workload_class: "backfill",
-          attempt_count: 1,
-          attempt_limit: 3,
-          lease_token: crypto.randomUUID(),
-          job_kind: "reduce",
           session_id: sessionId,
           normalizer_version: "sherlock.codex-rollout.v3",
           activity_version: ACTIVITY_VERSION,
-          target_event_id: BigInt(current.at(-1)!.id),
-          request_generation: 10n,
-        }, 30_000);
-        const versions = await sql.unsafe(
-          "select distinct frame_version from analytics.frame_projection_receipts where workspace_id=$1 and request_generation=10",
-          [workspaceId],
-        );
-        assert(
-          versions.length === 2,
-          "worker reduction must refresh v4 and v5",
-        );
-      } finally {
-        await processor.close();
-      }
-
-      // A copied native item's creation time can be recent even when the whole
-      // batch's envelope and commit times are old. The replay/gate must find it.
-      const oldBatchId = crypto.randomUUID();
-      const oldAt = new Date(start.getTime() - 86_400_000).toISOString();
-      await sql.unsafe(
-        `insert into telemetry.ingest_batches (
-        id,workspace_id,person_id,collector_key,source_kind,source_stream_key,
-        generation_key,generation_seq,start_offset,end_offset,source_byte_count,
-        source_sha256,storage_path,storage_encoding,stored_byte_count,stored_sha256,
-        record_count,contract_version,first_occurred_at,last_occurred_at,committed_at
-      ) values ($1::uuid,$2,$3,'v3-test','rollout',$1::text,$1::text,0,0,2,2,$4,$1::text,'gzip',2,$4,1,$5,$6,$6,$6)`,
-        [
-          oldBatchId,
-          workspaceId,
-          personId,
-          "c".repeat(64),
-          CONTRACT_VERSION,
-          oldAt,
-        ],
+          request_generation: 1n,
+          job_kind: "reduce",
+          target_event_id: current.reduce(
+            (max, e) => BigInt(e.id) > max ? BigInt(e.id) : max,
+            0n,
+          ),
+          attempt_count: 1,
+          attempt_limit: 3,
+          lease_token: crypto.randomUUID(),
+          workload_class: "live",
+        },
+        30000,
       );
-      const [native] = await sql.unsafe(
-        `insert into telemetry.native_records (
-        workspace_id,batch_id,record_index,source_start_offset,source_end_offset,record_sha256,
-        native_type,native_payload_type,occurred_at,parse_status
-      ) values ($1,$2,0,0,2,$3,'response_item','message',$4,'ok') returning id`,
-        [workspaceId, oldBatchId, "c".repeat(64), oldAt],
+      await processor.close();
+      const versions = await sql.unsafe(
+        "select distinct frame_version from analytics.frame_projection_receipts where workspace_id=$1",
+        [workspaceId],
       );
-      await sql.unsafe(
-        `insert into telemetry.events (
-        workspace_id,session_id,source_record_id,normalizer_version,projection_index,source_priority,
-        event_kind,event_subtype,actor_role,occurred_at,server_received_at,native_item_id
-      ) values ($1,$2,$3,'sherlock.codex-rollout.v2',0,50,'message','message','primary',$4,$4,$5)`,
-        [workspaceId, sessionId, native.id, oldAt, nativeId],
+      assert(
+        versions.length === 1 &&
+          versions[0].frame_version === "frame-evidence-v5",
+        "worker must project only one frame version",
       );
-      const missing = await sql.unsafe(MISSING_NORMALIZATION_BATCHES_SQL, [
+      await projector.projectSession({
         workspaceId,
-        start.toISOString(),
-        6,
-      ]);
+        sessionId,
+        requestGeneration: 2n,
+        now,
+      });
+      await proveAndActivateFrameProjection(sql, proof);
+      const day = await dashboard.fetchDay({ now });
       assert(
-        missing.some((batch) => batch.batch_id === oldBatchId),
-        "native-time batch escaped normalization proof",
+        Object(decodeSnapshotToken(day.snapshot)).frameVersion ===
+          "frame-evidence-v5",
+        "v5 not selected after handoff",
+      );
+      const evidence = await dashboard.fetchPromptEvidence({
+        personId,
+        start: at.toISOString(),
+        snapshot: day.snapshot,
+        signal: undefined,
+        now,
+      });
+      assert(
+        evidence.eligiblePromptCount === 3,
+        "historical, cross-cutover and new human prompts should each count once",
       );
       assert(
-        (await replayCodexV3(sql, { ...replay, end: new Date().toISOString() }))
-          .candidates === 2,
-        "native-time batch escaped bounded replay",
+        evidence.prompts.every((p: { excerpt: string }) =>
+          !p.excerpt.includes("codex_internal_context")
+        ),
+        "new runtime context leaked into prompt evidence",
+      );
+      const rawDay = await rawDashboard.fetchDay({ now });
+      const rawEvidence = await rawDashboard.fetchPromptEvidence({
+        personId,
+        start: at.toISOString(),
+        snapshot: rawDay.snapshot,
+        signal: undefined,
+        now,
+      });
+      assert(
+        rawEvidence.eligiblePromptCount === 3,
+        "raw reader double counted the cross-version prompt or missed new data",
+      );
+      const pinnedEvidence = await rawDashboard.fetchPromptEvidence({
+        personId,
+        start: at.toISOString(),
+        snapshot: pinnedRaw.snapshot,
+        signal: undefined,
+        now,
+      });
+      assert(
+        pinnedEvidence.eligiblePromptCount === 2,
+        "pinned pre-upload snapshot changed",
+      );
+      const query = createSherlockQuerySource(dashboard);
+      const session = await query.fetchSession({ sessionId });
+      assert(
+        session.observedEventCounts.messages === 5,
+        "MCP must include corrected messages and deduplicate the cross-version human",
+      );
+      assert(
+        session.session.provider === "codex",
+        "MCP provider missing for corrected data",
       );
     } finally {
+      await rawDashboard.close();
       await dashboard.close();
       for (
         const table of [

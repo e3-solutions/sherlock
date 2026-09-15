@@ -280,7 +280,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
             raw_watermark: id === workspaceId ? ago(1) : null,
             canonical_watermark: id === workspaceId ? ago(4) : null,
             oldest_pending_normalize: id === workspaceId ? ago(20) : null,
-            pending_normalize_count: id === workspaceId ? "4" : "0",
+            pending_normalize_count: id === workspaceId ? "2" : "0",
           };
           const expected = id === workspaceId
             ? [
@@ -904,7 +904,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         snapshot: legacyDay.snapshot,
         now: partialRead,
       });
-      expect(legacyDay.snapshot).toMatch(/^v3\./);
+      expect(legacyDay.snapshot).toMatch(/^v4\./);
       expect(legacyDay.latest).toBe(partialActivityAt.toISOString());
       expect(legacyDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),

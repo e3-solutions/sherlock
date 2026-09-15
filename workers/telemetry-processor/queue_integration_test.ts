@@ -360,7 +360,7 @@ Deno.test({
       await sql.unsafe(
         `insert into processing.telemetry_jobs (
            workspace_id, job_kind, batch_id, normalizer_version, workload_class
-         ) values ($1, 'normalize', $2, 'sherlock.codex-rollout.v2', 'live')
+         ) values ($1, 'normalize', $2, 'sherlock.codex-rollout.v3', 'live')
          on conflict (workspace_id, batch_id, normalizer_version)
            where job_kind = 'normalize' do nothing`,
         [workspaceId, batchId],
@@ -531,21 +531,10 @@ Deno.test({
           where workspace_id = $1 and collector_key = 'queue-plan-collector'`,
         [workspaceId],
       );
-      // The v3 dual-enqueue contract is exercised in codex_v3_postgres_test.
-      // Complete its sibling here so this single-job lease/fencing scenario
-      // continues to exercise the original version's full lifecycle.
-      await sql.unsafe(
-        `update processing.telemetry_jobs
-        set status='succeeded', completed_at=now(), lease_token=null,
-            lease_owner=null, lease_started_at=null, lease_expires_at=null
-        where workspace_id=$1 and normalizer_version='sherlock.codex-rollout.v3'`,
-        [workspaceId],
-      );
       const count = await sql.unsafe(
         `select count(*)::int as count
            from processing.telemetry_jobs
-          where workspace_id = $1 and batch_id = $2
-            and normalizer_version = 'sherlock.codex-rollout.v2'`,
+          where workspace_id = $1 and batch_id = $2`,
         [workspaceId, batchId],
       );
       assert(Number(count[0].count) === 1, "duplicate enqueue must converge");
@@ -568,7 +557,7 @@ Deno.test({
       assert(claimed !== null, "one worker must claim the job");
       assert(
         claimed.job_kind === "normalize" &&
-          claimed.normalizer_version === "sherlock.codex-rollout.v2",
+          claimed.normalizer_version === "sherlock.codex-rollout.v3",
         "claims must preserve the versioned provider normalization target",
       );
       assert(
@@ -685,14 +674,6 @@ Deno.test({
           independent.batch_id === independentId,
         "another provider stream must remain concurrently eligible",
       );
-      const sibling = await queue.claim("backfill", "independent-version", 60);
-      assert(
-        sibling?.job_kind === "normalize" &&
-          sibling.batch_id === independentId &&
-          sibling.normalizer_version !== independent.normalizer_version,
-        "the second Codex version must be independently eligible",
-      );
-      assert(await queue.complete(sibling) === "succeeded");
       const hook = await queue.claim("backfill", "hook", 60);
       assert(
         hook?.job_kind === "normalize" && hook.batch_id === hookId,

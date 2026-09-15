@@ -21,6 +21,8 @@ import {
   MCP_PROMPT_EVIDENCE_LIMIT,
   NORMALIZER_VERSION,
   NORMALIZER_VERSIONS,
+  PREVIOUS_NORMALIZER_VERSIONS,
+  CORRECTED_CODEX_NORMALIZER_VERSION,
   PEOPLE_SQL,
   PREFERRED_DASHBOARD_EMAIL_DOMAIN,
   PROJECTION_FLAME_SQL,
@@ -416,11 +418,12 @@ describe("Sherlock Flame payload", () => {
     expect(NORMALIZER_VERSIONS).toEqual([
       NORMALIZER_VERSION,
       CLAUDE_NORMALIZER_VERSION,
+      CORRECTED_CODEX_NORMALIZER_VERSION,
     ]);
     for (const sql of [FLAME_SQL, INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
       expect(sql).toContain("$4::text[] normalizer_versions");
       expect(sql).toContain("e.normalizer_version = any(p.normalizer_versions)");
-      expect(sql).toContain("e.normalizer_version, e.logical_event_key, e.event_kind");
+      expect(sql).toContain("then 'codex' else e.normalizer_version end");
     }
   });
 
@@ -560,7 +563,7 @@ describe("Sherlock Flame payload", () => {
   it("round-trips a bounded immutable aggregate snapshot receipt", () => {
     const token = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 
-    expect(token).toMatch(/^v3\.[A-Za-z0-9_-]+$/);
+    expect(token).toMatch(/^v4\.[A-Za-z0-9_-]+$/);
     expect(decodeSnapshotToken(token)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
@@ -571,6 +574,9 @@ describe("Sherlock Flame payload", () => {
       PG_SNAPSHOT,
       READ.toISOString(),
     ])).toString("base64url");
+    expect(decodeSnapshotToken(`v3.${legacyBody}`)).toEqual({
+      snapshot: PG_SNAPSHOT, read: READ, normalizerVersions: PREVIOUS_NORMALIZER_VERSIONS,
+    });
     expect(decodeSnapshotToken(`v1.${legacyBody}`)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
@@ -659,8 +665,8 @@ describe("Sherlock Flame payload", () => {
   it.each([
     [true, false, PROJECTION_FLAME_SQL, "v2", FRAME_VERSION],
     [false, true, PROJECTION_FLAME_SQL, "v2", COMPATIBLE_WORK_FRAME_VERSION],
-    [false, false, FLAME_SQL, "v3", null],
-    [null, null, FLAME_SQL, "v3", null],
+    [false, false, FLAME_SQL, "v4", null],
+    [null, null, FLAME_SQL, "v4", null],
   ])("routes current activation %s and compatible work activation %s", async (
     frameProjectionActive,
     compatibleWorkProjectionActive,
@@ -743,7 +749,7 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.frame_projection_activations");
     expect(unsafe.mock.calls[0][1]).toBeUndefined();
     expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
-    expect(payload.snapshot).toMatch(/^v3\./);
+    expect(payload.snapshot).toMatch(/^v4\./);
   });
 
   it("selects the 60-second transaction timeout only for the cached timeline", async () => {
@@ -768,7 +774,7 @@ describe("Sherlock Flame payload", () => {
     expect(UNKEYED_PROMPT_MATCH_SECONDS).toBe(2);
     expect(FLAME_SQL).toContain("native_identity_candidates as materialized");
     expect(FLAME_SQL).not.toContain("partition by session_id, native_item_id");
-    expect(FLAME_SQL).toContain("'logical:' || canonical_scope_key || ':' || normalizer_version");
+    expect(FLAME_SQL).toContain("'logical:' || canonical_scope_key || ':' || canonical_normalizer_version");
     expect(FLAME_SQL).toContain("'native:' || submitted.native_item_id");
     expect(FLAME_SQL).toContain("'native:' || paired.matched_native_item_id");
     expect(FLAME_SQL).toContain("'event:' || submitted.id::text");
@@ -884,7 +890,7 @@ describe("Sherlock Flame payload", () => {
       "coalesce(\n           'native:' || keyed_native_item_id,",
     );
     expect(FLAME_SQL).toContain(
-      "'logical:' || canonical_scope_key || ':' || normalizer_version",
+      "'logical:' || canonical_scope_key || ':' || canonical_normalizer_version",
     );
   });
 
@@ -904,7 +910,7 @@ describe("Sherlock Flame payload", () => {
       expect(sql).toContain("not e.is_replay");
       expect(sql).toContain("e.actor_role <> 'automation'");
       expect(sql).toContain("partition by e.session_id, e.canonical_scope_key");
-      expect(sql).toContain("e.normalizer_version, e.logical_event_key, e.event_kind");
+      expect(sql).toContain("then 'codex' else e.normalizer_version end");
       expect(sql).toContain("order by e.source_priority desc, e.occurred_at asc nulls last, e.id");
       expect(sql).toContain("where canonical_rank = 1");
       expect(sql).toContain("pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)");

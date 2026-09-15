@@ -7,8 +7,7 @@ import {
 
 export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
-// Explicit opt-in target. Keep the existing default and old outputs frozen
-// while v3 is replayed and the corrected dashboard projection is activated.
+// New queue jobs explicitly target v3; legacy jobs keep reproducible outputs.
 export const CODEX_V3_NORMALIZER_VERSION = "sherlock.codex-rollout.v3";
 export const ROLE_VERSION = "sherlock.codex-role.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";

@@ -3,7 +3,6 @@ import {
   diffEvidence,
   type EvidenceState,
   FRAME_SOURCE_EVENTS_SQL,
-  frameSourceEventsSql,
   PostgresFrameEvidenceProjector,
   revisionInsertBatches,
   type SourceEvent,
@@ -258,7 +257,7 @@ Deno.test("projector reads only bounded source metadata and never copies content
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $3"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("analytics.normalizer_cutovers"));
   assert(
-    frameSourceEventsSql("frame-evidence-v4").includes(
+    FRAME_SOURCE_EVENTS_SQL.includes(
       "s.started_at >= cutover.cutover_at",
     ),
   );
@@ -266,7 +265,7 @@ Deno.test("projector reads only bounded source metadata and never copies content
   assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v2"));
 });
 
-Deno.test("activation requires corrected normalization for every native record", () => {
+Deno.test("activation accepts existing legacy or new corrected normalization", () => {
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.native_records"),
   );
@@ -285,14 +284,14 @@ Deno.test("activation requires corrected normalization for every native record",
     !MISSING_NORMALIZATION_BATCHES_SQL.includes("processing.telemetry_jobs"),
   );
   assert(
-    !MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v1"),
+    MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v1"),
   );
   assert(
-    !MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v2"),
+    MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v2"),
   );
-  assert(frameSourceEventsSql("frame-evidence-v4").includes("not exists ("));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("not exists ("));
   assert(
-    frameSourceEventsSql("frame-evidence-v4").includes(
+    FRAME_SOURCE_EVENTS_SQL.includes(
       "telemetry.events legacy",
     ),
   );

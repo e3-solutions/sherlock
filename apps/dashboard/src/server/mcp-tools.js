@@ -1,7 +1,7 @@
 import {
   BUCKET_COUNT,
   BUCKET_MS,
-  NORMALIZER_VERSION,
+  decodeSnapshotToken,
 } from "./flame-source.js";
 
 export const MCP_USAGE_SCHEMA_VERSION = "bonaparte.usage-evidence.v1";
@@ -73,7 +73,10 @@ export function listUsageEvidence(payload) {
       endExclusive: new Date(startMs + BUCKET_COUNT * BUCKET_MS).toISOString(),
       readAt: readAt.toISOString(),
     },
-    provenance: { projectionVersion: NORMALIZER_VERSION },
+    provenance: {
+      projectionVersion: decodeSnapshotToken(payload.snapshot).frameVersion ??
+        `raw-snapshot-${payload.snapshot.split(".")[0]}`,
+    },
     coverage: {
       state: "partial",
       basis: "observed_canonical_events",
