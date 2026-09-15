@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "collector-final",
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests/collector"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/7c79/sherlock",
+  "started_at": "2026-09-15T04:31:06.156545Z",
+  "ended_at": "2026-09-15T04:31:24.551323Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/opt/homebrew/bin/python3",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/7c79/sherlock",
+    "sha256": "db8f98fafc36d0646b20245d4ca8a6456240902f942fb629ed0e8dba834a4e52"
+  },
+  "log": "runs/collector-final.log",
+  "log_sha256": "8143464df028f6b2118d2249994844830135347db51b2799b75e9ae2774a016c"
+}
