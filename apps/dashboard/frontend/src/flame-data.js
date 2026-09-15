@@ -379,6 +379,35 @@ function requirePullRequest(value, path) {
   return { number, url };
 }
 
+function requireLinkedPrs(value, path) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 50) fail(path, "at most 50 linked PRs");
+  const identities = new Set();
+  return value.map((item, index) => {
+    const itemPath = `${path}[${index}]`;
+    const row = requireObject(item, itemPath);
+    const number = requirePositiveCount(row.number, `${itemPath}.number`);
+    const repository = requireNonemptyString(row.repository, `${itemPath}.repository`);
+    if (!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9_.-]{1,100}$/.test(repository) ||
+        [".", ".."].includes(repository.split("/")[1])) fail(itemPath, "a GitHub repository");
+    const identity = `${repository}#${number}`;
+    if (identities.has(identity)) fail(itemPath, "unique PR identity");
+    identities.add(identity);
+    const status = requireEnum(row.status,
+      ["pending", "checked", "inaccessible", "failed", "identity_mismatch", "out_of_scope"],
+      `${itemPath}.status`);
+    const checkedAt = row.checkedAt === null ? null
+      : new Date(requireDate(row.checkedAt, `${itemPath}.checkedAt`)).toISOString();
+    if (status === "checked") {
+      requirePullRequest(row, itemPath);
+      if (row.url !== `https://github.com/${repository}/pull/${number}` || checkedAt === null) {
+        fail(itemPath, "the checked repository identity and observation time");
+      }
+    } else if (row.url !== null) fail(itemPath, "no URL until identity is checked");
+    return { number, repository, url: row.url, status, checkedAt };
+  });
+}
+
 /** Validates the bounded, snapshot-pinned interval overview response. */
 export function adaptIntervalEvidence(value, expected) {
   const payload = requireObject(value, "interval evidence");
@@ -410,6 +439,8 @@ export function adaptIntervalEvidence(value, expected) {
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
       summary,
       pullRequest: requirePullRequest(item.pullRequest, `${path}.pullRequest`),
+      linkedPrs: requireLinkedPrs(item.linkedPrs, `${path}.linkedPrs`),
+      linkedPrsTruncated: item.linkedPrsTruncated === true,
     };
   });
 

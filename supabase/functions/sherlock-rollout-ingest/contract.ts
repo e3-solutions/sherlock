@@ -37,7 +37,7 @@ export interface RecordLocator {
 export interface BatchManifest {
   contract_version: typeof CONTRACT_VERSION;
   source_provider: "codex" | "claude_code";
-  source_kind: "rollout" | "transcript" | "hook";
+  source_kind: "rollout" | "transcript" | "hook" | "collector";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -76,7 +76,7 @@ export interface CommittedReceipt extends Attribution {
   receipt_version: typeof RECEIPT_VERSION;
   status: "committed";
   batch_id: string;
-  source_kind: "rollout" | "transcript" | "hook";
+  source_kind: "rollout" | "transcript" | "hook" | "collector";
   source_stream_key: string;
   generation_key: string;
   generation_seq: number;
@@ -165,7 +165,10 @@ function boundedNullableText(
   return result;
 }
 
-function nullableTimestamp(value: unknown, field: string): string | null {
+export function nullableTimestamp(
+  value: unknown,
+  field: string,
+): string | null {
   const result = nullableText(value, field);
   if (result === null) return null;
   const match =
@@ -469,10 +472,13 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
   if (
     contractVersion !== CONTRACT_VERSION ||
     !(["codex", "claude_code"] as string[]).includes(sourceProvider) ||
-    !(["rollout", "transcript", "hook"] as string[]).includes(sourceKind) ||
-    (sourceProvider === "codex" && sourceKind !== "rollout") ||
+    !(["rollout", "transcript", "hook", "collector"] as string[]).includes(
+      sourceKind,
+    ) ||
+    (sourceProvider === "codex" &&
+      !["rollout", "collector"].includes(sourceKind)) ||
     (sourceProvider === "claude_code" &&
-      !(["transcript", "hook"] as string[]).includes(sourceKind))
+      !(["transcript", "hook", "collector"] as string[]).includes(sourceKind))
   ) {
     throw new IngestError(
       "unsupported_contract",
@@ -548,9 +554,11 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
 export function validateManifest(manifest: BatchManifest): void {
   if (
     (manifest.source_provider === "codex" &&
-      manifest.source_kind !== "rollout") ||
+      !["rollout", "collector"].includes(manifest.source_kind)) ||
     (manifest.source_provider === "claude_code" &&
-      !(["transcript", "hook"] as string[]).includes(manifest.source_kind))
+      !(["transcript", "hook", "collector"] as string[]).includes(
+        manifest.source_kind,
+      ))
   ) {
     throw new IngestError(
       "unsupported_contract",

@@ -64,6 +64,39 @@ creating pair failures. Sync runs each minute while backlogged, otherwise every
 five minutes. Database failures retry from failure completion with exponential
 backoff capped at fifteen minutes.
 
+Explicit session context uses a separate opt-in repository scope:
+`SHERLOCK_GITHUB_PR_CONTEXT_REPOSITORIES=workspace-uuid=owner/repo,workspace-uuid=owner/other`.
+Only workspaces also present in `SHERLOCK_GITHUB_WORKSPACE_IDS` are processed.
+An empty value disables explicit verification without affecting commit lookup.
+The scope comes from operator configuration, never collector metadata. Prefer a
+fine-grained GitHub token limited to these repositories. Each cycle handles at
+most 25 declared links after commit sync and stops starting targets after 30
+seconds. In-flight requests and writes retain their own timeouts. Both paths
+share the one-connection pool, auth/rate-limit pause, and shutdown signal.
+Work-selection queries and explicit verification writes have a 20-second SQL
+timeout. Explicit database failures are logged separately and do not increase
+commit-matching backoff. Successful checks and scope/identity failures are
+reconsidered after six hours; other failures after ten minutes. All checks
+append observations.
+
+The verifier uses only `api.github.com/repos/{owner}/{repo}/pulls/{number}` and
+refuses redirects. A rename therefore requires an operator-approved scope update
+and a new declaration for the canonical repository; the old report stays
+auditable. Canonical repository and PR IDs are pinned by the first successful
+check, including concurrent-worker fencing, so a reused repository name cannot
+silently replace the identity. Closed, merged, and reopened PRs remain
+historical session context. Link and correction facts never allocate activity,
+tokens, time, or authorship; provenance remains **collector-reported, GitHub
+identity checked** under the existing unauthenticated collector trust boundary.
+
+Apply `20260909195438_add_explicit_session_pr_context.sql` before code that
+reads its tables. Upgrade the worker before enabling collector-sidecar ingestion
+and production producers. Older workers reject the new normalizer version;
+during rollback, stop producers/ingestion of new sidecars, retain queued
+sidecars and all raw/audit facts, and use a compatible worker until they drain.
+Never rewrite old native transcripts or convert commit associations to explicit
+declarations.
+
 The worker pins `e3-solutions/postgres@a7bc76a` with integrity hashes. It is
 postgres.js 3.4.9 plus upstream PR #1168 and two reserved-connection guards.
 Remove the fork after an upstream release contains all three guards and the
@@ -83,9 +116,9 @@ schema work or replacement startup:
 4. Verify the connection gate, deploy the new worker at exactly one replica, and
    confirm it owns the handoff before processing begins.
 
-For exact PR links, keep `GITHUB_TOKEN` unset and apply all migrations through
-`20260826182052_add_exact_session_pull_request_sources.sql` before step 4. Then
-set the CodeActivity-only allowlist and run
+For SHA-derived commit associations, keep `GITHUB_TOKEN` unset and apply all
+migrations through `20260826182052_add_exact_session_pull_request_sources.sql`
+before step 4. Then set the CodeActivity-only allowlist and run
 `deno run --allow-env --allow-net scripts/backfill-session-scm.ts`, wait for the
 replayed jobs to finish, and enable the token. The restart-safe replay uses the
 same allowlist and is limited to the dashboard's 26-hour database-received

@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,8 @@ from .config import (
     default_state_root,
     load_config,
 )
+from .contract import ContractError
+from .pr_context import enqueue_context, validate_session, create_pull_request, creation_guard
 from .drain import Drain
 from .discovery import (
     CLAUDE_DEFAULT_LOOKBACK_SECONDS,
@@ -46,7 +49,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="sherlock-collector")
     result.add_argument("--codex-home", type=Path)
     result.add_argument("--claude-home", type=Path)
-    result.add_argument("--provider", choices=("codex", "claude_code"), default="codex")
+    result.add_argument("--provider", choices=("codex", "claude_code"))
     result.add_argument("--state-root", type=Path)
     result.add_argument("--config", type=Path)
     commands = result.add_subparsers(dest="command", required=True)
@@ -64,6 +67,27 @@ def parser() -> argparse.ArgumentParser:
     hook.add_argument("event_name")
     commands.add_parser("drain")
     commands.add_parser("health")
+    context = commands.add_parser("pr-context", help="Declare or retract exact session PR context")
+    operations = context.add_subparsers(dest="operation", required=True)
+    for operation in ("link", "retract", "create"):
+        command = operations.add_parser(operation)
+        command.add_argument("--session-id", required=True)
+        command.add_argument("--transcript", type=Path)
+        command.add_argument("--event-id")
+        command.add_argument("--occurred-at")
+        command.add_argument("--drain", action="store_true", help="Attempt delivery after durable enqueue")
+        if operation == "retract":
+            command.add_argument("--link-event-id", required=True)
+        else:
+            command.add_argument("--repository", required=True)
+            if operation == "link":
+                command.add_argument("--pr-number", type=int, required=True)
+            else:
+                command.add_argument("--head", required=True)
+                command.add_argument("--title", required=True)
+                command.add_argument("--body", required=True)
+                command.add_argument("--base")
+                command.add_argument("--draft", action="store_true")
     return result
 
 
@@ -123,6 +147,10 @@ def _rfc3339_ns(value: str) -> int | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "pr-context" and args.provider is None:
+        print("PR context requires explicit --provider", file=sys.stderr)
+        return 2
+    args.provider = args.provider or "codex"
     source_home = (
         Path(
             (args.claude_home or default_claude_home())
@@ -373,6 +401,41 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigurationError as error:
         print(f"sherlock collector is not configured: {error}", file=sys.stderr)
         return 78
+    if args.command == "pr-context":
+        created_url = None
+        try:
+            identity_check = validate_session(args.provider, args.session_id, source_home, args.transcript)
+            with creation_guard(state_root, configuration) if args.operation == "create" else nullcontext():
+                if args.operation == "create":
+                    # Check replay and request metadata before the external side effect.
+                    from .pr_context import canonical_event_id, repository_name
+                    repository_name(args.repository)
+                    if args.event_id:
+                        canonical_event_id(args.event_id)
+                        if (state_root / "pr-context" / "events" / f"{args.event_id}.jsonl").exists():
+                            raise ContractError("creation event ID already exists; replay it with pr-context link")
+                    if args.occurred_at is not None:
+                        raise ContractError("create timestamps are recorded after successful PR creation")
+                    created_url, args.pr_number = create_pull_request(repository=args.repository,
+                        head=args.head, title=args.title, body=args.body, base=args.base, draft=args.draft)
+                result = enqueue_context(state_root=state_root, configuration=configuration,
+                    provider=args.provider, session_id=args.session_id,
+                    operation="link" if args.operation == "create" else args.operation,
+                    event_id=args.event_id, occurred_at=args.occurred_at,
+                    repository=getattr(args, "repository", None), pr_number=getattr(args, "pr_number", None),
+                    link_event_id=getattr(args, "link_event_id", None))
+            result["identity_check"] = identity_check
+            if created_url:
+                result["created_pull_request_url"] = created_url
+            if args.drain:
+                result["delivery"] = asdict(Drain(spool, HttpTransport(configuration.endpoint, configuration.identity)).run())
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        except (ContractError, OSError, ValueError) as error:
+            print(f"PR context failed: {error}", file=sys.stderr)
+            if created_url:
+                print(f"PR was created at {created_url}; retry using pr-context link with this PR number", file=sys.stderr)
+            return 2
     if args.command == "health":
         pending_batches = len(spool.list_pending())
         processing_batches = len(list(spool.processing.glob("*.json")))

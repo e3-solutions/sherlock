@@ -5,6 +5,13 @@ including prompts, tool use, primary agents, and subagents. Each provider keeps
 its own plugin, source identity, and normalizer while sharing Sherlock's
 immutable telemetry backend.
 
+Explicit session-to-PR context is available through `sherlock-collector pr-context`
+for both providers. See [the producer and sidecar contract](packages/telemetry-contract/pr-context-v1.md),
+[local end-to-end tests](tests/end-to-end/README.md), and
+[the coordinated PR #81/#91 rollout plan](docs/explicit-pr-context-rollout.md).
+Linked PRs are collector-reported context with a separate GitHub identity check;
+they do not attribute every event or minute to a PR.
+
 ## Install for Codex and Claude Code
 
 You need macOS or Linux, Git, Python 3, and at least one of the Codex or Claude

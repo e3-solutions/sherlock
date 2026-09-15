@@ -110,6 +110,7 @@ class DurableSpool:
         stored_payload: bytes,
         *,
         workload_class: str | None = None,
+        collector_binding: str | None = None,
     ) -> Path:
         validate_stored_payload(manifest, stored_payload)
         if workload_class not in {None, "live", "backfill"}:
@@ -117,6 +118,8 @@ class DurableSpool:
         metadata = {"enqueued_at": utc_now()}
         if workload_class is not None:
             metadata["workload_class"] = workload_class
+        if collector_binding is not None:
+            metadata["collector_binding"] = collector_binding
         item = SpoolItem(manifest, stored_payload, metadata)
         destination = self.pending / f"{manifest.spool_key}.json"
         if destination.exists():
@@ -124,6 +127,7 @@ class DurableSpool:
             if (
                 existing.manifest != manifest
                 or existing.stored_payload != stored_payload
+                or existing.metadata.get("collector_binding") != collector_binding
             ):
                 raise ContractError(
                     "deterministic spool key collided with different bytes"

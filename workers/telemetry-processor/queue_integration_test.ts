@@ -43,7 +43,7 @@ async function insertQueueBatch(
     id: string;
     workspaceId: string;
     personId: string;
-    sourceKind: "rollout" | "transcript" | "hook";
+    sourceKind: "rollout" | "transcript" | "hook" | "collector";
     streamKey: string;
     generationKey: string;
     startOffset: number;
@@ -1285,6 +1285,176 @@ Deno.test({
     } finally {
       await deleteQueueFixture(sql, workspaceId);
       await Promise.allSettled([queue.close(), sql.end()]);
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "explicit verification recovers from timeout and fences competing first identities",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const blocker = postgres(databaseUrl!, { prepare: false, max: 1 });
+    const sql = postgres(databaseUrl!, { prepare: false, max: 1 });
+    const { workspaceId, personId } = await insertQueueFixture(sql, "pr-fence");
+    const applicationName = `pr-fence-${workspaceId}`;
+    const queue = PostgresJobQueue.connect(databaseUrl!, 1, applicationName);
+    const competitor = PostgresJobQueue.connect(
+      databaseUrl!,
+      1,
+      applicationName,
+    );
+    const batchId = crypto.randomUUID();
+    await insertQueueBatch(sql, {
+      id: batchId,
+      workspaceId,
+      personId,
+      sourceKind: "collector",
+      streamKey: batchId,
+      generationKey: batchId,
+      startOffset: 0,
+    });
+    const [record] = await sql.unsafe(
+      `insert into telemetry.native_records (workspace_id, batch_id, record_index,
+        source_start_offset, source_end_offset, record_sha256, native_type, occurred_at, parse_status)
+       values ($1,$2,0,0,1,repeat('a',64),'pr_context',now(),'ok') returning id::text`,
+      [workspaceId, batchId],
+    );
+    const target = {
+      workspaceId,
+      sourceRecordId: String(record.id),
+      repositoryFullName: "e3-solutions/sherlock",
+      pullRequestNumber: 91,
+      outcome: "checked" as const,
+      repositoryId: 1,
+      pullRequestId: 91,
+      pullRequestState: "open" as const,
+    };
+    await sql.unsafe(
+      `insert into telemetry.session_pr_context_events (source_record_id, workspace_id,
+        person_id, collector_key, source_provider, native_session_id, event_id, operation,
+        repository_full_name, pull_request_number, occurred_at, payload_sha256,
+        disposition, server_received_at)
+       values ($1,$2,$3,'queue-collector','claude_code','fence-session',$4,'link',
+         'e3-solutions/sherlock',91,now(),repeat('a',64),'accepted',now())`,
+      [record.id, workspaceId, personId, crypto.randomUUID()],
+    );
+    const lockKey = JSON.stringify([
+      "pr-context-verification",
+      workspaceId,
+      target.sourceRecordId,
+    ]);
+    let releaseLock!: () => void;
+    let lockAcquired!: () => void;
+    const holdLock = new Promise<void>((resolve) => releaseLock = resolve);
+    const lockReady = new Promise<void>((resolve) => lockAcquired = resolve);
+    const transaction = blocker.begin(async (tx) => {
+      await tx.unsafe("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        lockKey,
+      ]);
+      lockAcquired();
+      await holdLock;
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([lockReady, transaction]);
+      const error = await Promise.race([
+        queue.appendPrContextVerification(target).then(
+          () => null,
+          (error: unknown) => error,
+        ),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(
+            () => resolve(null),
+            GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS + 5_000,
+          );
+        }),
+      ]);
+      assert(
+        error instanceof Error && "code" in error && error.code === "57014",
+        "the blocked identity fence must be canceled by PostgreSQL before it stalls commit sync",
+      );
+      assert(
+        (await queue.pendingGithubCommitPairs(1, [workspaceId])).length === 0,
+        "commit lookups must reuse the same connection while the explicit lock remains held",
+      );
+      assert(
+        (await sql.unsafe(
+          "select id from github.pr_context_verifications where workspace_id = $1",
+          [workspaceId],
+        )).length === 0,
+        "a canceled append must not establish a canonical identity",
+      );
+      const competing = Promise.allSettled([
+        queue.appendPrContextVerification({
+          ...target,
+          repositoryId: 42,
+          pullRequestId: 910,
+        }),
+        competitor.appendPrContextVerification({
+          ...target,
+          repositoryId: 43,
+          pullRequestId: 911,
+        }),
+      ]);
+      let waiting = 0;
+      for (let attempt = 0; attempt < 100 && waiting < 2; attempt++) {
+        const [row] = await sql.unsafe(
+          `select count(*)::int n from pg_stat_activity
+            where application_name = $1 and wait_event = 'advisory'`,
+          [applicationName],
+        );
+        waiting = row.n;
+        if (waiting < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+      releaseLock();
+      const results = await competing;
+      assert(
+        waiting === 2,
+        "both first observations must contend on the same identity fence",
+      );
+      assert(results.every((result) => result.status === "fulfilled"));
+      const observations = await sql.unsafe(
+        `select outcome, repository_id::int, pull_request_id::int
+           from github.pr_context_verifications where workspace_id = $1 order by id`,
+        [workspaceId],
+      );
+      assert(
+        observations.length === 2 && observations[0].outcome === "checked" &&
+          observations[1].outcome === "identity_mismatch" &&
+          ((observations[0].repository_id === 42 &&
+            observations[0].pull_request_id === 910) ||
+            (observations[0].repository_id === 43 &&
+              observations[0].pull_request_id === 911)) &&
+          observations[1].repository_id === null &&
+          observations[1].pull_request_id === null,
+        "only the first successful canonical IDs may survive the race",
+      );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      releaseLock();
+      await transaction.catch(() => undefined);
+      await queue.close();
+      await competitor.close();
+      await blocker.end({ timeout: 1 });
+      await sql.unsafe(
+        "delete from github.pr_context_verifications where workspace_id = $1",
+        [workspaceId],
+      );
+      await sql.unsafe(
+        "delete from telemetry.session_pr_context_events where workspace_id = $1",
+        [workspaceId],
+      );
+      await sql.unsafe(
+        "delete from telemetry.native_records where workspace_id = $1",
+        [workspaceId],
+      );
+      await deleteQueueFixture(sql, workspaceId);
+      await sql.end();
     }
   },
 });

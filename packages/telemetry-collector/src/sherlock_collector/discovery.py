@@ -655,11 +655,14 @@ def _claude_transcript_identity(
     handle,
     filename: str,
     expected_identity: tuple[str, str | None],
+    *,
+    require_declaration: bool = False,
 ) -> tuple[str, str | None] | None:
-    """Validate a bounded prefix against provider-native path identity."""
+    """Validate the prefix; explicit links also require a matching declaration."""
     expected_native_id, expected_parent_id = expected_identity
     declared_session_id: str | None = None
     declared_agent_id: str | None = None
+    matching_declaration = False
     handle.seek(0)
     remaining = CLAUDE_IDENTITY_SCAN_BYTES
     for _ in range(CLAUDE_IDENTITY_SCAN_RECORDS):
@@ -675,8 +678,13 @@ def _claude_transcript_identity(
             continue
         if not isinstance(value, dict):
             continue
-        session_id = _text_identity(value.get("sessionId", value.get("session_id")))
-        agent_id = _text_identity(value.get("agentId", value.get("agent_id")))
+        raw_session_id = value.get("sessionId", value.get("session_id"))
+        raw_agent_id = value.get("agentId", value.get("agent_id"))
+        if (raw_session_id == (expected_parent_id or expected_native_id)
+                or raw_agent_id == expected_native_id):
+            matching_declaration = True
+        session_id = _text_identity(raw_session_id)
+        agent_id = _text_identity(raw_agent_id)
         if session_id is not None:
             if declared_session_id is not None and declared_session_id != session_id:
                 return None
@@ -686,6 +694,8 @@ def _claude_transcript_identity(
                 return None
             declared_agent_id = agent_id
 
+    if require_declaration and not matching_declaration:
+        return None
     if expected_parent_id is not None:
         if declared_agent_id not in (None, expected_native_id):
             return None

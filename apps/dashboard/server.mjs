@@ -318,8 +318,8 @@ const server = createServer(async (request, response) => {
   sendJson(response, 404, { error: "not_found" });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(JSON.stringify({ event: "dashboard_listening", port: PORT }));
+server.listen(PORT, process.env.HOST ?? "0.0.0.0", () => {
+  console.log(JSON.stringify({ event: "dashboard_listening", port: server.address().port }));
 });
 
 async function shutdown(signal) {

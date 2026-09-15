@@ -1,3 +1,4 @@
+import { projectPrContextBatch } from "./pr-context.ts";
 import {
   type Attribution,
   type BatchManifest,
@@ -106,6 +107,9 @@ export async function validateStoredBatch(
         400,
       );
     }
+  }
+  if (manifest.source_kind === "collector") {
+    await projectPrContextBatch(manifest, source);
   }
   return source;
 }
