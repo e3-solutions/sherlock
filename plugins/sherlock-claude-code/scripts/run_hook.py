@@ -135,12 +135,18 @@ def _path_signatures(paths: list[Path]) -> tuple[tuple[str, int, int] | None, ..
 def dispatch(event_name: str) -> int:
     """Detach capture before returning so `claude -p` teardown cannot kill it."""
     try:
+        windows = os.name == "nt"
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--capture", event_name],
             stdin=sys.stdin,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=not windows,
+            creationflags=(
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                if windows
+                else 0
+            ),
             close_fds=True,
             env=os.environ.copy(),
         )

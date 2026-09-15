@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import json
 import os
 import shutil
+import sys
 import uuid
 from pathlib import Path
 
@@ -25,11 +28,45 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def copy_marketplace(source: Path, destination: Path) -> None:
+def _write_windows_hooks(staging: Path, python: Path) -> None:
+    codex_manifest = staging / "plugins" / "sherlock" / "hooks" / "hooks.json"
+    codex = json.loads(codex_manifest.read_text(encoding="utf-8"))
+    for event_name, groups in codex["hooks"].items():
+        for group in groups:
+            for handler in group["hooks"]:
+                quoted_python = str(python).replace("'", "''")
+                quoted_event = event_name.replace("'", "''")
+                powershell = (
+                    f"& '{quoted_python}' (Join-Path $env:PLUGIN_ROOT "
+                    f"'scripts\\run_hook.py') '{quoted_event}'; exit $LASTEXITCODE"
+                )
+                encoded = base64.b64encode(powershell.encode("utf-16-le")).decode("ascii")
+                handler["commandWindows"] = (
+                    "powershell.exe -NoProfile -NonInteractive "
+                    f"-ExecutionPolicy Bypass -EncodedCommand {encoded}"
+                )
+    codex_manifest.write_text(json.dumps(codex, indent=2) + "\n", encoding="utf-8")
+
+    claude_manifest = staging / "plugins" / "sherlock-claude-code" / "hooks" / "hooks.json"
+    claude = json.loads(claude_manifest.read_text(encoding="utf-8"))
+    for event_name, groups in claude["hooks"].items():
+        for group in groups:
+            for handler in group["hooks"]:
+                handler["command"] = str(python)
+                handler["args"] = [
+                    "${CLAUDE_PLUGIN_ROOT}/scripts/run_hook.py",
+                    event_name,
+                ]
+    claude_manifest.write_text(json.dumps(claude, indent=2) + "\n", encoding="utf-8")
+
+
+def copy_marketplace(source: Path, destination: Path, *, windows_python: Path | None = None) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(destination.parent, 0o700)
     staging = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     backup = destination.with_name(f".{destination.name}.previous")
+    if backup.exists() and not destination.exists():
+        os.replace(backup, destination)
     staging.mkdir(mode=0o700)
     try:
         for relative in MARKETPLACE_PATHS:
@@ -46,12 +83,19 @@ def copy_marketplace(source: Path, destination: Path) -> None:
                 shutil.copy2(source_path, target_path)
             else:
                 raise SystemExit(f"missing marketplace source: {source_path}")
-        if backup.exists():
+        if windows_python is not None:
+            _write_windows_hooks(staging, windows_python)
+        if backup.exists() and destination.exists():
             shutil.rmtree(backup)
         if destination.exists():
             os.replace(destination, backup)
-        os.replace(staging, destination)
-        if backup.exists():
+        try:
+            os.replace(staging, destination)
+        except BaseException:
+            if backup.exists() and not destination.exists():
+                os.replace(backup, destination)
+            raise
+        if backup.exists() and destination.exists():
             shutil.rmtree(backup)
     finally:
         if staging.exists():
@@ -62,7 +106,11 @@ def main() -> int:
     args = arguments()
     source = args.repo_root.expanduser().resolve()
     destination = args.destination.expanduser().resolve()
-    copy_marketplace(source, destination)
+    copy_marketplace(
+        source,
+        destination,
+        windows_python=Path(sys.executable).resolve() if os.name == "nt" else None,
+    )
     print(f"Staged Sherlock's client marketplace under {destination}")
     return 0
 

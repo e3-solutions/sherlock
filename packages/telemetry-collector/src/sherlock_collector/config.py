@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .platform import is_owner_only
+
 
 class ConfigurationError(ValueError):
     """Collector configuration is missing or unsafe."""
@@ -86,9 +88,8 @@ def validate_endpoint(value: object) -> str:
 
 def validate_install_email(value: object) -> str:
     normalized_email = _bounded(value, "email", 320).lower()
-    if (
-        normalized_email.count("@") != 1
-        or any(character.isspace() or ord(character) < 32 for character in normalized_email)
+    if normalized_email.count("@") != 1 or any(
+        character.isspace() or ord(character) < 32 for character in normalized_email
     ):
         raise ConfigurationError("email must be a valid address")
     local, domain = normalized_email.split("@")
@@ -103,10 +104,7 @@ def _require_clean_or_configured_collector_home(
     collector_home: Path | str,
 ) -> None:
     queue_root = (
-        Path(collector_home).expanduser().resolve()
-        / "sherlock"
-        / "telemetry"
-        / "queue"
+        Path(collector_home).expanduser().resolve() / "sherlock" / "telemetry" / "queue"
     )
     for directory_name in ("pending", "processing"):
         if any((queue_root / directory_name).glob("*.json")):
@@ -163,9 +161,8 @@ def validate_identity(
     if not GITHUB_ID.fullmatch(normalized_github_id):
         raise ConfigurationError("github_id must be a GitHub login")
     normalized_email = _bounded(email, "email", 320).lower()
-    if (
-        normalized_email.count("@") != 1
-        or any(character.isspace() or ord(character) < 32 for character in normalized_email)
+    if normalized_email.count("@") != 1 or any(
+        character.isspace() or ord(character) < 32 for character in normalized_email
     ):
         raise ConfigurationError("email must be a valid address")
     local, domain = normalized_email.split("@")
@@ -175,9 +172,10 @@ def validate_identity(
         parsed_installation_id = uuid.UUID(str(installation_id))
     except (ValueError, TypeError, AttributeError) as error:
         raise ConfigurationError("installation_id must be a UUIDv4") from error
-    if parsed_installation_id.version != 4 or str(parsed_installation_id) != str(
-        installation_id
-    ).lower():
+    if (
+        parsed_installation_id.version != 4
+        or str(parsed_installation_id) != str(installation_id).lower()
+    ):
         raise ConfigurationError("installation_id must be a canonical UUIDv4")
     return CollectorIdentity(
         name=normalized_name,
@@ -194,10 +192,18 @@ def _read_owner_only(path: Path) -> dict[str, object]:
         return {}
     if not stat.S_ISREG(details.st_mode):
         raise ConfigurationError("the collector config must be a regular file")
-    if stat.S_IMODE(details.st_mode) & 0o077:
-        raise ConfigurationError("the collector config must be owner-only (mode 0600)")
+    if not is_owner_only(path):
+        raise ConfigurationError(
+            "the collector config must have owner-only permissions"
+        )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ConfigurationError("the collector config must be a regular file")
+            if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
+                raise ConfigurationError("the collector config changed while opening")
+            value = json.load(handle)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ConfigurationError("the collector config is unreadable") from error
     if not isinstance(value, dict):
@@ -236,9 +242,7 @@ def load_config(
         endpoint = file_values.get("endpoint")
     identity = validate_identity(
         name=os.environ.get("SHERLOCK_NAME", file_values.get("name")),
-        github_id=os.environ.get(
-            "SHERLOCK_GITHUB_ID", file_values.get("github_id")
-        ),
+        github_id=os.environ.get("SHERLOCK_GITHUB_ID", file_values.get("github_id")),
         email=os.environ.get("SHERLOCK_EMAIL", file_values.get("email")),
         installation_id=os.environ.get(
             "SHERLOCK_INSTALLATION_ID", file_values.get("installation_id")

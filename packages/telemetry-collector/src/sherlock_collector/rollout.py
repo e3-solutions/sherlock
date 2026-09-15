@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -18,7 +17,8 @@ from .contract import (
     ContractError,
     build_source_batch,
 )
-from .spool import DurableSpool, _atomic_json, secure_lock
+from .spool import DurableSpool, _atomic_json
+from .platform import file_identity, nonblocking_lock, open_regular_under, secure_directory
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
 DEFAULT_MAX_FILES = 64
@@ -104,6 +104,8 @@ def open_regular_under_root(
     if not relative.parts:
         raise ValueError("capture path must name a file under allowed_root")
 
+    if os.name == "nt":
+        return open_regular_under(root, candidate)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     # Nonblocking open lets fstat reject a raced FIFO without waiting for a writer.
     file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -169,8 +171,7 @@ class RolloutCapturer:
                 "capture byte limits are invalid or exceed the rollout contract"
             )
         self.state_root = Path(state_root)
-        self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.state_root, 0o700)
+        secure_directory(self.state_root)
         self.spool = spool
         self.chunk_bytes = chunk_bytes
         self.max_object_bytes = max_object_bytes
@@ -212,10 +213,8 @@ class RolloutCapturer:
         backlog_workload_class: str | None = None,
         source_snapshots: Mapping[str, SourceSnapshot] | None = None,
     ) -> CaptureResult:
-        with secure_lock(self.lock_path) as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with nonblocking_lock(self.lock_path) as acquired:
+            if not acquired:
                 return CaptureResult(locked=True)
             states, candidate_cursor = self._load_state()
             enqueued = captured = errors = 0
@@ -307,11 +306,12 @@ class RolloutCapturer:
             key = _stream_key(path)
             state = states.get(key)
             details = os.fstat(handle.fileno())
+            device, inode = file_identity(handle)
             stable_end = details.st_size
             if snapshot is not None:
                 if (
-                    details.st_dev != snapshot.device
-                    or details.st_ino != snapshot.inode
+                    device != snapshot.device
+                    or inode != snapshot.inode
                     or details.st_size < snapshot.end_offset
                 ):
                     raise OSError("source changed after discovery")
@@ -327,8 +327,8 @@ class RolloutCapturer:
                 and state.prefix_length == 0
                 and state.offset == 0
                 and state.path == str(path)
-                and state.device == details.st_dev
-                and state.inode == details.st_ino
+                and state.device == device
+                and state.inode == inode
                 and stable_end > 0
             )
             fingerprint_size = (
@@ -341,21 +341,21 @@ class RolloutCapturer:
                 state.prefix_length = prefix_length
                 state.prefix_sha256 = prefix_sha
             replaced = state is None or not self._same_generation(
-                state, path, details, prefix_length, prefix_sha
+                state, path, details, prefix_length, prefix_sha, device, inode
             )
             if replaced:
                 sequence = 0 if state is None else state.generation_seq + 1
                 state = StreamState(
                     path=str(path),
-                    device=details.st_dev,
-                    inode=details.st_ino,
+                    device=device,
+                    inode=inode,
                     prefix_length=prefix_length,
                     prefix_sha256=prefix_sha,
                     generation_seq=sequence,
                     generation_key=_generation_key(
                         path,
-                        details.st_dev,
-                        details.st_ino,
+                        device,
+                        inode,
                         prefix_sha,
                         sequence,
                     ),
@@ -398,9 +398,7 @@ class RolloutCapturer:
                     )
                     after = os.fstat(handle.fileno())
                     if (
-                        after.st_dev != details.st_dev
-                        or after.st_ino != details.st_ino
-                        or after.st_size < stable_end
+                        after.st_size < stable_end
                     ):
                         raise OSError("native source file changed while fragmenting")
                     state.offset = plan.end_offset
@@ -584,11 +582,13 @@ class RolloutCapturer:
         stat: os.stat_result,
         prefix_length: int,
         prefix_sha: str,
+        device: int,
+        inode: int,
     ) -> bool:
         return (
             state.path == str(path)
-            and state.device == stat.st_dev
-            and state.inode == stat.st_ino
+            and state.device == device
+            and state.inode == inode
             and stat.st_size >= state.offset
             and state.prefix_length == prefix_length
             and state.prefix_sha256 == prefix_sha
