@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "task": {
+    "title": "Codex source discovery and durable ingestion receipts",
+    "mode": "standard",
+    "type": "bug"
+  },
+  "intent": {
+    "goal": "Include all native Codex task sources in collection and make per-source delivery and raw token-payload evidence auditable.",
+    "must_happen": [
+      "Automated, archived and continuing tasks remain eligible for raw collection.",
+      "Exact native-ID lookup bypasses reporting recency and row/database caps.",
+      "Validated receipts are durable before queued source deletion; token-payload presence is assessed before upload/normalization.",
+      "An explicit inventory reports received coverage or a specific exclusion/unresolved reason per selected source; incomplete scans fail coverage."
+    ],
+    "must_not_happen": [
+      "Treat missing source, missing token payload or unacknowledged bytes as zero usage.",
+      "Rewrite raw telemetry or forge historical acknowledgements.",
+      "Traverse unsupported roots or symlinks to widen collection.",
+      "Claim the sampled remote sessions are repaired without collector-side evidence."
+    ],
+    "constraints": [
+      "No production schema change is required for retained local receipts.",
+      "Use existing collector capture/drain and immutable server batch receipts."
+    ],
+    "non_goals": [
+      "Billing inference",
+      "Remote machine installation without an available management channel",
+      "Continuous capture guarantees while the collector is not running"
+    ],
+    "open_questions": [
+      "The exact sampled collector files and historical acknowledgements are unavailable from this host.",
+      "Sharad native ID has not been supplied."
+    ],
+    "assumptions": [
+      "Current native rollout roots are sessions and archived_sessions; other roots require explicit support."
+    ]
+  },
+  "proof_obligations": [
+    {
+      "id": "P1",
+      "claim": "All task-source categories and exact continued IDs can be discovered and captured.",
+      "verification": "SQLite/native file fixtures including archived/old/ninth database and an explicit no-hook backfill run."
+    },
+    {
+      "id": "P2",
+      "claim": "Validated immutable receipts and scoped token-payload presence survive acknowledgement without lost queued data on failure.",
+      "verification": "Real local spool/filesystem tests for receipt mismatch, receipt-write failure, fragments, null payload and successful retries."
+    },
+    {
+      "id": "P3",
+      "claim": "Inventory only claims received when matching source-byte ranges cover the snapshot; gaps/exclusions remain explicit.",
+      "verification": "End-to-end discovery/capture/drain/inventory tests, missing/outside-root sources and changed-byte receipt mismatch."
+    }
+  ]
+}
