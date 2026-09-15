@@ -257,20 +257,22 @@ Deno.test("projector reads only bounded source metadata and never copies content
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.id <= $3"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("analytics.normalizer_cutovers"));
   assert(
-    FRAME_SOURCE_EVENTS_SQL.includes("s.started_at >= cutover.cutover_at"),
+    FRAME_SOURCE_EVENTS_SQL.includes(
+      "s.started_at >= cutover.cutover_at",
+    ),
   );
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v1"));
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v3"));
   assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.codex-rollout.v2"));
 });
 
-Deno.test("activation proves only the session-selected normalization version", () => {
+Deno.test("activation accepts existing legacy or new corrected normalization", () => {
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.native_records"),
   );
   assert(MISSING_NORMALIZATION_BATCHES_SQL.includes("telemetry.events"));
   assert(
     MISSING_NORMALIZATION_BATCHES_SQL.includes(
-      "session.started_at",
+      "sherlock.codex-rollout.v3",
     ),
   );
   assert(
@@ -288,7 +290,11 @@ Deno.test("activation proves only the session-selected normalization version", (
     MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.codex-rollout.v2"),
   );
   assert(FRAME_SOURCE_EVENTS_SQL.includes("not exists ("));
-  assert(FRAME_SOURCE_EVENTS_SQL.includes("telemetry.events legacy"));
+  assert(
+    FRAME_SOURCE_EVENTS_SQL.includes(
+      "telemetry.events legacy",
+    ),
+  );
 });
 
 Deno.test("large revision writes are split below PostgreSQL's parameter limit", () => {

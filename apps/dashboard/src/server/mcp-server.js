@@ -46,7 +46,8 @@ const usageOutputSchema = z.object({
     readAt: ISO_TIMESTAMP,
   }).strict(),
   provenance: z.object({
-    projectionVersion: z.literal("sherlock.codex-rollout.v2"),
+    projectionVersion: z.enum(["frame-evidence-v2", "frame-evidence-v4", "frame-evidence-v5",
+      "raw-snapshot-v1", "raw-snapshot-v3", "raw-snapshot-v4"]),
   }).strict(),
   coverage: z.object({
     state: z.literal("partial"),

@@ -173,6 +173,11 @@ rows are retained beside v2 rows; v2 keeps the native `user` role but records
 machine-injected envelopes as `message_origin = 'runtime_context'` instead of
 rewriting them into human prompt facts.
 
+Codex v3 classifies `codex_internal_context` and the existing reserved runtime
+envelopes in both user-message representations. The queue migration routes each
+new Codex upload to v3, including uploads in existing sessions. Previously queued
+jobs and v1/v2 facts keep their original versions; no normalization replay occurs.
+
 ### Activity spans are rebuildable
 
 Activity spans are append-only revisions of logical intervals. A later row
@@ -207,7 +212,14 @@ native user-role item is explicitly classified as `human` or
 `runtime_context`. Reserved Codex envelope names and legacy runtime prefixes are
 classified once during normalization; projectors and dashboard reads no longer
 interpret stored excerpt text. A new envelope name requires a new normalizer
-version instead of a broader text heuristic. All versions deduplicate by native
+version instead of a broader text heuristic. Frame v5 accepts v3 plus the existing v4-selected legacy facts, preferring v3
+when a source record has both interpretations. It shares Codex message identity
+across the upload cutover so two representations remain one prompt. Only v5 is
+produced by the current worker; existing v4 receipts remain readable. Raw snapshot
+tokens v4 include Codex v3, while raw tokens v3 retain their original v2/Claude
+source universe and grouping.
+
+All versions deduplicate by native
 prompt identity; later frames prefer an existing envelope-backed source when both
 representations are present. This stabilizes
 duplicate identity over time while keeping the semantic change versioned and

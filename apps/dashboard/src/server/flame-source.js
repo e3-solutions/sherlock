@@ -5,26 +5,31 @@ export const BUCKET_MS = 10 * 60 * 1000;
 // Keep this immutable reader contract aligned with the worker's frame version.
 // The dashboard Docker build context is apps/dashboard, so it cannot import the
 // repository-level worker module at runtime.
-export const FRAME_VERSION = "frame-evidence-v4";
-// Prompt classification moved into Codex normalization v2. During the v3
-// backfill, continue serving work from the already-active immutable v2
-// projection so interval clicks never regress to raw activity scans. Frame v4
-// selects Codex v1/v2 per immutable workspace cutover and session start.
+export const FRAME_VERSION = "frame-evidence-v5";
+export const PREVIOUS_FRAME_VERSION = "frame-evidence-v4";
+// V5 reads new v3 uploads alongside existing legacy facts. Keep issued v4
+// and older v2 work tokens readable through the projection handoff.
 export const COMPATIBLE_WORK_FRAME_VERSION = "frame-evidence-v2";
 export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
+export const CORRECTED_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v3";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 // Frozen source universe for raw v3 snapshot tokens. Add a new token version
 // before changing either provider version.
-export const NORMALIZER_VERSIONS = Object.freeze([
+export const PREVIOUS_NORMALIZER_VERSIONS = Object.freeze([
   NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
+]);
+export const NORMALIZER_VERSIONS = Object.freeze([
+  ...PREVIOUS_NORMALIZER_VERSIONS,
+  CORRECTED_CODEX_NORMALIZER_VERSION,
 ]);
 export const LEGACY_NORMALIZER_VERSIONS = Object.freeze([
   LEGACY_CODEX_NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
 export const FRESHNESS_NORMALIZER_VERSIONS = Object.freeze([
+  CORRECTED_CODEX_NORMALIZER_VERSION,
   LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
@@ -36,7 +41,8 @@ const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
 export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
 const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
-const RAW_SNAPSHOT_TOKEN_VERSION = "v3";
+const PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION = "v3";
+const RAW_SNAPSHOT_TOKEN_VERSION = "v4";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -111,6 +117,14 @@ function dashboardSummaryContentPredicate(column) {
        and ${internalContextPrefixExclusion(column)}`;
 }
 
+// Raw v4 tokens share Codex identity across the upload cutover. Older token
+// versions keep their original source universe and canonical grouping.
+function canonicalNormalizerSql() {
+  return `case when '${CORRECTED_CODEX_NORMALIZER_VERSION}' = any(p.normalizer_versions)
+    and e.normalizer_version like 'sherlock.codex-rollout.%'
+    then 'codex' else e.normalizer_version end`;
+}
+
 function activityCte({ joins = "" } = {}) {
   return `
 activity_candidates as materialized (
@@ -126,7 +140,7 @@ activity_candidates as materialized (
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then row_number() over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.normalizer_version, e.logical_event_key, e.event_kind
+                             ${canonicalNormalizerSql()}, e.logical_event_key, e.event_kind
                 order by e.source_priority desc, e.occurred_at asc nulls last, e.id
               )
               else 1 end canonical_rank
@@ -197,6 +211,7 @@ function promptsCte({
 prompt_candidates as materialized (
   select s.person_id, e.id, e.session_id, e.canonical_scope_key,
          e.logical_event_key, e.turn_id, e.normalizer_version, e.event_kind,
+         ${canonicalNormalizerSql()} canonical_normalizer_version,
          e.event_subtype, e.source_priority,
          e.native_item_id, e.content_sha256,
          (e.message_origin = 'human'
@@ -219,13 +234,13 @@ prompt_candidates as materialized (
                   and ${nativePromptContentPredicate("e.content_excerpt")}
               ) over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.normalizer_version, e.logical_event_key, e.event_kind
+                             ${canonicalNormalizerSql()}, e.logical_event_key, e.event_kind
               )
               else null end keyed_native_item_id,
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then bool_or(e.event_subtype = 'user_message') over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.normalizer_version, e.logical_event_key, e.event_kind
+                             ${canonicalNormalizerSql()}, e.logical_event_key, e.event_kind
               )
               else null end keyed_submitted
     from telemetry.events e
@@ -266,7 +281,7 @@ prompt_candidates as materialized (
              case when canonical_scope_key is not null and logical_event_key is not null
                   then row_number() over (
                     partition by session_id, canonical_scope_key,
-                                 normalizer_version, logical_event_key, event_kind
+                                 canonical_normalizer_version, logical_event_key, event_kind
                     order by source_priority desc, source_occurred_at asc nulls last, id
                   )
                   else 1 end semantic_rank
@@ -277,7 +292,7 @@ prompt_candidates as materialized (
   select canonical_prompt_candidates.*,
          coalesce(
            'native:' || keyed_native_item_id,
-           'logical:' || canonical_scope_key || ':' || normalizer_version || ':' ||
+           'logical:' || canonical_scope_key || ':' || canonical_normalizer_version || ':' ||
              logical_event_key || ':' || event_kind
          ) prompt_identity,
          (keyed_submitted or keyed_native_item_id is not null) has_submitted,
@@ -603,7 +618,7 @@ activity_candidates as materialized (
          case when e.canonical_scope_key is not null and e.logical_event_key is not null
               then row_number() over (
                 partition by e.session_id, e.canonical_scope_key,
-                             e.normalizer_version, e.logical_event_key, e.event_kind
+                             ${canonicalNormalizerSql()}, e.logical_event_key, e.event_kind
                 order by e.source_priority desc, e.occurred_at asc nulls last, e.id
               )
               else 1 end canonical_rank
@@ -1413,7 +1428,7 @@ export function encodeSnapshotToken({ snapshot, read }) {
 }
 
 export function encodeProjectionSnapshotToken({ snapshot, read, frameVersion }) {
-  if (![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
+  if (![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
     throw new FlameSourceError("flame_snapshot_invalid");
   }
   const readAt = asDate(read).toISOString();
@@ -1430,7 +1445,7 @@ export function decodeSnapshotToken(token) {
   }
   const [version, body, extra] = token.split(".");
   if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION,
-    RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
+    PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
       !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
     throw new FlameSourceError("flame_prompt_request_invalid");
@@ -1453,7 +1468,7 @@ export function decodeSnapshotToken(token) {
     const receipt = { snapshot: parsePgSnapshot(snapshot), read };
     if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
       if (
-        ![FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
+        ![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
           pinnedFrameVersion,
         )
       ) {
@@ -1462,6 +1477,8 @@ export function decodeSnapshotToken(token) {
       receipt.frameVersion = pinnedFrameVersion;
     } else if (version === RAW_SNAPSHOT_TOKEN_VERSION) {
       receipt.normalizerVersions = NORMALIZER_VERSIONS;
+    } else if (version === PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION) {
+      receipt.normalizerVersions = PREVIOUS_NORMALIZER_VERSIONS;
     } else {
       receipt.normalizerVersions = LEGACY_NORMALIZER_VERSIONS;
     }
@@ -1956,13 +1973,17 @@ export class DirectFlameSource {
                     from analytics.frame_projection_activations activation
                    where activation.workspace_id = $1
                      and activation.frame_version = $3
-                ) compatible_work_projection_active`
+                ) compatible_work_projection_active,
+                exists (
+                  select 1 from analytics.frame_projection_activations activation
+                   where activation.workspace_id = $1 and activation.frame_version = $4
+                ) previous_frame_projection_active`
           : `select transaction_timestamp() as now,
                     pg_current_snapshot()::text as snapshot,
                     false as frame_projection_active,
                     false as compatible_work_projection_active`,
         projectionEnabled
-          ? [this.workspaceId, FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+          ? [this.workspaceId, FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION, PREVIOUS_FRAME_VERSION]
           : undefined,
         signal,
       ))[0];
@@ -1980,6 +2001,8 @@ export class DirectFlameSource {
       }
       const selectedFrameVersion = receipt.frame_projection_active === true
         ? FRAME_VERSION
+        : receipt.previous_frame_projection_active === true
+          ? PREVIOUS_FRAME_VERSION
         : receipt.compatible_work_projection_active === true
           ? COMPATIBLE_WORK_FRAME_VERSION
           : null;
@@ -2039,7 +2062,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
-      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = projected
@@ -2147,7 +2170,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
-      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
       const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
@@ -2233,7 +2256,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const projected = [FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const rows = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [

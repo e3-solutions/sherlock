@@ -2,8 +2,10 @@
 
 import postgres from "npm:postgres@3.4.7";
 import {
+  FRAME_ACTIVATION_WINDOW_HOURS,
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
+  FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
@@ -29,6 +31,7 @@ interface ActivationOptions {
   workspaceId: string;
   activate: boolean;
   windowStart?: Date;
+  windowEnd?: Date;
 }
 
 const RELEVANT_EVENT_WINDOW_SQL = `(
@@ -64,7 +67,7 @@ with selected_events as materialized (
    group by e.session_id, e.session_updated_at
 ), latest_receipt as (
   select distinct on (session_id)
-         session_id, through_event_id, source_event_count, session_updated_at
+         session_id, through_event_id, source_event_count, session_updated_at, covered_from, covered_through
     from analytics.frame_projection_receipts
    where workspace_id = $1 and frame_version = $2
    order by session_id, id desc
@@ -76,6 +79,8 @@ select current_source.session_id::text session_id
     or latest_receipt.through_event_id is distinct from current_source.through_event_id
     or latest_receipt.source_event_count <> current_source.source_event_count
     or latest_receipt.session_updated_at <> current_source.session_updated_at
+    or latest_receipt.covered_from > $3::timestamptz
+    or latest_receipt.covered_through < $5::timestamptz
  order by current_source.session_id
  limit 20
 `;
@@ -108,7 +113,8 @@ select batch.id::text batch_id
                batch.source_provider = 'claude_code'
                and event.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
                or batch.source_provider = 'codex'
-               and (
+               and (event.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+                 or (
                  cutover.cutover_at is null
                  or coalesce(
                    session.started_at,
@@ -127,6 +133,7 @@ select batch.id::text batch_id
                  '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}',
                  '${FRAME_CODEX_NORMALIZER_VERSION}'
                )
+               )
              )
         )
    )
@@ -139,7 +146,7 @@ export async function proveAndActivateFrameProjection(
   options: ActivationOptions,
 ): Promise<void> {
   const windowStart = options.windowStart ?? new Date(
-    Date.now() - FRAME_WINDOW_HOURS * 60 * 60 * 1_000,
+    Date.now() - FRAME_ACTIVATION_WINDOW_HOURS * 60 * 60 * 1_000,
   );
   await sql.begin("isolation level repeatable read", async (tx) => {
     await tx.unsafe("set local statement_timeout = '30s'");
@@ -161,6 +168,7 @@ export async function proveAndActivateFrameProjection(
       FRAME_VERSION,
       windowStart.toISOString(),
       FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
+      (options.windowEnd ?? new Date()).toISOString(),
     ]);
     if (missing.length > 0) {
       throw new Error(
@@ -261,7 +269,11 @@ if (import.meta.main) {
     await proveAndActivateFrameProjection(sql, {
       workspaceId: options.workspaceId,
       activate: options.activate,
-      windowStart: coveredFrom,
+      windowStart: new Date(
+        coveredThrough.getTime() -
+          FRAME_ACTIVATION_WINDOW_HOURS * 60 * 60 * 1_000,
+      ),
+      windowEnd: coveredThrough,
     });
     console.log(JSON.stringify({
       event: options.activate

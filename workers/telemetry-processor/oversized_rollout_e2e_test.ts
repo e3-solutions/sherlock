@@ -1,4 +1,5 @@
 import postgres from "./postgres.ts";
+import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";
 import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
 import { handler as ingestHandler } from "../../supabase/functions/sherlock-rollout-ingest/index.ts";
 import {
@@ -603,9 +604,27 @@ async function runOversizedE2E(
     assert(Number(spans[0].count) >= 1, "later activity was not reduced");
     if (provider === "claude_code") {
       assert(Number(spans[0].tools) >= 1, "later Claude tool was not reduced");
+      // Activation certifies a fixed window, not a moving wall-clock endpoint
+      // newer than the worker receipts. Match the production handoff command.
+      const projectionAt = new Date();
+      const frameProjector = new PostgresFrameEvidenceProjector(sql);
+      const projectedSessions = await sql.unsafe(
+        "select id::text id from telemetry.sessions where workspace_id = $1",
+        [workspaceId],
+      );
+      for (const session of projectedSessions) {
+        await frameProjector.projectSession({
+          workspaceId,
+          sessionId: session.id,
+          requestGeneration: 1n,
+          now: projectionAt,
+        });
+      }
       await proveAndActivateFrameProjection(sql, {
         workspaceId,
         activate: true,
+        windowStart: new Date(projectionAt.getTime() - 26 * 60 * 60 * 1_000),
+        windowEnd: projectionAt,
       });
       await sql.unsafe("grant sherlock_reader to postgres");
       await assertClaudeDashboard(databaseUrl!, workspaceId);

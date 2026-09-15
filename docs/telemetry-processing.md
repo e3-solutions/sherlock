@@ -182,40 +182,36 @@ safe.
 
 ## Deploy and rollback order
 
-1. Deploy the version-aware worker first. It treats legacy normalize jobs whose
-   target version is still null as that provider's v1, so it is safe before and
-   after the queue migration. Existing v1 events and raw batches stay immutable.
-2. Apply the additive queue and cutover migrations. Each workspace records the
-   first Codex v2 job time as its immutable session boundary. Do not enqueue
-   historical Codex batches: pre-cutover sessions remain on v1 and later
-   sessions use v2. During the already-started transition, a pre-cutover
-   session may use an existing v2 record only when no v1 fact exists for that
-   source record; this closes the live gap without replaying it.
-3. Project the current 26-hour window into frame v4. In one repeatable-read
-   owner transaction, prove
-   each latest receipt exactly matches the session's accepted-version event
-   maximum, event count, and `updated_at`, then insert the one
-   workspace/version activation fact. The worker cannot self-activate.
-4. Enable the dashboard's versioned projection path. Existing v1 snapshot
-   tokens continue on the raw path for their bounded lifetime.
-5. Upload a smoke batch and verify v2 normalized message origins, search,
-   activity spans, frame receipts, revisions, and indexed frame reads.
+The Codex v3 change is forward-only. New uploads are normalized once with v3,
+including uploads from existing sessions; existing jobs and facts are unchanged.
+Known runtime envelopes are excluded from human prompts. No collector update or
+historical normalization replay is required.
 
-For application rollback, stop minting projection-backed tokens before rolling
-the worker back, then let all queued or leased jobs drain and review or requeue
-terminal failures. An activation row is an immutable capability fact, not a
-mutable on/off flag: the reader checks whether the exact workspace/version row
-exists, and rollback does not delete it. A dashboard version that retains the v2
-reader must continue honoring already-issued v2 tokens until their normal
-25-hour expiry; a dashboard rollback that removes v2 support must reject those
-tokens explicitly instead of falling back to raw reads. Keep the migration,
-queue history, raw objects, normalized events, activity revisions, and frame
-projection history. Never delete frame receipts or revisions to roll back a
-reader. Because
-the old full-scan Cron remains disabled, stopping Railway also intentionally
-disables automatic activity reduction; this is a degraded emergency mode, not
-a steady state. Do not stop Railway with backlog present, delete queue/raw rows,
-or re-enable the full-workspace Cron as a permanent design.
+1. Deploy the v3-capable worker and dashboard together. The worker produces only
+   frame v5, selecting existing legacy facts alongside new v3 facts. The dashboard
+   retains old snapshot readers and serves v4 until v5 is activated.
+2. Run `scripts/backfill-frame-evidence.ts --workspace <uuid> --activate` with
+   `SUPABASE_DB_URL` to project the current 26-hour window from **already normalized
+   facts**. This is the existing projection handoff, not a raw-data replay or
+   historical classification repair. Activation requires complete normalization
+   and matching receipts covering 25 hours (the dashboard serves 24 hours).
+   The 26-hour projection leaves room for live receipts to advance during handoff.
+   Coordinate steps 1–2: v4 stops refreshing
+   when the new worker starts and remains stale until activation completes.
+3. Apply `20260915154051_codex_v3_runtime_classification.sql`. It replaces routing
+   in the existing trigger so each newly committed Codex batch gets one v3 job.
+   Claude retains its existing normalizer. Existing v1/v2 jobs drain unchanged.
+4. Send a new human prompt and verify it appears once; verify a known runtime
+   continuation appears as activity but contributes zero new human prompts.
+
+Old false-positive counts remain as recorded. The normalizer keeps v1/v2 support
+for previously queued jobs and reproducibility; it does not continually produce
+those versions for new uploads.
+
+Rollback requires a coordinated worker/reader release that still accepts v3 facts
+and queued jobs. Do not deploy a v2-only worker after enabling v3 routing, delete
+activation facts, rewrite old events, or reactivate v4 as a live view of v3 data.
+Preserve issued snapshot support and all raw and derived history.
 
 ## Oversized native records
 

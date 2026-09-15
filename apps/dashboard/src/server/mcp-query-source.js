@@ -16,6 +16,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const PROVIDER_VERSIONS = Object.freeze([
   "sherlock.codex-rollout.v1",
   "sherlock.codex-rollout.v2",
+  "sherlock.codex-rollout.v3",
   "sherlock.claude-code-transcript.v1",
 ]);
 
@@ -31,6 +32,14 @@ function activeNormalizerPredicate(event, session, batch, cutover) {
     and ${event}.normalizer_version = '${FRAME_CLAUDE_VERSION}'
     or ${batch}.source_provider = 'codex'
     and (
+      ${event}.normalizer_version = 'sherlock.codex-rollout.v3'
+      or not exists (
+        select 1 from telemetry.events corrected
+         where corrected.workspace_id = ${event}.workspace_id
+           and corrected.source_record_id = ${event}.source_record_id
+           and corrected.normalizer_version = 'sherlock.codex-rollout.v3'
+           and not corrected.is_replay
+      ) and (
       (${cutover}.cutover_at is null
        or ${session}.started_at >= ${cutover}.cutover_at)
       and ${event}.normalizer_version = '${FRAME_CODEX_VERSION}'
@@ -46,8 +55,15 @@ function activeNormalizerPredicate(event, session, batch, cutover) {
              and not legacy.is_replay
         )
       )
+      )
     )
   )`;
+}
+
+function canonicalNormalizer(event) {
+  return `case when ${event}.event_kind = 'message'
+    and ${event}.normalizer_version like 'sherlock.codex-rollout.%'
+    then 'codex' else ${event}.normalizer_version end`;
 }
 
 // Resolve canonical identity against all visible projections, not only those
@@ -67,7 +83,7 @@ function canonicalWinnerPredicate(event, session) {
      and winner_cutover.to_normalizer_version = '${FRAME_CODEX_VERSION}'
     where winner.workspace_id = ${event}.workspace_id
       and winner.session_id = ${event}.session_id
-      and winner.normalizer_version = ${event}.normalizer_version
+      and ${canonicalNormalizer("winner")} = ${canonicalNormalizer(event)}
       and winner.canonical_scope_key = ${event}.canonical_scope_key
       and winner.logical_event_key = ${event}.logical_event_key
       and winner.event_kind = ${event}.event_kind and not winner.is_replay
@@ -184,7 +200,8 @@ export function decodeSessionCursor(cursor, fingerprint) {
 function providerFromVersion(version) {
   if (version === "sherlock.claude-code-transcript.v1") return "claude";
   if (version === "sherlock.codex-rollout.v1" ||
-      version === "sherlock.codex-rollout.v2") return "codex";
+      version === "sherlock.codex-rollout.v2" ||
+      version === "sherlock.codex-rollout.v3") return "codex";
   return "unknown";
 }
 

@@ -12,7 +12,7 @@ function payload() {
   return {
     start: START,
     read: "2026-08-19T03:30:08.000Z",
-    snapshot: "v1.snapshot",
+    snapshot: `v4.${Buffer.from(JSON.stringify(["100:100:", "2026-08-19T03:30:08.000Z"])).toString("base64url")}`,
     nextCursor: null,
     coverage: {
       evidence: "observed_events",
