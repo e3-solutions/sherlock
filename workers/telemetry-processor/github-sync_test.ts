@@ -61,7 +61,8 @@ Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async
       "matched",
       null,
     ],
-    [[{ ...pull, merged_at: null }], "error"],
+    [[{ ...pull, merged_at: null }], "matched", "2026-08-21T01:02:03.000Z"],
+    [[{ ...pull, closed_at: null, merged_at: null }], "error"],
     [[{ ...pull, base: { repo: { full_name: "other/repo" } } }], "error"],
     ["invalid", "error"],
   ];
@@ -80,11 +81,43 @@ Deno.test("commit lookup accepts one exact PR and fails closed otherwise", async
       if (expected === "matched") {
         assert(result.pullRequestNumber === 57);
         assert(result.pullRequestTerminalAt === terminalAt);
+        assert(result.errorCode === null);
       }
     } catch {
       assert(expected === "error");
     }
   }
+});
+
+Deno.test("sync classifies only an exact commit-not-found 422", async () => {
+  const cases = [
+    [`No commit found for SHA: ${pair.commitSha}`, "commit_not_found"],
+    ["No commit found for SHA: " + "b".repeat(40), "github_http_422"],
+    ["Validation Failed", "github_http_422"],
+  ] as const;
+
+  for (const [message, expectedCode] of cases) {
+    const results: LookupResult[] = [];
+    const summary = await sync(storeFor(results, [pair]), {
+      fetcher: () =>
+        Promise.resolve(Response.json({ message }, { status: 422 })),
+    });
+    assert(summary.attempted === 1 && summary.failed === 1);
+    assert(!summary.backlogRemaining && summary.pause === null);
+    assert(
+      results.length === 1 && results[0].outcome === "failed" &&
+        results[0].errorCode === expectedCode,
+    );
+  }
+
+  const malformed: LookupResult[] = [];
+  await sync(storeFor(malformed, [pair]), {
+    fetcher: () => Promise.resolve(new Response("not-json", { status: 422 })),
+  });
+  assert(
+    malformed.length === 1 && malformed[0].outcome === "failed" &&
+      malformed[0].errorCode === "github_http_422",
+  );
 });
 
 Deno.test("sync pauses globally without writing a pair failure", async () => {
@@ -148,7 +181,10 @@ Deno.test("sync continues after pair-specific HTTP failures", async () => {
   assert(summary.attempted === 2 && summary.failed === 2);
   assert(!summary.backlogRemaining && summary.pause === null);
   assert(
-    results.length === 2 && results.every((row) => row.outcome === "failed"),
+    results.length === 2 &&
+      results.every((row) =>
+        row.outcome === "failed" && row.errorCode === "github_http_403"
+      ),
   );
 });
 

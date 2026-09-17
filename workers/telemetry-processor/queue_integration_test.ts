@@ -232,6 +232,10 @@ async function insertGithubFact(
 }
 
 async function deleteGithubFixture(sql: Sql, workspaceId: string) {
+  await sql.unsafe(
+    "delete from github.commit_pr_lookups where workspace_id = $1",
+    [workspaceId],
+  ).catch(() => undefined);
   await sql.unsafe("delete from telemetry.events where workspace_id = $1", [
     workspaceId,
   ]).catch(() => undefined);
@@ -980,10 +984,12 @@ Deno.test({
       const old = new Date(now - 27 * 60 * 60 * 1_000).toISOString();
       for (
         const [label, sha, createdAt, recentEvent] of [
-          ["recent-and-active", "a", new Date(now).toISOString(), "live"],
-          ["old-but-active", "b", old, "live"],
-          ["old-replay-only", "c", old, "replay"],
-          ["old-inactive", "d", old, null],
+          ["recent-missing", "a", new Date(now).toISOString(), "live"],
+          ["due-missing", "b", old, "live"],
+          ["transient-failure", "c", old, "live"],
+          ["appended-current", "f", old, "live"],
+          ["old-replay-only", "d", old, "replay"],
+          ["old-inactive", "e", old, null],
         ] as const
       ) {
         await insertGithubFact(sql, {
@@ -1008,8 +1014,52 @@ Deno.test({
       const pairs = await queue.pendingGithubCommitPairs(10, [workspaceId]);
       assert(
         pairs.map((pair) => pair.repositoryFullName).sort().join(",") ===
-          "e3-solutions/old-but-active,e3-solutions/recent-and-active",
+          "e3-solutions/appended-current,e3-solutions/due-missing,e3-solutions/recent-missing,e3-solutions/transient-failure",
         "only distinct recent or non-replay active candidates remain visible",
+      );
+
+      await queue.appendGithubLookup({
+        workspaceId,
+        repositoryFullName: "e3-solutions/appended-current",
+        commitSha: "f".repeat(40),
+        outcome: "failed",
+        pullRequestNumber: null,
+        pullRequestTerminalAt: null,
+        errorCode: "commit_not_found",
+      });
+      await sql.unsafe(
+        `insert into github.commit_pr_lookups (
+           workspace_id, source_version, repository_full_name, commit_sha,
+           outcome, error_code, created_at
+         ) values
+           ($1, 'sherlock.github-associated-pulls.v1',
+            'e3-solutions/recent-missing', $2, 'failed', 'commit_not_found',
+            now() - interval '59 minutes'),
+           ($1, 'sherlock.github-associated-pulls.v1',
+            'e3-solutions/due-missing', $3, 'failed', 'commit_not_found',
+            now() - interval '61 minutes'),
+           ($1, 'sherlock.github-associated-pulls.v1',
+            'e3-solutions/transient-failure', $4, 'failed',
+            'github_http_422', now() - interval '11 minutes')`,
+        [workspaceId, "a".repeat(40), "b".repeat(40), "c".repeat(40)],
+      );
+      const retryable = await queue.pendingGithubCommitPairs(10, [workspaceId]);
+      assert(
+        retryable.map((pair) => pair.repositoryFullName).sort().join(",") ===
+          "e3-solutions/due-missing,e3-solutions/transient-failure",
+        "confirmed missing commits wait an hour while transient failures retry after ten minutes",
+      );
+      const [stored] = await sql.unsafe(
+        `select error_code
+           from github.commit_pr_lookups
+          where workspace_id = $1
+            and repository_full_name = 'e3-solutions/appended-current'
+          order by id desc limit 1`,
+        [workspaceId],
+      );
+      assert(
+        stored.error_code === "commit_not_found",
+        "the append-only lookup fact must preserve its normalized failure code",
       );
     } finally {
       await deleteGithubFixture(sql, workspaceId);
