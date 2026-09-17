@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "template_only": true,
+  "activation_gate": "Resolve BONAPARTE_PRODUCTION_URL, create both checks disabled, verify their assertions from three probes, then enable them before unpausing any dependent alert rule.",
+  "variables": {
+    "BONAPARTE_PRODUCTION_URL": {
+      "required": true,
+      "format": "https_origin",
+      "example": "https://bonaparte.example.com"
+    }
+  },
+  "checks": [
+    {
+      "job": "bonaparte-production-healthz",
+      "target": "${BONAPARTE_PRODUCTION_URL}/healthz",
+      "enabled": false,
+      "frequency_seconds": 60,
+      "timeout_seconds": 10,
+      "probes": [
+        "Oregon",
+        "Ohio",
+        "Virginia"
+      ],
+      "labels": {
+        "service": "bonaparte",
+        "environment": "production",
+        "component": "dashboard",
+        "owner": "bonaparte"
+      },
+      "http": {
+        "method": "GET",
+        "follow_redirects": true,
+        "fail_if_not_ssl": true,
+        "valid_status_codes": [
+          200
+        ],
+        "body_regex": [
+          "\"status\"\\s*:\\s*\"ok\""
+        ],
+        "header_regex": [],
+        "preferred_ip_protocol": "ip4"
+      }
+    },
+    {
+      "job": "bonaparte-production-freshness",
+      "target": "${BONAPARTE_PRODUCTION_URL}/api/flame/freshness?refresh=wait",
+      "enabled": false,
+      "frequency_seconds": 60,
+      "timeout_seconds": 10,
+      "probes": [
+        "Oregon",
+        "Ohio",
+        "Virginia"
+      ],
+      "labels": {
+        "service": "bonaparte",
+        "environment": "production",
+        "component": "pipeline",
+        "owner": "bonaparte"
+      },
+      "http": {
+        "method": "GET",
+        "follow_redirects": true,
+        "fail_if_not_ssl": true,
+        "valid_status_codes": [
+          200
+        ],
+        "body_regex": [
+          "\"delayed\"\\s*:\\s*false"
+        ],
+        "header_regex": [
+          {
+            "name": "X-Sherlock-Freshness-Cache",
+            "pattern": "^hit$"
+          }
+        ],
+        "preferred_ip_protocol": "ip4"
+      }
+    }
+  ]
+}
