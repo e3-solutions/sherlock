@@ -3,13 +3,7 @@
   "id": "sherlock",
   "version": "0.1.0",
   "owner": "e3-solutions",
-  "providers": [
-    "codex",
-    "claude"
-  ],
-  "runtime": {
-    "python_min": "3.11"
-  },
+  "providers": ["codex", "claude"],
   "include": [
     "packages/telemetry-collector/src",
     "plugins/sherlock/scripts/run_hook.py",
@@ -17,28 +11,23 @@
     "plugins/sherlock-claude-code/scripts/run_hook.py",
     "plugins/sherlock-claude-code/scripts/collective_feedback.py"
   ],
-  "environment": {
-    "SHERLOCK_COLLECTOR_SOURCE": {
-      "component_path": "packages/telemetry-collector/src"
+  "environment": {"SHERLOCK_COLLECTOR_SOURCE": {"component_path": "packages/telemetry-collector/src"}},
+  "hook_defaults": {
+    "providers": ["claude"],
+    "timeout_seconds": 2,
+    "background_work": {
+      "mode": "existing-worker",
+      "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
     }
   },
   "hooks": [
     {
       "id": "codex-session-start",
       "event": "SessionStart",
-      "providers": [
-        "codex"
-      ],
+      "providers": ["codex"],
       "entrypoint": "plugins/sherlock/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "SessionStart"
-        ],
-        "output": "codex-json"
-      },
+      "invocation": {"kind": "python-script", "args": ["SessionStart"], "output": "codex-json"},
       "timeout_seconds": 30,
-      "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
         "purpose": "Existing detached queue drain after foreground capture; lifecycle remains unready, centrally reject selected worker hooks."
@@ -47,19 +36,10 @@
     {
       "id": "codex-user-prompt-submit",
       "event": "UserPromptSubmit",
-      "providers": [
-        "codex"
-      ],
+      "providers": ["codex"],
       "entrypoint": "plugins/sherlock/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "UserPromptSubmit"
-        ],
-        "output": "codex-json"
-      },
+      "invocation": {"kind": "python-script", "args": ["UserPromptSubmit"], "output": "codex-json"},
       "timeout_seconds": 30,
-      "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
         "purpose": "Existing detached queue drain after foreground capture; lifecycle remains unready, centrally reject selected worker hooks."
@@ -68,19 +48,10 @@
     {
       "id": "codex-post-tool-use",
       "event": "PostToolUse",
-      "providers": [
-        "codex"
-      ],
+      "providers": ["codex"],
       "entrypoint": "plugins/sherlock/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "PostToolUse"
-        ],
-        "output": "codex-json"
-      },
+      "invocation": {"kind": "python-script", "args": ["PostToolUse"], "output": "codex-json"},
       "timeout_seconds": 30,
-      "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
         "purpose": "Existing detached queue drain after foreground capture; lifecycle remains unready, centrally reject selected worker hooks."
@@ -89,19 +60,10 @@
     {
       "id": "codex-post-compact",
       "event": "PostCompact",
-      "providers": [
-        "codex"
-      ],
+      "providers": ["codex"],
       "entrypoint": "plugins/sherlock/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "PostCompact"
-        ],
-        "output": "codex-json"
-      },
+      "invocation": {"kind": "python-script", "args": ["PostCompact"], "output": "codex-json"},
       "timeout_seconds": 30,
-      "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
         "purpose": "Existing detached queue drain after foreground capture; lifecycle remains unready, centrally reject selected worker hooks."
@@ -110,19 +72,10 @@
     {
       "id": "codex-subagent-start",
       "event": "SubagentStart",
-      "providers": [
-        "codex"
-      ],
+      "providers": ["codex"],
       "entrypoint": "plugins/sherlock/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "SubagentStart"
-        ],
-        "output": "codex-json"
-      },
+      "invocation": {"kind": "python-script", "args": ["SubagentStart"], "output": "codex-json"},
       "timeout_seconds": 30,
-      "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
         "purpose": "Existing detached queue drain after foreground capture; lifecycle remains unready, centrally reject selected worker hooks."
@@ -131,19 +84,10 @@
     {
       "id": "codex-subagent-stop",
       "event": "SubagentStop",
-      "providers": [
-        "codex"
-      ],
+      "providers": ["codex"],
       "entrypoint": "plugins/sherlock/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "SubagentStop"
-        ],
-        "output": "codex-json"
-      },
+      "invocation": {"kind": "python-script", "args": ["SubagentStop"], "output": "codex-json"},
       "timeout_seconds": 30,
-      "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
         "purpose": "Existing detached queue drain after foreground capture; lifecycle remains unready, centrally reject selected worker hooks."
@@ -152,19 +96,10 @@
     {
       "id": "codex-stop",
       "event": "Stop",
-      "providers": [
-        "codex"
-      ],
+      "providers": ["codex"],
       "entrypoint": "plugins/sherlock/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "Stop"
-        ],
-        "output": "codex-json"
-      },
+      "invocation": {"kind": "python-script", "args": ["Stop"], "output": "codex-json"},
       "timeout_seconds": 30,
-      "failure_policy": "continue",
       "background_work": {
         "mode": "existing-worker",
         "purpose": "Existing detached queue drain after foreground capture; lifecycle remains unready, centrally reject selected worker hooks."
@@ -173,159 +108,47 @@
     {
       "id": "claude-session-start",
       "event": "SessionStart",
-      "providers": [
-        "claude"
-      ],
       "entrypoint": "plugins/sherlock-claude-code/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "SessionStart"
-        ],
-        "output": "context"
-      },
-      "timeout_seconds": 2,
-      "failure_policy": "continue",
-      "background_work": {
-        "mode": "existing-worker",
-        "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
-      }
+      "invocation": {"kind": "python-script", "args": ["SessionStart"], "output": "context"}
     },
     {
       "id": "claude-user-prompt-submit",
       "event": "UserPromptSubmit",
-      "providers": [
-        "claude"
-      ],
       "entrypoint": "plugins/sherlock-claude-code/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "UserPromptSubmit"
-        ],
-        "output": "ignore"
-      },
-      "timeout_seconds": 2,
-      "failure_policy": "continue",
-      "background_work": {
-        "mode": "existing-worker",
-        "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
-      }
+      "invocation": {"kind": "python-script", "args": ["UserPromptSubmit"], "output": "ignore"}
     },
     {
       "id": "claude-post-tool-use",
       "event": "PostToolUse",
-      "providers": [
-        "claude"
-      ],
       "entrypoint": "plugins/sherlock-claude-code/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "PostToolUse"
-        ],
-        "output": "ignore"
-      },
-      "timeout_seconds": 2,
-      "failure_policy": "continue",
-      "background_work": {
-        "mode": "existing-worker",
-        "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
-      }
+      "invocation": {"kind": "python-script", "args": ["PostToolUse"], "output": "ignore"}
     },
     {
       "id": "claude-stop",
       "event": "Stop",
-      "providers": [
-        "claude"
-      ],
       "entrypoint": "plugins/sherlock-claude-code/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "Stop"
-        ],
-        "output": "ignore"
-      },
-      "timeout_seconds": 2,
-      "failure_policy": "continue",
-      "background_work": {
-        "mode": "existing-worker",
-        "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
-      }
+      "invocation": {"kind": "python-script", "args": ["Stop"], "output": "ignore"}
     },
     {
       "id": "claude-subagent-start",
       "event": "SubagentStart",
-      "providers": [
-        "claude"
-      ],
       "entrypoint": "plugins/sherlock-claude-code/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "SubagentStart"
-        ],
-        "output": "ignore"
-      },
-      "timeout_seconds": 2,
-      "failure_policy": "continue",
-      "background_work": {
-        "mode": "existing-worker",
-        "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
-      }
+      "invocation": {"kind": "python-script", "args": ["SubagentStart"], "output": "ignore"}
     },
     {
       "id": "claude-subagent-stop",
       "event": "SubagentStop",
-      "providers": [
-        "claude"
-      ],
       "entrypoint": "plugins/sherlock-claude-code/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "SubagentStop"
-        ],
-        "output": "ignore"
-      },
-      "timeout_seconds": 2,
-      "failure_policy": "continue",
-      "background_work": {
-        "mode": "existing-worker",
-        "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
-      }
+      "invocation": {"kind": "python-script", "args": ["SubagentStop"], "output": "ignore"}
     },
     {
       "id": "claude-session-end",
       "event": "SessionEnd",
-      "providers": [
-        "claude"
-      ],
       "entrypoint": "plugins/sherlock-claude-code/scripts/run_hook.py",
-      "invocation": {
-        "kind": "python-script",
-        "args": [
-          "SessionEnd"
-        ],
-        "output": "ignore"
-      },
-      "timeout_seconds": 2,
-      "failure_policy": "continue",
-      "background_work": {
-        "mode": "existing-worker",
-        "purpose": "Existing detached capture and queue drain, including terminal transcript settling; lifecycle remains unready, centrally reject selected worker hooks."
-      }
+      "invocation": {"kind": "python-script", "args": ["SessionEnd"], "output": "ignore"}
     }
   ],
-  "skills": [],
-  "commands": [],
-  "dependencies": [
-    {
-      "kind": "executable",
-      "name": "git"
-    }
-  ],
+  "dependencies": [{"kind": "executable", "name": "git"}],
   "state": [
     {
       "id": "codex-telemetry",
