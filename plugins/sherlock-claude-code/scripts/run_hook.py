@@ -38,7 +38,7 @@ def collector_source() -> Path | None:
     return None
 
 
-def capture(event_name: str) -> int:
+def capture(event_name: str, *, state_root: Path | None = None) -> int:
     source = collector_source()
     if source is None:
         return 0
@@ -62,7 +62,7 @@ def capture(event_name: str) -> int:
         "--claude-home",
         str(claude_home),
         "--state-root",
-        str(claude_home / "sherlock" / "telemetry"),
+        str(state_root if state_root is not None else claude_home / "sherlock" / "telemetry"),
         "--config",
         os.environ.get(
             "SHERLOCK_CONFIG_PATH",
