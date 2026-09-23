@@ -1280,6 +1280,16 @@ export default function FlameGraph({
       data-state={stale ? "stale" : "current"}
       aria-label={`Code activity over the last ${windowLabel}`}
     >
+      {fullPeak > typicalPeak && (
+        <button
+          className="flame-scale-toggle"
+          type="button"
+          aria-pressed={showFullScale}
+          onClick={() => setShowFullScale((current) => !current)}
+        >
+          {showFullScale ? "Fit typical activity" : "Show full scale"}
+        </button>
+      )}
       <div className="flame-meta-row">
         <div className="flame-meta-rail">{timelineMeta}</div>
         <div
@@ -1287,16 +1297,6 @@ export default function FlameGraph({
           style={{ width }}
           aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
         >
-          {fullPeak > typicalPeak && (
-            <button
-              className="flame-scale-toggle"
-              type="button"
-              aria-pressed={showFullScale}
-              onClick={() => setShowFullScale((current) => !current)}
-            >
-              {showFullScale ? "Fit typical activity" : "Show full scale"}
-            </button>
-          )}
           {ticks.map((tick, index) => {
             const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
             return (

@@ -362,10 +362,10 @@ input { font: inherit; }
 }
 
 .flame-scale-toggle {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  z-index: 1;
+  position: fixed;
+  top: 42px;
+  right: 32px;
+  z-index: 20;
   border: 1px solid var(--flame-rule);
   border-radius: 4px;
   padding: 4px 8px;
@@ -1161,6 +1161,7 @@ input { font: inherit; }
     --flame-rail: 214px;
   }
   #root { padding: 24px; }
+  .flame-scale-toggle { top: 33px; right: 24px; }
   .portal-header {
     min-height: 0;
     gap: 36px;
@@ -1186,6 +1187,7 @@ input { font: inherit; }
 @media (max-width: 520px) {
   :root { --flame-rail: 164px; }
   #root { padding: 16px; }
+  .flame-scale-toggle { top: 23px; right: 16px; }
   .portal-header { gap: 32px; padding-bottom: 8px; }
   .portal-header__brand { gap: 9px; }
   .portal-header__logo { width: 31px; height: 38px; }
