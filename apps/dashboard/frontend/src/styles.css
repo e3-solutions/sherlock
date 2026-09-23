@@ -55,6 +55,14 @@ input { font: inherit; }
   margin-bottom: 12px;
 }
 
+.portal-header__top {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .portal-header__brand {
   display: flex;
   min-width: max-content;
@@ -359,6 +367,23 @@ input { font: inherit; }
   color: var(--flame-muted);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
+}
+
+.flame-scale-toggle {
+  flex: 0 0 auto;
+  border: 1px solid var(--flame-rule);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: var(--flame-surface);
+  color: var(--flame-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.flame-scale-toggle:hover,
+.flame-scale-toggle:focus-visible {
+  color: var(--flame-ink);
+  border-color: currentColor;
 }
 
 .flame-time-axis::after {

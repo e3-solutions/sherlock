@@ -3,12 +3,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import bonaparteLogo from "./assets/bonaparte-logo.png";
 import FlameGraph, {
   DEFAULT_PERSON_RANK,
+  getActivityDisplayScale,
   PERSON_RANK_OPTIONS,
 } from "./FlameGraph.jsx";
 import {
   adaptFlameFreshness,
   adaptFlamePayload,
   BUCKET_MS,
+  getGlobalPeak,
   mergeFlameFreshness,
 } from "./flame-data.js";
 
@@ -54,6 +56,7 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [freshnessState, setFreshnessState] = useState("loading");
   const [rankBy, setRankBy] = useState(DEFAULT_PERSON_RANK);
+  const [showFullScale, setShowFullScale] = useState(false);
   const lastGoodRef = useRef(null);
   const timerRef = useRef(null);
   const requestRef = useRef(null);
@@ -190,10 +193,18 @@ export default function App() {
   }
 
   const liveProblem = freshnessState === "delayed" || freshnessState === "stale";
+  const hasOutliers = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people))
+    > getActivityDisplayScale(data.people);
 
   return (
     <>
-      <PortalHeader rankBy={rankBy} onRankChange={setRankBy} />
+      <PortalHeader
+        rankBy={rankBy}
+        onRankChange={setRankBy}
+        showScaleToggle={hasOutliers}
+        showFullScale={showFullScale}
+        onScaleToggle={() => setShowFullScale((current) => !current)}
+      />
       {liveProblem && (
         <p className="refresh-warning" role="status">
           {freshnessState === "delayed"
@@ -204,6 +215,7 @@ export default function App() {
       <FlameGraph
         data={data}
         rankBy={rankBy}
+        showFullScale={showFullScale}
         stale={state === "stale" || state === "delayed" || liveProblem}
         onRefresh={() => load({ refresh: "force" })}
         timelineMeta={(
@@ -244,17 +256,29 @@ function TimelineFreshness({ data, state, message }) {
   );
 }
 
-function PortalHeader({ rankBy, onRankChange }) {
+function PortalHeader({ rankBy, onRankChange, showScaleToggle, showFullScale, onScaleToggle }) {
   return (
     <header className="portal-header">
-      <div className="portal-header__brand">
-        <img
-          className="portal-header__logo"
-          src={bonaparteLogo}
-          alt=""
-          aria-hidden="true"
-        />
-        <h1>Bonaparte</h1>
+      <div className="portal-header__top">
+        <div className="portal-header__brand">
+          <img
+            className="portal-header__logo"
+            src={bonaparteLogo}
+            alt=""
+            aria-hidden="true"
+          />
+          <h1>Bonaparte</h1>
+        </div>
+        {showScaleToggle && (
+          <button
+            className="flame-scale-toggle"
+            type="button"
+            aria-pressed={showFullScale}
+            onClick={onScaleToggle}
+          >
+            {showFullScale ? "Fit typical activity" : "Show full scale"}
+          </button>
+        )}
       </div>
       <aside className="portal-header__legend" aria-label="Timeline legend">
         <SemanticLegend rankBy={rankBy} onRankChange={onRankChange} />

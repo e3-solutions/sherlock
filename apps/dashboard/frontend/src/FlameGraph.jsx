@@ -86,6 +86,36 @@ export function rankPeople(people, rankBy) {
     .map(({ person }) => person);
 }
 
+/** Limit exceptional buckets on the shared display scale without changing source counts. */
+export function getActivityDisplayScale(people) {
+  const values = people.flatMap((person) => person.buckets
+    .map((bucket) => bucket.activity)
+    .filter((value) => value > 0))
+    .sort((left, right) => left - right);
+  const fullPeak = values.at(-1) ?? 0;
+  if (values.length < 4) {
+    const previousPeak = values.at(-2) ?? fullPeak;
+    const isolatedOutlier = fullPeak > Math.max(10, previousPeak * 4);
+    return Math.max(1, isolatedOutlier ? previousPeak : fullPeak);
+  }
+
+  const upperQuartile = values[Math.floor((values.length - 1) * 0.75)];
+  const cutoff = Math.max(10, upperQuartile * 4);
+  const typicalPeak = values.filter((value) => value <= cutoff).at(-1) ?? fullPeak;
+  return Math.max(1, typicalPeak);
+}
+
+/** Keep the plotted stack within the scale while retaining exact counts on the point. */
+export function capActivityForDisplay(point, peak) {
+  const ratio = point.activity > peak ? peak / point.activity : 1;
+  return {
+    ...point,
+    chartAgent: point.agent * ratio,
+    chartSubagent: point.subagent * ratio,
+    chartUnclassified: point.unclassified * ratio,
+  };
+}
+
 async function apiFailure(response, fallback) {
   let code = fallback;
   try {
@@ -746,10 +776,10 @@ const PersonLane = memo(function PersonLane({
   const headingId = `flame-person-${id}`;
   const points = useMemo(
     () => person.buckets.map((point) => ({
-      ...point,
+      ...capActivityForDisplay(point, peak),
       promptMarker: point.prompts > 0 ? 0 : null,
     })),
-    [person.buckets],
+    [person.buckets, peak],
   );
 
   const select = (point) => {
@@ -865,7 +895,7 @@ const PersonLane = memo(function PersonLane({
           />
           <Bar
             yAxisId="activity"
-            dataKey="agent"
+            dataKey="chartAgent"
             name="Agent"
             stackId="activity"
             fill="var(--flame-agent)"
@@ -873,7 +903,7 @@ const PersonLane = memo(function PersonLane({
           />
           <Bar
             yAxisId="activity"
-            dataKey="subagent"
+            dataKey="chartSubagent"
             name="Subagent"
             stackId="activity"
             fill="var(--flame-subagent)"
@@ -881,7 +911,7 @@ const PersonLane = memo(function PersonLane({
           />
           <Bar
             yAxisId="activity"
-            dataKey="unclassified"
+            dataKey="chartUnclassified"
             name="Unclassified"
             stackId="activity"
             fill="var(--flame-unclassified)"
@@ -940,6 +970,7 @@ export default function FlameGraph({
   stale = false,
   onRefresh,
   rankBy = DEFAULT_PERSON_RANK,
+  showFullScale = false,
   timelineMeta,
 }) {
   const peopleScrollRef = useRef(null);
@@ -960,7 +991,9 @@ export default function FlameGraph({
     state: "idle", items: [], nextCursor: null,
   });
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
-  const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
+  const typicalPeak = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
+  const fullPeak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
+  const peak = showFullScale ? fullPeak : typicalPeak;
   const promptPeak = data.people.reduce(
     (peoplePeak, person) => person.buckets.reduce(
       (personPeak, { prompts }) => Math.max(personPeak, prompts),

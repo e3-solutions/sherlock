@@ -18,13 +18,14 @@ vi.mock("./flame-data.js", () => ({
   adaptFlameFreshness: adaptFreshnessMock,
   mergeFlameFreshness: mergeFreshnessMock,
   BUCKET_MS: 10 * 60 * 1000,
+  getGlobalPeak: () => 1,
 }));
 
 vi.mock("./FlameGraph.jsx", () => ({
-  default: ({ data, rankBy, stale, onRefresh, timelineMeta }) => {
+  default: ({ data, rankBy, showFullScale, stale, onRefresh, timelineMeta }) => {
     flameGraphRenderMock();
     return (
-      <div data-testid="flame-graph" data-rank-by={rankBy} data-stale={String(stale)}>
+      <div data-testid="flame-graph" data-rank-by={rankBy} data-full-scale={String(showFullScale)} data-stale={String(stale)}>
         {timelineMeta}
         {data.marker}
         <button type="button" onClick={onRefresh}>Refresh timeline</button>
@@ -39,6 +40,7 @@ vi.mock("./FlameGraph.jsx", () => ({
     { value: "subagents", label: "Subagents" },
   ],
   DEFAULT_PERSON_RANK: "active-time",
+  getActivityDisplayScale: () => 4,
 }));
 
 import App, { expectedTimelineEnd, nextRefreshDelay, timelineFreshness } from "./App.jsx";
@@ -198,7 +200,7 @@ describe("App", () => {
     });
 
     expect(header.querySelector(".portal-header__brand")).toHaveTextContent("Bonaparte");
-    expect(header.querySelector(".portal-header__brand + .portal-header__legend"))
+    expect(header.querySelector(".portal-header__top + .portal-header__legend"))
       .toBe(legendRegion);
     expect(statusLegend.parentElement).toHaveClass("flame-legends");
     expect(activityLegend.parentElement).toBe(statusLegend.parentElement);
@@ -217,6 +219,25 @@ describe("App", () => {
     expect(within(statusLegend).getByLabelText(
       "Red: activity more than 30 minutes ago or no activity",
     )).toHaveTextContent(">30m / none");
+  });
+
+  it("keeps the scale toggle beside the logo and passes its state to the chart", async () => {
+    adaptMock.mockReturnValue({ ...model, globalPeak: 800, people: [] });
+    vi.stubGlobal("fetch", routedFetch([response()]));
+
+    const { container } = render(<App />);
+    await settle();
+
+    const headerRow = container.querySelector(".portal-header__top");
+    expect(headerRow.querySelector(".portal-header__brand")).toBeInTheDocument();
+    const toggle = within(headerRow).getByRole("button", { name: "Show full scale" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-full-scale", "false");
+
+    fireEvent.click(toggle);
+    expect(within(headerRow).getByRole("button", { name: "Fit typical activity" }))
+      .toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-full-scale", "true");
   });
 
   it("updates the graph ranking from the inline selector", async () => {

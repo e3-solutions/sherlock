@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import FlameGraph, {
   BucketCursor,
   BucketTooltip,
+  capActivityForDisplay,
   getAvailableChartWidth,
   getBucketCenterX,
   getBucketTooltipPlacement,
   formatActiveTime,
+  getActivityDisplayScale,
   rankPeople,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
@@ -202,6 +204,43 @@ describe("bucket hover geometry", () => {
 });
 
 describe("FlameGraph", () => {
+  it("recognizes an isolated outlier when only two buckets have activity", () => {
+    expect(getActivityDisplayScale([{
+      buckets: [{ activity: 2 }, { activity: 800 }],
+    }])).toBe(2);
+  });
+
+  it("caps mixed-role stacks proportionally and leaves normal buckets alone", () => {
+    const extreme = { agent: 200, subagent: 600, unclassified: 0, activity: 800 };
+    const capped = capActivityForDisplay(extreme, 8);
+    expect([capped.chartAgent, capped.chartSubagent, capped.chartUnclassified]).toEqual([2, 6, 0]);
+    expect(extreme).toEqual({ agent: 200, subagent: 600, unclassified: 0, activity: 800 });
+    expect(capActivityForDisplay({ agent: 2, subagent: 1, unclassified: 0, activity: 3 }, 8))
+      .toMatchObject({ chartAgent: 2, chartSubagent: 1, chartUnclassified: 0 });
+  });
+
+  it("toggles between a shortened outlier bar and its full height without changing its count", () => {
+    const data = model();
+    data.people[0].buckets[1] = {
+      ...data.people[0].buckets[1], subagent: 800, activity: 800,
+    };
+    data.people[0].buckets[2] = {
+      ...data.people[0].buckets[2], agent: 2, activity: 2,
+    };
+    data.globalPeak = 800;
+
+    expect(getActivityDisplayScale(data.people)).toBe(4);
+    const capped = capActivityForDisplay(data.people[0].buckets[1], 4);
+    expect(capped.chartSubagent).toBe(4);
+    expect(capped.subagent).toBe(800);
+    expect(capActivityForDisplay(data.people[0].buckets[1], 800).chartSubagent).toBe(800);
+    const { container, rerender } = render(<FlameGraph data={data} chartWidth={1008} showFullScale={false} />);
+    expect(container.querySelector('[aria-label="Ada Lovelace activity timeline, 144 ten-minute buckets"]'))
+      .toBeInTheDocument();
+    rerender(<FlameGraph data={data} chartWidth={1008} showFullScale />);
+    expect(data.people[0].buckets[1].subagent).toBe(800);
+  });
+
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn((url) => {
       const request = new URL(url, "http://dashboard.test");
