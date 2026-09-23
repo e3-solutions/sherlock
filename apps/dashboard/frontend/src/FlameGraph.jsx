@@ -970,6 +970,7 @@ export default function FlameGraph({
   stale = false,
   onRefresh,
   rankBy = DEFAULT_PERSON_RANK,
+  showFullScale = false,
   timelineMeta,
 }) {
   const peopleScrollRef = useRef(null);
@@ -989,7 +990,6 @@ export default function FlameGraph({
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], nextCursor: null,
   });
-  const [showFullScale, setShowFullScale] = useState(false);
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
   const typicalPeak = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
   const fullPeak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
@@ -1280,16 +1280,6 @@ export default function FlameGraph({
       data-state={stale ? "stale" : "current"}
       aria-label={`Code activity over the last ${windowLabel}`}
     >
-      {fullPeak > typicalPeak && (
-        <button
-          className="flame-scale-toggle"
-          type="button"
-          aria-pressed={showFullScale}
-          onClick={() => setShowFullScale((current) => !current)}
-        >
-          {showFullScale ? "Fit typical activity" : "Show full scale"}
-        </button>
-      )}
       <div className="flame-meta-row">
         <div className="flame-meta-rail">{timelineMeta}</div>
         <div

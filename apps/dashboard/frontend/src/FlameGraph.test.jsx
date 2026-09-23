@@ -234,14 +234,10 @@ describe("FlameGraph", () => {
     expect(capped.chartSubagent).toBe(4);
     expect(capped.subagent).toBe(800);
     expect(capActivityForDisplay(data.people[0].buckets[1], 800).chartSubagent).toBe(800);
-    const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
-    const toggle = screen.getByRole("button", { name: "Show full scale" });
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    const { container, rerender } = render(<FlameGraph data={data} chartWidth={1008} showFullScale={false} />);
     expect(container.querySelector('[aria-label="Ada Lovelace activity timeline, 144 ten-minute buckets"]'))
       .toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(screen.getByRole("button", { name: "Fit typical activity" }))
-      .toHaveAttribute("aria-pressed", "true");
+    rerender(<FlameGraph data={data} chartWidth={1008} showFullScale />);
     expect(data.people[0].buckets[1].subagent).toBe(800);
   });
 
