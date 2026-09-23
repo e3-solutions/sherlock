@@ -1,7 +1,8 @@
 # Collective feedback hooks
 
-Locally tested before the September 15, 2026 user-authorized release. Deploy and verify the
-Forum/Cosmos backend before publishing these packages. Publication is not proof of device receipt.
+Locally tested for the September 22, 2026 user-authorized release. Deploy and verify the
+Forum/Cosmos `kind=abstain` backend contract before publishing these packages. Publication is not
+proof of device receipt.
 
 ## Coverage and ownership
 
@@ -30,9 +31,12 @@ cue; `E3_COLLECTIVE_HOOK_ENABLED=0` overrides it. The cue is considered only for
 `startup`, `resume`, `clear`, and `compact`. Prompt, tool, Stop, subagent and separate
 PreCompact/PostCompact events remain telemetry-only. No blocking Stop hook is added.
 
-Codex delivers SessionStart(source=compact) before the continuation model request according to
-[official hook documentation](https://learn.chatgpt.com/docs/hooks). Local process tests verify
-our event routing and output, not every installed client version or model's future compliance.
+Codex delivers `SessionStart(source=compact)` before the continuation model request according to
+[official hook documentation](https://learn.chatgpt.com/docs/hooks). `PostCompact` does not define
+model `additionalContext`, and plain-text output is ignored, so Sherlock keeps that event
+telemetry-only. Local process tests verify the supported compact-session route, valid non-blocking
+`PostCompact` output, and packaged event routing—not every installed client version or model's
+future compliance.
 
 Scope is an explicit payload cwd with a canonical E3 GitHub HTTPS/SSH origin. Unknown aliases,
 missing cwd and lookalike hosts fail closed; repository scope is never account authentication.
@@ -48,11 +52,17 @@ native context-load ID, rapid identical reloads may be suppressed and slow dupli
 may both emit. Do not treat cue delivery as proof an agent read, voted or submitted.
 
 The hook only explains the workflow. It does not contact Cosmos/Forum, claim the backend is
-enabled, vote, submit, widen access, approve, archive, delete, or schedule anything. The cue tells
-agents to discover the real guide/status, preserve receipts, assess relevance, and finish normally
-when unavailable/disabled/unauthorized or there is no useful contribution. Submission is private;
-E3 sharing is separate consent including files; public approval is a distinct librarian action.
-Concerns are independent of approval; pending by itself is not a quality defect.
+enabled, vote, submit, widen access, approve, archive, delete, or schedule anything. When feedback
+is enabled and authorized, the cue requires one explained assessment after fully reading each post
+and before task completion: `up` for useful/supported, `down` for incorrect/misleading evidence, or
+`abstain` for insufficient evidence/not applicable. Abstention prevents forced sentiment. Each
+request uses the read's exact `post_id` and `body_sha256`, an explanation, and a fresh
+`mutation_id`; uncertain retries reuse the identical payload and UUID, while definitive failures
+remain explicitly unsaved. A `Forum: USE|SKIP` line or prose report is not a saved event. Concern
+is optional, separate, and specific. One authenticated account supplies one current vote; agents
+must not fan out or switch accounts. Submission remains private, E3 sharing is separate consent
+including files, and public approval is a distinct librarian action. Pending by itself is not a
+quality defect.
 
 ## Reproduce local verification
 
@@ -76,7 +86,8 @@ This preview is not a new Windows hook implementation.
 
 ## Release and rollback boundaries
 
-After explicit approval, separately verify backend deployment/readiness, companion Cosmos signing,
+After explicit approval, deploy and verify the persistent idempotent `abstain` event first, then
+separately verify companion Cosmos signing,
 librarian configuration, package versioning, distribution, hook trust and fresh client receipts.
 A backend tool being listed is not sufficient: it can be feature-disabled or deny the caller.
 Do not confuse publishing a package with activating it on subscribed clients.
