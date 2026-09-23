@@ -214,9 +214,10 @@ describe("FlameGraph", () => {
     const extreme = { agent: 200, subagent: 600, unclassified: 0, activity: 800 };
     const capped = capActivityForDisplay(extreme, 8);
     expect([capped.chartAgent, capped.chartSubagent, capped.chartUnclassified]).toEqual([2, 6, 0]);
+    expect(capped.isCapped).toBe(true);
     expect(extreme).toEqual({ agent: 200, subagent: 600, unclassified: 0, activity: 800 });
     expect(capActivityForDisplay({ agent: 2, subagent: 1, unclassified: 0, activity: 3 }, 8))
-      .toMatchObject({ chartAgent: 2, chartSubagent: 1, chartUnclassified: 0 });
+      .toMatchObject({ chartAgent: 2, chartSubagent: 1, chartUnclassified: 0, isCapped: false });
   });
 
   it("toggles between a shortened outlier bar and its full height without changing its count", () => {
@@ -235,9 +236,11 @@ describe("FlameGraph", () => {
     expect(capped.subagent).toBe(800);
     expect(capActivityForDisplay(data.people[0].buckets[1], 800).chartSubagent).toBe(800);
     const { container, rerender } = render(<FlameGraph data={data} chartWidth={1008} showFullScale={false} />);
+    expect(container.querySelectorAll('[fill="var(--flame-capped)"]').length).toBeGreaterThan(0);
     expect(container.querySelector('[aria-label="Ada Lovelace activity timeline, 144 ten-minute buckets"]'))
       .toBeInTheDocument();
     rerender(<FlameGraph data={data} chartWidth={1008} showFullScale />);
+    expect(container.querySelectorAll('[fill="var(--flame-capped)"]')).toHaveLength(0);
     expect(data.people[0].buckets[1].subagent).toBe(800);
   });
 
@@ -551,6 +554,18 @@ describe("FlameGraph", () => {
       "datetime",
       new Date(point.startMs).toISOString(),
     );
+  });
+
+  it("explains a shortened bar while retaining its exact observed count", () => {
+    const point = capActivityForDisplay({
+      ...model().people[0].buckets[0], activity: 800, agent: 200, subagent: 600,
+    }, 8);
+    render(<BucketTooltip active personName="Ada Lovelace" payload={[{ payload: point }]} />);
+
+    const tooltip = screen.getByRole("status");
+    expect(tooltip).toHaveTextContent("800 observed sessions");
+    expect(tooltip).toHaveTextContent("Bar shortened to fit scale");
+    expect(tooltip).toHaveAttribute("aria-label", expect.stringContaining("bar shortened to fit scale"));
   });
 
   it("anchors the tooltip to the same indexed bucket center as the hover guide", () => {

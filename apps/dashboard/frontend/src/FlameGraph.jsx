@@ -10,6 +10,7 @@ import {
 } from "react";
 import {
   Bar,
+  Cell,
   ComposedChart,
   Line,
   Tooltip,
@@ -110,6 +111,7 @@ export function capActivityForDisplay(point, peak) {
   const ratio = point.activity > peak ? peak / point.activity : 1;
   return {
     ...point,
+    isCapped: ratio < 1,
     chartAgent: point.agent * ratio,
     chartSubagent: point.subagent * ratio,
     chartUnclassified: point.unclassified * ratio,
@@ -292,7 +294,7 @@ export function BucketTooltip({ active, bucketCount = BUCKET_COUNT, laneRef, pay
       })
     : null;
   const activityLabel = formatSessionCount(point.activity);
-  const description = `${personName}, ${formatTime(point.startMs)} to ${formatTime(point.endMs)}: ${activityLabel}; ${point.agent} agent, ${point.subagent} subagent, ${point.unclassified} unclassified; ${point.prompts} prompts`;
+  const description = `${personName}, ${formatTime(point.startMs)} to ${formatTime(point.endMs)}: ${activityLabel}; ${point.agent} agent, ${point.subagent} subagent, ${point.unclassified} unclassified; ${point.prompts} prompts${point.isCapped ? "; bar shortened to fit scale" : ""}`;
 
   return (
     <output
@@ -313,6 +315,7 @@ export function BucketTooltip({ active, bucketCount = BUCKET_COUNT, laneRef, pay
         </time>
       </span>
       <strong className="flame-tooltip-activity">{activityLabel}</strong>
+      {point.isCapped && <span className="flame-tooltip-capped">Bar shortened to fit scale</span>}
       <span className="flame-tooltip-count"><span>Agent</span> {point.agent}</span>
       <span className="flame-tooltip-count"><span>Subagent</span> {point.subagent}</span>
       <span className="flame-tooltip-count"><span>Unclassified</span> {point.unclassified}</span>
@@ -900,7 +903,14 @@ const PersonLane = memo(function PersonLane({
             stackId="activity"
             fill="var(--flame-agent)"
             isAnimationActive={false}
-          />
+          >
+            {points.map((point) => (
+              <Cell
+                key={point.index}
+                fill={point.isCapped ? "var(--flame-capped)" : "var(--flame-agent)"}
+              />
+            ))}
+          </Bar>
           <Bar
             yAxisId="activity"
             dataKey="chartSubagent"
@@ -908,7 +918,14 @@ const PersonLane = memo(function PersonLane({
             stackId="activity"
             fill="var(--flame-subagent)"
             isAnimationActive={false}
-          />
+          >
+            {points.map((point) => (
+              <Cell
+                key={point.index}
+                fill={point.isCapped ? "var(--flame-capped)" : "var(--flame-subagent)"}
+              />
+            ))}
+          </Bar>
           <Bar
             yAxisId="activity"
             dataKey="chartUnclassified"
@@ -916,7 +933,14 @@ const PersonLane = memo(function PersonLane({
             stackId="activity"
             fill="var(--flame-unclassified)"
             isAnimationActive={false}
-          />
+          >
+            {points.map((point) => (
+              <Cell
+                key={point.index}
+                fill={point.isCapped ? "var(--flame-capped)" : "var(--flame-unclassified)"}
+              />
+            ))}
+          </Bar>
           <Line
             yAxisId="prompts"
             dataKey="promptMarker"
