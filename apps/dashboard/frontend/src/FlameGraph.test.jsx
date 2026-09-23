@@ -219,7 +219,7 @@ describe("FlameGraph", () => {
       .toMatchObject({ chartAgent: 2, chartSubagent: 1, chartUnclassified: 0 });
   });
 
-  it("shortens an extreme subagent bar without changing its count", () => {
+  it("toggles between a shortened outlier bar and its full height without changing its count", () => {
     const data = model();
     data.people[0].buckets[1] = {
       ...data.people[0].buckets[1], subagent: 800, activity: 800,
@@ -233,10 +233,15 @@ describe("FlameGraph", () => {
     const capped = capActivityForDisplay(data.people[0].buckets[1], 4);
     expect(capped.chartSubagent).toBe(4);
     expect(capped.subagent).toBe(800);
+    expect(capActivityForDisplay(data.people[0].buckets[1], 800).chartSubagent).toBe(800);
     const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
-    expect(screen.queryByRole("button", { name: /full scale/i })).not.toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "Show full scale" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
     expect(container.querySelector('[aria-label="Ada Lovelace activity timeline, 144 ten-minute buckets"]'))
       .toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.getByRole("button", { name: "Fit typical activity" }))
+      .toHaveAttribute("aria-pressed", "true");
     expect(data.people[0].buckets[1].subagent).toBe(800);
   });
 

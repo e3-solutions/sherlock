@@ -23,6 +23,7 @@ import {
   adaptIntervalEvidence,
   adaptWorkEvidence,
   createTimeAxisTicks,
+  getGlobalPeak,
   getPersonActivityStatus,
 } from "./flame-data.js";
 
@@ -988,8 +989,11 @@ export default function FlameGraph({
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], nextCursor: null,
   });
+  const [showFullScale, setShowFullScale] = useState(false);
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
-  const peak = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
+  const typicalPeak = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
+  const fullPeak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
+  const peak = showFullScale ? fullPeak : typicalPeak;
   const promptPeak = data.people.reduce(
     (peoplePeak, person) => person.buckets.reduce(
       (personPeak, { prompts }) => Math.max(personPeak, prompts),
@@ -1283,6 +1287,16 @@ export default function FlameGraph({
           style={{ width }}
           aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
         >
+          {fullPeak > typicalPeak && (
+            <button
+              className="flame-scale-toggle"
+              type="button"
+              aria-pressed={showFullScale}
+              onClick={() => setShowFullScale((current) => !current)}
+            >
+              {showFullScale ? "Fit typical activity" : "Show full scale"}
+            </button>
+          )}
           {ticks.map((tick, index) => {
             const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
             return (
