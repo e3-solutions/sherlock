@@ -232,12 +232,14 @@ describe("App", () => {
     expect(headerRow.querySelector(".portal-header__brand")).toBeInTheDocument();
     const toggle = within(headerRow).getByRole("button", { name: "Show full scale" });
     expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("list", { name: "Activity legend" })).toHaveTextContent("Shortened bar");
     expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-full-scale", "false");
 
     fireEvent.click(toggle);
     expect(within(headerRow).getByRole("button", { name: "Fit typical activity" }))
       .toHaveAttribute("aria-pressed", "true");
     expect(screen.getByTestId("flame-graph")).toHaveAttribute("data-full-scale", "true");
+    expect(screen.getByRole("list", { name: "Activity legend" })).not.toHaveTextContent("Shortened bar");
   });
 
   it("updates the graph ranking from the inline selector", async () => {

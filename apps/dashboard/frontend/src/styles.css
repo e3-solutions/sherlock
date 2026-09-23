@@ -10,6 +10,7 @@
   --flame-agent: #ff5a1f;
   --flame-subagent: #2fe6cf;
   --flame-unclassified: #b991ff;
+  --flame-capped: #8b5cf6;
   --flame-prompt: #fff8da;
   --flame-selected: #f2eee2;
   --flame-stale: #f0b35c;
@@ -334,6 +335,7 @@ input { font: inherit; }
 .flame-key--agent { background: var(--flame-agent); }
 .flame-key--subagent { background: var(--flame-subagent); }
 .flame-key--unclassified { background: var(--flame-unclassified); }
+.flame-key--capped { background: var(--flame-capped); }
 .flame-key--prompt {
   position: relative;
   border: 0;
@@ -595,6 +597,12 @@ input { font: inherit; }
 .flame-tooltip-activity {
   grid-column: 1 / -1;
   margin-bottom: 1px;
+}
+
+.flame-tooltip-capped {
+  grid-column: 1 / -1;
+  color: #5b2ba6;
+  font-size: 11px;
 }
 
 .flame-tooltip-count {
@@ -1178,10 +1186,10 @@ input { font: inherit; }
     padding: 8px 0 0;
     border-top: 1px solid var(--flame-rule);
   }
-  .flame-legends { gap: 6px; }
+  .flame-legends { display: flex; flex-wrap: wrap; gap: 8px 16px; }
   .flame-rank-selector { gap: 5px; }
   .flame-rank-selector button { padding: 0 5px; font-size: 8px; }
-  .flame-legend { gap: 10px; }
+  .flame-legend { flex-wrap: wrap; gap: 8px 10px; margin-left: 0; }
   .flame-legend li { gap: 4px; }
   .flame-legend,
   .flame-status-legend { font-size: 8px; }

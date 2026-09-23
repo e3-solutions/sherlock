@@ -281,13 +281,17 @@ function PortalHeader({ rankBy, onRankChange, showScaleToggle, showFullScale, on
         )}
       </div>
       <aside className="portal-header__legend" aria-label="Timeline legend">
-        <SemanticLegend rankBy={rankBy} onRankChange={onRankChange} />
+        <SemanticLegend
+          rankBy={rankBy}
+          onRankChange={onRankChange}
+          showCappedKey={showScaleToggle && !showFullScale}
+        />
       </aside>
     </header>
   );
 }
 
-function SemanticLegend({ rankBy, onRankChange }) {
+function SemanticLegend({ rankBy, onRankChange, showCappedKey }) {
   return (
     <div className="flame-legends">
       <ul className="flame-status-legend" aria-label="Activity recency legend">
@@ -328,6 +332,9 @@ function SemanticLegend({ rankBy, onRankChange }) {
         <li><i className="flame-key flame-key--subagent" aria-hidden="true" />Subagent</li>
         <li><i className="flame-key flame-key--unclassified" aria-hidden="true" />Unclassified</li>
         <li><i className="flame-key flame-key--prompt" aria-hidden="true" />Prompts</li>
+        {showCappedKey && (
+          <li><i className="flame-key flame-key--capped" aria-hidden="true" />Shortened bar</li>
+        )}
       </ul>
     </div>
   );
