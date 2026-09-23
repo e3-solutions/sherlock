@@ -361,26 +361,6 @@ input { font: inherit; }
   font-variant-numeric: tabular-nums;
 }
 
-.flame-scale-toggle {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  z-index: 1;
-  border: 1px solid var(--flame-rule);
-  border-radius: 4px;
-  padding: 4px 8px;
-  background: var(--flame-surface);
-  color: var(--flame-muted);
-  font: inherit;
-  cursor: pointer;
-}
-
-.flame-scale-toggle:hover,
-.flame-scale-toggle:focus-visible {
-  color: var(--flame-ink);
-  border-color: currentColor;
-}
-
 .flame-time-axis::after {
   position: absolute;
   right: 0;

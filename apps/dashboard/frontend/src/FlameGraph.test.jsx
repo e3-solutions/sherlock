@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import FlameGraph, {
   BucketCursor,
   BucketTooltip,
+  capActivityForDisplay,
   getAvailableChartWidth,
   getBucketCenterX,
   getBucketTooltipPlacement,
@@ -206,10 +207,19 @@ describe("FlameGraph", () => {
   it("recognizes an isolated outlier when only two buckets have activity", () => {
     expect(getActivityDisplayScale([{
       buckets: [{ activity: 2 }, { activity: 800 }],
-    }])).toEqual({ peak: 2, outlierCount: 1 });
+    }])).toBe(2);
   });
 
-  it("keeps an extreme subagent bucket from setting the default display scale", () => {
+  it("caps mixed-role stacks proportionally and leaves normal buckets alone", () => {
+    const extreme = { agent: 200, subagent: 600, unclassified: 0, activity: 800 };
+    const capped = capActivityForDisplay(extreme, 8);
+    expect([capped.chartAgent, capped.chartSubagent, capped.chartUnclassified]).toEqual([2, 6, 0]);
+    expect(extreme).toEqual({ agent: 200, subagent: 600, unclassified: 0, activity: 800 });
+    expect(capActivityForDisplay({ agent: 2, subagent: 1, unclassified: 0, activity: 3 }, 8))
+      .toMatchObject({ chartAgent: 2, chartSubagent: 1, chartUnclassified: 0 });
+  });
+
+  it("shortens an extreme subagent bar without changing its count", () => {
     const data = model();
     data.people[0].buckets[1] = {
       ...data.people[0].buckets[1], subagent: 800, activity: 800,
@@ -219,15 +229,14 @@ describe("FlameGraph", () => {
     };
     data.globalPeak = 800;
 
-    expect(getActivityDisplayScale(data.people)).toEqual({ peak: 4, outlierCount: 1 });
+    expect(getActivityDisplayScale(data.people)).toBe(4);
+    const capped = capActivityForDisplay(data.people[0].buckets[1], 4);
+    expect(capped.chartSubagent).toBe(4);
+    expect(capped.subagent).toBe(800);
     const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
-    const toggle = screen.getByRole("button", { name: "Show full scale (1 outlier)" });
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("button", { name: /full scale/i })).not.toBeInTheDocument();
     expect(container.querySelector('[aria-label="Ada Lovelace activity timeline, 144 ten-minute buckets"]'))
       .toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(screen.getByRole("button", { name: "Fit typical activity" }))
-      .toHaveAttribute("aria-pressed", "true");
     expect(data.people[0].buckets[1].subagent).toBe(800);
   });
 

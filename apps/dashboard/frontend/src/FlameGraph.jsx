@@ -23,7 +23,6 @@ import {
   adaptIntervalEvidence,
   adaptWorkEvidence,
   createTimeAxisTicks,
-  getGlobalPeak,
   getPersonActivityStatus,
 } from "./flame-data.js";
 
@@ -96,18 +95,23 @@ export function getActivityDisplayScale(people) {
   if (values.length < 4) {
     const previousPeak = values.at(-2) ?? fullPeak;
     const isolatedOutlier = fullPeak > Math.max(10, previousPeak * 4);
-    return {
-      peak: Math.max(1, isolatedOutlier ? previousPeak : fullPeak),
-      outlierCount: isolatedOutlier ? 1 : 0,
-    };
+    return Math.max(1, isolatedOutlier ? previousPeak : fullPeak);
   }
 
   const upperQuartile = values[Math.floor((values.length - 1) * 0.75)];
   const cutoff = Math.max(10, upperQuartile * 4);
   const typicalPeak = values.filter((value) => value <= cutoff).at(-1) ?? fullPeak;
+  return Math.max(1, typicalPeak);
+}
+
+/** Keep the plotted stack within the scale while retaining exact counts on the point. */
+export function capActivityForDisplay(point, peak) {
+  const ratio = point.activity > peak ? peak / point.activity : 1;
   return {
-    peak: Math.max(1, typicalPeak),
-    outlierCount: values.filter((value) => value > cutoff).length,
+    ...point,
+    chartAgent: point.agent * ratio,
+    chartSubagent: point.subagent * ratio,
+    chartUnclassified: point.unclassified * ratio,
   };
 }
 
@@ -771,10 +775,10 @@ const PersonLane = memo(function PersonLane({
   const headingId = `flame-person-${id}`;
   const points = useMemo(
     () => person.buckets.map((point) => ({
-      ...point,
+      ...capActivityForDisplay(point, peak),
       promptMarker: point.prompts > 0 ? 0 : null,
     })),
-    [person.buckets],
+    [person.buckets, peak],
   );
 
   const select = (point) => {
@@ -890,7 +894,7 @@ const PersonLane = memo(function PersonLane({
           />
           <Bar
             yAxisId="activity"
-            dataKey="agent"
+            dataKey="chartAgent"
             name="Agent"
             stackId="activity"
             fill="var(--flame-agent)"
@@ -898,7 +902,7 @@ const PersonLane = memo(function PersonLane({
           />
           <Bar
             yAxisId="activity"
-            dataKey="subagent"
+            dataKey="chartSubagent"
             name="Subagent"
             stackId="activity"
             fill="var(--flame-subagent)"
@@ -906,7 +910,7 @@ const PersonLane = memo(function PersonLane({
           />
           <Bar
             yAxisId="activity"
-            dataKey="unclassified"
+            dataKey="chartUnclassified"
             name="Unclassified"
             stackId="activity"
             fill="var(--flame-unclassified)"
@@ -984,12 +988,8 @@ export default function FlameGraph({
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], nextCursor: null,
   });
-  const [showFullScale, setShowFullScale] = useState(false);
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
-  const displayScale = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
-  const peak = showFullScale
-    ? Math.max(1, data.globalPeak ?? getGlobalPeak(data.people))
-    : displayScale.peak;
+  const peak = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
   const promptPeak = data.people.reduce(
     (peoplePeak, person) => person.buckets.reduce(
       (personPeak, { prompts }) => Math.max(personPeak, prompts),
@@ -1283,17 +1283,6 @@ export default function FlameGraph({
           style={{ width }}
           aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
         >
-          {displayScale.outlierCount > 0 && (
-            <button
-              className="flame-scale-toggle"
-              type="button"
-              onClick={() => setShowFullScale((current) => !current)}
-              aria-pressed={showFullScale}
-              title={`${displayScale.outlierCount} unusually high activity ${displayScale.outlierCount === 1 ? "bucket" : "buckets"}; counts remain available in the timeline`}
-            >
-              {showFullScale ? "Fit typical activity" : `Show full scale (${displayScale.outlierCount} ${displayScale.outlierCount === 1 ? "outlier" : "outliers"})`}
-            </button>
-          )}
           {ticks.map((tick, index) => {
             const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
             return (
