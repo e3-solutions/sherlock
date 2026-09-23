@@ -206,7 +206,7 @@ describe("adaptFlamePayload", () => {
     ["invalid start", payload({ start: "not-a-date" })],
     ["invalid read", payload({ read: null })],
     ["invalid latest", payload({ latest: "not-a-date" })],
-    ["empty people", payload({ people: [] })],
+    ["non-array people", payload({ people: null })],
     ["non-string id", payload({ people: [person({ id: 17 })] })],
     ["blank id", payload({ people: [person({ id: "  " })] })],
     ["blank name", payload({ people: [person({ name: "" })] })],
@@ -274,6 +274,13 @@ describe("adaptFlamePayload", () => {
     ],
   ])("rejects %s", (_description, source) => {
     expect(() => adaptFlamePayload(source)).toThrow(FlameDataError);
+  });
+
+  it("accepts an empty roster from a newly provisioned workspace", () => {
+    const result = adaptFlamePayload(payload({ people: [] }));
+
+    expect(result.people).toEqual([]);
+    expect(result.globalPeak).toBe(0);
   });
 
   it("rejects duplicate stable person ids", () => {
