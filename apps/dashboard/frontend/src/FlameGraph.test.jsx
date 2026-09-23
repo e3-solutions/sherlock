@@ -8,6 +8,7 @@ import FlameGraph, {
   getBucketCenterX,
   getBucketTooltipPlacement,
   formatActiveTime,
+  getActivityDisplayScale,
   rankPeople,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
@@ -202,6 +203,34 @@ describe("bucket hover geometry", () => {
 });
 
 describe("FlameGraph", () => {
+  it("recognizes an isolated outlier when only two buckets have activity", () => {
+    expect(getActivityDisplayScale([{
+      buckets: [{ activity: 2 }, { activity: 800 }],
+    }])).toEqual({ peak: 2, outlierCount: 1 });
+  });
+
+  it("keeps an extreme subagent bucket from setting the default display scale", () => {
+    const data = model();
+    data.people[0].buckets[1] = {
+      ...data.people[0].buckets[1], subagent: 800, activity: 800,
+    };
+    data.people[0].buckets[2] = {
+      ...data.people[0].buckets[2], agent: 2, activity: 2,
+    };
+    data.globalPeak = 800;
+
+    expect(getActivityDisplayScale(data.people)).toEqual({ peak: 4, outlierCount: 1 });
+    const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
+    const toggle = screen.getByRole("button", { name: "Show full scale (1 outlier)" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(container.querySelector('[aria-label="Ada Lovelace activity timeline, 144 ten-minute buckets"]'))
+      .toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.getByRole("button", { name: "Fit typical activity" }))
+      .toHaveAttribute("aria-pressed", "true");
+    expect(data.people[0].buckets[1].subagent).toBe(800);
+  });
+
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn((url) => {
       const request = new URL(url, "http://dashboard.test");

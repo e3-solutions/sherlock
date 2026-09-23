@@ -86,6 +86,31 @@ export function rankPeople(people, rankBy) {
     .map(({ person }) => person);
 }
 
+/** Limit exceptional buckets on the shared display scale without changing source counts. */
+export function getActivityDisplayScale(people) {
+  const values = people.flatMap((person) => person.buckets
+    .map((bucket) => bucket.activity)
+    .filter((value) => value > 0))
+    .sort((left, right) => left - right);
+  const fullPeak = values.at(-1) ?? 0;
+  if (values.length < 4) {
+    const previousPeak = values.at(-2) ?? fullPeak;
+    const isolatedOutlier = fullPeak > Math.max(10, previousPeak * 4);
+    return {
+      peak: Math.max(1, isolatedOutlier ? previousPeak : fullPeak),
+      outlierCount: isolatedOutlier ? 1 : 0,
+    };
+  }
+
+  const upperQuartile = values[Math.floor((values.length - 1) * 0.75)];
+  const cutoff = Math.max(10, upperQuartile * 4);
+  const typicalPeak = values.filter((value) => value <= cutoff).at(-1) ?? fullPeak;
+  return {
+    peak: Math.max(1, typicalPeak),
+    outlierCount: values.filter((value) => value > cutoff).length,
+  };
+}
+
 async function apiFailure(response, fallback) {
   let code = fallback;
   try {
@@ -959,8 +984,12 @@ export default function FlameGraph({
   const [workEvidence, setWorkEvidence] = useState({
     state: "idle", items: [], nextCursor: null,
   });
+  const [showFullScale, setShowFullScale] = useState(false);
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
-  const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
+  const displayScale = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
+  const peak = showFullScale
+    ? Math.max(1, data.globalPeak ?? getGlobalPeak(data.people))
+    : displayScale.peak;
   const promptPeak = data.people.reduce(
     (peoplePeak, person) => person.buckets.reduce(
       (personPeak, { prompts }) => Math.max(personPeak, prompts),
@@ -1254,6 +1283,17 @@ export default function FlameGraph({
           style={{ width }}
           aria-label={`Time from ${formatTime(data.startMs)} to ${formatTime(endMs)}`}
         >
+          {displayScale.outlierCount > 0 && (
+            <button
+              className="flame-scale-toggle"
+              type="button"
+              onClick={() => setShowFullScale((current) => !current)}
+              aria-pressed={showFullScale}
+              title={`${displayScale.outlierCount} unusually high activity ${displayScale.outlierCount === 1 ? "bucket" : "buckets"}; counts remain available in the timeline`}
+            >
+              {showFullScale ? "Fit typical activity" : `Show full scale (${displayScale.outlierCount} ${displayScale.outlierCount === 1 ? "outlier" : "outliers"})`}
+            </button>
+          )}
           {ticks.map((tick, index) => {
             const at = typeof tick === "number" ? tick : (tick.atMs ?? tick.value ?? tick.startMs);
             return (
