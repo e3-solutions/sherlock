@@ -174,7 +174,329 @@ raise SystemExit(2)
 """
 
 
+FAKE_VERIFY_CODEX = r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+capture = Path(os.environ["SHERLOCK_FAKE_CAPTURE"])
+with capture.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:], separators=(",", ":")) + "\n")
+
+if sys.argv[1:] == ["--version"]:
+    print("codex-test")
+    raise SystemExit(0)
+if sys.argv[1:] == ["plugin", "list", "--json"]:
+    print(os.environ.get("SHERLOCK_FAKE_PLUGIN_LIST", "{}"))
+    raise SystemExit(int(os.environ.get("SHERLOCK_FAKE_PLUGIN_EXIT", "0")))
+if sys.argv[1:] == ["app-server", "--stdio"]:
+    for line in sys.stdin:
+        message = json.loads(line)
+        if message.get("method") == "initialized":
+            continue
+        if message["method"] == "initialize":
+            result = {"codexHome": os.environ["CODEX_HOME"]}
+        elif message["method"] == "hooks/list":
+            result = {
+                "data": [
+                    {
+                        "cwd": os.getcwd(),
+                        "hooks": json.loads(os.environ["SHERLOCK_FAKE_HOOKS"]),
+                        "warnings": [],
+                        "errors": json.loads(
+                            os.environ.get("SHERLOCK_FAKE_HOOK_ERRORS", "[]")
+                        ),
+                    }
+                ]
+            }
+        else:
+            raise SystemExit(3)
+        print(json.dumps({"id": message["id"], "result": result}), flush=True)
+    raise SystemExit(0)
+raise SystemExit(2)
+"""
+
+
 class TeamInstallerTests(unittest.TestCase):
+    def run_verify(
+        self,
+        root: Path,
+        plugins: object,
+        *,
+        exit_code: int = 0,
+        materialize: bool = True,
+        trust_status: str = "trusted",
+        command_uses_codex_home: bool = True,
+        hook_errors: list[str] | None = None,
+    ):
+        fake_codex = root / "codex"
+        capture = root / "verify-calls.jsonl"
+        fake_codex.write_text(textwrap.dedent(FAKE_VERIFY_CODEX), encoding="utf-8")
+        fake_codex.chmod(0o755)
+        codex_home = root / "codex-home"
+        hooks = []
+        if not isinstance(plugins, str):
+            plugins = json.loads(json.dumps(plugins))
+            for item in plugins.get("installed", []):
+                plugin_id = item.get("pluginId", "unknown@unknown")
+                if materialize:
+                    name, marketplace = plugin_id.split("@", 1)
+                    plugin_root = (
+                        codex_home
+                        / "plugins"
+                        / "cache"
+                        / marketplace
+                        / name
+                        / "v1"
+                    )
+                    manifest = plugin_root / ".codex-plugin" / "plugin.json"
+                    manifest.parent.mkdir(parents=True)
+                    manifest.write_text(
+                        json.dumps({"name": name}),
+                        encoding="utf-8",
+                    )
+                    hook_file = plugin_root / "hooks" / "hooks.json"
+                    hook_file.parent.mkdir(parents=True)
+                    hook_file.write_text("{}\n", encoding="utf-8")
+                    script = plugin_root / "scripts" / "run_hook.py"
+                    script.parent.mkdir(parents=True)
+                    script.write_text("# fixture\n", encoding="utf-8")
+                    hooks.append(
+                        {
+                            "pluginId": plugin_id,
+                            "source": "plugin",
+                            "sourcePath": str(hook_file),
+                            "key": f"{plugin_id}:hooks/hooks.json:session_start:0:0",
+                            "currentHash": "sha256:" + "1" * 64,
+                            "enabled": True,
+                            "trustStatus": trust_status,
+                            "command": (
+                                'root=${CODEX_HOME}; python3 scripts/run_hook.py'
+                                if command_uses_codex_home
+                                else 'python3 "$HOME/.codex/plugins/cache/test/scripts/run_hook.py"'
+                            ),
+                        }
+                    )
+        environment = {
+            **os.environ,
+            "CODEX_BIN": str(fake_codex),
+            "CODEX_HOME": str(codex_home),
+            "PYTHON_BIN": sys.executable,
+            "SHERLOCK_FAKE_CAPTURE": str(capture),
+            "SHERLOCK_FAKE_HOOKS": json.dumps(hooks),
+            "SHERLOCK_FAKE_HOOK_ERRORS": json.dumps(hook_errors or []),
+            "SHERLOCK_FAKE_PLUGIN_LIST": (
+                plugins if isinstance(plugins, str) else json.dumps(plugins)
+            ),
+            "SHERLOCK_FAKE_PLUGIN_EXIT": str(exit_code),
+        }
+        completed = subprocess.run(
+            ["sh", str(UNIFIED_INSTALLER), "verify"],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        calls = [json.loads(line) for line in capture.read_text().splitlines()]
+        return completed, calls
+
+    def test_verify_accepts_enabled_sherlock_and_legacy_logger(self):
+        with TemporaryDirectory() as temporary:
+            completed, calls = self.run_verify(
+                Path(temporary),
+                {
+                    "installed": [
+                        {
+                            "pluginId": "sherlock@sherlock",
+                            "installed": True,
+                            "enabled": True,
+                        },
+                        {
+                            "pluginId": "codex-session-logging@coreedge-local",
+                            "installed": True,
+                            "enabled": True,
+                        },
+                    ],
+                    "available": [],
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(
+                {item["plugin_id"] for item in result["required_plugins"]},
+                {
+                    "sherlock@sherlock",
+                    "codex-session-logging@coreedge-local",
+                },
+            )
+            self.assertTrue(
+                all(item["status"] == "ready" for item in result["required_plugins"])
+            )
+            self.assertEqual(
+                calls,
+                [
+                    ["--version"],
+                    ["plugin", "list", "--json"],
+                    ["app-server", "--stdio"],
+                ],
+            )
+
+    def test_verify_rejects_untrusted_runtime_hooks(self):
+        with TemporaryDirectory() as temporary:
+            completed, _ = self.run_verify(
+                Path(temporary),
+                {
+                    "installed": [
+                        {
+                            "pluginId": "sherlock@sherlock",
+                            "installed": True,
+                            "enabled": True,
+                        },
+                        {
+                            "pluginId": "codex-session-logging@coreedge-local",
+                            "installed": True,
+                            "enabled": True,
+                        },
+                    ]
+                },
+                trust_status="untrusted",
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["status"], "degraded")
+            self.assertTrue(
+                all(
+                    item["status"] == "untrusted"
+                    for item in result["required_plugins"]
+                )
+            )
+
+    def test_verify_rejects_hook_discovery_errors_and_runtime_path_mismatch(self):
+        plugins = {
+            "installed": [
+                {
+                    "pluginId": "sherlock@sherlock",
+                    "installed": True,
+                    "enabled": True,
+                },
+                {
+                    "pluginId": "codex-session-logging@coreedge-local",
+                    "installed": True,
+                    "enabled": True,
+                },
+            ]
+        }
+        cases = (
+            ({"hook_errors": ["broken hook"]}, "hooks_listing_failed"),
+            ({"command_uses_codex_home": False}, "runtime_path_mismatch"),
+        )
+        for options, expected_problem in cases:
+            with self.subTest(expected_problem=expected_problem), TemporaryDirectory() as temporary:
+                completed, _ = self.run_verify(
+                    Path(temporary), plugins, **options
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                result = json.loads(completed.stdout)
+                self.assertIn(expected_problem, json.dumps(result))
+
+    def test_verify_rejects_enabled_metadata_with_missing_plugin_payloads(self):
+        with TemporaryDirectory() as temporary:
+            completed, calls = self.run_verify(
+                Path(temporary),
+                {
+                    "installed": [
+                        {
+                            "pluginId": "sherlock@sherlock",
+                            "installed": True,
+                            "enabled": True,
+                        },
+                        {
+                            "pluginId": "codex-session-logging@coreedge-local",
+                            "installed": True,
+                            "enabled": True,
+                        },
+                    ]
+                },
+                materialize=False,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["status"], "degraded")
+            self.assertTrue(
+                all(
+                    item["status"] == "runtime_missing"
+                    for item in result["required_plugins"]
+                )
+            )
+            self.assertEqual(
+                calls,
+                [
+                    ["--version"],
+                    ["plugin", "list", "--json"],
+                    ["app-server", "--stdio"],
+                ],
+            )
+
+    def test_verify_rejects_unusable_plugin_states_and_invalid_listing(self):
+        cases = {
+            "missing legacy logger": (
+                {
+                    "installed": [
+                        {
+                            "pluginId": "sherlock@sherlock",
+                            "installed": True,
+                            "enabled": True,
+                        }
+                    ]
+                },
+                0,
+                "missing",
+            ),
+            "disabled legacy logger": (
+                {
+                    "installed": [
+                        {
+                            "pluginId": "sherlock@sherlock",
+                            "installed": True,
+                            "enabled": True,
+                        },
+                        {
+                            "pluginId": "codex-session-logging@coreedge-local",
+                            "installed": True,
+                            "enabled": False,
+                        },
+                    ]
+                },
+                0,
+                "disabled",
+            ),
+            "malformed listing": ("{", 0, "invalid_plugin_listing"),
+            "listing command failure": ({}, 9, "plugin_listing_failed"),
+        }
+        for name, (plugins, exit_code, expected_problem) in cases.items():
+            with self.subTest(name=name), TemporaryDirectory() as temporary:
+                completed, calls = self.run_verify(
+                    Path(temporary), plugins, exit_code=exit_code
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                result = json.loads(completed.stdout)
+                self.assertIn(result["status"], {"degraded", "error"})
+                self.assertIn(expected_problem, json.dumps(result))
+                expected_calls = [["--version"], ["plugin", "list", "--json"]]
+                if exit_code == 0 and not isinstance(plugins, str):
+                    expected_calls.append(["app-server", "--stdio"])
+                self.assertEqual(
+                    calls, expected_calls
+                )
+
     def test_unified_command_rejects_ambiguous_hours_before_writing(self):
         for hours in ("060", "18446744073709551617"):
             with self.subTest(hours=hours), TemporaryDirectory() as temporary:
