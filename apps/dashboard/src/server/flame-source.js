@@ -5,10 +5,10 @@ export const BUCKET_MS = 10 * 60 * 1000;
 // Keep this immutable reader contract aligned with the worker's frame version.
 // The dashboard Docker build context is apps/dashboard, so it cannot import the
 // repository-level worker module at runtime.
-export const FRAME_VERSION = "frame-evidence-v5";
-export const PREVIOUS_FRAME_VERSION = "frame-evidence-v4";
-// V5 reads new v3 uploads alongside existing legacy facts. Keep issued v4
-// and older v2 work tokens readable through the projection handoff.
+export const FRAME_VERSION = "frame-evidence-v6";
+export const PREVIOUS_FRAME_VERSION = "frame-evidence-v5";
+export const OLDER_FRAME_VERSION = "frame-evidence-v4";
+// V6 adds Cursor observations. Preserve issued v5, v4 and v2 tokens.
 export const COMPATIBLE_WORK_FRAME_VERSION = "frame-evidence-v2";
 export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
@@ -20,15 +20,19 @@ export const PREVIOUS_NORMALIZER_VERSIONS = Object.freeze([
   NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
-export const NORMALIZER_VERSIONS = Object.freeze([
+export const PRE_CURSOR_NORMALIZER_VERSIONS = Object.freeze([
   ...PREVIOUS_NORMALIZER_VERSIONS,
   CORRECTED_CODEX_NORMALIZER_VERSION,
+]);
+export const NORMALIZER_VERSIONS = Object.freeze([
+  ...PRE_CURSOR_NORMALIZER_VERSIONS, "sherlock.cursor-hook.v1",
 ]);
 export const LEGACY_NORMALIZER_VERSIONS = Object.freeze([
   LEGACY_CODEX_NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
 export const FRESHNESS_NORMALIZER_VERSIONS = Object.freeze([
+  "sherlock.cursor-hook.v1",
   CORRECTED_CODEX_NORMALIZER_VERSION,
   LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
@@ -42,7 +46,8 @@ export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
 const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
 const PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION = "v3";
-const RAW_SNAPSHOT_TOKEN_VERSION = "v4";
+const PRE_CURSOR_RAW_SNAPSHOT_TOKEN_VERSION = "v4";
+const RAW_SNAPSHOT_TOKEN_VERSION = "v5";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -1428,7 +1433,7 @@ export function encodeSnapshotToken({ snapshot, read }) {
 }
 
 export function encodeProjectionSnapshotToken({ snapshot, read, frameVersion }) {
-  if (![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
+  if (![FRAME_VERSION, PREVIOUS_FRAME_VERSION, OLDER_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(frameVersion)) {
     throw new FlameSourceError("flame_snapshot_invalid");
   }
   const readAt = asDate(read).toISOString();
@@ -1445,7 +1450,7 @@ export function decodeSnapshotToken(token) {
   }
   const [version, body, extra] = token.split(".");
   if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION,
-    PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
+    PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, PRE_CURSOR_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
       !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
     throw new FlameSourceError("flame_prompt_request_invalid");
@@ -1468,7 +1473,7 @@ export function decodeSnapshotToken(token) {
     const receipt = { snapshot: parsePgSnapshot(snapshot), read };
     if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
       if (
-        ![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
+        ![FRAME_VERSION, PREVIOUS_FRAME_VERSION, OLDER_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
           pinnedFrameVersion,
         )
       ) {
@@ -1477,6 +1482,8 @@ export function decodeSnapshotToken(token) {
       receipt.frameVersion = pinnedFrameVersion;
     } else if (version === RAW_SNAPSHOT_TOKEN_VERSION) {
       receipt.normalizerVersions = NORMALIZER_VERSIONS;
+    } else if (version === PRE_CURSOR_RAW_SNAPSHOT_TOKEN_VERSION) {
+      receipt.normalizerVersions = PRE_CURSOR_NORMALIZER_VERSIONS;
     } else if (version === PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION) {
       receipt.normalizerVersions = PREVIOUS_NORMALIZER_VERSIONS;
     } else {
@@ -1977,13 +1984,17 @@ export class DirectFlameSource {
                 exists (
                   select 1 from analytics.frame_projection_activations activation
                    where activation.workspace_id = $1 and activation.frame_version = $4
-                ) previous_frame_projection_active`
+                ) previous_frame_projection_active,
+                exists (
+                  select 1 from analytics.frame_projection_activations activation
+                   where activation.workspace_id = $1 and activation.frame_version = $5
+                ) older_frame_projection_active`
           : `select transaction_timestamp() as now,
                     pg_current_snapshot()::text as snapshot,
                     false as frame_projection_active,
                     false as compatible_work_projection_active`,
         projectionEnabled
-          ? [this.workspaceId, FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION, PREVIOUS_FRAME_VERSION]
+          ? [this.workspaceId, FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION, PREVIOUS_FRAME_VERSION, OLDER_FRAME_VERSION]
           : undefined,
         signal,
       ))[0];
@@ -2003,6 +2014,8 @@ export class DirectFlameSource {
         ? FRAME_VERSION
         : receipt.previous_frame_projection_active === true
           ? PREVIOUS_FRAME_VERSION
+        : receipt.older_frame_projection_active === true
+          ? OLDER_FRAME_VERSION
         : receipt.compatible_work_projection_active === true
           ? COMPATIBLE_WORK_FRAME_VERSION
           : null;
@@ -2062,7 +2075,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "interval");
-      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, OLDER_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = projected
@@ -2170,7 +2183,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "work");
-      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, OLDER_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const bucketStartMicroseconds = BigInt(startAt.getTime()) * 1000n;
       const bucketEndMicroseconds = BigInt(bounds.bucketEnd.getTime()) * 1000n;
@@ -2256,7 +2269,7 @@ export class DirectFlameSource {
       ))[0].now);
       const read = now ? asDate(now) : databaseRead;
       const bounds = snapshotBounds(snapshotReceipt, startAt, read, "prompt");
-      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
+      const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, OLDER_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const rows = projected
         ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [

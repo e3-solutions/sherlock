@@ -135,6 +135,7 @@ jobs:
           deno test --config workers/telemetry-processor/deno.json --allow-env --allow-net
           workers/telemetry-processor/frame-projector_postgres_test.ts
           workers/telemetry-processor/codex_v3_postgres_test.ts
+          workers/telemetry-processor/cursor_postgres_test.ts
 
       - name: Run oversized provider end-to-end tests
         env:

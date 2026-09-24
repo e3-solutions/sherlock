@@ -26,6 +26,7 @@ MAX_STORED_BYTES = 17 * 1024 * 1024
 FRAGMENT_BYTES = 4 * 1024 * 1024
 MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024
 SOURCE_KINDS = {
+    "cursor": frozenset({"hook"}),
     "codex": frozenset({"rollout"}),
     "claude_code": frozenset({"transcript", "hook"}),
 }

@@ -5,6 +5,13 @@ including prompts, tool use, primary agents, and subagents. Each provider keeps
 its own plugin, source identity, and normalizer while sharing Sherlock's
 immutable telemetry backend.
 
+## Cursor IDE and CLI
+
+Cursor tracking is available through a separate native-hook collector. See
+[Cursor setup, coverage, and server rollout](docs/cursor-tracking.md). It captures
+future observed sessions and tool activity; v1 does not backfill transcripts or
+infer token usage. Deploy the Cursor-capable backend before installing it.
+
 ## Install for Codex and Claude Code
 
 You need macOS or Linux, Git, Python 3, and at least one of the Codex or Claude
