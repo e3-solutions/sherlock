@@ -339,3 +339,26 @@ Deno.test("frame projection rechecks the absolute deadline after pool reserve", 
   assert(databaseOperations === 0, "expired work must not mutate the database");
   assert(released, "the reserved connection must always be released");
 });
+
+Deno.test("Cursor hook activity never upgrades attempted prompts to submissions", () => {
+  const rows = canonicalEvidence(
+    [sourceEvent({
+      normalizer_version: "sherlock.cursor-hook.v1",
+      source_kind: "hook",
+      source_native_type: "cursor_hook",
+      source_native_payload_type: null,
+      native_item_id: "cursor-observation",
+      canonical_scope_key: "session:cursor:parent",
+      logical_event_key: "cursor:observation:one",
+      event_subtype: "prompt_attempt",
+    })],
+    "2026-08-20T11:00:00.000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  );
+  assert(rows.length === 1);
+  assert(rows[0].evidence_kind === "activity");
+  assert(!rows[0].is_summary_candidate);
+  assert(FRAME_SOURCE_EVENTS_SQL.includes("sherlock.cursor-hook.v1"));
+  assert(MISSING_NORMALIZATION_BATCHES_SQL.includes("sherlock.cursor-hook.v1"));
+});

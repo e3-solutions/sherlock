@@ -6,6 +6,7 @@ import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
   FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
+  FRAME_CURSOR_NORMALIZER_VERSION,
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
@@ -110,7 +111,9 @@ select batch.id::text batch_id
            where event.workspace_id = record.workspace_id
              and event.source_record_id = record.id
              and (
-               batch.source_provider = 'claude_code'
+               batch.source_provider = 'cursor'
+               and event.normalizer_version = '${FRAME_CURSOR_NORMALIZER_VERSION}'
+               or batch.source_provider = 'claude_code'
                and event.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
                or batch.source_provider = 'codex'
                and (event.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'

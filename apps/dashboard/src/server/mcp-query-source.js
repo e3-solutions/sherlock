@@ -14,6 +14,7 @@ const LEGACY_QUERY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_CURSOR_LENGTH = 512;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROVIDER_VERSIONS = Object.freeze([
+  "sherlock.cursor-hook.v1",
   "sherlock.codex-rollout.v1",
   "sherlock.codex-rollout.v2",
   "sherlock.codex-rollout.v3",
@@ -28,7 +29,9 @@ const FRAME_CLAUDE_VERSION = "sherlock.claude-code-transcript.v1";
 // for an immutable source record that has no non-replay v1 projection.
 function activeNormalizerPredicate(event, session, batch, cutover) {
   return `(
-    ${batch}.source_provider = 'claude_code'
+    ${batch}.source_provider = 'cursor'
+    and ${event}.normalizer_version = 'sherlock.cursor-hook.v1'
+    or ${batch}.source_provider = 'claude_code'
     and ${event}.normalizer_version = '${FRAME_CLAUDE_VERSION}'
     or ${batch}.source_provider = 'codex'
     and (
@@ -198,6 +201,7 @@ export function decodeSessionCursor(cursor, fingerprint) {
 }
 
 function providerFromVersion(version) {
+  if (version === "sherlock.cursor-hook.v1") return "cursor";
   if (version === "sherlock.claude-code-transcript.v1") return "claude";
   if (version === "sherlock.codex-rollout.v1" ||
       version === "sherlock.codex-rollout.v2" ||
@@ -447,7 +451,7 @@ with p as not materialized (
          e.normalizer_version, e.event_kind, e.event_subtype, e.projection_index,
          e.canonical_scope_key, e.logical_event_key, e.usage_stream_key, e.usage_is_cumulative,
          e.model recorded_model, e.source_priority,
-         case when ib.source_provider = 'claude_code' then 'claude' else 'codex' end provider,
+         case ib.source_provider when 'claude_code' then 'claude' when 'cursor' then 'cursor' else 'codex' end provider,
          e.input_tokens, e.cached_input_tokens, e.output_tokens,
          e.reasoning_tokens, e.total_tokens, e.occurred_at usage_at,
          coalesce(nr.native_record_start_offset, nr.source_start_offset) native_start,

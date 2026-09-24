@@ -36,7 +36,7 @@ export interface RecordLocator {
 
 export interface BatchManifest {
   contract_version: typeof CONTRACT_VERSION;
-  source_provider: "codex" | "claude_code";
+  source_provider: "codex" | "claude_code" | "cursor";
   source_kind: "rollout" | "transcript" | "hook";
   source_stream_key: string;
   generation_key: string;
@@ -468,8 +468,11 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
   const storageEncoding = text(raw.storage_encoding, "storage_encoding");
   if (
     contractVersion !== CONTRACT_VERSION ||
-    !(["codex", "claude_code"] as string[]).includes(sourceProvider) ||
+    !(["codex", "claude_code", "cursor"] as string[]).includes(
+      sourceProvider,
+    ) ||
     !(["rollout", "transcript", "hook"] as string[]).includes(sourceKind) ||
+    (sourceProvider === "cursor" && sourceKind !== "hook") ||
     (sourceProvider === "codex" && sourceKind !== "rollout") ||
     (sourceProvider === "claude_code" &&
       !(["transcript", "hook"] as string[]).includes(sourceKind))
@@ -547,6 +550,8 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
 
 export function validateManifest(manifest: BatchManifest): void {
   if (
+    (manifest.source_provider === "cursor" &&
+      manifest.source_kind !== "hook") ||
     (manifest.source_provider === "codex" &&
       manifest.source_kind !== "rollout") ||
     (manifest.source_provider === "claude_code" &&

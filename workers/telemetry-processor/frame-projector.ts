@@ -10,6 +10,7 @@ import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
   FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
+  FRAME_CURSOR_NORMALIZER_VERSION,
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
@@ -174,7 +175,9 @@ export function frameSourceNormalizerPredicateSql(
   cutoverAlias: string,
 ): string {
   return `(
-    ${batchAlias}.source_provider = 'claude_code'
+    ${batchAlias}.source_provider = 'cursor'
+    and ${eventAlias}.normalizer_version = '${FRAME_CURSOR_NORMALIZER_VERSION}'
+    or ${batchAlias}.source_provider = 'claude_code'
     and ${eventAlias}.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
     or ${batchAlias}.source_provider = 'codex'
     and (

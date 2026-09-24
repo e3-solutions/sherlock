@@ -166,7 +166,7 @@ const sessionSchema = z.object({
   sessionId: UUID,
   personId: UUID,
   displayName: SHORT_TEXT,
-  provider: z.enum(["codex", "claude", "unknown"]),
+  provider: z.enum(["codex", "claude", "cursor", "unknown"]),
   actorRole: z.enum(["primary", "worker", "guardian", "automation", "unknown"]),
   model: SHORT_TEXT,
   startedAt: ISO_TIMESTAMP,
@@ -218,7 +218,7 @@ const queryUsageInputSchema = z.object({
 const usageGroupSchema = z.object({
   personId: UUID.optional(),
   displayName: SHORT_TEXT.optional(),
-  provider: z.enum(["codex", "claude"]),
+  provider: z.enum(["codex", "claude", "cursor"]),
   model: SHORT_TEXT.optional(),
   tokens: z.object({
     input: z.number().int().nonnegative().nullable(),

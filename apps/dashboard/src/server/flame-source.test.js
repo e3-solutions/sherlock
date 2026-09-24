@@ -9,6 +9,7 @@ import {
   DEFAULT_WORK_DETAIL_LIMIT,
   FRAME_VERSION,
   PREVIOUS_FRAME_VERSION,
+  OLDER_FRAME_VERSION,
   FRESHNESS_NORMALIZER_VERSIONS,
   FRESHNESS_SQL,
   FLAME_SQL,
@@ -419,6 +420,7 @@ describe("Sherlock Flame payload", () => {
       NORMALIZER_VERSION,
       CLAUDE_NORMALIZER_VERSION,
       CORRECTED_CODEX_NORMALIZER_VERSION,
+      "sherlock.cursor-hook.v1",
     ]);
     for (const sql of [FLAME_SQL, INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
       expect(sql).toContain("$4::text[] normalizer_versions");
@@ -563,7 +565,7 @@ describe("Sherlock Flame payload", () => {
   it("round-trips a bounded immutable aggregate snapshot receipt", () => {
     const token = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 
-    expect(token).toMatch(/^v4\.[A-Za-z0-9_-]+$/);
+    expect(token).toMatch(/^v5\.[A-Za-z0-9_-]+$/);
     expect(decodeSnapshotToken(token)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
@@ -665,8 +667,8 @@ describe("Sherlock Flame payload", () => {
   it.each([
     [true, false, PROJECTION_FLAME_SQL, "v2", FRAME_VERSION],
     [false, true, PROJECTION_FLAME_SQL, "v2", COMPATIBLE_WORK_FRAME_VERSION],
-    [false, false, FLAME_SQL, "v4", null],
-    [null, null, FLAME_SQL, "v4", null],
+    [false, false, FLAME_SQL, "v5", null],
+    [null, null, FLAME_SQL, "v5", null],
   ])("routes current activation %s and compatible work activation %s", async (
     frameProjectionActive,
     compatibleWorkProjectionActive,
@@ -704,6 +706,7 @@ describe("Sherlock Flame payload", () => {
       FRAME_VERSION,
       COMPATIBLE_WORK_FRAME_VERSION,
       PREVIOUS_FRAME_VERSION,
+      OLDER_FRAME_VERSION,
     ]);
     expect(unsafe.mock.calls[2][0]).toBe(expectedSql);
     const expectedSnapshot = {
@@ -749,7 +752,7 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.frame_projection_activations");
     expect(unsafe.mock.calls[0][1]).toBeUndefined();
     expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
-    expect(payload.snapshot).toMatch(/^v4\./);
+    expect(payload.snapshot).toMatch(/^v5\./);
   });
 
   it("selects the 60-second transaction timeout only for the cached timeline", async () => {
@@ -1594,4 +1597,21 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
+});
+
+
+describe("Cursor snapshot compatibility", () => {
+  it("preserves the pre-Cursor raw source universe", () => {
+    const body = Buffer.from(JSON.stringify([PG_SNAPSHOT, READ.toISOString()])).toString("base64url");
+    expect(decodeSnapshotToken(`v4.${body}`).normalizerVersions).not.toContain("sherlock.cursor-hook.v1");
+    expect(decodeSnapshotToken(encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ })).normalizerVersions)
+      .toContain("sherlock.cursor-hook.v1");
+  });
+  it.each(["frame-evidence-v2", "frame-evidence-v4", "frame-evidence-v5", "frame-evidence-v6"])(
+    "retains the exact projection version %s", (frameVersion) => {
+      expect(decodeSnapshotToken(encodeProjectionSnapshotToken({
+        snapshot: PG_SNAPSHOT, read: READ, frameVersion,
+      })).frameVersion).toBe(frameVersion);
+    },
+  );
 });

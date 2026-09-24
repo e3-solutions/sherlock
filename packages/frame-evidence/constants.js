@@ -1,4 +1,5 @@
-export const FRAME_VERSION = "frame-evidence-v5";
+export const FRAME_CURSOR_NORMALIZER_VERSION = "sherlock.cursor-hook.v1";
+export const FRAME_VERSION = "frame-evidence-v6";
 export const FRAME_CORRECTED_CODEX_NORMALIZER_VERSION =
   "sherlock.codex-rollout.v3";
 
@@ -8,6 +9,7 @@ export const FRAME_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
 export const FRAME_CLAUDE_NORMALIZER_VERSION =
   "sherlock.claude-code-transcript.v1";
 export const FRAME_NORMALIZER_VERSIONS = Object.freeze([
+  FRAME_CURSOR_NORMALIZER_VERSION,
   FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,

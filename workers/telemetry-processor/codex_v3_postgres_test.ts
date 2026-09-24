@@ -332,7 +332,7 @@ Deno.test({
       );
       assert(
         versions.length === 1 &&
-          versions[0].frame_version === "frame-evidence-v5",
+          versions[0].frame_version === "frame-evidence-v6",
         "worker must project only one frame version",
       );
       await projector.projectSession({
@@ -358,8 +358,8 @@ Deno.test({
       const day = await dashboard.fetchDay({ now });
       assert(
         Object(decodeSnapshotToken(day.snapshot)).frameVersion ===
-          "frame-evidence-v5",
-        "v5 not selected after handoff",
+          "frame-evidence-v6",
+        "current frame not selected after handoff",
       );
       const evidence = await dashboard.fetchPromptEvidence({
         personId,
