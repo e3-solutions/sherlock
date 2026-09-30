@@ -8,6 +8,7 @@ import {
   decodeSessionCursor,
   encodeSessionCursor,
   queryWindow,
+  SEARCH_SESSIONS_SQL,
 } from "./mcp-query-source.js";
 
 const NOW = new Date("2026-09-01T20:00:00.000Z");
@@ -15,6 +16,56 @@ const START = new Date(MCP_QUERY_HISTORY_START);
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("Sherlock MCP query source", () => {
+  it("searches only bounded live excerpts from the configured workspace", async () => {
+    const unsafe = vi.fn(async (sql) => sql.includes("bounded_roster")
+      ? [{ person_count: 1 }]
+      : [{
+          session_id: SESSION_ID,
+          person_id: "33333333-3333-4333-8333-333333333333",
+          display_name: "Ada",
+          event_id: "22222222-2222-4222-8222-222222222222",
+          occurred_at: "2026-09-01T19:00:00.000Z",
+          normalizer_version: "sherlock.codex-rollout.v3",
+          content_excerpt: "A matching message",
+        }]);
+    const source = {
+      workspaceId: "44444444-4444-4444-8444-444444444444",
+      expectedEmailDomain: "e3group.ai",
+      maxPeople: 500,
+      readiness: vi.fn(),
+      transaction: vi.fn(async (callback) => await callback({ unsafe })),
+    };
+    const result = await createSherlockQuerySource(source).searchSessions({
+      query: "matching message", now: NOW,
+    });
+    expect(result.matches).toEqual([expect.objectContaining({
+      sessionId: SESSION_ID, excerpt: "A matching message", provider: "codex",
+    })]);
+    expect(result.coverage.state).toBe("partial");
+    expect(unsafe.mock.calls[1][0]).toBe(SEARCH_SESSIONS_SQL);
+    expect(unsafe.mock.calls[1][1].slice(0, 5)).toEqual([
+      source.workspaceId, "matching message", "2026-08-25T20:00:00.000Z",
+      NOW.toISOString(), NOW.toISOString(),
+    ]);
+    expect(SEARCH_SESSIONS_SQL).toContain("e.message_search @@ plainto_tsquery");
+    expect(SEARCH_SESSIONS_SQL).toContain("not e.is_replay");
+    expect(SEARCH_SESSIONS_SQL).toContain("from telemetry.events winner");
+  });
+
+  it("rejects unbounded or empty excerpt searches", async () => {
+    const source = {
+      workspaceId: SESSION_ID,
+      expectedEmailDomain: "e3group.ai",
+      maxPeople: 500,
+      readiness: vi.fn(),
+      transaction: vi.fn(),
+    };
+    const search = createSherlockQuerySource(source).searchSessions;
+    await expect(search({ query: "?", now: NOW })).rejects.toThrow(FlameSourceError);
+    await expect(search({ query: "message", start: "2026-07-01T00:00:00.000Z", now: NOW }))
+      .rejects.toThrow(FlameSourceError);
+    expect(source.transaction).not.toHaveBeenCalled();
+  });
   it("keeps a measured prefix separate from unknown totals after a discontinuity", () => {
     const result = buildUsageResult([{
       person_id: SESSION_ID, display_name: "Ada", provider: "codex", model: "model-A",

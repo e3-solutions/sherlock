@@ -75,7 +75,19 @@ describe("Bonaparte MCP protocol", () => {
         pendingNormalize: 0,
       }),
       transaction: vi.fn(async (callback) => await callback({
-        unsafe: vi.fn(async (sql) => sql.includes("read_dashboard_freshness")
+        unsafe: vi.fn(async (sql) => sql.includes("bounded_roster")
+          ? [{ person_count: 1 }]
+          : sql.includes("message_search @@")
+          ? [{
+              session_id: "33333333-3333-4333-8333-333333333333",
+              person_id: personId,
+              display_name: "Ada",
+              event_id: "44444444-4444-4444-8444-444444444444",
+              occurred_at: "2026-08-19T03:00:00.000Z",
+              normalizer_version: "sherlock.codex-rollout.v3",
+              content_excerpt: "Found the session",
+            }]
+          : sql.includes("read_dashboard_freshness")
           ? [{
               read_at: "2026-08-19T03:30:08.000Z",
               raw_watermark: "2026-08-19T03:30:07.000Z",
@@ -130,6 +142,7 @@ describe("Bonaparte MCP protocol", () => {
       "coverage",
       "list_sessions",
       "get_session",
+      "search_sessions",
       "query_usage",
       "list_usage_evidence",
       "list_prompt_evidence",
@@ -145,6 +158,19 @@ describe("Bonaparte MCP protocol", () => {
       status: "ok",
       mode: "sherlock_backend_aggregate",
       pendingNormalizationJobs: 0,
+    });
+    const searchResult = await client.callTool({
+      name: "search_sessions",
+      arguments: {
+        query: "session",
+        start: "2026-08-18T00:00:00.000Z",
+        end: "2026-08-19T12:00:00.000Z",
+      },
+    });
+    expect(searchResult.isError).not.toBe(true);
+    expect(searchResult.structuredContent).toMatchObject({
+      matches: [{ excerpt: "Found the session", sessionId: "33333333-3333-4333-8333-333333333333" }],
+      coverage: { state: "partial" },
     });
     const usageResult = await client.callTool({
       name: "query_usage",
