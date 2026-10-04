@@ -1858,11 +1858,13 @@ export class DirectFlameSource {
     expectedEmailDomain,
     maxPeople = 500,
     projectionEnabled = true,
+    privateView = false,
   }) {
     this.workspaceId = workspaceId;
     this.expectedEmailDomain = validateDashboardEmailDomain(expectedEmailDomain);
     this.maxPeople = maxPeople;
     this.projectionEnabled = projectionEnabled;
+    this.privateView = privateView;
     this.applicationName = `sherlock-dashboard:${workspaceId}`;
     this.sql = postgres(dashboardDatabaseUrl(databaseUrl), {
       prepare: false,
@@ -1937,11 +1939,12 @@ export class DirectFlameSource {
       return await this.transaction(async (tx) => {
         const rows = await tx.unsafe(`
           select current_role = '${DATABASE_ROLE}' as backend_role,
+                 (session_user = 'sherlock_aqil_private_login') = $1::boolean as private_boundary,
                  current_setting('transaction_read_only') = 'on' as read_only,
                  has_table_privilege(current_role, 'telemetry.people', 'select') as can_read_people,
                  has_table_privilege(current_role, 'telemetry.events', 'select') as can_read_events
             from pg_roles where rolname = current_role
-        `);
+        `, [this.privateView]);
         if (!rows[0] || Object.values(rows[0]).some((value) => value !== true)) {
           throw new FlameSourceError("flame_database_reader_unsafe");
         }
