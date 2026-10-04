@@ -8,6 +8,10 @@ insert into telemetry.people(id,workspace_id,identity_key,email) values
 ('a4110000-0000-4000-8000-000000000003','a4110000-0000-4000-8000-000000000001','ordinary-proof','ordinary@e3group.ai');
 insert into telemetry.sessions(id,workspace_id,person_id,collector_key,native_session_id,actor_role,role_version,started_at)
 values ('a4110000-0000-4000-8000-000000000004','a4110000-0000-4000-8000-000000000001','a4110000-0000-4000-8000-000000000002','privacy-proof','private-proof','primary','proof.v1',now()-interval '1 minute');
+insert into telemetry.sessions(id,workspace_id,person_id,collector_key,native_session_id,actor_role,role_version,started_at,parent_session_id) values
+('a4110000-0000-4000-8000-000000000006','a4110000-0000-4000-8000-000000000001','a4110000-0000-4000-8000-000000000003','privacy-proof','ordinary-proof','primary','proof.v1',now()-interval '1 minute',null),
+('a4110000-0000-4000-8000-000000000007','a4110000-0000-4000-8000-000000000001','a4110000-0000-4000-8000-000000000003','privacy-proof','ordinary-private-parent','primary','proof.v1',now()-interval '1 minute','a4110000-0000-4000-8000-000000000004'),
+('a4110000-0000-4000-8000-000000000008','a4110000-0000-4000-8000-000000000001','a4110000-0000-4000-8000-000000000002','privacy-proof','private-ordinary-parent','primary','proof.v1',now()-interval '1 minute','a4110000-0000-4000-8000-000000000006');
 insert into telemetry.ingest_batches(id,workspace_id,person_id,collector_key,source_kind,source_stream_key,generation_key,generation_seq,start_offset,end_offset,source_byte_count,source_sha256,storage_path,storage_encoding,stored_byte_count,stored_sha256,record_count,contract_version)
 values ('a4110000-0000-4000-8000-000000000005','a4110000-0000-4000-8000-000000000001','a4110000-0000-4000-8000-000000000002','privacy-proof','collector','proof','proof',0,0,1,1,repeat('a',64),'privacy-proof/raw','identity',1,repeat('a',64),1,'proof.v1');
 insert into telemetry.native_records(workspace_id,batch_id,record_index,source_start_offset,source_end_offset,record_sha256,parse_status)
@@ -33,7 +37,8 @@ set local role sherlock_reader;
 do $$ begin
  if exists(select 1 from telemetry.events where workspace_id='a4110000-0000-4000-8000-000000000001') then raise exception 'Null-session event leaks protected source'; end if;
  if exists(select 1 from telemetry.native_records where workspace_id='a4110000-0000-4000-8000-000000000001') then raise exception 'Native record leaks protected source'; end if;
- if exists(select 1 from telemetry.sessions where workspace_id='a4110000-0000-4000-8000-000000000001') then raise exception 'Session leaks protected identity'; end if;
+ if exists(select 1 from telemetry.sessions where workspace_id='a4110000-0000-4000-8000-000000000001' and id<>'a4110000-0000-4000-8000-000000000006') then raise exception 'Session or parent link leaks protected identity'; end if;
+ if not exists(select 1 from telemetry.sessions where id='a4110000-0000-4000-8000-000000000006') then raise exception 'Ordinary session lost'; end if;
  if exists(select 1 from telemetry.people where id='a4110000-0000-4000-8000-000000000002') then raise exception 'Public reader sees protected identity'; end if;
  if not exists(select 1 from telemetry.people where id='a4110000-0000-4000-8000-000000000003') then raise exception 'Public reader lost ordinary identity'; end if;
  if exists(select 1 from analytics.read_dashboard_freshness('a4110000-0000-4000-8000-000000000001','e3group.ai',array['sherlock.codex-rollout.v3'],500) where person_id='a4110000-0000-4000-8000-000000000002') then raise exception 'Definer function leaks protected identity'; end if;
@@ -44,6 +49,7 @@ reset role;
 set local session authorization sherlock_aqil_private_login;
 set local role sherlock_reader;
 do $$ begin
+ if exists(select 1 from telemetry.sessions where workspace_id='a4110000-0000-4000-8000-000000000001' and id<>'a4110000-0000-4000-8000-000000000004') then raise exception 'Private principal sees forbidden ownership or parent link'; end if;
  if not exists(select 1 from telemetry.events where workspace_id='a4110000-0000-4000-8000-000000000001') then raise exception 'Private source event not visible'; end if;
  if not exists(select 1 from telemetry.people where id='a4110000-0000-4000-8000-000000000002') then raise exception 'Private principal cannot see protected identity'; end if;
  if exists(select 1 from telemetry.people where id='a4110000-0000-4000-8000-000000000003') then raise exception 'Private principal sees ordinary identity'; end if;
