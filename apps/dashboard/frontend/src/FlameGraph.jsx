@@ -501,7 +501,7 @@ function IntervalOverview({
             <span aria-hidden="true">–</span>
             <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
             <span aria-hidden="true">·</span>
-            <small>{work.eventCount} {work.eventCount === 1 ? "event" : "events"}</small>
+            <small>{work.evidenceSource === "completed_turn_interval" ? "Recorded turn timing · transcript detail unavailable" : `${work.eventCount} ${work.eventCount === 1 ? "event" : "events"}`}</small>
           </span>
         </span>
         <span className="flame-detail__chevron" aria-hidden="true">›</span>
@@ -509,7 +509,7 @@ function IntervalOverview({
     );
     return (
       <li key={work.id}>
-        <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
+        <button type="button" disabled={work.evidenceSource === "completed_turn_interval"} onClick={() => onOpenWork(work)}>{contents}</button>
         {work.pullRequest && (
           <PullRequestLink pullRequest={work.pullRequest} />
         )}

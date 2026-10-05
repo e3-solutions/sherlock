@@ -166,3 +166,12 @@ describe("Bonaparte MCP tools", () => {
     await expect(protocol.close()).resolves.toBeUndefined();
   });
 });
+
+it("exposes and documents provider usage separately from token queries", async () => {
+ const data={schemaVersion:"provider-plan-usage-v1",snapshots:[{weeklyLimitPercent:19.44527799749026,tokenCountsAvailable:false}]};
+ const fetchProviderUsage=vi.fn().mockResolvedValue(data);const tools=registeredTools({fetchProviderUsage});
+ const signal=new AbortController().signal;
+ expect((await tools.get("list_provider_usage").handler({}, {signal})).structuredContent).toEqual(data);
+ expect(fetchProviderUsage).toHaveBeenCalledWith({signal});
+ expect((await tools.get("documentation").handler({})).structuredContent.tools.map(x=>x.name)).toContain("list_provider_usage");
+});

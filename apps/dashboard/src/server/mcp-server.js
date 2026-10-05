@@ -46,12 +46,13 @@ const usageOutputSchema = z.object({
     readAt: ISO_TIMESTAMP,
   }).strict(),
   provenance: z.object({
+    recovery: z.object({basis:z.literal("recovered_completed_turn_intervals"),sourceHashes:z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(100),latestCompletedAt:ISO_TIMESTAMP}).strict().optional(),
     projectionVersion: z.enum(["frame-evidence-v2", "frame-evidence-v4", "frame-evidence-v5",
       "raw-snapshot-v1", "raw-snapshot-v3", "raw-snapshot-v4"]),
   }).strict(),
   coverage: z.object({
     state: z.literal("partial"),
-    basis: z.literal("observed_canonical_events"),
+    basis: z.enum(["observed_canonical_events", "observed_canonical_events_and_recovered_completed_turns"]),
     limitations: z.array(z.literal("event_presence_not_continuous_attention")),
   }).strict(),
   people: z.array(z.object({
@@ -306,6 +307,7 @@ const QUERY_DOCUMENTATION = Object.freeze({
   ],
   guidance: [
     "Call coverage before interpreting an empty or incomplete usage result.",
+    "Activity evidence can include recovered completed turn intervals. These are distinct-thread counts per bucket, not simultaneous peak counts or token observations. Pauses and unfinished turns are excluded; already-imported native sessions are excluded to avoid double counting.",
     "Query v1 currently reports observed data as partial because terminal normalization failures are not yet included in its freshness receipt.",
     "Use query_usage for token/model questions and list_sessions/get_session for metadata drill-down.",
     "Usage groups carry arithmetic/model coverage. Null tokens mean the total is unknown; knownTokens retains only accepted contributions, and zero knownTokens is not proof of no usage. No post-regression recovery is counted without a verified counter epoch.",
@@ -396,6 +398,15 @@ function failure(error, { query = false } = {}) {
 }
 
 export function registerBonaparteTools(server, source) {
+  if (typeof source.fetchProviderUsage === "function") server.registerTool("list_provider_usage", {
+    title: "Recovered provider plan usage",
+    description: "Read immutable provider billing snapshots. Weekly allowance percentages are separate from token counts. Check dataStatus and dataAsOf; allowance windows and descendant inclusion are unknown. Never add these percentages to token totals or across threads.",
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY_ANNOTATIONS,
+  }, async (_args, context = {}) => {
+    try { return success(await source.fetchProviderUsage({ signal: context.signal })); }
+    catch (error) { return failure(error, { query: true }); }
+  });
+
   server.registerTool(
     "documentation",
     {
@@ -405,7 +416,11 @@ export function registerBonaparteTools(server, source) {
       outputSchema: documentationOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => success(QUERY_DOCUMENTATION),
+    async () => success(typeof source.fetchProviderUsage === "function" ? {
+      ...QUERY_DOCUMENTATION,
+      tools: [...QUERY_DOCUMENTATION.tools, { name: "list_provider_usage", purpose: "Read recovered provider plan percentages with cutoff and coverage; separate from tokens." }],
+      guidance: [...QUERY_DOCUMENTATION.guidance, "Provider snapshots may be partial or stale. Allowance window and descendant inclusion are unknown; do not sum percentages across threads or convert them to tokens."],
+    } : QUERY_DOCUMENTATION),
   );
 
   server.registerTool(
