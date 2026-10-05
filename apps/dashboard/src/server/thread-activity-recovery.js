@@ -70,7 +70,10 @@ export function mergeRecoveredTimeline(payload, intervals) {
       const count=role=>new Set(owned.filter(i=>i.role===role && i.startMs<hi && i.endMs>lo).map(i=>i.threadId)).size;
       return [bucket[0]+count("agent"),bucket[1]+count("subagent"),bucket[2],bucket[3]];
     });
-    return {...person, buckets, total:[person.total[0]+distinct(["agent"]),person.total[1]+distinct(["subagent"]),person.total[2]],
+    const recoveredLatest = Math.max(...owned.map(i=>i.endMs));
+    const nativeLatest = person.lastActivity == null ? null : Date.parse(person.lastActivity);
+    const lastActivity = new Date(Math.max(nativeLatest ?? recoveredLatest, recoveredLatest)).toISOString();
+    return {...person, lastActivity, buckets, total:[person.total[0]+distinct(["agent"]),person.total[1]+distinct(["subagent"]),person.total[2]],
       activeSeconds:buckets.filter(b=>b.slice(0,3).some(n=>n>0)).length*BUCKET_MS/1000};
   });
   const ongoing = relevant.some(i=>i.ongoing), completed = relevant.filter(i=>!i.ongoing);
