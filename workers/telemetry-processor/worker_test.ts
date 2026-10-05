@@ -4,6 +4,7 @@ import {
   capacityRetryMilliseconds,
   chooseLane,
   chooseOverloadJobKind,
+  claimNormalJob,
   claimOverloadJob,
   DatabaseRecoveryCircuit,
   databaseRetryMilliseconds,
@@ -849,6 +850,83 @@ Deno.test("live capacity is reserved and backfill remains bounded", () => {
     alternateLane("backfill", 0, config) === "live",
     "live work may borrow the backfill slot",
   );
+});
+
+Deno.test("short jobs in both saturated lanes receive bounded admissions", () => {
+  for (const liveReserved of [11, 6]) {
+    const config = { concurrency: 12, liveReserved };
+    let previous: "live" | "backfill" | undefined;
+    const admissions: string[] = [];
+    // Both queues stay nonempty, but every job finishes before the next poll.
+    for (let pass = 0; pass < 20; pass++) {
+      const lane = chooseLane(0, 0, config, previous);
+      admissions.push(lane);
+      previous = lane;
+    }
+    for (let pass = 1; pass < admissions.length; pass++) {
+      assert(admissions[pass] !== admissions[pass - 1]);
+    }
+    assert(chooseLane(0, 12 - liveReserved, config, "live") === "live");
+    assert(chooseLane(liveReserved, 0, config, "backfill") === "backfill");
+  }
+});
+
+Deno.test("normal admission falls back to the actual lane and respects its cap", async () => {
+  const calls: string[] = [];
+  const liveJob = {
+    workload_class: "live",
+    job_kind: "normalize",
+  } as TelemetryJob;
+  const queue = {
+    claim(lane: string) {
+      calls.push(lane);
+      return Promise.resolve(lane === "live" ? liveJob : null);
+    },
+  };
+  const config = {
+    concurrency: 12,
+    liveReserved: 11,
+    workerId: "test",
+    leaseSeconds: 120,
+  } as WorkerConfig;
+  const actual = await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    "live",
+  );
+  assert(actual === liveJob);
+  assert(calls.join(",") === "backfill,live");
+  calls.length = 0;
+  await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    actual!.workload_class,
+  );
+  assert(calls.join(",") === "backfill,live");
+  const active = new Map<
+    Promise<void>,
+    Pick<TelemetryJob, "job_kind" | "workload_class">
+  >();
+  active.set(Promise.resolve(), {
+    workload_class: "backfill",
+    job_kind: "normalize",
+  });
+  calls.length = 0;
+  const empty = {
+    claim(lane: string) {
+      calls.push(lane);
+      return Promise.resolve(null);
+    },
+  };
+  assert(
+    await claimNormalJob(empty as never, active, config, () => {}, "live") ===
+      null,
+  );
+  assert(calls.join(",") === "live");
 });
 
 Deno.test("retry backoff grows exponentially and caps", () => {
