@@ -90,6 +90,8 @@ export function listUsageEvidence(payload) {
     },
     provenance: {
       ...(payload.recovery ? { recovery: payload.recovery } : {}),
+      ...(decodeSnapshotToken(payload.snapshot).originClassificationVersion
+        ? { originClassificationVersion: decodeSnapshotToken(payload.snapshot).originClassificationVersion } : {}),
       projectionVersion: decodeSnapshotToken(payload.snapshot).frameVersion ??
         `raw-snapshot-${payload.snapshot.split(".")[0]}`,
     },

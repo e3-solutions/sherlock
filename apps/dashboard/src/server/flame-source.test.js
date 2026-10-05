@@ -45,6 +45,7 @@ import {
   encodeWorkCursor,
   encodeProjectionSnapshotToken,
   encodeSnapshotToken,
+  classificationSnapshotQuery,
   validateDashboardEmailDomain,
 } from "./flame-source.js";
 
@@ -237,6 +238,7 @@ describe("Sherlock Flame payload", () => {
       snapshot: PG_SNAPSHOT,
       read: READ,
       normalizerVersions: NORMALIZER_VERSIONS,
+      originClassificationVersion: "bonaparte-origin-v1",
     });
   });
 
@@ -358,6 +360,7 @@ describe("Sherlock Flame payload", () => {
       snapshot: PG_SNAPSHOT,
       read: READ,
       normalizerVersions: NORMALIZER_VERSIONS,
+      originClassificationVersion: "bonaparte-origin-v1",
     });
     expect(() => buildFlamePayload({
       rows: [{ person_id: "unexpected" }],
@@ -563,11 +566,12 @@ describe("Sherlock Flame payload", () => {
   it("round-trips a bounded immutable aggregate snapshot receipt", () => {
     const token = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 
-    expect(token).toMatch(/^v4\.[A-Za-z0-9_-]+$/);
+    expect(token).toMatch(/^v5\.[A-Za-z0-9_-]+$/);
     expect(decodeSnapshotToken(token)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
       normalizerVersions: NORMALIZER_VERSIONS,
+      originClassificationVersion: "bonaparte-origin-v1",
     });
 
     const legacyBody = Buffer.from(JSON.stringify([
@@ -591,11 +595,12 @@ describe("Sherlock Flame payload", () => {
       frameVersion: FRAME_VERSION,
     });
 
-    expect(token).toMatch(/^v2\.[A-Za-z0-9_-]+$/);
+    expect(token).toMatch(/^v6\.[A-Za-z0-9_-]+$/);
     expect(decodeSnapshotToken(token)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
       frameVersion: FRAME_VERSION,
+      originClassificationVersion: "bonaparte-origin-v1",
     });
     const compatibleToken = encodeProjectionSnapshotToken({
       snapshot: PG_SNAPSHOT,
@@ -606,6 +611,7 @@ describe("Sherlock Flame payload", () => {
       snapshot: PG_SNAPSHOT,
       read: READ,
       frameVersion: COMPATIBLE_WORK_FRAME_VERSION,
+      originClassificationVersion: "bonaparte-origin-v1",
     });
     expect(() => encodeProjectionSnapshotToken({
       snapshot: PG_SNAPSHOT,
@@ -651,6 +657,7 @@ describe("Sherlock Flame payload", () => {
       snapshot: PG_SNAPSHOT,
       read: READ,
       normalizerVersions: NORMALIZER_VERSIONS,
+      originClassificationVersion: "bonaparte-origin-v1",
     });
     expect(unsafe.mock.calls[2][1]).toEqual([
       source.workspaceId,
@@ -663,10 +670,10 @@ describe("Sherlock Flame payload", () => {
   });
 
   it.each([
-    [true, false, PROJECTION_FLAME_SQL, "v2", FRAME_VERSION],
-    [false, true, PROJECTION_FLAME_SQL, "v2", COMPATIBLE_WORK_FRAME_VERSION],
-    [false, false, FLAME_SQL, "v4", null],
-    [null, null, FLAME_SQL, "v4", null],
+    [true, false, PROJECTION_FLAME_SQL, "v6", FRAME_VERSION],
+    [false, true, PROJECTION_FLAME_SQL, "v6", COMPATIBLE_WORK_FRAME_VERSION],
+    [false, false, FLAME_SQL, "v5", null],
+    [null, null, FLAME_SQL, "v5", null],
   ])("routes current activation %s and compatible work activation %s", async (
     frameProjectionActive,
     compatibleWorkProjectionActive,
@@ -707,6 +714,7 @@ describe("Sherlock Flame payload", () => {
     ]);
     expect(unsafe.mock.calls[2][0]).toBe(expectedSql);
     const expectedSnapshot = {
+      originClassificationVersion: "bonaparte-origin-v1",
       snapshot: PG_SNAPSHOT,
       read: READ,
     };
@@ -749,7 +757,7 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.frame_projection_activations");
     expect(unsafe.mock.calls[0][1]).toBeUndefined();
     expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
-    expect(payload.snapshot).toMatch(/^v4\./);
+    expect(payload.snapshot).toMatch(/^v5\./);
   });
 
   it("selects the 60-second transaction timeout only for the cached timeline", async () => {
@@ -1268,9 +1276,9 @@ describe("Sherlock Flame payload", () => {
       snapshot: `v1.${legacyBody}`,
     });
 
-    expect(unsafe.mock.calls[1][0]).toBe(INTERVAL_WORK_SQL);
+    expect(unsafe.mock.calls[1][0]).toBe(classificationSnapshotQuery(INTERVAL_WORK_SQL, decodeSnapshotToken(`v1.${legacyBody}`)));
     expect(unsafe.mock.calls[1][1][3]).toEqual(LEGACY_NORMALIZER_VERSIONS);
-    expect(unsafe.mock.calls[2][0]).toBe(INTERVAL_PROMPTS_SQL);
+    expect(unsafe.mock.calls[2][0]).toBe(classificationSnapshotQuery(INTERVAL_PROMPTS_SQL, decodeSnapshotToken(`v1.${legacyBody}`)));
     expect(unsafe.mock.calls[2][1][3]).toEqual(LEGACY_NORMALIZER_VERSIONS);
   });
 
@@ -1594,4 +1602,16 @@ describe("Sherlock Flame payload", () => {
     });
   });
 
+});
+
+
+it("keeps pre-classification snapshots unannotated even after metadata exists", () => {
+  const body = Buffer.from(JSON.stringify([PG_SNAPSHOT, READ.toISOString(), FRAME_VERSION])).toString("base64url");
+  const legacy = decodeSnapshotToken(`v2.${body}`);
+  expect(legacy.originClassificationVersion).toBeUndefined();
+  expect(classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, legacy)).toContain("where c.workspace_id = p.workspace_id and false");
+  const current = decodeSnapshotToken(encodeProjectionSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ, frameVersion: FRAME_VERSION }));
+  expect(classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, current)).toBe(PROJECTION_INTERVAL_PROMPTS_SQL);
+  const rawBody = Buffer.from(JSON.stringify([PG_SNAPSHOT, READ.toISOString()])).toString("base64url");
+  expect(decodeSnapshotToken(`v4.${rawBody}`)).toEqual({ snapshot: PG_SNAPSHOT, read: READ, normalizerVersions: NORMALIZER_VERSIONS });
 });

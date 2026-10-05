@@ -41,9 +41,12 @@ const TIMELINE_STATEMENT_TIMEOUT_MS = 60_000;
 const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
 export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
-const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
+const LEGACY_PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
+const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v6";
+export const ORIGIN_CLASSIFICATION_VERSION = "bonaparte-origin-v1";
 const PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION = "v3";
-const RAW_SNAPSHOT_TOKEN_VERSION = "v4";
+const UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION = "v4";
+const RAW_SNAPSHOT_TOKEN_VERSION = "v5";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -1482,7 +1485,8 @@ export function decodeSnapshotToken(token) {
   }
   const [version, body, extra] = token.split(".");
   if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION,
-    PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
+    PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION,
+    UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION, LEGACY_PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version) ||
       !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
     throw new FlameSourceError("flame_prompt_request_invalid");
@@ -1493,7 +1497,8 @@ export function decodeSnapshotToken(token) {
       throw new Error("noncanonical_token");
     }
     const value = JSON.parse(decoded);
-    const expectedLength = version === PROJECTION_SNAPSHOT_TOKEN_VERSION
+    const projected = [PROJECTION_SNAPSHOT_TOKEN_VERSION, LEGACY_PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version);
+    const expectedLength = projected
       ? 3
       : 2;
     if (!Array.isArray(value) || value.length !== expectedLength) {
@@ -1503,7 +1508,7 @@ export function decodeSnapshotToken(token) {
     const read = asDate(rawRead);
     if (read.toISOString() !== rawRead) throw new Error("noncanonical_read");
     const receipt = { snapshot: parsePgSnapshot(snapshot), read };
-    if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
+    if (projected) {
       if (
         ![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
           pinnedFrameVersion,
@@ -1512,17 +1517,26 @@ export function decodeSnapshotToken(token) {
         throw new Error("unsupported_frame_version");
       }
       receipt.frameVersion = pinnedFrameVersion;
-    } else if (version === RAW_SNAPSHOT_TOKEN_VERSION) {
+    } else if ([RAW_SNAPSHOT_TOKEN_VERSION, UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION].includes(version)) {
       receipt.normalizerVersions = NORMALIZER_VERSIONS;
     } else if (version === PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION) {
       receipt.normalizerVersions = PREVIOUS_NORMALIZER_VERSIONS;
     } else {
       receipt.normalizerVersions = LEGACY_NORMALIZER_VERSIONS;
     }
+    if ([RAW_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version)) {
+      receipt.originClassificationVersion = ORIGIN_CLASSIFICATION_VERSION;
+    }
     return receipt;
   } catch {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
+}
+
+export function classificationSnapshotQuery(query, receipt) {
+  return receipt.originClassificationVersion === ORIGIN_CLASSIFICATION_VERSION
+    ? query
+    : query.replace("where c.workspace_id = p.workspace_id", "where c.workspace_id = p.workspace_id and false");
 }
 
 const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
@@ -2114,7 +2128,7 @@ export class DirectFlameSource {
         .includes(snapshotReceipt.frameVersion);
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_INTERVAL_WORK_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2126,7 +2140,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           workLimit,
         ], signal)
-        : await runQuery(tx, INTERVAL_WORK_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(INTERVAL_WORK_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
@@ -2156,7 +2170,7 @@ export class DirectFlameSource {
       ]));
       const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
       const prompts = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2168,7 +2182,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           promptLimit,
         ], signal)
-        : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
@@ -2234,7 +2248,7 @@ export class DirectFlameSource {
         bucketStartMicroseconds.toString();
       const cursorId = decodedCursor?.id ?? "0";
       const resultRows = projected
-        ? await runQuery(tx, PROJECTION_WORK_DETAIL_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_WORK_DETAIL_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2248,7 +2262,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           pageSize + 1,
         ], signal)
-        : await runQuery(tx, WORK_DETAIL_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(WORK_DETAIL_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
@@ -2309,7 +2323,7 @@ export class DirectFlameSource {
       const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const rows = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2321,7 +2335,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           MCP_PROMPT_EVIDENCE_LIMIT,
         ], signal)
-        : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
