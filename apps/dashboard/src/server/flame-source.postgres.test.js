@@ -32,14 +32,15 @@ function bucketIndex(at) {
   return Math.floor((at.getTime() - start) / BUCKET_MS);
 }
 
-function collectPlanRelations(value, relations = new Set()) {
+function collectPlanRelations(value, relations = new Set(), excludedSubplan = null) {
   if (Array.isArray(value)) {
-    for (const item of value) collectPlanRelations(item, relations);
+    for (const item of value) collectPlanRelations(item, relations, excludedSubplan);
   } else if (value && typeof value === "object") {
+    if (excludedSubplan !== null && value["Subplan Name"] === excludedSubplan) return relations;
     if (typeof value["Relation Name"] === "string") {
       relations.add(value["Relation Name"]);
     }
-    for (const child of Object.values(value)) collectPlanRelations(child, relations);
+    for (const child of Object.values(value)) collectPlanRelations(child, relations, excludedSubplan);
   }
   return relations;
 }
@@ -1040,7 +1041,10 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect(relations.has("frame_evidence_revisions")).toBe(true);
       expect(relations.has("frame_projection_receipts")).toBe(false);
       expect(relations.has("events")).toBe(true);
-      expect(relations.has("sessions")).toBe(false);
+      // Source-session RLS authorizes origin metadata once in its materialized
+      // CTE. Projected activity itself must still avoid mutable session joins.
+      expect(relations.has("bonaparte_run_classifications")).toBe(true);
+      expect(collectPlanRelations(plan, new Set(), "CTE run_classifications").has("sessions")).toBe(false);
       expect(relations.has("native_records")).toBe(false);
       expect(relations.has("ingest_batches")).toBe(false);
       expect([...indexes].some((name) =>
