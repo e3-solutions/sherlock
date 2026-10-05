@@ -2569,14 +2569,23 @@ describePostgres("Bonaparte automated run annotations", () => {
         expect(await check(session, "2026-10-05T13:30:00Z", snapshot)).toBe(false);
         // A post-commit-style snapshot sees this transaction ID; the old one does not.
         const [{ visible }] = await tx.unsafe("select ((xmin::text::bigint + 1)::text || ':' || (xmin::text::bigint + 1)::text || ':')::pg_snapshot::text visible from analytics.bonaparte_run_classifications where workspace_id = $1 limit 1", [workspace]);
+        // Reader visibility of origin annotations must follow the source session.
+        await tx.unsafe(`insert into analytics.bonaparte_run_classifications
+          (workspace_id, session_id, effective_start, effective_end, classification, reason, evidence_sha256, request_reference)
+          values ($1, $2, '2026-10-05T13:00:00Z', '2026-10-05T14:00:00Z', 'automated_run', 'Synthetic private run', $3, 'integration test')`, [workspace, other, "c".repeat(64)]);
+        await tx.unsafe("alter table telemetry.sessions enable row level security");
+        await tx.unsafe("create policy synthetic_annotation_visibility on telemetry.sessions for select to sherlock_reader using (true)");
+        await tx.unsafe(`create policy synthetic_annotation_private_session on telemetry.sessions as restrictive for select to sherlock_reader using (id <> '${other}'::uuid)`);
         await tx.unsafe("set local role sherlock_reader");
+        expect(await check(other, "2026-10-05T13:30:00Z")).toBe(false);
+        expect((await tx.unsafe("select count(*)::int n from analytics.bonaparte_run_classifications where workspace_id = $1 and session_id = $2", [workspace, other]))[0].n).toBe(0);
         expect(await check(session, "2026-10-05T13:30:00Z", visible)).toBe(true);
         await tx.unsafe("reset role");
         await expect(tx.savepoint((sp) => sp.unsafe("update analytics.bonaparte_run_classifications set reason = 'changed' where workspace_id = $1", [workspace]))).rejects.toThrow("append-only");
         await expect(tx.savepoint((sp) => sp.unsafe("delete from analytics.bonaparte_run_classifications where workspace_id = $1", [workspace]))).rejects.toThrow("append-only");
         await append("default", "b");
         expect(await check(session, "2026-10-05T13:30:00Z")).toBe(false);
-        expect((await tx.unsafe("select count(*)::int n from analytics.bonaparte_run_classifications where workspace_id = $1", [workspace]))[0].n).toBe(2);
+        expect((await tx.unsafe("select count(*)::int n from analytics.bonaparte_run_classifications where workspace_id = $1 and session_id = $2", [workspace, session]))[0].n).toBe(2);
         throw rollback;
       })).rejects.toBe(rollback);
     } finally {
