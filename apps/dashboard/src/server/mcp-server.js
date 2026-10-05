@@ -46,13 +46,13 @@ const usageOutputSchema = z.object({
     readAt: ISO_TIMESTAMP,
   }).strict(),
   provenance: z.object({
-    recovery: z.object({basis:z.literal("recovered_completed_turn_intervals"),sourceHashes:z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(100),latestCompletedAt:ISO_TIMESTAMP}).strict().optional(),
+    recovery: z.object({basis:z.enum(["recovered_completed_turn_intervals", "recovered_observed_turn_intervals"]),sourceHashes:z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(100),latestCompletedAt:ISO_TIMESTAMP.optional(),latestObservedAt:ISO_TIMESTAMP.optional()}).strict().optional(),
     projectionVersion: z.enum(["frame-evidence-v2", "frame-evidence-v4", "frame-evidence-v5",
       "raw-snapshot-v1", "raw-snapshot-v3", "raw-snapshot-v4"]),
   }).strict(),
   coverage: z.object({
     state: z.literal("partial"),
-    basis: z.enum(["observed_canonical_events", "observed_canonical_events_and_recovered_completed_turns"]),
+    basis: z.enum(["observed_canonical_events", "observed_canonical_events_and_recovered_completed_turns", "observed_canonical_events_and_recovered_observed_turns"]),
     limitations: z.array(z.literal("event_presence_not_continuous_attention")),
   }).strict(),
   people: z.array(z.object({

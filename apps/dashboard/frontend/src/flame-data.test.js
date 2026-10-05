@@ -464,11 +464,11 @@ describe("chart helpers", () => {
   });
 });
 
-it("accepts recovered timing rows with explicitly unknown event counts",()=>{
+it.each(["completed_turn_interval", "observed_ongoing_turn_interval"])("accepts %s rows with explicitly unknown event counts",(evidenceSource)=>{
  const start="2026-10-05T05:30:00.000Z";
- const row={id:"recovery:worker",sessionId:"worker",role:"subagent",firstAt:start,lastAt:"2026-10-05T05:39:59.999Z",eventCount:null,summary:"Recovered cloud turn activity",evidenceSource:"completed_turn_interval"};
+ const row={id:"recovery:worker",sessionId:"worker",role:"subagent",firstAt:start,lastAt:"2026-10-05T05:39:59.999Z",eventCount:null,summary:"Recovered cloud turn activity",evidenceSource};
  const input={personId:"owner",start,snapshot:"snapshot",work:[row],prompts:[]};
  const expected={personId:"owner",startMs:Date.parse(start),snapshot:"snapshot",promptCount:0};
- expect(adaptIntervalEvidence(input,expected).work[0]).toMatchObject({eventCount:null,evidenceSource:"completed_turn_interval"});
+ expect(adaptIntervalEvidence(input,expected).work[0]).toMatchObject({eventCount:null,evidenceSource});
  expect(()=>adaptIntervalEvidence({...input,work:[{...row,eventCount:2}]},expected)).toThrow();
 });

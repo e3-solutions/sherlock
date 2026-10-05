@@ -406,8 +406,8 @@ export function adaptIntervalEvidence(value, expected) {
       sessionId,
       firstAtMs,
       lastAtMs,
-      evidenceSource: item.evidenceSource === "completed_turn_interval" ? item.evidenceSource : null,
-      eventCount: item.evidenceSource === "completed_turn_interval"
+      evidenceSource: ["completed_turn_interval", "observed_ongoing_turn_interval"].includes(item.evidenceSource) ? item.evidenceSource : null,
+      eventCount: ["completed_turn_interval", "observed_ongoing_turn_interval"].includes(item.evidenceSource)
         ? (item.eventCount === null ? null : fail(`${path}.eventCount`, "null for recovered timing"))
         : requirePositiveCount(item.eventCount, `${path}.eventCount`),
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),

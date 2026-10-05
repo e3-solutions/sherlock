@@ -27,3 +27,25 @@ it('combines native bucket counts without inventing prompts or token facts',()=>
 it('pins manifest visibility to source snapshot/read and configured roster',()=>{
  expect(RECOVERY_SQL).toContain('pg_visible_in_snapshot(s.xmin::text::xid8, $3::pg_snapshot)');expect(RECOVERY_SQL).toContain('b.imported_at <= $2');expect(RECOVERY_SQL).toContain('b.workspace_id=$1');expect(RECOVERY_SQL).toContain('sherlock-smoke');expect(RECOVERY_SQL).toContain("split_part(pe.email,'@',2)=$4");
 });
+it('bounds an ongoing turn to its retained page observation and snapshot read',()=>{
+ const input=row([{threadId:'root',turns:[{...turn('a',0,null,'inProgress'),observedAt:start+1200,sourcePageSha256:'page'}]}]);
+ const manifest=JSON.parse(input.manifest_text);manifest.sourcePages=[{sha256:'page',observedAt:start+1200}];input.manifest_text=JSON.stringify(manifest);
+ expect(recoveredIntervals([input],{readAt:(start+1199)*1000})).toEqual([]);
+ const intervals=recoveredIntervals([input],{readAt:(start+1200)*1000});
+ expect(intervals).toHaveLength(1);
+ const payload=mergeRecoveredTimeline(base(),intervals);
+ expect(payload.people[0].buckets.slice(0,3)).toEqual([[1,0,0,0],[1,0,0,0],[0,0,0,0]]);
+ expect(payload.recovery.basis).toBe('recovered_observed_turn_intervals');
+ expect(payload.recovery.latestCompletedAt).toBeUndefined();
+ expect(payload.recovery.latestObservedAt).toBe(new Date((start+1200)*1000).toISOString());
+ expect(recoveredIntervalWork(intervals,'owner',start*1000)[0].evidenceSource).toBe('observed_ongoing_turn_interval');
+ manifest.sourcePages=[];input.manifest_text=JSON.stringify(manifest);expect(recoveredIntervals([input])).toEqual([]);
+});
+it('uses the refreshed completed turn instead of its older ongoing observation',()=>{
+ const ongoing=row([{threadId:'root',turns:[{...turn('a',0,null,'inProgress'),observedAt:start+600,sourcePageSha256:'page'}]}]);
+ const manifest=JSON.parse(ongoing.manifest_text);manifest.sourcePages=[{sha256:'page',observedAt:start+600}];ongoing.manifest_text=JSON.stringify(manifest);
+ const completed=row([{threadId:'root',turns:[turn('a',0,900)]}]);
+ expect(recoveredIntervals([completed,ongoing])).toHaveLength(1);
+ expect(recoveredIntervals([ongoing,completed])[0]).toMatchObject({endMs:(start+900)*1000,ongoing:false});
+ expect(recoveredIntervals([completed,ongoing])[0]).toMatchObject({endMs:(start+900)*1000,ongoing:false});
+});
