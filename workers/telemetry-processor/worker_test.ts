@@ -926,7 +926,7 @@ Deno.test("normal admission falls back to the actual lane and respects its cap",
     await claimNormalJob(empty as never, active, config, () => {}, "live") ===
       null,
   );
-  assert(calls.join(",") === "live");
+  assert(calls.join(",") === "live,live");
 });
 
 Deno.test("retry backoff grows exponentially and caps", () => {
@@ -1097,4 +1097,129 @@ Deno.test("targeted scheduling has no fifty-session ceiling", async () => {
     },
   );
   assert(reduced === 75 && result.session_count === 75);
+});
+
+Deno.test("short jobs receive bounded kind fairness in normal and overload modes", async () => {
+  const config = {
+    concurrency: 12,
+    liveReserved: 11,
+    normalizeReserved: 11,
+    workerId: "fair",
+    leaseSeconds: 120,
+  } as WorkerConfig;
+  for (const overloaded of [false, true]) {
+    let previousKind: "normalize" | "reduce" | undefined;
+    let previousLane: "live" | "backfill" | undefined;
+    const admitted: string[] = [];
+    const queue = {
+      claim(
+        lane: "live" | "backfill",
+        _owner: string,
+        _lease: number,
+        kind: "normalize" | "reduce",
+      ) {
+        assert(kind !== undefined, "kind must be explicit");
+        return Promise.resolve(
+          { job_kind: kind, workload_class: lane } as TelemetryJob,
+        );
+      },
+      claimLiveNormalizationFrontier() {
+        return Promise.resolve(
+          { job_kind: "normalize", workload_class: "live" } as TelemetryJob,
+        );
+      },
+    };
+    for (let pass = 0; pass < 20; pass++) {
+      // Every previous job finishes before the next admission; occupancy is zero.
+      const job = overloaded
+        ? await claimOverloadJob(
+          queue as never,
+          new Map(),
+          config,
+          () => {},
+          previousKind,
+        )
+        : await claimNormalJob(
+          queue as never,
+          new Map(),
+          config,
+          () => {},
+          previousLane,
+          previousKind,
+        );
+      assert(job !== null);
+      previousKind = job.job_kind;
+      previousLane = job.workload_class;
+      admitted.push(job.job_kind);
+    }
+    assert(admitted.filter((kind) => kind === "normalize").length === 10);
+    assert(admitted.filter((kind) => kind === "reduce").length === 10);
+  }
+});
+
+Deno.test("overload fallback cannot exceed the single reduction reservation", async () => {
+  let ordinaryClaims = 0;
+  const queue = {
+    claimLiveNormalizationFrontier: () => Promise.resolve(null),
+    claim: () => {
+      ordinaryClaims++;
+      return Promise.resolve(null);
+    },
+  };
+  const active = new Map<
+    Promise<void>,
+    Pick<TelemetryJob, "job_kind" | "workload_class">
+  >();
+  active.set(Promise.resolve(), { job_kind: "reduce", workload_class: "live" });
+  const job = await claimOverloadJob(
+    queue as never,
+    active,
+    {
+      normalizeReserved: 11,
+      workerId: "test",
+      leaseSeconds: 120,
+    } as WorkerConfig,
+  );
+  assert(job === null);
+  assert(ordinaryClaims === 0);
+});
+
+Deno.test("kind fallback accounts for the actual admission across both lanes", async () => {
+  const calls: string[] = [];
+  const config = {
+    concurrency: 12,
+    liveReserved: 11,
+    workerId: "test",
+    leaseSeconds: 120,
+  } as WorkerConfig;
+  const queue = {
+    claim(lane: string, _owner: string, _lease: number, kind: string) {
+      calls.push(`${lane}:${kind}`);
+      return Promise.resolve(
+        kind === "normalize"
+          ? { job_kind: kind, workload_class: lane } as TelemetryJob
+          : null,
+      );
+    },
+  };
+  const actual = await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    "live",
+    "normalize",
+  );
+  assert(actual?.job_kind === "normalize");
+  assert(calls.join(",") === "backfill:reduce,live:reduce,backfill:normalize");
+  calls.length = 0;
+  await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    actual!.workload_class,
+    actual!.job_kind,
+  );
+  assert(calls[0] === "live:reduce");
 });
