@@ -10,7 +10,7 @@ Follow-up: [Sesh companion draft PR #49](https://github.com/e3-solutions/sesh/pu
 now implements a separate, explicitly partial reviewed-excerpt path. Synthetic
 PostgreSQL → authenticated MCP search → correct reviewed source-open tests pass.
 Exact review hashes, source/session/project selection, recipient/workspace checks,
-expiry/withdrawal and physical purge address the contract gap identified below.
+expiry/withdrawal and derived-row deletion address the contract gap identified below.
 The pinned **base-code** probes remain valid evidence for why that companion is
 needed; they do not claim the new draft is deployed or accepts real content.
 
@@ -81,7 +81,7 @@ No new hosting service or credentials are required by this code-only design.
 The companion's synthetic integration tests prove ingestion → authorized Sesh
 query → correct source-open, including scope/recipient/public denial, hash binding,
 retry/restart and lost acknowledgements, redaction, pagination, expiry/withdrawal
-and physical payload purge. No embedding/cache/native rows are created, so the
+and deletion of derived content rows. No embedding/cache/native rows are created, so the
 new path has no additional derived text stores. Content-free scope/hash receipts
 remain sensitive; backup and delivered-copy retention still need operator policy.
 
