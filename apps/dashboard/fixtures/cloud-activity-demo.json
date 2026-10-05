@@ -1,0 +1,30 @@
+{
+  "scope": {
+    "workspaceId": "00000000-0000-4000-8000-000000000001",
+    "personId": "00000000-0000-4000-8000-000000000002",
+    "sourceIdentity": "synthetic-demo:account",
+    "rootThreadId": "00000000-0000-7000-8000-000000000003",
+    "sessions": [{ "threadId": "00000000-0000-7000-8000-000000000003", "role": "agent", "projectCwd": "/synthetic/slack-setup" }]
+  },
+  "observedAt": 1791174000,
+  "pages": [
+    {
+      "schemaVersion": 1,
+      "thread": { "id": "00000000-0000-7000-8000-000000000003", "kind": "chatgpt", "cwd": "/synthetic/slack-setup", "title": "Synthetic Slack automation setup" },
+      "page": { "order": "newest_first", "hasMore": true, "nextCursor": "synthetic-older-page" },
+      "turns": [
+        { "id": "00000000-0000-7000-8000-000000000004", "status": "inProgress", "startedAt": 1791173400, "completedAt": null, "items": [{ "type": "agentMessage", "text": "SYNTHETIC_PRIVATE_SENTINEL: discard all item content" }] },
+        { "id": "00000000-0000-7000-8000-000000000005", "status": "completed", "startedAt": null, "completedAt": null, "durationMs": 90000 }
+      ]
+    },
+    {
+      "schemaVersion": 1,
+      "thread": { "id": "00000000-0000-7000-8000-000000000003", "kind": "chatgpt", "cwd": "/synthetic/slack-setup" },
+      "page": { "order": "newest_first", "hasMore": false, "nextCursor": null },
+      "turns": [
+        { "id": "00000000-0000-7000-8000-000000000006", "status": "completed", "startedAt": 1791172800, "completedAt": 1791173100, "items": [{ "type": "commandExecution", "command": "SYNTHETIC_PRIVATE_SENTINEL", "output": "Do not persist" }] },
+        { "id": "00000000-0000-7000-8000-000000000006", "status": "completed", "startedAt": 1791172800, "completedAt": 1791173100 }
+      ]
+    }
+  ]
+}

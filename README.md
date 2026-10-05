@@ -102,6 +102,10 @@ that Sherlock did not observe.
 For missing Codex sessions, see [collector inventory and receipt recovery](docs/collector-receipts.md).
 It distinguishes local capture from acknowledged delivery and records raw token-payload presence.
 
+For selected hosted Codex/dot tasks, see the [scoped cloud activity bridge](docs/cloud-session-activity.md).
+It captures redacted turn timing through an authorized host tool, separately from
+native transcripts; it does not install a VM collector or provide a Sesh content export.
+
 ```sh
 codex plugin list --marketplace sherlock
 ```
