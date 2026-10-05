@@ -464,11 +464,13 @@ export function chooseLane(
   activeLive: number,
   activeBackfill: number,
   config: Pick<WorkerConfig, "concurrency" | "liveReserved">,
+  previousAdmission?: WorkloadClass,
 ): WorkloadClass {
-  if (activeLive < config.liveReserved) return "live";
   const backfillReserved = config.concurrency - config.liveReserved;
-  if (activeBackfill < backfillReserved) return "backfill";
-  return "live";
+  if (activeBackfill >= backfillReserved) return "live";
+  if (activeLive >= config.liveReserved) return "backfill";
+  // Occupancy alone cannot ensure progress when jobs finish between polls.
+  return previousAdmission === "live" ? "backfill" : "live";
 }
 
 export function alternateLane(
@@ -512,6 +514,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     )
     : null;
   let processor: TelemetryProcessor | null = null;
+  let previousNormalAdmission: WorkloadClass | undefined;
   const active = new Map<
     Promise<void>,
     Pick<TelemetryJob, "job_kind" | "workload_class">
@@ -770,8 +773,10 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
               active,
               config,
               () => progressWatchdog.touch(),
+              previousNormalAdmission,
             );
           if (!job) break;
+          if (!overload.active) previousNormalAdmission = job.workload_class;
           admissions += 1;
           claimedAny = true;
           const task = runJob(
@@ -864,16 +869,22 @@ export async function superviseWorker(
   }
 }
 
-async function claimNormalJob(
+export async function claimNormalJob(
   queue: PostgresJobQueue,
   active: Map<Promise<void>, Pick<TelemetryJob, "job_kind" | "workload_class">>,
   config: WorkerConfig,
   onProgress: () => void = () => {},
+  previousAdmission?: WorkloadClass,
 ): Promise<TelemetryJob | null> {
   const activeLive =
     [...active.values()].filter((job) => job.workload_class === "live").length;
   const activeBackfill = active.size - activeLive;
-  const preferred = chooseLane(activeLive, activeBackfill, config);
+  const preferred = chooseLane(
+    activeLive,
+    activeBackfill,
+    config,
+    previousAdmission,
+  );
   const preferredJob = await queue.claim(
     preferred,
     config.workerId,
