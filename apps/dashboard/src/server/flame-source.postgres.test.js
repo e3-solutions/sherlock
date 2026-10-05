@@ -2553,10 +2553,10 @@ describePostgres("Bonaparte automated run annotations", () => {
       const [{ snapshot }] = await sql.unsafe("select pg_current_snapshot()::text snapshot");
       await expect(sql.begin(async (tx) => {
         await tx.unsafe("insert into telemetry.workspaces (id, slug, name) values ($1, $2, 'Synthetic automation')", [workspace, workspace]);
-        await tx.unsafe("insert into telemetry.people (id, workspace_id, identity_key, email) values ($1, $2, $1::text, 'synthetic@e3group.ai')", [person, workspace]);
+        await tx.unsafe("insert into telemetry.people (id, workspace_id, identity_key, email) values ($1::uuid, $2::uuid, $1::uuid::text, 'synthetic@e3group.ai')", [person, workspace]);
         for (const id of [session, other]) await tx.unsafe(`insert into telemetry.sessions
           (id, workspace_id, person_id, collector_key, native_session_id, actor_role, role_version, started_at)
-          values ($1, $2, $3, 'synthetic', $1::text, 'primary', 'synthetic.v1', '2026-10-05T13:00:00Z')`, [id, workspace, person]);
+          values ($1::uuid, $2::uuid, $3::uuid, 'synthetic', $1::uuid::text, 'primary', 'synthetic.v1', '2026-10-05T13:00:00Z')`, [id, workspace, person]);
         const append = (classification, evidence) => tx.unsafe(`insert into analytics.bonaparte_run_classifications
           (workspace_id, session_id, effective_start, effective_end, classification, reason, evidence_sha256, request_reference)
           values ($1, $2, '2026-10-05T13:00:00Z', '2026-10-05T14:00:00Z', $3, 'Synthetic supervisor provenance', $4, 'integration test')`, [workspace, session, classification, evidence.repeat(64)]);
