@@ -1,3 +1,4 @@
+import { createProviderUsageSource } from "./src/server/provider-usage-source.js";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -85,10 +86,12 @@ const freshnessCache = source
 if (source) await source.reserveCapacity();
 cache?.start();
 freshnessCache?.start();
+const providerUsageSource = source ? createProviderUsageSource(source) : null;
 const mcpSource = source && cache ? createCachedMcpSource({
   cache,
   source,
   querySource: createSherlockQuerySource(source),
+  providerUsageSource,
 }) : null;
 const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
 
@@ -218,6 +221,16 @@ const server = createServer(async (request, response) => {
         sendJson(response, code === "flame_refresh_throttled" ? 429 : 503, { error: code },
           code === "flame_refresh_throttled" ? { "Retry-After": "60" } : {});
       }
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/provider-usage") {
+    if (!providerUsageSource) { sendJson(response, 503, { error: "dashboard_not_configured" }); return; }
+    const signal = requestAbortSignal(request, response);
+    try { sendJson(response, 200, await providerUsageSource.fetchProviderUsage({ signal })); }
+    catch (error) {
+      if (!signal.aborted) sendJson(response, 503, { error: error instanceof FlameSourceError ? error.code : "flame_database_unavailable" });
     }
     return;
   }

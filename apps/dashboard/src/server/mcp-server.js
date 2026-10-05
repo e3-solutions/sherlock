@@ -396,6 +396,15 @@ function failure(error, { query = false } = {}) {
 }
 
 export function registerBonaparteTools(server, source) {
+  if (typeof source.fetchProviderUsage === "function") server.registerTool("list_provider_usage", {
+    title: "Recovered provider plan usage",
+    description: "Read immutable provider billing snapshots. Weekly allowance percentages are separate from token counts. Check dataStatus and dataAsOf; allowance windows and descendant inclusion are unknown. Never add these percentages to token totals or across threads.",
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY_ANNOTATIONS,
+  }, async (_args, context = {}) => {
+    try { return success(await source.fetchProviderUsage({ signal: context.signal })); }
+    catch (error) { return failure(error, { query: true }); }
+  });
+
   server.registerTool(
     "documentation",
     {
@@ -405,7 +414,11 @@ export function registerBonaparteTools(server, source) {
       outputSchema: documentationOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => success(QUERY_DOCUMENTATION),
+    async () => success(typeof source.fetchProviderUsage === "function" ? {
+      ...QUERY_DOCUMENTATION,
+      tools: [...QUERY_DOCUMENTATION.tools, { name: "list_provider_usage", purpose: "Read recovered provider plan percentages with cutoff and coverage; separate from tokens." }],
+      guidance: [...QUERY_DOCUMENTATION.guidance, "Provider snapshots may be partial or stale. Allowance window and descendant inclusion are unknown; do not sum percentages across threads or convert them to tokens."],
+    } : QUERY_DOCUMENTATION),
   );
 
   server.registerTool(

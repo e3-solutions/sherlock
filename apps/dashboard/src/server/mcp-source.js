@@ -62,7 +62,7 @@ export function pageCachedUsageEvidence(payload, cursor = "") {
   };
 }
 
-export function createCachedMcpSource({ cache, source, querySource }) {
+export function createCachedMcpSource({ cache, source, querySource, providerUsageSource }) {
   if (typeof cache?.read !== "function" || typeof source?.fetchPromptEvidence !== "function") {
     throw new TypeError("A timeline cache and prompt evidence source are required");
   }
@@ -76,6 +76,7 @@ export function createCachedMcpSource({ cache, source, querySource }) {
     throw new TypeError("A complete Sherlock query source is required");
   }
   return Object.freeze({
+    ...(providerUsageSource ? { fetchProviderUsage: (request) => providerUsageSource.fetchProviderUsage(request) } : {}),
     async fetchUsageEvidence({ cursor = "", signal } = {}) {
       const { payload } = await cache.read({ signal });
       return pageCachedUsageEvidence(payload, cursor);
