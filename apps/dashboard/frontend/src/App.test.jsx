@@ -13,8 +13,6 @@ const {
   mergeFreshnessMock: vi.fn(),
 }));
 
-vi.mock("./ProviderUsage.jsx", () => ({ default: () => null }));
-
 vi.mock("./flame-data.js", () => ({
   adaptFlamePayload: adaptMock,
   adaptFlameFreshness: adaptFreshnessMock,

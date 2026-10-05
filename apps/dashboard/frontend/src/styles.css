@@ -1267,9 +1267,3 @@ input { font: inherit; }
     transition-duration: .01ms !important;
   }
 }
-
-.provider-usage { flex: 0 0 auto; max-height: 28vh; overflow: auto; border: 1px solid var(--flame-rule); padding: 10px 14px; margin-bottom: 12px; background: var(--flame-surface); }
-.provider-usage h2 { font-size: 14px; margin: 0 0 6px; }
-.provider-usage p { color: var(--flame-muted); margin: 6px 0; }
-.provider-usage summary { cursor: pointer; color: var(--flame-partial); }
-.provider-usage code { overflow-wrap: anywhere; }

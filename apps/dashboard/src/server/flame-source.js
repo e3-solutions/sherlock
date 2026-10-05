@@ -1,3 +1,4 @@
+import { readRecovery, mergeRecoveredTimeline, recoveredIntervalWork } from "./thread-activity-recovery.js";
 import postgres from "postgres";
 
 export const BUCKET_COUNT = 144;
@@ -2023,7 +2024,7 @@ export class DirectFlameSource {
           read.toISOString(),
           this.expectedEmailDomain,
         ], signal);
-      return buildFlamePayload({
+      const payload = buildFlamePayload({
         rows,
         roster,
         start,
@@ -2031,6 +2032,8 @@ export class DirectFlameSource {
         snapshot: receipt.snapshot,
         frameVersion: selectedFrameVersion,
       });
+      const recovery = await readRecovery(tx, { workspaceId:this.workspaceId, read, snapshot:receipt.snapshot, expectedEmailDomain:this.expectedEmailDomain });
+      return mergeRecoveredTimeline(payload, recovery);
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
   }
 
@@ -2136,14 +2139,15 @@ export class DirectFlameSource {
       if (prompts.length === promptLimit) {
         throw new FlameSourceError("flame_interval_prompt_result_too_large");
       }
-      return {
-        personId,
-        start: startAt.toISOString(),
-        snapshot,
-        work: work.map((row) => workFromRow(
+      const recovered = recoveredIntervalWork(await readRecovery(tx, { workspaceId:this.workspaceId, read:snapshotReceipt.read, snapshot:snapshotReceipt.snapshot, expectedEmailDomain:this.expectedEmailDomain }), personId, startAt.getTime());
+      const nativeWork = work.map((row) => workFromRow(
           row,
           pullRequestBySession.get(String(row.session_id)) ?? null,
-        )),
+        ));
+      if (nativeWork.length + recovered.length > INTERVAL_WORK_LIMIT) throw new FlameSourceError("flame_interval_work_result_too_large");
+      return {
+        personId, start: startAt.toISOString(), snapshot,
+        work: [...nativeWork, ...recovered].sort((a,b)=>Date.parse(a.firstAt)-Date.parse(b.firstAt) || a.id.localeCompare(b.id)),
         prompts: prompts.map(promptFromRow),
       };
     }, { signal });

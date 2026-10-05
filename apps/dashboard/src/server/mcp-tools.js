@@ -74,12 +74,13 @@ export function listUsageEvidence(payload) {
       readAt: readAt.toISOString(),
     },
     provenance: {
+      ...(payload.recovery ? { recovery: payload.recovery } : {}),
       projectionVersion: decodeSnapshotToken(payload.snapshot).frameVersion ??
         `raw-snapshot-${payload.snapshot.split(".")[0]}`,
     },
     coverage: {
       state: "partial",
-      basis: "observed_canonical_events",
+      basis: payload.recovery ? "observed_canonical_events_and_recovered_completed_turns" : "observed_canonical_events",
       limitations: ["event_presence_not_continuous_attention"],
     },
     people: people.map((person) => usagePerson(person, payload.start)),

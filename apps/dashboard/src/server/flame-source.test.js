@@ -59,7 +59,7 @@ const SNAPSHOT = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 function mockSource(...results) {
   const source = Object.create(DirectFlameSource.prototype);
   source.workspaceId = WORKSPACE_ID;
-  const unsafe = vi.fn();
+  const unsafe = vi.fn().mockResolvedValue([]);
   for (const result of results) unsafe.mockResolvedValueOnce(result);
   const array = vi.fn((values) => values);
   source.transaction = (callback) => callback({ unsafe, array });
@@ -163,7 +163,7 @@ describe("Sherlock Flame payload", () => {
       person_id: null,
       latest_canonical_activity: null,
     };
-    const unsafe = vi.fn().mockResolvedValue([row]);
+    const unsafe = vi.fn().mockResolvedValue([]).mockResolvedValue([row]);
     const source = Object.create(DirectFlameSource.prototype);
     Object.assign(source, {
       workspaceId: "00000000-0000-4000-8000-000000000001",
@@ -242,7 +242,7 @@ describe("Sherlock Flame payload", () => {
 
   it("checks source read access before reporting ready", async () => {
     const source = Object.create(DirectFlameSource.prototype);
-    const unsafe = vi.fn().mockResolvedValueOnce([{
+    const unsafe = vi.fn().mockResolvedValue([]).mockResolvedValueOnce([{
       backend_role: true,
       read_only: true,
       can_read_people: true,
@@ -303,7 +303,7 @@ describe("Sherlock Flame payload", () => {
   });
 
   it("configures default source transactions before pinning the read-only role", async () => {
-    const unsafe = vi.fn().mockResolvedValue([]);
+    const unsafe = vi.fn().mockResolvedValue([]).mockResolvedValue([]);
     const source = Object.create(DirectFlameSource.prototype);
     source.sql = { begin: (callback) => callback({ unsafe }) };
 
@@ -317,7 +317,7 @@ describe("Sherlock Flame payload", () => {
   });
 
   it("allows a source transaction to select a 30-second statement timeout", async () => {
-    const unsafe = vi.fn().mockResolvedValue([]);
+    const unsafe = vi.fn().mockResolvedValue([]).mockResolvedValue([]);
     const source = Object.create(DirectFlameSource.prototype);
     source.sql = { begin: (callback) => callback({ unsafe }) };
 
@@ -635,7 +635,7 @@ describe("Sherlock Flame payload", () => {
     source.expectedEmailDomain = "e3group.ai";
     source.maxPeople = 5;
     const roster = [{ person_id: "ada", display_name: "Ada" }];
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: READ, snapshot: PG_SNAPSHOT }])
       .mockResolvedValueOnce(roster)
       .mockResolvedValueOnce(rowsFor("ada"));
@@ -679,7 +679,7 @@ describe("Sherlock Flame payload", () => {
     source.expectedEmailDomain = "e3group.ai";
     source.maxPeople = 5;
     const roster = [{ person_id: "ada", display_name: "Ada" }];
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{
         now: READ,
         snapshot: PG_SNAPSHOT,
@@ -738,7 +738,7 @@ describe("Sherlock Flame payload", () => {
     source.expectedEmailDomain = "e3group.ai";
     source.maxPeople = 5;
     source.projectionEnabled = false;
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: READ, snapshot: PG_SNAPSHOT, frame_projection_active: false }])
       .mockResolvedValueOnce([{ person_id: "ada", display_name: "Ada" }])
       .mockResolvedValueOnce(rowsFor("ada"));
@@ -1182,7 +1182,7 @@ describe("Sherlock Flame payload", () => {
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     const personId = "22222222-2222-4222-8222-222222222222";
     const sessionId = "33333333-3333-4333-8333-333333333333";
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
       .mockResolvedValueOnce([{
         session_id: sessionId,
@@ -1249,7 +1249,7 @@ describe("Sherlock Flame payload", () => {
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     source.expectedEmailDomain = "e3group.ai";
     const personId = "22222222-2222-4222-8222-222222222222";
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
@@ -1279,7 +1279,7 @@ describe("Sherlock Flame payload", () => {
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     const personId = "22222222-2222-4222-8222-222222222222";
     const failure = new Error("projection unavailable");
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
       .mockRejectedValueOnce(failure);
     source.transaction = (callback) => callback({ unsafe });
@@ -1302,7 +1302,7 @@ describe("Sherlock Flame payload", () => {
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     source.expectedEmailDomain = "e3group.ai";
     const personId = "22222222-2222-4222-8222-222222222222";
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
@@ -1345,7 +1345,7 @@ describe("Sherlock Flame payload", () => {
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     const personId = "22222222-2222-4222-8222-222222222222";
     const snapshot = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
-    const unsafe = vi.fn().mockResolvedValue([{
+    const unsafe = vi.fn().mockResolvedValue([]).mockResolvedValue([{
       now: new Date(READ.getTime() + 25 * 60 * 60 * 1000 + 1),
     }]);
     source.transaction = (callback) => callback({ unsafe });
@@ -1378,7 +1378,7 @@ describe("Sherlock Flame payload", () => {
       result.cancel = vi.fn();
       return result;
     };
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockImplementationOnce(() => resolved([]))
       .mockImplementationOnce(() => resolved([]))
       .mockImplementationOnce(() => resolved([]))
@@ -1538,7 +1538,7 @@ describe("Sherlock Flame payload", () => {
       content_excerpt: index === 0 ? "Short" : `Prompt ${index}`,
       eligible_prompt_count: 8,
     }));
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
       .mockResolvedValueOnce(rows);
     const array = vi.fn((values) => values);
@@ -1567,7 +1567,7 @@ describe("Sherlock Flame payload", () => {
     const source = Object.create(DirectFlameSource.prototype);
     source.workspaceId = "11111111-1111-4111-8111-111111111111";
     const personId = "22222222-2222-4222-8222-222222222222";
-    const unsafe = vi.fn()
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ now: new Date("2026-08-17T12:00:02.000Z") }])
       .mockResolvedValueOnce([{
         content_byte_size: 9,

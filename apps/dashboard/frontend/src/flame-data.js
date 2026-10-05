@@ -185,7 +185,7 @@ export function adaptFlamePayload(value) {
       ? null
       : requireNonemptyString(rawCoverage.reason, "coverage.reason"),
   };
-  if (coverage.evidence !== "observed_events") {
+  if (!["observed_events", "observed_events_and_recovered_turn_intervals"].includes(coverage.evidence)) {
     fail("coverage.evidence", '"observed_events"');
   }
   if (!["complete", "partial"].includes(coverage.state)) {
@@ -406,7 +406,10 @@ export function adaptIntervalEvidence(value, expected) {
       sessionId,
       firstAtMs,
       lastAtMs,
-      eventCount: requirePositiveCount(item.eventCount, `${path}.eventCount`),
+      evidenceSource: item.evidenceSource === "completed_turn_interval" ? item.evidenceSource : null,
+      eventCount: item.evidenceSource === "completed_turn_interval"
+        ? (item.eventCount === null ? null : fail(`${path}.eventCount`, "null for recovered timing"))
+        : requirePositiveCount(item.eventCount, `${path}.eventCount`),
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
       summary,
       pullRequest: requirePullRequest(item.pullRequest, `${path}.pullRequest`),

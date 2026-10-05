@@ -1,4 +1,3 @@
-import ProviderUsage from "./ProviderUsage.jsx";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import bonaparteLogo from "./assets/bonaparte-logo.png";
@@ -176,7 +175,6 @@ export default function App() {
     return (
       <>
         <PortalHeader rankBy={rankBy} onRankChange={setRankBy} />
-        <ProviderUsage />
         <div className="load-state" role="status">Loading timeline</div>
       </>
     );
@@ -186,7 +184,6 @@ export default function App() {
     return (
       <>
         <PortalHeader rankBy={rankBy} onRankChange={setRankBy} />
-        <ProviderUsage />
         <div className="load-state" role="alert">
           <span>Timeline unavailable</span>
           <button type="button" onClick={load}>Retry</button>
@@ -208,7 +205,6 @@ export default function App() {
         showFullScale={showFullScale}
         onScaleToggle={() => setShowFullScale((current) => !current)}
       />
-      <ProviderUsage />
       {liveProblem && (
         <p className="refresh-warning" role="status">
           {freshnessState === "delayed"
