@@ -18,6 +18,7 @@ It adds no HTTP import endpoint, installer hook, credentials, grants or deployme
 | Codex OTel | Opt-in events produced by the configured runtime; prompts redacted by default | Future source option, not implemented | Forward-looking, not retroactive hosted-history access; tool snippets can be sensitive. |
 | Enterprise Compliance API | Supported Work `conversation_message` / `codex_log` audit records | Documented preferred audit route when entitled | Administrator role, Enterprise key, exact reference schema, coverage and retention must be verified. No credentials were requested or created. Records are not guaranteed to cover every action. |
 | Sherlock MCP `list_usage_evidence` | Existing bearer-protected recovered turn counts and source hashes | Synthetic ingestion → reader → actual authenticated MCP tested | Coarse activity presence, not token or prompt facts. |
+| Reviewed hosted excerpt handoff (Sesh draft #49) | Exact-hash owner-reviewed partial payload; authenticated private search/source-open | Synthetic-tested companion, separate from native indexes | Disabled until approved SQL/tool deployment and a fixed workspace are configured; exact real-content review and recipients required. No turnkey full hosted-history export. |
 | Cosmos Sherlock `coverage`, `list_sessions`, `query_usage` / Sesh search | Read-only native-session/usage metadata / separate transcript search | No fabricated sessions or transcripts added; current Sesh contract tested with synthetic input | Native Cosmos leaves do not expose recovery batches. Sesh's full TimeTracker/native contracts reject a truthful hosted excerpt; provenance and source-open need an external Sesh change. See [verified boundary](sesh-hosted-handoff-boundary.md). |
 
 No supported consumer-account full hosted-transcript interface was established
@@ -196,8 +197,11 @@ is an owner-reviewed, redacted set of those specific setup excerpts, shared
 through an approved destination. Current Sesh code has now been inspected and
 probed: its importer rejects a truthful partial hosted excerpt, its generic
 normalizer drops excerpt provenance, and source-open routes to TimeTracker.
-An automated Sesh import needs an external source/consent/provenance change
-before real-sharing approval can enable it. See the [pinned evidence, reproduction
+[Sesh companion draft PR #49](https://github.com/e3-solutions/sesh/pull/49) now
+provides that separate reviewed-excerpt source/consent/provenance path, with
+synthetic SQL → authenticated MCP search/source-open tests. It requires code
+review, approved deployment/tool registration and exact owner review before real
+sharing; no hosted full-transcript export is implied. See the [pinned evidence, reproduction
 and smallest next step](sesh-hosted-handoff-boundary.md). Do not bulk-export the parent.
 
 ## Verification
