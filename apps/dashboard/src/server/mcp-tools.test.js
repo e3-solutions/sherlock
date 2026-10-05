@@ -175,3 +175,21 @@ describe("Bonaparte MCP prompt evidence", () => {
     expect(result.coverage.returnedPromptCount).toBe(0);
   });
 });
+
+it("reports automated runs as an activity subset without adding human prompts", () => {
+  const payload = dayPayload();
+  const person = payload.people[0];
+  person.buckets[2][3] = 0;
+  person.automatedRunSessionCount = 2;
+  person.automatedRuns = Array(144).fill(0);
+  person.automatedRuns[2] = 2;
+  const result = listUsageEvidence(payload).people[0];
+  expect(result.primaryAgentSessionCount).toBe(1);
+  expect(result.subagentSessionCount).toBe(2);
+  expect(result.primaryHumanPromptCount).toBe(0);
+  expect(result.promptBuckets).toEqual([]);
+  expect(result.automatedRunSessionCount).toBe(2);
+  expect(result.automatedRunBuckets).toEqual([{ start: "2026-08-18T03:50:00.000Z", automatedRunSessionCount: 2 }]);
+  person.automatedRuns[2] = 4;
+  expect(() => listUsageEvidence(payload)).toThrow("evidence_invalid");
+});

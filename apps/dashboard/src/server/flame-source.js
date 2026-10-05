@@ -176,7 +176,8 @@ activity_candidates as materialized (
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
      ) < p.read_at
 ), activity_events as materialized (
-  select person_id, session_id, actor_role, observed_at
+  select person_id, session_id, actor_role, observed_at,
+         analytics.bonaparte_is_automated_run((select workspace_id from p), session_id, observed_at) is_automated_run
     from activity_candidates
    where canonical_rank = 1
      and actor_role <> 'guardian'
@@ -446,6 +447,10 @@ prompt_candidates as materialized (
    where canonical_rank = 1
      and observed_at >= (select start_at from p)
      and observed_at < (select end_at from p)
+     and not analytics.bonaparte_is_automated_run(
+       (select workspace_id from p), session_id, observed_at,
+       ${visibilityPredicate ? '(select snapshot from p)' : 'null::pg_snapshot'}
+     )
  )`;
 }
 
@@ -472,7 +477,8 @@ with p as materialized (
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint agent,
          count(distinct a.session_id) filter (where a.actor_role = 'worker')::bigint subagent,
-         count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other
+         count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other,
+         count(distinct a.session_id) filter (where a.is_automated_run)::bigint automated_runs
     from activity_events a cross join p
    where a.observed_at < p.end_at
    group by a.person_id, bucket_start
@@ -486,7 +492,8 @@ with p as materialized (
          )::bigint day_subagent,
          count(distinct a.session_id) filter (
            where a.actor_role = 'unknown' and a.observed_at < p.end_at
-         )::bigint day_other
+         )::bigint day_other,
+         count(distinct a.session_id) filter (where a.is_automated_run and a.observed_at < p.end_at)::bigint day_automated_runs
     from roster r left join activity_events a using (person_id)
     cross join p
    group by r.person_id
@@ -514,7 +521,8 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(ba.subagent, 0)::bigint subagent,
        coalesce(ba.other, 0)::bigint other,
        coalesce(pc.prompts, 0)::bigint prompts,
-       d.day_agent, d.day_subagent, d.day_other, l.latest,
+       d.day_agent, d.day_subagent, d.day_other, d.day_automated_runs,
+       coalesce(ba.automated_runs, 0)::bigint automated_runs, l.latest,
        ra.latest_activity
   from roster r cross join buckets b
   join day_activity d using (person_id)
@@ -675,7 +683,8 @@ activity_candidates as materialized (
      and observed_at < p.bucket_end + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
 ), activity_events as materialized (
   select ids.person_id, ids.session_id, ids.actor_role,
-         ids.observed_at${DETAIL_EVENT_COLUMNS}
+         ids.observed_at${DETAIL_EVENT_COLUMNS},
+         analytics.bonaparte_is_automated_run((select workspace_id from p), ids.session_id, ids.observed_at, (select snapshot from p)) is_automated_run
     from activity_event_ids ids
     join telemetry.events e on e.id = ids.id
     join telemetry.native_records nr
@@ -841,7 +850,7 @@ with p as materialized (
 ), grouped as (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
-         count(*)::bigint event_count,
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
          (array_agg(content_excerpt order by observed_at, id) filter (
            where event_kind = 'message' and message_role = 'user'
              and (
@@ -855,7 +864,7 @@ with p as materialized (
    group by session_id, semantic_role
 )
 select session_id::text session_id, semantic_role, first_at, last_at,
-       event_count, summary
+       event_count, summary, is_automated_run
   from grouped
  order by first_at, session_id, semantic_role
  limit $11
@@ -954,7 +963,7 @@ with p as materialized (
 ), header as (
   select bucket_events.session_id, bucket_events.semantic_role,
          min(bucket_events.observed_at) first_at, max(bucket_events.observed_at) last_at,
-         count(*)::bigint event_count,
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
          (array_agg(bucket_events.content_excerpt order by bucket_events.observed_at, bucket_events.id) filter (
            where bucket_events.event_kind = 'message'
              and bucket_events.message_role = 'user'
@@ -988,7 +997,7 @@ with p as materialized (
    limit $15
 )
 select header.session_id::text session_id, header.semantic_role,
-       header.first_at, header.last_at, header.event_count, header.summary,
+       header.first_at, header.last_at, header.event_count, header.summary, header.is_automated_run,
        selected.id::text id, selected.observed_at,
        selected.observed_at_microseconds, selected.message_role,
        selected.content_byte_size, selected.content_excerpt
@@ -1115,7 +1124,10 @@ ${splitCandidates}ranked_frame_revisions as materialized (
     from ranked_frame_revisions
    where ${latestPredicate}
 ), projected_activity as materialized (
-  select latest_frame_evidence.*
+  select latest_frame_evidence.*,
+         analytics.bonaparte_is_automated_run(p.workspace_id,
+           latest_frame_evidence.session_id, latest_frame_evidence.observed_at,
+           ${snapshotVisible ? 'p.snapshot' : 'null::pg_snapshot'}) is_automated_run
    from latest_frame_evidence cross join p
    where evidence_kind = 'activity'
      and actor_role <> 'guardian'
@@ -1132,6 +1144,9 @@ ${splitCandidates}ranked_frame_revisions as materialized (
     from latest_frame_evidence cross join p
    where evidence_kind = 'prompt'
      and prompt_identity is not null
+     and not analytics.bonaparte_is_automated_run(p.workspace_id,
+       latest_frame_evidence.session_id, latest_frame_evidence.observed_at,
+       ${snapshotVisible ? 'p.snapshot' : 'null::pg_snapshot'})
      and observed_at >= p.start_at and observed_at < p.end_at
 ), projected_prompts as materialized (
   select * from projected_prompt_candidates where prompt_rank = 1
@@ -1164,7 +1179,8 @@ with p as materialized (
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'worker')::bigint subagent,
-         count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other
+         count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other,
+         count(distinct evidence.session_id) filter (where evidence.is_automated_run)::bigint automated_runs
     from projected_activity evidence cross join p
    where evidence.observed_at < p.end_at
    group by evidence.person_id, bucket_start
@@ -1179,7 +1195,10 @@ with p as materialized (
          )::bigint day_subagent,
          count(distinct evidence.session_id) filter (
            where evidence.actor_role = 'unknown' and evidence.observed_at < p.end_at
-         )::bigint day_other
+         )::bigint day_other,
+         count(distinct evidence.session_id) filter (
+           where evidence.is_automated_run and evidence.observed_at < p.end_at
+         )::bigint day_automated_runs
     from roster r left join projected_activity evidence using (person_id)
     cross join p
    group by r.person_id
@@ -1204,7 +1223,8 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(ba.subagent, 0)::bigint subagent,
        coalesce(ba.other, 0)::bigint other,
        coalesce(pc.prompts, 0)::bigint prompts,
-       d.day_agent, d.day_subagent, d.day_other, l.latest,
+       d.day_agent, d.day_subagent, d.day_other, d.day_automated_runs,
+       coalesce(ba.automated_runs, 0)::bigint automated_runs, l.latest,
        ra.latest_activity
   from roster r cross join buckets b
   join day_activity d using (person_id)
@@ -1238,7 +1258,7 @@ with p as materialized (
 ), grouped as materialized (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
-         count(*)::bigint event_count
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run
     from bucket_events
    group by session_id, semantic_role
    order by first_at, session_id, semantic_role
@@ -1265,7 +1285,7 @@ with p as materialized (
    group by candidate.session_id, candidate.semantic_role
 )
 select grouped.session_id::text session_id, grouped.semantic_role,
-       grouped.first_at, grouped.last_at, grouped.event_count,
+       grouped.first_at, grouped.last_at, grouped.event_count, grouped.is_automated_run,
        session_summaries.summary
   from grouped
   left join session_summaries using (session_id, semantic_role)
@@ -1324,7 +1344,7 @@ with p as materialized (
   select bucket_events.session_id, bucket_events.semantic_role,
          min(bucket_events.observed_at) first_at,
          max(bucket_events.observed_at) last_at,
-         count(*)::bigint event_count,
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
          (array_agg(bucket_events.source_event_id order by bucket_events.observed_at,
                     bucket_events.source_event_id)
            filter (where bucket_events.is_summary_candidate)
@@ -1354,7 +1374,7 @@ with p as materialized (
    limit $12
 )
 select header.session_id::text session_id, header.semantic_role,
-       header.first_at, header.last_at, header.event_count,
+       header.first_at, header.last_at, header.event_count, header.is_automated_run,
        summary.content_excerpt summary,
        selected.source_event_id::text id, selected.observed_at,
        selected.observed_at_microseconds, selected.message_role,
@@ -1628,6 +1648,7 @@ function workFromRow(row, pullRequest = null) {
     lastAt: asDate(row.last_at).toISOString(),
     eventCount: count(row.event_count),
     summary,
+    ...(row.is_automated_run === true ? { automatedRun: true } : {}),
     ...(pullRequest === null ? {} : { pullRequest }),
   };
 }
@@ -1741,6 +1762,13 @@ export function buildFlamePayload({
     )) {
       throw new FlameSourceError("flame_database_result_invalid");
     }
+    const automatedRuns = personRows.map((row) => count(row.automated_runs ?? 0));
+    const automatedRunSessionCount = count(first.day_automated_runs ?? 0);
+    if (automatedRunSessionCount > total.reduce((sum, n) => sum + n, 0) ||
+        automatedRuns.some((n, i) => n > automatedRunSessionCount ||
+          n > buckets[i].slice(0, 3).reduce((sum, value) => sum + value, 0))) {
+      throw new FlameSourceError("flame_database_result_invalid");
+    }
     const activeSeconds = buckets.reduce(
       (seconds, bucket) => seconds + (
         bucket.slice(0, 3).some((value) => value > 0) ? BUCKET_MS / 1000 : 0
@@ -1760,6 +1788,7 @@ export function buildFlamePayload({
       activeSeconds,
       total,
       buckets,
+      ...(automatedRunSessionCount > 0 ? { automatedRunSessionCount, automatedRuns } : {}),
     };
   });
 
@@ -2241,6 +2270,7 @@ export class DirectFlameSource {
         firstAt: header.firstAt,
         lastAt: header.lastAt,
         eventCount: header.eventCount,
+        ...(header.automatedRun ? { automatedRun: true } : {}),
         items: pageRows.map(detailItemFromRow),
         nextCursor,
       };

@@ -224,6 +224,11 @@ export function adaptFlamePayload(value) {
       fail(`${path}.buckets`, `an array of exactly ${BUCKET_COUNT} buckets`);
     }
 
+    const automatedRunSessionCount = requireCount(person.automatedRunSessionCount ?? 0, `${path}.automatedRunSessionCount`);
+    if (automatedRunSessionCount > total.reduce((sum, n) => sum + n, 0)) fail(`${path}.automatedRunSessionCount`, "a subset of activity sessions");
+    const automatedRuns = person.automatedRuns === undefined
+      ? Array(BUCKET_COUNT).fill(0)
+      : requireFixedCounts(person.automatedRuns, BUCKET_COUNT, `${path}.automatedRuns`);
     const buckets = person.buckets.map((rawBucket, bucketIndex) => {
       const bucketPath = `${path}.buckets[${bucketIndex}]`;
       const [agent, subagent, unclassified, prompts] = requireFixedCounts(
@@ -240,6 +245,8 @@ export function adaptFlamePayload(value) {
         }
       });
 
+      const automated = automatedRuns[bucketIndex];
+      if (automated > automatedRunSessionCount || automated > safeActivity(agent, subagent, unclassified, bucketPath)) fail(`${bucketPath}.automatedRuns`, "a subset of activity sessions");
       const bucketStartMs = startMs + bucketIndex * BUCKET_MS;
       return {
         index: bucketIndex,
@@ -249,6 +256,7 @@ export function adaptFlamePayload(value) {
         subagent,
         unclassified,
         prompts,
+        ...(automated > 0 ? { automatedRuns: automated } : {}),
         activity: safeActivity(agent, subagent, unclassified, bucketPath),
       };
     });
@@ -263,7 +271,7 @@ export function adaptFlamePayload(value) {
       );
     }
 
-    return { id, name, activeSeconds, lastActivityMs, total, buckets };
+    return { id, name, activeSeconds, lastActivityMs, total, buckets, ...(automatedRunSessionCount > 0 ? { automatedRunSessionCount } : {}) };
   });
 
   return {
@@ -412,6 +420,7 @@ export function adaptIntervalEvidence(value, expected) {
         : requirePositiveCount(item.eventCount, `${path}.eventCount`),
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
       summary,
+      ...(item.automatedRun === undefined ? {} : { automatedRun: requireBoolean(item.automatedRun, `${path}.automatedRun`) }),
       pullRequest: requirePullRequest(item.pullRequest, `${path}.pullRequest`),
     };
   });
@@ -483,6 +492,7 @@ export function adaptWorkEvidence(value, expected) {
     firstAtMs,
     lastAtMs,
     eventCount: requirePositiveCount(payload.eventCount, "work evidence.eventCount"),
+    ...(payload.automatedRun === undefined ? {} : { automatedRun: requireBoolean(payload.automatedRun, "work evidence.automatedRun") }),
     role: (() => {
       const role = requireEnum(payload.role, SEMANTIC_ROLES, "work evidence.role");
       if (role !== expected.role) fail("work evidence.role", "the selected semantic role");

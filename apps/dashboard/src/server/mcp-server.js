@@ -63,6 +63,8 @@ const usageOutputSchema = z.object({
     unclassifiedSessionCount: z.number().int().nonnegative(),
     primaryHumanPromptCount: z.number().int().nonnegative(),
     promptBuckets: z.array(promptBucketSchema).max(144),
+    automatedRunSessionCount: z.number().int().nonnegative().optional().describe("Distinct automated runs, already included in activity session counts."),
+    automatedRunBuckets: z.array(z.object({ start: ISO_TIMESTAMP, automatedRunSessionCount: z.number().int().nonnegative() }).strict()).max(144).optional(),
   }).strict()).max(20),
   nextCursor: CURSOR.nullable(),
 }).strict();

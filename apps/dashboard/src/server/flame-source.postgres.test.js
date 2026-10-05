@@ -2538,3 +2538,49 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     }
   }, 30_000);
 });
+
+// Rolled-back synthetic evidence exercises real RLS and MVCC without changing
+// telemetry or leaving mutable cleanup exceptions for append-only annotations.
+describePostgres("Bonaparte automated run annotations", () => {
+  it("bounds classification, preserves old snapshots, and reverses by appending", async () => {
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const workspace = crypto.randomUUID();
+    const person = crypto.randomUUID();
+    const session = crypto.randomUUID();
+    const other = crypto.randomUUID();
+    const rollback = new Error("synthetic annotation rollback");
+    try {
+      const [{ snapshot }] = await sql.unsafe("select pg_current_snapshot()::text snapshot");
+      await expect(sql.begin(async (tx) => {
+        await tx.unsafe("insert into telemetry.workspaces (id, slug, name) values ($1, $2, 'Synthetic automation')", [workspace, workspace]);
+        await tx.unsafe("insert into telemetry.people (id, workspace_id, identity_key, email) values ($1, $2, $1::text, 'synthetic@e3group.ai')", [person, workspace]);
+        for (const id of [session, other]) await tx.unsafe(`insert into telemetry.sessions
+          (id, workspace_id, person_id, collector_key, native_session_id, actor_role, role_version, started_at)
+          values ($1, $2, $3, 'synthetic', $1::text, 'primary', 'synthetic.v1', '2026-10-05T13:00:00Z')`, [id, workspace, person]);
+        const append = (classification, evidence) => tx.unsafe(`insert into analytics.bonaparte_run_classifications
+          (workspace_id, session_id, effective_start, effective_end, classification, reason, evidence_sha256, request_reference)
+          values ($1, $2, '2026-10-05T13:00:00Z', '2026-10-05T14:00:00Z', $3, 'Synthetic supervisor provenance', $4, 'integration test')`, [workspace, session, classification, evidence.repeat(64)]);
+        await append("automated_run", "a");
+        const check = async (id, at, visible = null) => (await tx.unsafe("select analytics.bonaparte_is_automated_run($1, $2, $3, $4::pg_snapshot) automated", [workspace, id, at, visible]))[0].automated;
+        expect(await check(session, "2026-10-05T13:00:00Z")).toBe(true);
+        expect(await check(session, "2026-10-05T12:59:59Z")).toBe(false);
+        expect(await check(session, "2026-10-05T14:00:00Z")).toBe(false);
+        expect(await check(other, "2026-10-05T13:30:00Z")).toBe(false);
+        expect(await check(session, "2026-10-05T13:30:00Z", snapshot)).toBe(false);
+        // A post-commit-style snapshot sees this transaction ID; the old one does not.
+        const [{ visible }] = await tx.unsafe("select ((xmin::text::bigint + 1)::text || ':' || (xmin::text::bigint + 1)::text || ':')::pg_snapshot::text visible from analytics.bonaparte_run_classifications where workspace_id = $1 limit 1", [workspace]);
+        await tx.unsafe("set local role sherlock_reader");
+        expect(await check(session, "2026-10-05T13:30:00Z", visible)).toBe(true);
+        await tx.unsafe("reset role");
+        await expect(tx.savepoint((sp) => sp.unsafe("update analytics.bonaparte_run_classifications set reason = 'changed' where workspace_id = $1", [workspace]))).rejects.toThrow("append-only");
+        await expect(tx.savepoint((sp) => sp.unsafe("delete from analytics.bonaparte_run_classifications where workspace_id = $1", [workspace]))).rejects.toThrow("append-only");
+        await append("default", "b");
+        expect(await check(session, "2026-10-05T13:30:00Z")).toBe(false);
+        expect((await tx.unsafe("select count(*)::int n from analytics.bonaparte_run_classifications where workspace_id = $1", [workspace]))[0].n).toBe(2);
+        throw rollback;
+      })).rejects.toBe(rollback);
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+});

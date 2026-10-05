@@ -46,6 +46,20 @@ function usagePerson(person, start) {
   });
   const totals = Array.isArray(person.total) ? person.total.map(finiteCount) : [];
   if (totals.length !== 3) throw new McpEvidenceError("evidence_invalid");
+  const automatedRunSessionCount = finiteCount(person.automatedRunSessionCount ?? 0);
+  const automatedRuns = person.automatedRuns ?? Array(BUCKET_COUNT).fill(0);
+  if (!Array.isArray(automatedRuns) || automatedRuns.length !== BUCKET_COUNT ||
+      automatedRunSessionCount > totals.reduce((sum, n) => sum + n, 0)) {
+    throw new McpEvidenceError("evidence_invalid");
+  }
+  const automatedRunBuckets = [];
+  automatedRuns.forEach((value, index) => {
+    const n = finiteCount(value);
+    if (n > automatedRunSessionCount || n > person.buckets[index].slice(0, 3).reduce((sum, v) => sum + finiteCount(v), 0)) {
+      throw new McpEvidenceError("evidence_invalid");
+    }
+    if (n > 0) automatedRunBuckets.push({ start: new Date(startMs + index * BUCKET_MS).toISOString(), automatedRunSessionCount: n });
+  });
   return {
     personId: String(person.id),
     displayName: String(person.name),
@@ -54,6 +68,7 @@ function usagePerson(person, start) {
     unclassifiedSessionCount: totals[2],
     primaryHumanPromptCount,
     promptBuckets,
+    ...(automatedRunSessionCount > 0 ? { automatedRunSessionCount, automatedRunBuckets } : {}),
   };
 }
 
