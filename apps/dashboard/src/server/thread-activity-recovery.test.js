@@ -24,6 +24,17 @@ it('combines native bucket counts without inventing prompts or token facts',()=>
  const output=mergeRecoveredTimeline(payload,recoveredIntervals([row([{threadId:'worker',turns:[turn('a',0,600)]}])]));
  expect(output.people[0].buckets[0]).toEqual([2,4,0,4]);expect(output.people[0].total).toEqual([2,4,0]);expect(output.recovery.basis).toBe('recovered_completed_turn_intervals');
 });
+it('uses the latest native or recovered activity for recency without changing other people',()=>{
+ const payload=base();payload.people[0].lastActivity=new Date((start+100)*1000).toISOString();
+ const intervals=recoveredIntervals([row([{threadId:'root',turns:[turn('a',0,600)]}])]);
+ const output=mergeRecoveredTimeline(payload,intervals);
+ expect(output.people[0].lastActivity).toBe(new Date((start+600)*1000).toISOString());
+ expect(output.people[1]).toEqual(payload.people[1]);
+ payload.people[0].lastActivity=new Date((start+900)*1000).toISOString();
+ expect(mergeRecoveredTimeline(payload,intervals).people[0].lastActivity).toBe(payload.people[0].lastActivity);
+ payload.people[0].lastActivity=null;
+ expect(mergeRecoveredTimeline(payload,intervals).people[0].lastActivity).toBe(new Date((start+600)*1000).toISOString());
+});
 it('pins manifest visibility to source snapshot/read and configured roster',()=>{
  expect(RECOVERY_SQL).toContain('pg_visible_in_snapshot(s.xmin::text::xid8, $3::pg_snapshot)');expect(RECOVERY_SQL).toContain('b.imported_at <= $2');expect(RECOVERY_SQL).toContain('b.workspace_id=$1');expect(RECOVERY_SQL).toContain('sherlock-smoke');expect(RECOVERY_SQL).toContain("split_part(pe.email,'@',2)=$4");
 });
