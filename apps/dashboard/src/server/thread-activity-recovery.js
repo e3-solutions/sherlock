@@ -16,9 +16,9 @@ order by b.imported_at desc, b.id desc limit 101`;
 
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
-export function recoveredIntervals(rows) {
+export function recoveredIntervals(rows, { readAt = Infinity } = {}) {
   if (rows.length > 100) throw new FlameSourceError("flame_database_result_incomplete");
-  const seen = new Set(), intervals = [];
+  const intervals = [];
   for (const row of rows) {
     const manifest = JSON.parse(row.manifest_text);
     if (manifest.schemaVersion !== "thread-api-timing-manifest-v1" || !Array.isArray(manifest.sessions)) {
@@ -33,23 +33,29 @@ export function recoveredIntervals(rows) {
       if (!role || native.has(session.threadId)) continue;
       if (!UUID.test(session.threadId)) throw new FlameSourceError("flame_database_result_invalid");
       for (const turn of session.turns ?? []) {
-        const key = `${row.person_id}:${session.threadId}:${turn.id}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
         if (!UUID.test(turn.id)) throw new FlameSourceError("flame_database_result_invalid");
-        if (!["completed", "interrupted", "failed"].includes(turn.status) ||
-            !Number.isSafeInteger(turn.startedAt) || !Number.isSafeInteger(turn.completedAt) ||
-            turn.startedAt <= 0 || turn.completedAt <= turn.startedAt ||
-            turn.completedAt*1000 > 8.64e15) continue;
+        const ongoing = turn.status === "inProgress" && turn.completedAt == null;
+        const endAt = ongoing ? turn.observedAt : turn.completedAt;
+        if ((!ongoing && !["completed", "interrupted", "failed"].includes(turn.status)) ||
+            !Number.isSafeInteger(turn.startedAt) || !Number.isSafeInteger(endAt) ||
+            turn.startedAt <= 0 || endAt <= turn.startedAt ||
+            endAt*1000 > Math.min(8.64e15, readAt)) continue;
+        if (ongoing && !(manifest.sourcePages ?? []).some(page =>
+          page.sha256 === turn.sourcePageSha256 && page.observedAt === endAt)) continue;
         intervals.push({personId:row.person_id, threadId:session.threadId, turnId:turn.id,
-          role, startMs:turn.startedAt*1000, endMs:turn.completedAt*1000, sourceHash:row.manifest_sha256});
+          role, startMs:turn.startedAt*1000, endMs:endAt*1000, ongoing, observedAt:turn.observedAt ?? 0, sourceHash:row.manifest_sha256});
       }
     }
   }
-  return intervals;
+  const seen = new Set();
+  return intervals.sort((a,b)=>Number(a.ongoing)-Number(b.ongoing) || b.observedAt-a.observedAt || b.endMs-a.endMs).filter(interval=>{
+    const key = `${interval.personId}:${interval.threadId}:${interval.turnId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);return true;
+  });
 }
 export async function readRecovery(tx, { workspaceId, read, snapshot, expectedEmailDomain }) {
-  return recoveredIntervals(await tx.unsafe(RECOVERY_SQL, [workspaceId, new Date(read).toISOString(), snapshot, expectedEmailDomain]));
+  return recoveredIntervals(await tx.unsafe(RECOVERY_SQL, [workspaceId, new Date(read).toISOString(), snapshot, expectedEmailDomain]), { readAt:new Date(read).getTime() });
 }
 export function mergeRecoveredTimeline(payload, intervals) {
   const start = Date.parse(payload.start), end = start + BUCKET_COUNT * BUCKET_MS;
@@ -67,7 +73,12 @@ export function mergeRecoveredTimeline(payload, intervals) {
     return {...person, buckets, total:[person.total[0]+distinct(["agent"]),person.total[1]+distinct(["subagent"]),person.total[2]],
       activeSeconds:buckets.filter(b=>b.slice(0,3).some(n=>n>0)).length*BUCKET_MS/1000};
   });
-  return {...payload,people,coverage:{...payload.coverage,evidence:"observed_events_and_recovered_turn_intervals"},recovery:{basis:"recovered_completed_turn_intervals",sourceHashes:[...new Set(relevant.map(i=>i.sourceHash))], latestCompletedAt:new Date(Math.max(...relevant.map(i=>i.endMs))).toISOString()}};
+  const ongoing = relevant.some(i=>i.ongoing), completed = relevant.filter(i=>!i.ongoing);
+  return {...payload,people,coverage:{...payload.coverage,evidence:"observed_events_and_recovered_turn_intervals"},recovery:{
+    basis:ongoing ? "recovered_observed_turn_intervals" : "recovered_completed_turn_intervals",
+    sourceHashes:[...new Set(relevant.map(i=>i.sourceHash))],
+    ...(completed.length ? {latestCompletedAt:new Date(Math.max(...completed.map(i=>i.endMs))).toISOString()} : {}),
+    ...(ongoing ? {latestObservedAt:new Date(Math.max(...relevant.filter(i=>i.ongoing).map(i=>i.endMs))).toISOString()} : {})}};
 }
 export function recoveredIntervalWork(intervals, personId, startMs) {
   const endMs=startMs+BUCKET_MS, threads=new Map();
@@ -78,7 +89,7 @@ export function recoveredIntervalWork(intervals, personId, startMs) {
     threads.set(key,{id:`recovery:${key}:${interval.role}`,sessionId:key,role:interval.role,
       firstAt:new Date(Math.min(previous ? Date.parse(previous.firstAt) : firstAt, firstAt)).toISOString(),
       lastAt:new Date(Math.max(previous ? Date.parse(previous.lastAt) : lastAt, lastAt)).toISOString(),
-      eventCount:null,summary:"Recovered cloud turn activity", evidenceSource:"completed_turn_interval"});
+      eventCount:null,summary:"Recovered cloud turn activity", evidenceSource:interval.ongoing || previous?.evidenceSource === "observed_ongoing_turn_interval" ? "observed_ongoing_turn_interval" : "completed_turn_interval"});
   }
   return [...threads.values()];
 }

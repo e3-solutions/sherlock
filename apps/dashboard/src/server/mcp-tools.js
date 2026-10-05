@@ -80,7 +80,7 @@ export function listUsageEvidence(payload) {
     },
     coverage: {
       state: "partial",
-      basis: payload.recovery ? "observed_canonical_events_and_recovered_completed_turns" : "observed_canonical_events",
+      basis: payload.recovery?.basis === "recovered_observed_turn_intervals" ? "observed_canonical_events_and_recovered_observed_turns" : payload.recovery ? "observed_canonical_events_and_recovered_completed_turns" : "observed_canonical_events",
       limitations: ["event_presence_not_continuous_attention"],
     },
     people: people.map((person) => usagePerson(person, payload.start)),

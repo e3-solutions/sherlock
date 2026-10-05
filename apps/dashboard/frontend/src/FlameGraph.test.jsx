@@ -1172,12 +1172,12 @@ describe("FlameGraph", () => {
 
 describe("recovered timing evidence",()=>{
  afterEach(()=>vi.unstubAllGlobals());
- it("shows recovered work without inventing transcript events or opening unavailable detail",async()=>{
+ it.each([["completed_turn_interval", /Recorded turn timing/], ["observed_ongoing_turn_interval", /Recorded ongoing turn window/]])("shows %s without inventing transcript events or opening unavailable detail",async(evidenceSource,label)=>{
   const data=model();data.people[0].buckets[0].prompts=0;
-  const fetchMock=vi.fn(async(url)=>{const u=new URL(url,"http://dashboard.test");const start=u.searchParams.get("start");return {ok:true,json:async()=>({personId:u.searchParams.get("personId"),start,snapshot:u.searchParams.get("snapshot"),work:[{id:"recovery:worker",sessionId:"worker",role:"subagent",firstAt:start,lastAt:new Date(Date.parse(start)+599999).toISOString(),eventCount:null,summary:"Recovered cloud turn activity",evidenceSource:"completed_turn_interval"}],prompts:[]})};});
+  const fetchMock=vi.fn(async(url)=>{const u=new URL(url,"http://dashboard.test");const start=u.searchParams.get("start");return {ok:true,json:async()=>({personId:u.searchParams.get("personId"),start,snapshot:u.searchParams.get("snapshot"),work:[{id:"recovery:worker",sessionId:"worker",role:"subagent",firstAt:start,lastAt:new Date(Date.parse(start)+599999).toISOString(),eventCount:null,summary:"Recovered cloud turn activity",evidenceSource}],prompts:[]})};});
   vi.stubGlobal("fetch",fetchMock);
   const {container}=render(<FlameGraph data={data} chartWidth={1008}/>);
   const wrapper=container.querySelector(".flame-person .recharts-wrapper");vi.spyOn(wrapper,"getBoundingClientRect").mockReturnValue(chartBounds);fireEvent.click(wrapper,{clientX:3,clientY:34});
-  const row=await screen.findByRole("button",{name:/Recovered cloud turn activity/});expect(row).toBeDisabled();expect(screen.getByText(/Recorded turn timing/)).toBeInTheDocument();fireEvent.click(row);expect(fetchMock.mock.calls.some(([url])=>String(url).includes("/api/flame/work"))).toBe(false);expect(screen.queryByText("Recovered cloud usage")).not.toBeInTheDocument();
+  const row=await screen.findByRole("button",{name:/Recovered cloud turn activity/});expect(row).toBeDisabled();expect(screen.getByText(label)).toBeInTheDocument();fireEvent.click(row);expect(fetchMock.mock.calls.some(([url])=>String(url).includes("/api/flame/work"))).toBe(false);expect(screen.queryByText("Recovered cloud usage")).not.toBeInTheDocument();
  });
 });
