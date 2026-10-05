@@ -18,7 +18,7 @@ It adds no HTTP import endpoint, installer hook, credentials, grants or deployme
 | Codex OTel | Opt-in events produced by the configured runtime; prompts redacted by default | Future source option, not implemented | Forward-looking, not retroactive hosted-history access; tool snippets can be sensitive. |
 | Enterprise Compliance API | Supported Work `conversation_message` / `codex_log` audit records | Documented preferred audit route when entitled | Administrator role, Enterprise key, exact reference schema, coverage and retention must be verified. No credentials were requested or created. Records are not guaranteed to cover every action. |
 | Sherlock MCP `list_usage_evidence` | Existing bearer-protected recovered turn counts and source hashes | Synthetic ingestion → reader → actual authenticated MCP tested | Coarse activity presence, not token or prompt facts. |
-| Cosmos Sherlock `coverage`, `list_sessions`, `query_usage` / Sesh search | Read-only native-session/usage metadata / separate transcript search | No fabricated sessions or transcripts added | These native-query Cosmos leaves do not currently expose recovery batches; Sesh indexing lives outside this repo. Wiring another consumer is separate work. |
+| Cosmos Sherlock `coverage`, `list_sessions`, `query_usage` / Sesh search | Read-only native-session/usage metadata / separate transcript search | No fabricated sessions or transcripts added; current Sesh contract tested with synthetic input | Native Cosmos leaves do not expose recovery batches. Sesh's full TimeTracker/native contracts reject a truthful hosted excerpt; provenance and source-open need an external Sesh change. See [verified boundary](sesh-hosted-handoff-boundary.md). |
 
 No supported consumer-account full hosted-transcript interface was established
 in the inspected documentation or public code. The existence of Enterprise audit
@@ -193,9 +193,12 @@ Read access does not grant control of its automations. No automation is edited,
 paused or rerun by this adapter. Timing alone cannot show the actual three
 automation prompts or their setup receipts. The smallest content-sharing step
 is an owner-reviewed, redacted set of those specific setup excerpts, shared
-through an approved destination. If an automated Sesh import is required, first
-verify an entitled official content export and Sesh's authenticated ingestion
-contract; this repo does not supply either. Do not bulk-export the parent.
+through an approved destination. Current Sesh code has now been inspected and
+probed: its importer rejects a truthful partial hosted excerpt, its generic
+normalizer drops excerpt provenance, and source-open routes to TimeTracker.
+An automated Sesh import needs an external source/consent/provenance change
+before real-sharing approval can enable it. See the [pinned evidence, reproduction
+and smallest next step](sesh-hosted-handoff-boundary.md). Do not bulk-export the parent.
 
 ## Verification
 

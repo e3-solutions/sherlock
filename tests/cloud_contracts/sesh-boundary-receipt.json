@@ -1,0 +1,37 @@
+{
+  "content_published": false,
+  "hosted_excerpt_sesh_support": "requires_external_sesh_changes",
+  "network_used": false,
+  "probes": [
+    {
+      "case": "synthetic_timetracker_positive_control",
+      "result": "accepted"
+    },
+    {
+      "case": "selected_excerpt_consent",
+      "reason": "consent scope does not permit transcript indexing",
+      "result": "rejected"
+    },
+    {
+      "case": "truthful_hosted_handoff_shape",
+      "reason": "get_chat export must contain only chat and messages",
+      "result": "rejected"
+    },
+    {
+      "case": "excerpt_without_original_stored_message",
+      "reason": "full stored message JSON is required",
+      "result": "rejected"
+    },
+    {
+      "case": "generic_normalizer",
+      "result": "accepts_text_but_drops_handoff_provenance"
+    },
+    {
+      "case": "hosted_source_open",
+      "result": "routes_to_existing_timetracker_catalog"
+    }
+  ],
+  "schema_version": 1,
+  "sesh_revision": "f1abaae89dbcf007293ea703d5e6e9896f764427",
+  "synthetic_only": true
+}
