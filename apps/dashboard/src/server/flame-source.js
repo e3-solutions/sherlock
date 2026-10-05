@@ -126,6 +126,28 @@ function canonicalNormalizerSql() {
     then 'codex' else e.normalizer_version end`;
 }
 
+// Read session-visible annotations once per query. Calling a lookup function
+// for every event repeats source-session privacy checks and can exhaust the
+// timeline timeout on a busy day.
+function automatedClassificationCte({ snapshotVisible = false, end = "p.end_at" } = {}) {
+  return `run_classifications as materialized (
+    select c.id, c.session_id, c.effective_start, c.effective_end, c.classification
+      from analytics.bonaparte_run_classifications c cross join p
+     where c.workspace_id = p.workspace_id
+       and c.effective_end > p.start_at and c.effective_start < ${end}
+       ${snapshotVisible ? "and pg_visible_in_snapshot(c.xmin::text::xid8, p.snapshot)" : ""}
+  )`;
+}
+
+function isAutomatedSql(alias) {
+  return `coalesce((select c.classification = 'automated_run'
+    from run_classifications c
+    where c.session_id = ${alias}.session_id
+      and ${alias}.observed_at >= c.effective_start
+      and ${alias}.observed_at < c.effective_end
+    order by c.id desc limit 1), false)`;
+}
+
 function activityCte({ joins = "" } = {}) {
   return `
 activity_candidates as materialized (
@@ -177,7 +199,7 @@ activity_candidates as materialized (
      ) < p.read_at
 ), activity_events as materialized (
   select person_id, session_id, actor_role, observed_at,
-         analytics.bonaparte_is_automated_run((select workspace_id from p), session_id, observed_at) is_automated_run
+         ${isAutomatedSql("activity_candidates")} is_automated_run
     from activity_candidates
    where canonical_rank = 1
      and actor_role <> 'guardian'
@@ -447,10 +469,7 @@ prompt_candidates as materialized (
    where canonical_rank = 1
      and observed_at >= (select start_at from p)
      and observed_at < (select end_at from p)
-     and not analytics.bonaparte_is_automated_run(
-       (select workspace_id from p), session_id, observed_at,
-       ${visibilityPredicate ? '(select snapshot from p)' : 'null::pg_snapshot'}
-     )
+     and not ${isAutomatedSql("ranked")}
  )`;
 }
 
@@ -468,7 +487,7 @@ with p as materialized (
      and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = p.expected_email_domain
      and split_part(pe.email, '@', 3) = ''
-), buckets as materialized (
+), ${automatedClassificationCte({ end: "greatest(p.end_at, p.read_at)" })}, buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start
     from p
@@ -684,7 +703,7 @@ activity_candidates as materialized (
 ), activity_events as materialized (
   select ids.person_id, ids.session_id, ids.actor_role,
          ids.observed_at${DETAIL_EVENT_COLUMNS},
-         analytics.bonaparte_is_automated_run((select workspace_id from p), ids.session_id, ids.observed_at, (select snapshot from p)) is_automated_run
+         ${isAutomatedSql("ids")} is_automated_run
     from activity_event_ids ids
     join telemetry.events e on e.id = ids.id
     join telemetry.native_records nr
@@ -837,7 +856,7 @@ with p as materialized (
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end, $10::text expected_email_domain
-), ${relevantActivitySessionsCte()}, ${detailActivityCte(`and s.person_id = p.person_id
+), ${automatedClassificationCte({ snapshotVisible: true })}, ${relevantActivitySessionsCte()}, ${detailActivityCte(`and s.person_id = p.person_id
      and e.session_id in (select session_id from relevant_activity_sessions)`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
@@ -877,7 +896,7 @@ with p as materialized (
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end, $10::text expected_email_domain
-), ${promptsCte({
+), ${automatedClassificationCte({ snapshotVisible: true })}, ${promptsCte({
   candidatePredicate: "and s.person_id = p.person_id",
   contentColumns: ", e.content_byte_size, e.content_excerpt",
   visibilityPredicate: "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
@@ -949,7 +968,7 @@ with p as materialized (
          $9::timestamptz bucket_end, $10::uuid session_id,
          $11::text semantic_role, $12::bigint cursor_at_microseconds,
          $13::bigint cursor_id, $14::text expected_email_domain
-), ${detailActivityCte(`and s.person_id = p.person_id
+), ${automatedClassificationCte({ snapshotVisible: true })}, ${detailActivityCte(`and s.person_id = p.person_id
      and e.session_id = p.session_id`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
@@ -1117,6 +1136,7 @@ frame_revision_candidates as materialized (
     ? "not is_tombstone"
     : "latest_rank = 1 and not is_tombstone";
   return `
+${automatedClassificationCte({ snapshotVisible, end: activityEnd })},
 ${splitCandidates}ranked_frame_revisions as materialized (
   ${rankedProjection}
 ), latest_frame_evidence as materialized (
@@ -1125,9 +1145,7 @@ ${splitCandidates}ranked_frame_revisions as materialized (
    where ${latestPredicate}
 ), projected_activity as materialized (
   select latest_frame_evidence.*,
-         analytics.bonaparte_is_automated_run(p.workspace_id,
-           latest_frame_evidence.session_id, latest_frame_evidence.observed_at,
-           ${snapshotVisible ? 'p.snapshot' : 'null::pg_snapshot'}) is_automated_run
+         ${isAutomatedSql("latest_frame_evidence")} is_automated_run
    from latest_frame_evidence cross join p
    where evidence_kind = 'activity'
      and actor_role <> 'guardian'
@@ -1144,9 +1162,7 @@ ${splitCandidates}ranked_frame_revisions as materialized (
     from latest_frame_evidence cross join p
    where evidence_kind = 'prompt'
      and prompt_identity is not null
-     and not analytics.bonaparte_is_automated_run(p.workspace_id,
-       latest_frame_evidence.session_id, latest_frame_evidence.observed_at,
-       ${snapshotVisible ? 'p.snapshot' : 'null::pg_snapshot'})
+     and not ${isAutomatedSql("latest_frame_evidence")}
      and observed_at >= p.start_at and observed_at < p.end_at
 ), projected_prompts as materialized (
   select * from projected_prompt_candidates where prompt_rank = 1
