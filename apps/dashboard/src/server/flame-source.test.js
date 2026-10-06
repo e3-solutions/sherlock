@@ -1608,6 +1608,7 @@ describe("Sherlock Flame payload", () => {
 it("keeps pre-classification snapshots unannotated even after metadata exists", () => {
   const body = Buffer.from(JSON.stringify([PG_SNAPSHOT, READ.toISOString(), FRAME_VERSION])).toString("base64url");
   const legacy = decodeSnapshotToken(`v2.${body}`);
+  expect(() => classificationSnapshotQuery("select 1", legacy)).toThrow(FlameSourceError);
   expect(legacy.originClassificationVersion).toBeUndefined();
   expect(classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, legacy)).toContain("where c.workspace_id = p.workspace_id and false");
   const current = decodeSnapshotToken(encodeProjectionSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ, frameVersion: FRAME_VERSION }));

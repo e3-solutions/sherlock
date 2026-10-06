@@ -7,6 +7,10 @@ import {
   BUCKET_MS,
   CLAUDE_NORMALIZER_VERSION,
   decodeSnapshotToken,
+  classificationSnapshotQuery,
+  INTERVAL_PROMPTS_SQL,
+  INTERVAL_WORK_SQL,
+  NORMALIZER_VERSIONS,
   DirectFlameSource,
   FRAME_VERSION,
   INTERVAL_PULL_REQUESTS_SQL,
@@ -905,7 +909,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         snapshot: legacyDay.snapshot,
         now: partialRead,
       });
-      expect(legacyDay.snapshot).toMatch(/^v4\./);
+      expect(legacyDay.snapshot).toMatch(/^v5\./);
       expect(legacyDay.latest).toBe(partialActivityAt.toISOString());
       expect(legacyDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),
@@ -925,8 +929,44 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         now: partialRead,
       });
 
-      expect(projectedDay.snapshot).toMatch(/^v2\./);
+      expect(projectedDay.snapshot).toMatch(/^v6\./);
       expect(projectedDay.people).toEqual(legacyDay.people);
+      const annotationRollback = new Error("annotation interpretation proof rollback");
+      await expect(sql.begin(async (tx) => {
+        await tx.unsafe(`insert into analytics.bonaparte_run_classifications
+          (workspace_id, session_id, effective_start, effective_end, classification, reason, evidence_sha256, request_reference)
+          values ($1, $2, $3, $4, 'automated_run', 'Synthetic supervisor evidence', $5, 'integration interpretation test')`,
+          [workspaceId, sessionId, bucketStart.toISOString(), new Date(bucketStart.getTime() + BUCKET_MS).toISOString(), "d".repeat(64)]);
+        const [{ visible }] = await tx.unsafe("select ((xmin::text::bigint + 1)::text || ':' || (xmin::text::bigint + 1)::text || ':')::pg_snapshot::text visible from analytics.bonaparte_run_classifications where workspace_id = $1 limit 1", [workspaceId]);
+        await tx.unsafe("set local role sherlock_reader");
+        for (const projected of [false, true]) {
+          const start = projectedDay.start;
+          const end = new Date(Date.parse(start) + 86400000).toISOString();
+          const bucketEnd = new Date(bucketStart.getTime() + BUCKET_MS).toISOString();
+          const args = projected
+            ? [workspaceId, FRAME_VERSION, visible, personId, start, end, bucketStart.toISOString(), bucketEnd, "e3group.ai", 201]
+            : [workspaceId, start, end, tx.array(NORMALIZER_VERSIONS), partialRead.toISOString(), visible, personId, bucketStart.toISOString(), bucketEnd, "e3group.ai", 201];
+          const query = projected ? PROJECTION_INTERVAL_PROMPTS_SQL : INTERVAL_PROMPTS_SQL;
+          const workQuery = projected ? PROJECTION_INTERVAL_WORK_SQL : INTERVAL_WORK_SQL;
+          const body = Buffer.from(JSON.stringify(projected
+            ? [visible, partialRead.toISOString(), FRAME_VERSION]
+            : [visible, partialRead.toISOString()])).toString("base64url");
+          const oldReceipt = decodeSnapshotToken(`${projected ? "v2" : "v4"}.${body}`);
+          const newReceipt = decodeSnapshotToken(`${projected ? "v6" : "v5"}.${body}`);
+          const oldPrompts = await tx.unsafe(classificationSnapshotQuery(query, oldReceipt), args);
+          const newPrompts = await tx.unsafe(classificationSnapshotQuery(query, newReceipt), args);
+          expect(oldPrompts).toHaveLength(1);
+          expect(newPrompts).toHaveLength(0);
+          const oldWork = await tx.unsafe(classificationSnapshotQuery(workQuery, oldReceipt), args);
+          const newWork = await tx.unsafe(classificationSnapshotQuery(workQuery, newReceipt), args);
+          const facts = (rows) => rows.map(({ session_id, semantic_role, event_count, first_at, last_at }) => ({ session_id, semantic_role, event_count, first_at, last_at }));
+          expect(facts(newWork)).toEqual(facts(oldWork));
+          expect(oldWork.some((row) => row.is_automated_run)).toBe(false);
+          expect(newWork.some((row) => row.is_automated_run)).toBe(true);
+        }
+        throw annotationRollback;
+      })).rejects.toBe(annotationRollback);
+
       expect(projectedDay.latest).toBe(partialActivityAt.toISOString());
       expect(projectedDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),

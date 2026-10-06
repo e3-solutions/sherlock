@@ -1534,6 +1534,9 @@ export function decodeSnapshotToken(token) {
 }
 
 export function classificationSnapshotQuery(query, receipt) {
+  if (!query.includes("where c.workspace_id = p.workspace_id")) {
+    throw new FlameSourceError("flame_snapshot_invalid");
+  }
   return receipt.originClassificationVersion === ORIGIN_CLASSIFICATION_VERSION
     ? query
     : query.replace("where c.workspace_id = p.workspace_id", "where c.workspace_id = p.workspace_id and false");
