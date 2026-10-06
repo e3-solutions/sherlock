@@ -41,9 +41,12 @@ const TIMELINE_STATEMENT_TIMEOUT_MS = 60_000;
 const FRESHNESS_STATEMENT_TIMEOUT_MS = 10_000;
 export const FRESHNESS_DELAY_MS = 5 * 60 * 1000;
 const LEGACY_SNAPSHOT_TOKEN_VERSION = "v1";
-const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
+const LEGACY_PROJECTION_SNAPSHOT_TOKEN_VERSION = "v2";
+const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v6";
+export const ORIGIN_CLASSIFICATION_VERSION = "bonaparte-origin-v1";
 const PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION = "v3";
-const RAW_SNAPSHOT_TOKEN_VERSION = "v4";
+const UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION = "v4";
+const RAW_SNAPSHOT_TOKEN_VERSION = "v5";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -126,6 +129,28 @@ function canonicalNormalizerSql() {
     then 'codex' else e.normalizer_version end`;
 }
 
+// Read session-visible annotations once per query. Calling a lookup function
+// for every event repeats source-session privacy checks and can exhaust the
+// timeline timeout on a busy day.
+function automatedClassificationCte({ snapshotVisible = false, end = "p.end_at" } = {}) {
+  return `run_classifications as materialized (
+    select c.id, c.session_id, c.effective_start, c.effective_end, c.classification
+      from analytics.bonaparte_run_classifications c cross join p
+     where c.workspace_id = p.workspace_id
+       and c.effective_end > p.start_at and c.effective_start < ${end}
+       ${snapshotVisible ? "and pg_visible_in_snapshot(c.xmin::text::xid8, p.snapshot)" : ""}
+  )`;
+}
+
+function isAutomatedSql(alias) {
+  return `coalesce((select c.classification = 'automated_run'
+    from run_classifications c
+    where c.session_id = ${alias}.session_id
+      and ${alias}.observed_at >= c.effective_start
+      and ${alias}.observed_at < c.effective_end
+    order by c.id desc limit 1), false)`;
+}
+
 function activityCte({ joins = "" } = {}) {
   return `
 activity_candidates as materialized (
@@ -176,7 +201,8 @@ activity_candidates as materialized (
        coalesce(e.occurred_at, e.observed_at, e.server_received_at)
      ) < p.read_at
 ), activity_events as materialized (
-  select person_id, session_id, actor_role, observed_at
+  select person_id, session_id, actor_role, observed_at,
+         ${isAutomatedSql("activity_candidates")} is_automated_run
     from activity_candidates
    where canonical_rank = 1
      and actor_role <> 'guardian'
@@ -446,6 +472,7 @@ prompt_candidates as materialized (
    where canonical_rank = 1
      and observed_at >= (select start_at from p)
      and observed_at < (select end_at from p)
+     and not ${isAutomatedSql("ranked")}
  )`;
 }
 
@@ -463,7 +490,7 @@ with p as materialized (
      and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = p.expected_email_domain
      and split_part(pe.email, '@', 3) = ''
-), buckets as materialized (
+), ${automatedClassificationCte({ end: "greatest(p.end_at, p.read_at)" })}, buckets as materialized (
   select generate_series(p.start_at, p.end_at - interval '10 minutes',
                          interval '10 minutes') bucket_start
     from p
@@ -472,7 +499,8 @@ with p as materialized (
          date_bin(interval '10 minutes', a.observed_at, p.start_at) bucket_start,
          count(distinct a.session_id) filter (where a.actor_role = 'primary')::bigint agent,
          count(distinct a.session_id) filter (where a.actor_role = 'worker')::bigint subagent,
-         count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other
+         count(distinct a.session_id) filter (where a.actor_role = 'unknown')::bigint other,
+         count(distinct a.session_id) filter (where a.is_automated_run)::bigint automated_runs
     from activity_events a cross join p
    where a.observed_at < p.end_at
    group by a.person_id, bucket_start
@@ -486,7 +514,8 @@ with p as materialized (
          )::bigint day_subagent,
          count(distinct a.session_id) filter (
            where a.actor_role = 'unknown' and a.observed_at < p.end_at
-         )::bigint day_other
+         )::bigint day_other,
+         count(distinct a.session_id) filter (where a.is_automated_run and a.observed_at < p.end_at)::bigint day_automated_runs
     from roster r left join activity_events a using (person_id)
     cross join p
    group by r.person_id
@@ -514,7 +543,8 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(ba.subagent, 0)::bigint subagent,
        coalesce(ba.other, 0)::bigint other,
        coalesce(pc.prompts, 0)::bigint prompts,
-       d.day_agent, d.day_subagent, d.day_other, l.latest,
+       d.day_agent, d.day_subagent, d.day_other, d.day_automated_runs,
+       coalesce(ba.automated_runs, 0)::bigint automated_runs, l.latest,
        ra.latest_activity
   from roster r cross join buckets b
   join day_activity d using (person_id)
@@ -675,7 +705,8 @@ activity_candidates as materialized (
      and observed_at < p.bucket_end + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
 ), activity_events as materialized (
   select ids.person_id, ids.session_id, ids.actor_role,
-         ids.observed_at${DETAIL_EVENT_COLUMNS}
+         ids.observed_at${DETAIL_EVENT_COLUMNS},
+         ${isAutomatedSql("ids")} is_automated_run
     from activity_event_ids ids
     join telemetry.events e on e.id = ids.id
     join telemetry.native_records nr
@@ -828,7 +859,7 @@ with p as materialized (
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end, $10::text expected_email_domain
-), ${relevantActivitySessionsCte()}, ${detailActivityCte(`and s.person_id = p.person_id
+), ${automatedClassificationCte({ snapshotVisible: true })}, ${relevantActivitySessionsCte()}, ${detailActivityCte(`and s.person_id = p.person_id
      and e.session_id in (select session_id from relevant_activity_sessions)`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
@@ -841,7 +872,7 @@ with p as materialized (
 ), grouped as (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
-         count(*)::bigint event_count,
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
          (array_agg(content_excerpt order by observed_at, id) filter (
            where event_kind = 'message' and message_role = 'user'
              and (
@@ -855,7 +886,7 @@ with p as materialized (
    group by session_id, semantic_role
 )
 select session_id::text session_id, semantic_role, first_at, last_at,
-       event_count, summary
+       event_count, summary, is_automated_run
   from grouped
  order by first_at, session_id, semantic_role
  limit $11
@@ -868,7 +899,7 @@ with p as materialized (
          $5::timestamptz read_at, $6::pg_snapshot snapshot,
          $7::uuid person_id, $8::timestamptz bucket_start,
          $9::timestamptz bucket_end, $10::text expected_email_domain
-), ${promptsCte({
+), ${automatedClassificationCte({ snapshotVisible: true })}, ${promptsCte({
   candidatePredicate: "and s.person_id = p.person_id",
   contentColumns: ", e.content_byte_size, e.content_excerpt",
   visibilityPredicate: "and pg_visible_in_snapshot(e.xmin::text::xid8, p.snapshot)",
@@ -940,7 +971,7 @@ with p as materialized (
          $9::timestamptz bucket_end, $10::uuid session_id,
          $11::text semantic_role, $12::bigint cursor_at_microseconds,
          $13::bigint cursor_id, $14::text expected_email_domain
-), ${detailActivityCte(`and s.person_id = p.person_id
+), ${automatedClassificationCte({ snapshotVisible: true })}, ${detailActivityCte(`and s.person_id = p.person_id
      and e.session_id = p.session_id`)}, ${canonicalActivityEvidenceCte()}, bucket_events as materialized (
   select candidate.*,
          case when actor_role = 'primary' then 'agent'
@@ -954,7 +985,7 @@ with p as materialized (
 ), header as (
   select bucket_events.session_id, bucket_events.semantic_role,
          min(bucket_events.observed_at) first_at, max(bucket_events.observed_at) last_at,
-         count(*)::bigint event_count,
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
          (array_agg(bucket_events.content_excerpt order by bucket_events.observed_at, bucket_events.id) filter (
            where bucket_events.event_kind = 'message'
              and bucket_events.message_role = 'user'
@@ -988,7 +1019,7 @@ with p as materialized (
    limit $15
 )
 select header.session_id::text session_id, header.semantic_role,
-       header.first_at, header.last_at, header.event_count, header.summary,
+       header.first_at, header.last_at, header.event_count, header.summary, header.is_automated_run,
        selected.id::text id, selected.observed_at,
        selected.observed_at_microseconds, selected.message_role,
        selected.content_byte_size, selected.content_excerpt
@@ -1108,6 +1139,7 @@ frame_revision_candidates as materialized (
     ? "not is_tombstone"
     : "latest_rank = 1 and not is_tombstone";
   return `
+${automatedClassificationCte({ snapshotVisible, end: activityEnd })},
 ${splitCandidates}ranked_frame_revisions as materialized (
   ${rankedProjection}
 ), latest_frame_evidence as materialized (
@@ -1115,7 +1147,8 @@ ${splitCandidates}ranked_frame_revisions as materialized (
     from ranked_frame_revisions
    where ${latestPredicate}
 ), projected_activity as materialized (
-  select latest_frame_evidence.*
+  select latest_frame_evidence.*,
+         ${isAutomatedSql("latest_frame_evidence")} is_automated_run
    from latest_frame_evidence cross join p
    where evidence_kind = 'activity'
      and actor_role <> 'guardian'
@@ -1132,6 +1165,7 @@ ${splitCandidates}ranked_frame_revisions as materialized (
     from latest_frame_evidence cross join p
    where evidence_kind = 'prompt'
      and prompt_identity is not null
+     and not ${isAutomatedSql("latest_frame_evidence")}
      and observed_at >= p.start_at and observed_at < p.end_at
 ), projected_prompts as materialized (
   select * from projected_prompt_candidates where prompt_rank = 1
@@ -1164,7 +1198,8 @@ with p as materialized (
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'worker')::bigint subagent,
-         count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other
+         count(distinct evidence.session_id) filter (where evidence.actor_role = 'unknown')::bigint other,
+         count(distinct evidence.session_id) filter (where evidence.is_automated_run)::bigint automated_runs
     from projected_activity evidence cross join p
    where evidence.observed_at < p.end_at
    group by evidence.person_id, bucket_start
@@ -1179,7 +1214,10 @@ with p as materialized (
          )::bigint day_subagent,
          count(distinct evidence.session_id) filter (
            where evidence.actor_role = 'unknown' and evidence.observed_at < p.end_at
-         )::bigint day_other
+         )::bigint day_other,
+         count(distinct evidence.session_id) filter (
+           where evidence.is_automated_run and evidence.observed_at < p.end_at
+         )::bigint day_automated_runs
     from roster r left join projected_activity evidence using (person_id)
     cross join p
    group by r.person_id
@@ -1204,7 +1242,8 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(ba.subagent, 0)::bigint subagent,
        coalesce(ba.other, 0)::bigint other,
        coalesce(pc.prompts, 0)::bigint prompts,
-       d.day_agent, d.day_subagent, d.day_other, l.latest,
+       d.day_agent, d.day_subagent, d.day_other, d.day_automated_runs,
+       coalesce(ba.automated_runs, 0)::bigint automated_runs, l.latest,
        ra.latest_activity
   from roster r cross join buckets b
   join day_activity d using (person_id)
@@ -1238,7 +1277,7 @@ with p as materialized (
 ), grouped as materialized (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
-         count(*)::bigint event_count
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run
     from bucket_events
    group by session_id, semantic_role
    order by first_at, session_id, semantic_role
@@ -1265,7 +1304,7 @@ with p as materialized (
    group by candidate.session_id, candidate.semantic_role
 )
 select grouped.session_id::text session_id, grouped.semantic_role,
-       grouped.first_at, grouped.last_at, grouped.event_count,
+       grouped.first_at, grouped.last_at, grouped.event_count, grouped.is_automated_run,
        session_summaries.summary
   from grouped
   left join session_summaries using (session_id, semantic_role)
@@ -1324,7 +1363,7 @@ with p as materialized (
   select bucket_events.session_id, bucket_events.semantic_role,
          min(bucket_events.observed_at) first_at,
          max(bucket_events.observed_at) last_at,
-         count(*)::bigint event_count,
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
          (array_agg(bucket_events.source_event_id order by bucket_events.observed_at,
                     bucket_events.source_event_id)
            filter (where bucket_events.is_summary_candidate)
@@ -1354,7 +1393,7 @@ with p as materialized (
    limit $12
 )
 select header.session_id::text session_id, header.semantic_role,
-       header.first_at, header.last_at, header.event_count,
+       header.first_at, header.last_at, header.event_count, header.is_automated_run,
        summary.content_excerpt summary,
        selected.source_event_id::text id, selected.observed_at,
        selected.observed_at_microseconds, selected.message_role,
@@ -1446,7 +1485,8 @@ export function decodeSnapshotToken(token) {
   }
   const [version, body, extra] = token.split(".");
   if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION,
-    PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION].includes(version) ||
+    PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION,
+    UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION, LEGACY_PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version) ||
       !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
     throw new FlameSourceError("flame_prompt_request_invalid");
@@ -1457,7 +1497,8 @@ export function decodeSnapshotToken(token) {
       throw new Error("noncanonical_token");
     }
     const value = JSON.parse(decoded);
-    const expectedLength = version === PROJECTION_SNAPSHOT_TOKEN_VERSION
+    const projected = [PROJECTION_SNAPSHOT_TOKEN_VERSION, LEGACY_PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version);
+    const expectedLength = projected
       ? 3
       : 2;
     if (!Array.isArray(value) || value.length !== expectedLength) {
@@ -1467,7 +1508,7 @@ export function decodeSnapshotToken(token) {
     const read = asDate(rawRead);
     if (read.toISOString() !== rawRead) throw new Error("noncanonical_read");
     const receipt = { snapshot: parsePgSnapshot(snapshot), read };
-    if (version === PROJECTION_SNAPSHOT_TOKEN_VERSION) {
+    if (projected) {
       if (
         ![FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION].includes(
           pinnedFrameVersion,
@@ -1476,17 +1517,29 @@ export function decodeSnapshotToken(token) {
         throw new Error("unsupported_frame_version");
       }
       receipt.frameVersion = pinnedFrameVersion;
-    } else if (version === RAW_SNAPSHOT_TOKEN_VERSION) {
+    } else if ([RAW_SNAPSHOT_TOKEN_VERSION, UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION].includes(version)) {
       receipt.normalizerVersions = NORMALIZER_VERSIONS;
     } else if (version === PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION) {
       receipt.normalizerVersions = PREVIOUS_NORMALIZER_VERSIONS;
     } else {
       receipt.normalizerVersions = LEGACY_NORMALIZER_VERSIONS;
     }
+    if ([RAW_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version)) {
+      receipt.originClassificationVersion = ORIGIN_CLASSIFICATION_VERSION;
+    }
     return receipt;
   } catch {
     throw new FlameSourceError("flame_prompt_request_invalid");
   }
+}
+
+export function classificationSnapshotQuery(query, receipt) {
+  if (!query.includes("where c.workspace_id = p.workspace_id")) {
+    throw new FlameSourceError("flame_snapshot_invalid");
+  }
+  return receipt.originClassificationVersion === ORIGIN_CLASSIFICATION_VERSION
+    ? query
+    : query.replace("where c.workspace_id = p.workspace_id", "where c.workspace_id = p.workspace_id and false");
 }
 
 const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
@@ -1628,6 +1681,7 @@ function workFromRow(row, pullRequest = null) {
     lastAt: asDate(row.last_at).toISOString(),
     eventCount: count(row.event_count),
     summary,
+    ...(row.is_automated_run === true ? { automatedRun: true } : {}),
     ...(pullRequest === null ? {} : { pullRequest }),
   };
 }
@@ -1741,6 +1795,13 @@ export function buildFlamePayload({
     )) {
       throw new FlameSourceError("flame_database_result_invalid");
     }
+    const automatedRuns = personRows.map((row) => count(row.automated_runs ?? 0));
+    const automatedRunSessionCount = count(first.day_automated_runs ?? 0);
+    if (automatedRunSessionCount > total.reduce((sum, n) => sum + n, 0) ||
+        automatedRuns.some((n, i) => n > automatedRunSessionCount ||
+          n > buckets[i].slice(0, 3).reduce((sum, value) => sum + value, 0))) {
+      throw new FlameSourceError("flame_database_result_invalid");
+    }
     const activeSeconds = buckets.reduce(
       (seconds, bucket) => seconds + (
         bucket.slice(0, 3).some((value) => value > 0) ? BUCKET_MS / 1000 : 0
@@ -1760,6 +1821,7 @@ export function buildFlamePayload({
       activeSeconds,
       total,
       buckets,
+      ...(automatedRunSessionCount > 0 ? { automatedRunSessionCount, automatedRuns } : {}),
     };
   });
 
@@ -2069,7 +2131,7 @@ export class DirectFlameSource {
         .includes(snapshotReceipt.frameVersion);
       const workLimit = INTERVAL_WORK_LIMIT + 1;
       const work = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_WORK_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_INTERVAL_WORK_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2081,7 +2143,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           workLimit,
         ], signal)
-        : await runQuery(tx, INTERVAL_WORK_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(INTERVAL_WORK_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
@@ -2111,7 +2173,7 @@ export class DirectFlameSource {
       ]));
       const promptLimit = INTERVAL_PROMPT_LIMIT + 1;
       const prompts = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2123,7 +2185,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           promptLimit,
         ], signal)
-        : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
@@ -2189,7 +2251,7 @@ export class DirectFlameSource {
         bucketStartMicroseconds.toString();
       const cursorId = decodedCursor?.id ?? "0";
       const resultRows = projected
-        ? await runQuery(tx, PROJECTION_WORK_DETAIL_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_WORK_DETAIL_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2203,7 +2265,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           pageSize + 1,
         ], signal)
-        : await runQuery(tx, WORK_DETAIL_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(WORK_DETAIL_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),
@@ -2241,6 +2303,7 @@ export class DirectFlameSource {
         firstAt: header.firstAt,
         lastAt: header.lastAt,
         eventCount: header.eventCount,
+        ...(header.automatedRun ? { automatedRun: true } : {}),
         items: pageRows.map(detailItemFromRow),
         nextCursor,
       };
@@ -2263,7 +2326,7 @@ export class DirectFlameSource {
       const projected = [FRAME_VERSION, PREVIOUS_FRAME_VERSION, COMPATIBLE_WORK_FRAME_VERSION]
         .includes(snapshotReceipt.frameVersion);
       const rows = projected
-        ? await runQuery(tx, PROJECTION_INTERVAL_PROMPTS_SQL, [
+        ? await runQuery(tx, classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           snapshotReceipt.frameVersion,
           snapshotReceipt.snapshot,
@@ -2275,7 +2338,7 @@ export class DirectFlameSource {
           this.expectedEmailDomain,
           MCP_PROMPT_EVIDENCE_LIMIT,
         ], signal)
-        : await runQuery(tx, INTERVAL_PROMPTS_SQL, [
+        : await runQuery(tx, classificationSnapshotQuery(INTERVAL_PROMPTS_SQL, snapshotReceipt), [
           this.workspaceId,
           bounds.snapshotStart.toISOString(),
           bounds.snapshotEnd.toISOString(),

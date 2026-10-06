@@ -320,6 +320,7 @@ export function BucketTooltip({ active, bucketCount = BUCKET_COUNT, laneRef, pay
       <span className="flame-tooltip-count"><span>Subagent</span> {point.subagent}</span>
       <span className="flame-tooltip-count"><span>Unclassified</span> {point.unclassified}</span>
       <span className="flame-tooltip-count"><span>Prompts</span> {point.prompts}</span>
+      {point.automatedRuns > 0 && <span className="flame-tooltip-count" title="Included in activity sessions"><span>Automated runs</span> {point.automatedRuns}</span>}
     </output>
   );
 }
@@ -488,14 +489,14 @@ function IntervalOverview({
     : primaryWork;
 
   function workRow(work) {
-    const label = work.summary ?? `${roleLabel(work.role)} session`;
+    const label = work.summary ?? (work.automatedRun ? "Automated run" : `${roleLabel(work.role)} session`);
     const contents = (
       <>
         <i className={`flame-key flame-key--${work.role}`} aria-hidden="true" />
         <span className="flame-detail__work-copy">
           <strong className={work.summary ? undefined : "flame-detail__work-generic"}>{label}</strong>
           <span>
-            <b>{roleLabel(work.role)}</b>
+            <b>{work.automatedRun ? "Automated run" : roleLabel(work.role)}</b>
             <span aria-hidden="true">·</span>
             <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
             <span aria-hidden="true">–</span>
@@ -640,7 +641,7 @@ function WorkDetail({
       </header>
       <div className="flame-detail__work-heading">
         <p className="flame-detail__eyebrow">Session evidence</p>
-        <h2 id={headingId}>{roleLabel(work.role)} session</h2>
+        <h2 id={headingId}>{work.automatedRun ? "Automated run" : `${roleLabel(work.role)} session`}</h2>
         <div className="flame-detail__work-meta">
           <p>
             <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>

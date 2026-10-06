@@ -1181,3 +1181,11 @@ describe("recovered timing evidence",()=>{
   const row=await screen.findByRole("button",{name:/Recovered cloud turn activity/});expect(row).toBeDisabled();expect(screen.getByText(label)).toBeInTheDocument();fireEvent.click(row);expect(fetchMock.mock.calls.some(([url])=>String(url).includes("/api/flame/work"))).toBe(false);expect(screen.queryByText("Recovered cloud usage")).not.toBeInTheDocument();
  });
 });
+
+it("labels automated activity in the tooltip without claiming human prompts", () => {
+  const point = { ...model().people[0].buckets[0], prompts: 0, automatedRuns: 2 };
+  render(<BucketTooltip active personName="Ada Lovelace" payload={[{ payload: point }]} />);
+  expect(screen.getByRole("status")).toHaveTextContent("Automated runs 2");
+  expect(screen.getByRole("status")).toHaveTextContent("Prompts 0");
+  expect(screen.getByRole("status")).toHaveTextContent("4 observed sessions");
+});

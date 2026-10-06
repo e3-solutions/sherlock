@@ -48,7 +48,8 @@ const usageOutputSchema = z.object({
   provenance: z.object({
     recovery: z.object({basis:z.enum(["recovered_completed_turn_intervals", "recovered_observed_turn_intervals"]),sourceHashes:z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(100),latestCompletedAt:ISO_TIMESTAMP.optional(),latestObservedAt:ISO_TIMESTAMP.optional()}).strict().optional(),
     projectionVersion: z.enum(["frame-evidence-v2", "frame-evidence-v4", "frame-evidence-v5",
-      "raw-snapshot-v1", "raw-snapshot-v3", "raw-snapshot-v4"]),
+      "raw-snapshot-v1", "raw-snapshot-v3", "raw-snapshot-v4", "raw-snapshot-v5"]),
+    originClassificationVersion: z.literal("bonaparte-origin-v1").optional(),
   }).strict(),
   coverage: z.object({
     state: z.literal("partial"),
@@ -63,6 +64,8 @@ const usageOutputSchema = z.object({
     unclassifiedSessionCount: z.number().int().nonnegative(),
     primaryHumanPromptCount: z.number().int().nonnegative(),
     promptBuckets: z.array(promptBucketSchema).max(144),
+    automatedRunSessionCount: z.number().int().nonnegative().optional().describe("Distinct automated runs, already included in activity session counts."),
+    automatedRunBuckets: z.array(z.object({ start: ISO_TIMESTAMP, automatedRunSessionCount: z.number().int().nonnegative() }).strict()).max(144).optional(),
   }).strict()).max(20),
   nextCursor: CURSOR.nullable(),
 }).strict();

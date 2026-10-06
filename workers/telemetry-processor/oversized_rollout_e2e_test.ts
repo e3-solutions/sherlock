@@ -138,7 +138,7 @@ async function assertClaudeDashboard(
   assert(receipt.promptCount >= 1);
   assert(receipt.detailCount >= 2);
   assert(
-    receipt.snapshotVersion === "v2",
+    receipt.snapshotVersion === "v6",
     "dashboard did not use frame projection",
   );
 }
