@@ -52,16 +52,34 @@ select requested.session_id::text as session_id,
 // the current batch version, but never drop that child merely for lacking it.
 export const CHANGED_SESSION_CUTOFFS_SQL = `
 select requested.session_id::text as session_id,
-       latest.id::text as cutoff, latest.normalizer_version
+       coalesce(preferred.id, fallback.id)::text as cutoff,
+       coalesce(preferred.normalizer_version, fallback.normalizer_version)
+         as normalizer_version
   from unnest($2::uuid[]) as requested(session_id)
-  join lateral (
+  left join lateral (
     select e.id, e.normalizer_version
       from telemetry.events e
      where e.workspace_id = $1 and e.session_id = requested.session_id
-       and e.normalizer_version = any($4::text[])
-     order by (e.normalizer_version = $3) desc, e.id desc
+       and e.normalizer_version = $3
+     order by e.id desc
      limit 1
-  ) latest on true
+  ) preferred on true
+  left join lateral (
+    select candidate.id, candidate.normalizer_version
+      from unnest($4::text[]) as version(normalizer_version)
+      join lateral (
+        select e.id, e.normalizer_version
+          from telemetry.events e
+         where preferred.id is null
+           and e.workspace_id = $1 and e.session_id = requested.session_id
+           and e.normalizer_version = version.normalizer_version
+         order by e.id desc
+         limit 1
+      ) candidate on true
+     order by candidate.id desc
+     limit 1
+  ) fallback on true
+ where coalesce(preferred.id, fallback.id) is not null
  order by requested.session_id
 `;
 
