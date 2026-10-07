@@ -1,6 +1,7 @@
 import postgres from "./postgres.ts";
 import {
   ADMISSION_HEADROOM_SQL,
+  enqueueReductionsInTransaction,
   GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS,
   PostgresJobQueue,
 } from "./queue.ts";
@@ -1453,6 +1454,72 @@ Deno.test({
       }
       await blocker.end({ timeout: 1 }).catch(() => undefined);
       await sql.end({ timeout: 1 }).catch(() => undefined);
+    }
+  },
+});
+
+Deno.test({
+  name: "rebuild enqueue commits or rolls back with normalized metadata",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 1 });
+    const { workspaceId, personId } = await insertQueueFixture(
+      sql,
+      "atomic-rebuild",
+    );
+    const sessionId = crypto.randomUUID();
+    try {
+      await sql.unsafe(
+        `insert into telemetry.sessions
+        (id,workspace_id,person_id,collector_key,native_session_id,actor_role,role_version,started_at)
+        values ($1,$2,$3,'atomic-test','atomic-test','unknown','test.v1',now())`,
+        [sessionId, workspaceId, personId],
+      );
+      for (const fail of [true, false]) {
+        let rejected = false;
+        try {
+          await sql.begin(async (tx) => {
+            await tx.unsafe("set local role sherlock_normalizer");
+            await tx.unsafe(
+              "update telemetry.sessions set actor_role='worker' where id=$1",
+              [sessionId],
+            );
+            await enqueueReductionsInTransaction(tx, [
+              job(workspaceId, sessionId, 1n, "live"),
+            ]);
+            if (fail) throw new Error("injected after enqueue");
+          });
+        } catch (error) {
+          rejected = String(error).includes("injected after enqueue");
+        }
+        assert(
+          rejected === fail,
+          "transaction outcome must match injected failure",
+        );
+        const [state] = await sql.unsafe(
+          `select actor_role,
+          (select count(*)::int from processing.telemetry_jobs where session_id=$1 and job_kind='reduce') jobs
+          from telemetry.sessions where id=$1`,
+          [sessionId],
+        );
+        assert(
+          state.actor_role === (fail ? "unknown" : "worker"),
+          "metadata commit must be atomic",
+        );
+        assert(state.jobs === (fail ? 0 : 1), "enqueue commit must be atomic");
+      }
+    } finally {
+      await sql.unsafe(
+        "delete from processing.telemetry_jobs where workspace_id=$1",
+        [workspaceId],
+      );
+      await sql.unsafe("delete from telemetry.sessions where workspace_id=$1", [
+        workspaceId,
+      ]);
+      await deleteQueueFixture(sql, workspaceId);
+      await sql.end();
     }
   },
 });

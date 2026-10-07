@@ -475,74 +475,7 @@ export class PostgresJobQueue {
   async enqueueReductions(
     options: readonly ReductionEnqueueOptions[],
   ): Promise<void> {
-    const targets = coalesceReductionTargets(options);
-    if (targets.length === 0) return;
-    await this.sql.begin(async (tx) => {
-      await tx.unsafe("set local role sherlock_processor");
-      await tx.unsafe(
-        `insert into processing.telemetry_jobs (
-           workspace_id, job_kind, session_id, normalizer_version,
-           activity_version, target_event_id, request_generation,
-           workload_class, available_at
-         )
-         select target.workspace_id, 'reduce', target.session_id,
-                target.normalizer_version, target.activity_version,
-                target.target_event_id, 1, target.workload_class,
-                now() + case when target.workload_class = 'live'
-                  then interval '100 milliseconds' else interval '2 seconds' end
-           from unnest(
-             $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::bigint[],
-             $6::text[]
-           ) as target(
-             workspace_id, session_id, normalizer_version, activity_version,
-             target_event_id, workload_class
-           )
-         on conflict (
-           workspace_id, session_id, normalizer_version, activity_version
-         ) where job_kind = 'reduce' do update set
-           target_event_id = greatest(
-             processing.telemetry_jobs.target_event_id,
-             excluded.target_event_id
-           ),
-           request_generation = processing.telemetry_jobs.request_generation + 1,
-           workload_class = case
-             when processing.telemetry_jobs.workload_class = 'live'
-               or excluded.workload_class = 'live' then 'live'
-             else 'backfill'
-           end,
-           status = case
-             when processing.telemetry_jobs.status = 'leased' then 'leased'
-             else 'queued'
-           end,
-           available_at = case
-             when processing.telemetry_jobs.status = 'leased'
-               then processing.telemetry_jobs.available_at
-             when processing.telemetry_jobs.status = 'queued'
-               then least(processing.telemetry_jobs.available_at, excluded.available_at)
-             else excluded.available_at
-           end,
-           attempt_count = case
-             when processing.telemetry_jobs.status in ('failed', 'succeeded')
-               then 0 else processing.telemetry_jobs.attempt_count
-           end,
-           requeue_count = processing.telemetry_jobs.requeue_count +
-             case when processing.telemetry_jobs.status = 'failed' then 1 else 0 end,
-           completed_at = case
-             when processing.telemetry_jobs.status = 'leased'
-               then processing.telemetry_jobs.completed_at
-             else null
-           end,
-           updated_at = now()`,
-        [
-          targets.map((target) => target.workspaceId),
-          targets.map((target) => target.sessionId),
-          targets.map((target) => target.normalizerVersion),
-          targets.map((target) => target.activityVersion),
-          targets.map((target) => target.targetEventId.toString()),
-          targets.map((target) => target.workloadClass),
-        ],
-      );
-    });
+    await this.sql.begin((tx) => enqueueReductionsInTransaction(tx, options));
   }
 
   async heartbeat(
@@ -714,4 +647,78 @@ function jobFromRow(row: Record<string, unknown>): TelemetryJob {
     target_event_id: BigInt(String(row.target_event_id)),
     request_generation: BigInt(String(row.request_generation)),
   };
+}
+
+// Reuse the normalization transaction so repaired topology cannot commit without
+// its corresponding rebuild request.
+export async function enqueueReductionsInTransaction(
+  tx: import("./database.ts").TransactionSql,
+  options: readonly ReductionEnqueueOptions[],
+): Promise<void> {
+  const targets = coalesceReductionTargets(options);
+  if (targets.length === 0) return;
+  await tx.unsafe("set local role sherlock_processor");
+  await tx.unsafe(
+    `insert into processing.telemetry_jobs (
+           workspace_id, job_kind, session_id, normalizer_version,
+           activity_version, target_event_id, request_generation,
+           workload_class, available_at
+         )
+         select target.workspace_id, 'reduce', target.session_id,
+                target.normalizer_version, target.activity_version,
+                target.target_event_id, 1, target.workload_class,
+                now() + case when target.workload_class = 'live'
+                  then interval '100 milliseconds' else interval '2 seconds' end
+           from unnest(
+             $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::bigint[],
+             $6::text[]
+           ) as target(
+             workspace_id, session_id, normalizer_version, activity_version,
+             target_event_id, workload_class
+           )
+         on conflict (
+           workspace_id, session_id, normalizer_version, activity_version
+         ) where job_kind = 'reduce' do update set
+           target_event_id = greatest(
+             processing.telemetry_jobs.target_event_id,
+             excluded.target_event_id
+           ),
+           request_generation = processing.telemetry_jobs.request_generation + 1,
+           workload_class = case
+             when processing.telemetry_jobs.workload_class = 'live'
+               or excluded.workload_class = 'live' then 'live'
+             else 'backfill'
+           end,
+           status = case
+             when processing.telemetry_jobs.status = 'leased' then 'leased'
+             else 'queued'
+           end,
+           available_at = case
+             when processing.telemetry_jobs.status = 'leased'
+               then processing.telemetry_jobs.available_at
+             when processing.telemetry_jobs.status = 'queued'
+               then least(processing.telemetry_jobs.available_at, excluded.available_at)
+             else excluded.available_at
+           end,
+           attempt_count = case
+             when processing.telemetry_jobs.status in ('failed', 'succeeded')
+               then 0 else processing.telemetry_jobs.attempt_count
+           end,
+           requeue_count = processing.telemetry_jobs.requeue_count +
+             case when processing.telemetry_jobs.status = 'failed' then 1 else 0 end,
+           completed_at = case
+             when processing.telemetry_jobs.status = 'leased'
+               then processing.telemetry_jobs.completed_at
+             else null
+           end,
+           updated_at = now()`,
+    [
+      targets.map((target) => target.workspaceId),
+      targets.map((target) => target.sessionId),
+      targets.map((target) => target.normalizerVersion),
+      targets.map((target) => target.activityVersion),
+      targets.map((target) => target.targetEventId.toString()),
+      targets.map((target) => target.workloadClass),
+    ],
+  );
 }

@@ -1002,7 +1002,6 @@ async function runJob(
   try {
     const result = job.job_kind === "normalize"
       ? await normalizeAndEnqueue(
-        queue,
         processor,
         job,
         config.processingTimeoutMilliseconds,
@@ -1065,7 +1064,6 @@ async function runJob(
 }
 
 async function normalizeAndEnqueue(
-  queue: PostgresJobQueue,
   processor: TelemetryProcessor,
   job: Extract<TelemetryJob, { job_kind: "normalize" }>,
   maximumDurationMs: number,
@@ -1076,7 +1074,7 @@ async function normalizeAndEnqueue(
   tombstone_count: number;
 }> {
   const targets = await processor.normalize(job, maximumDurationMs);
-  await enqueueReductionTargets(queue, targets);
+  // normalize commits rebuild requests atomically with its source changes.
   return {
     session_count: targets.length,
     candidate_count: 0,

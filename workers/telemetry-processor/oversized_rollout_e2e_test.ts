@@ -221,17 +221,8 @@ async function processAllJobs(
       if (job.job_kind === "normalize") {
         assert(job.batch_id, "normalize job is missing its batch ID");
         normalizedBatchIds.push(job.batch_id);
-        const targets = await processor.normalize(job);
-        await queue.enqueueReductions(
-          targets.map((target) => ({
-            workspaceId: target.workspace_id,
-            sessionId: target.session_id,
-            normalizerVersion: target.normalizer_version,
-            activityVersion: target.activity_version,
-            targetEventId: target.target_event_id,
-            workloadClass: target.workload_class,
-          })),
-        );
+        // Normalization publishes its rebuild requests in the same transaction.
+        await processor.normalize(job);
       } else {
         await processor.reduce(job, 60_000);
       }

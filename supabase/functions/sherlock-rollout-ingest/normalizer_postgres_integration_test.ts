@@ -733,9 +733,110 @@ Deno.test({
         unresolved[0].parent_session_id === null,
         "child must begin unresolved",
       );
-      const parentSessionId = await normalize(
-        firstNormalizer,
-        childFirstParent,
+      // A failed rebuild enqueue must roll back both the new parent and repair.
+      let rejected = false;
+      try {
+        await firstNormalizer.normalize(
+          childFirstParent.receipt,
+          childFirstParent.manifest,
+          childFirstParent.source,
+          undefined,
+          undefined,
+          undefined,
+          (_tx, changed) => {
+            assert(
+              changed.includes(childSessionId),
+              "repair must invalidate child",
+            );
+            return Promise.reject(new Error("injected enqueue failure"));
+          },
+        );
+      } catch (error) {
+        rejected = String(error).includes("injected enqueue failure");
+      }
+      assert(rejected, "enqueue failure must escape normalization");
+      const failedRepair = await sql.unsafe(
+        `select parent_session_id from telemetry.sessions where id = $1`,
+        [childSessionId],
+      );
+      assert(
+        failedRepair[0].parent_session_id === null,
+        "repair must roll back",
+      );
+      const failedEvents = await sql.unsafe(
+        `select count(*) as count from telemetry.events where source_record_id in
+          (select id from telemetry.native_records where batch_id = $1)`,
+        [childFirstParent.receipt.batch_id],
+      );
+      assert(
+        Number(failedEvents[0].count) === 0,
+        "events must roll back with enqueue",
+      );
+      let repairedIds: readonly string[] = [];
+      const parentResult = await firstNormalizer.normalize(
+        childFirstParent.receipt,
+        childFirstParent.manifest,
+        childFirstParent.source,
+        undefined,
+        undefined,
+        undefined,
+        (_tx, changed) => {
+          repairedIds = changed;
+          return Promise.resolve();
+        },
+      );
+      const parentSessionId = parentResult.session_ids[0];
+      assert(
+        repairedIds.length === 2 && repairedIds.includes(parentSessionId) &&
+          repairedIds.includes(childSessionId),
+        "retry must invalidate parent and repaired child",
+      );
+
+      const changedBy = async (
+        fixture: BatchFixture,
+      ): Promise<readonly string[]> => {
+        let changedIds: readonly string[] = [];
+        await firstNormalizer.normalize(
+          fixture.receipt,
+          fixture.manifest,
+          fixture.source,
+          undefined,
+          undefined,
+          undefined,
+          (_tx, changed) => {
+            changedIds = changed;
+            return Promise.resolve();
+          },
+        );
+        return changedIds;
+      };
+      assert(
+        (await changedBy(childFirstParent)).length === 0,
+        "identical parent replay must not enqueue already resolved children",
+      );
+      const nextParent = await seedBatch(sql, {
+        workspaceId,
+        personId,
+        collectorKey,
+        nativeSessionId: "child-first-parent",
+      });
+      const parentOnly = await changedBy(nextParent);
+      assert(
+        parentOnly.length === 1 && parentOnly[0] === parentSessionId,
+        "new parent events must not enqueue unchanged children",
+      );
+      await sql.unsafe(
+        `update telemetry.sessions set actor_role = 'unknown' where id = $1`,
+        [childSessionId],
+      );
+      const metadataOnly = await changedBy(childFirstChild);
+      assert(
+        metadataOnly.length === 1 && metadataOnly[0] === childSessionId,
+        "same-cutoff metadata correction must enqueue the changed child",
+      );
+      assert(
+        (await changedBy(childFirstChild)).length === 0,
+        "identical metadata replay must not enqueue again",
       );
       await assertParentLink(
         sql,

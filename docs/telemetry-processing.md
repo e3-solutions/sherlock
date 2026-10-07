@@ -51,6 +51,18 @@ normalized event facts and complete text stays in private Storage. Because the
 stored actor role is effective, normalization must enqueue every child whose
 previously unresolved parent is repaired.
 
+## Rebuild invalidation
+
+The worker enqueues reductions in the same transaction as normalization. A
+session needs rebuilding only when that transaction inserts new event facts or
+changes its session metadata. Parent discovery also invalidates exactly the
+children returned by the update that repairs previously unresolved parent
+links. Ordinary parent batches never enumerate all previously linked children.
+Identical normalization retries enqueue nothing; an enqueue failure rolls back
+normalization and parent repair so a retry cannot lose the invalidation. Real
+metadata changes still enqueue at an unchanged event cutoff. Existing queue
+request generations continue fencing changes that arrive during a reduction.
+
 ## Scheduling and backpressure
 
 The normal collector remains unchanged and defaults to automatic scheduling.

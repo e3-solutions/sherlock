@@ -126,6 +126,10 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
     statementTimeoutMs?: number,
     deadlineAtMs?: number,
     targetNormalizerVersion = normalizerVersionFor(manifest),
+    beforeCommit?: (
+      tx: TransactionSql,
+      changedSessionIds: readonly string[],
+    ) => Promise<void>,
   ): Promise<NormalizationResult> {
     const projection = await projectBatch(
       manifest,
@@ -246,12 +250,14 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
         // would store a JSON string, which our object-only constraint rejects.
         attributes: event.attributes ? tx.json(event.attributes) : null,
       }));
+      let insertedEvents = 0;
       for (let offset = 0; offset < events.length; offset += 500) {
         const eventBatch = events.slice(offset, offset + 500);
-        await tx`insert into telemetry.events ${
+        const inserted = await tx`insert into telemetry.events ${
           tx(eventBatch, ...EVENT_COLUMNS)
         } on conflict (source_record_id, normalizer_version, projection_index)
-          do nothing`;
+          do nothing returning id`;
+        insertedEvents += inserted.length;
       }
       const missing = await tx.unsafe(
         `select count(*)::bigint as count
@@ -271,6 +277,15 @@ export class PostgresBatchNormalizer implements BatchNormalizer {
           500,
         );
       }
+      const changedSessionIds = normalizedSession
+        ? [
+          ...(insertedEvents > 0 || normalizedSession.changed
+            ? [normalizedSession.id]
+            : []),
+          ...normalizedSession.repaired_child_ids,
+        ]
+        : [];
+      await beforeCommit?.(tx, changedSessionIds);
       return {
         session_ids: normalizedSession ? [normalizedSession.id] : [],
         normalizer_version: normalizerVersion,
@@ -335,7 +350,14 @@ async function upsertSession(
   tx: TransactionSql,
   receipt: CommittedReceipt,
   session: SessionProjection,
-): Promise<{ id: string; actor_role: ActorRole }> {
+): Promise<
+  {
+    id: string;
+    actor_role: ActorRole;
+    changed: boolean;
+    repaired_child_ids: string[];
+  }
+> {
   const lockNativeSessionIds = [
     session.native_session_id,
     session.parent_native_session_id,
@@ -470,12 +492,13 @@ async function upsertSession(
       409,
     );
   }
-  await tx.unsafe(
+  const repairedChildren = await tx.unsafe(
     `update telemetry.sessions
         set parent_session_id = $1, updated_at = now()
       where workspace_id = $2 and collector_key = $3 and person_id = $4
         and parent_native_session_id = $5 and parent_session_id is null
-        and id <> $1`,
+        and id <> $1
+      returning id`,
     [
       resolvedRows[0].id,
       receipt.workspace_id,
@@ -487,5 +510,7 @@ async function upsertSession(
   return {
     id: String(resolvedRows[0].id),
     actor_role: String(resolvedRows[0].actor_role) as ActorRole,
+    changed: rows.length > 0,
+    repaired_child_ids: repairedChildren.map((row) => String(row.id)),
   };
 }

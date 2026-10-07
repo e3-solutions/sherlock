@@ -8,6 +8,9 @@ import {
   receiptFromRow,
 } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
 import {
+  CLAUDE_NORMALIZER_VERSION,
+  CODEX_V3_NORMALIZER_VERSION,
+  LEGACY_CODEX_NORMALIZER_VERSION,
   legacyNormalizerVersionFor,
   NORMALIZER_VERSION,
 } from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
@@ -22,15 +25,12 @@ import {
   type TransactionRunner,
   withReservedConnection,
 } from "./database.ts";
-import type { NormalizationJob, ReductionJob, WorkloadClass } from "./queue.ts";
-
-export const AFFECTED_SESSIONS_SQL = `
-select id::text as id
-  from telemetry.sessions
- where workspace_id = $1
-   and (id = any($2::uuid[]) or parent_session_id = any($2::uuid[]))
- order by id
-`;
+import {
+  enqueueReductionsInTransaction,
+  type NormalizationJob,
+  type ReductionJob,
+  type WorkloadClass,
+} from "./queue.ts";
 
 export const SESSION_CUTOFFS_SQL = `
 select requested.session_id::text as session_id,
@@ -45,6 +45,41 @@ select requested.session_id::text as session_id,
      order by e.id desc
      limit 1
   ) latest on true
+ order by requested.session_id
+`;
+
+// Parent repair can invalidate a child written by an older normalizer. Prefer
+// the current batch version, but never drop that child merely for lacking it.
+export const CHANGED_SESSION_CUTOFFS_SQL = `
+select requested.session_id::text as session_id,
+       coalesce(preferred.id, fallback.id)::text as cutoff,
+       coalesce(preferred.normalizer_version, fallback.normalizer_version)
+         as normalizer_version
+  from unnest($2::uuid[]) as requested(session_id)
+  left join lateral (
+    select e.id, e.normalizer_version
+      from telemetry.events e
+     where e.workspace_id = $1 and e.session_id = requested.session_id
+       and e.normalizer_version = $3
+     order by e.id desc
+     limit 1
+  ) preferred on true
+  left join lateral (
+    select candidate.id, candidate.normalizer_version
+      from unnest($4::text[]) as version(normalizer_version)
+      join lateral (
+        select e.id, e.normalizer_version
+          from telemetry.events e
+         where preferred.id is null
+           and e.workspace_id = $1 and e.session_id = requested.session_id
+           and e.normalizer_version = version.normalizer_version
+         order by e.id desc
+         limit 1
+      ) candidate on true
+     order by candidate.id desc
+     limit 1
+  ) fallback on true
+ where coalesce(preferred.id, fallback.id) is not null
  order by requested.session_id
 `;
 
@@ -114,6 +149,8 @@ export class TelemetryProcessor {
     await this.sql.end({ timeout: 5 });
   }
 
+  // Returned targets are a receipt of rebuilds already enqueued atomically,
+  // not a list for the caller to enqueue after normalization commits.
   async normalize(
     job: NormalizationJob,
     maximumDurationMs = 90_000,
@@ -139,36 +176,52 @@ export class TelemetryProcessor {
         );
         const source = await validateStoredBatch(batch.manifest, stored);
         remainingMilliseconds(deadlineAtMs);
-        const normalized = await PostgresBatchNormalizer
-          .fromReservedConnection(connection, transactionRunner).normalize(
+        const targets: ReductionTarget[] = [];
+        await PostgresBatchNormalizer.fromReservedConnection(
+          connection,
+          transactionRunner,
+        )
+          .normalize(
             batch.receipt,
             batch.manifest,
             source,
             remainingMilliseconds(deadlineAtMs),
             deadlineAtMs,
             normalizationTarget(job.normalizer_version, batch.manifest),
+            async (tx, changedSessionIds) => {
+              const cutoffs = await resolveChangedSessionCutoffs(
+                async (callback) => await callback(tx),
+                job.workspace_id,
+                changedSessionIds,
+                normalizationTarget(job.normalizer_version, batch.manifest),
+                deadlineAtMs,
+              );
+              targets.push(
+                ...cutoffs.map((
+                  { session_id, target_event_id, normalizer_version },
+                ) => ({
+                  workspace_id: job.workspace_id,
+                  session_id,
+                  normalizer_version,
+                  activity_version: ACTIVITY_VERSION,
+                  target_event_id,
+                  workload_class: job.workload_class,
+                })),
+              );
+              await enqueueReductionsInTransaction(
+                tx,
+                targets.map((target) => ({
+                  workspaceId: target.workspace_id,
+                  sessionId: target.session_id,
+                  normalizerVersion: target.normalizer_version,
+                  activityVersion: target.activity_version,
+                  targetEventId: target.target_event_id,
+                  workloadClass: target.workload_class,
+                })),
+              );
+            },
           );
-        const affectedSessionIds = await this.resolveAffectedSessionIds(
-          transactionRunner,
-          job.workspace_id,
-          normalized.session_ids,
-          deadlineAtMs,
-        );
-        const cutoffs = await resolveSessionCutoffs(
-          transactionRunner,
-          job.workspace_id,
-          affectedSessionIds,
-          normalized.normalizer_version,
-          deadlineAtMs,
-        );
-        return cutoffs.map(({ session_id, target_event_id }) => ({
-          workspace_id: job.workspace_id,
-          session_id,
-          normalizer_version: normalized.normalizer_version,
-          activity_version: ACTIVITY_VERSION,
-          target_event_id,
-          workload_class: job.workload_class,
-        }));
+        return targets;
       },
     );
   }
@@ -316,24 +369,40 @@ export class TelemetryProcessor {
       return { receipt: receiptFromRow(row), manifest };
     });
   }
+}
 
-  private async resolveAffectedSessionIds(
-    transactionRunner: TransactionRunner,
-    workspaceId: string,
-    normalizedSessionIds: readonly string[],
-    deadlineAtMs: number,
-  ): Promise<string[]> {
-    if (normalizedSessionIds.length === 0) return [];
-    return await transactionRunner(async (tx) => {
-      await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
-      await tx.unsafe("set local role sherlock_normalizer");
-      const rows = await tx.unsafe(
-        AFFECTED_SESSIONS_SQL,
-        [workspaceId, normalizedSessionIds],
-      );
-      return rows.map((row) => String(row.id));
-    });
-  }
+export async function resolveChangedSessionCutoffs(
+  transactionRunner: TransactionRunner,
+  workspaceId: string,
+  sessionIds: readonly string[],
+  preferredVersion: string,
+  deadlineAtMs: number,
+): Promise<
+  Array<
+    { session_id: string; target_event_id: bigint; normalizer_version: string }
+  >
+> {
+  if (sessionIds.length === 0) return [];
+  return await transactionRunner(async (tx) => {
+    await setStatementTimeout(tx, remainingMilliseconds(deadlineAtMs));
+    await tx.unsafe("set local role sherlock_normalizer");
+    const rows = await tx.unsafe(CHANGED_SESSION_CUTOFFS_SQL, [
+      workspaceId,
+      sessionIds,
+      preferredVersion,
+      [
+        LEGACY_CODEX_NORMALIZER_VERSION,
+        NORMALIZER_VERSION,
+        CODEX_V3_NORMALIZER_VERSION,
+        CLAUDE_NORMALIZER_VERSION,
+      ],
+    ]);
+    return rows.map((row) => ({
+      session_id: String(row.session_id),
+      target_event_id: BigInt(String(row.cutoff)),
+      normalizer_version: String(row.normalizer_version),
+    }));
+  });
 }
 
 export async function resolveSessionCutoffs(
