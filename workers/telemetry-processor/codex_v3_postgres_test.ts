@@ -8,7 +8,11 @@ import {
 import { PostgresBatchRepository } from "../../supabase/functions/sherlock-rollout-ingest/postgres.ts";
 import { PostgresBatchNormalizer } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
 import { PostgresFrameEvidenceProjector } from "./frame-projector.ts";
-import { SupabaseRawStorage, TelemetryProcessor } from "./processor.ts";
+import {
+  resolveChangedSessionCutoffs,
+  SupabaseRawStorage,
+  TelemetryProcessor,
+} from "./processor.ts";
 import { ACTIVITY_VERSION } from "../../supabase/functions/sherlock-activity-reducer/reducer.ts";
 import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
 import { createSherlockQuerySource } from "../../apps/dashboard/src/server/mcp-query-source.js";
@@ -177,6 +181,21 @@ Deno.test({
         "sherlock.codex-rollout.v2",
       );
       const sessionId = historical.session_ids[0];
+      const repairedChildCutoffs = await resolveChangedSessionCutoffs(
+        async (callback) =>
+          await sql.begin(callback) as Awaited<ReturnType<typeof callback>>,
+        workspaceId,
+        [sessionId],
+        "sherlock.codex-rollout.v3",
+        performance.now() + 10_000,
+      );
+      assert(
+        repairedChildCutoffs.length === 1 &&
+          repairedChildCutoffs[0].normalizer_version ===
+            "sherlock.codex-rollout.v2",
+        "parent repair must retain a child that only has historical v2 evidence",
+      );
+
       const oldRows = await sql.unsafe(
         "select * from telemetry.events where workspace_id=$1 order by id",
         [workspaceId],
