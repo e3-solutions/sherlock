@@ -149,6 +149,8 @@ export class TelemetryProcessor {
     await this.sql.end({ timeout: 5 });
   }
 
+  // Returned targets are a receipt of rebuilds already enqueued atomically,
+  // not a list for the caller to enqueue after normalization commits.
   async normalize(
     job: NormalizationJob,
     maximumDurationMs = 90_000,
