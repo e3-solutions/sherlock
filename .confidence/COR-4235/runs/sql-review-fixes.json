@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "id": "sql-review-fixes",
+  "argv": [
+    "/Users/aryagm/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
+    "node_modules/vitest/vitest.mjs",
+    "run",
+    "--config",
+    "frontend/vitest.config.js",
+    "--environment",
+    "node",
+    "src/server/usage-reconciliation.postgres.test.js",
+    "src/server/flame-source.postgres.test.js",
+    "src/server/mcp-protocol.test.js"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/7c79/sherlock/apps/dashboard",
+  "started_at": "2026-09-14T21:32:44.297657Z",
+  "ended_at": "2026-09-14T21:32:46.200288Z",
+  "exit_code": 1,
+  "termination_reason": null,
+  "resolved_executable": "/Users/aryagm/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/7c79/sherlock",
+    "sha256": "093fb37f760700ce18464cc2ca4a7285a7310de1e0e9355ac67e37edb88ae06e"
+  },
+  "log": "runs/sql-review-fixes.log",
+  "log_sha256": "8830ea591ef4301009cd79a16ae4bcd3845d6263f82a35c4f304c61cb88e4e71"
+}

@@ -411,6 +411,66 @@ Deno.test("Codex v1 remains reproducible while v2 appends corrected facts", asyn
   );
 });
 
+Deno.test("Codex v3 excludes runtime continuations in both formats without reinterpreting v1/v2", async () => {
+  const goal =
+    '<codex_internal_context source="goal">Continue the active goal.</codex_internal_context>';
+  const texts = [
+    goal,
+    " \n\t" + goal,
+    " ".repeat(2048) + goal,
+    '<CODEX_INTERNAL_CONTEXT source="goal">Continue.</CODEX_INTERNAL_CONTEXT>',
+    "<environment_context>runtime</environment_context>",
+    "Please explain " + goal,
+    "```xml\n" + goal + "\n```",
+    "<codex_internal_contextual>human XML</codex_internal_contextual>",
+    "Continue working on my request.",
+  ];
+  const records = texts.flatMap((text, index) => [
+    { type: "event_msg", payload: { type: "user_message", message: text } },
+    {
+      type: "response_item",
+      payload: {
+        id: `message-${index}`,
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text }],
+      },
+    },
+  ]);
+  const { manifest, source } = await fixture(records);
+  const corrected = await projectBatch(
+    manifest,
+    source,
+    "sherlock.codex-rollout.v3",
+  );
+  for (const [index, event] of corrected.events.entries()) {
+    assert(
+      event.message_origin === (index < 10 ? "runtime_context" : "human"),
+      `wrong v3 origin for representation ${index}`,
+    );
+    assert(event.message_role === "user", "runtime role must remain user");
+    assert(
+      event.content_sha256 ===
+        await sha256Hex(
+          new TextEncoder().encode(texts[Math.floor(index / 2)].trim()),
+        ),
+      "classification must preserve full content hash",
+    );
+  }
+  for (
+    const version of ["sherlock.codex-rollout.v1", "sherlock.codex-rollout.v2"]
+  ) {
+    const historical = await projectBatch(manifest, source, version);
+    for (const [index, event] of historical.events.entries()) {
+      assert(
+        event.message_origin ===
+          (version.endsWith("v2") && index === 9 ? "runtime_context" : "human"),
+        `${version} interpretation changed at representation ${index}`,
+      );
+    }
+  }
+});
+
 Deno.test("normalizer emits observable unknown events for malformed records", async () => {
   const { manifest, source } = await fixture(["not-json"]);
 

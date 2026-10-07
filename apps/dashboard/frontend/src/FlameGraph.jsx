@@ -10,6 +10,7 @@ import {
 } from "react";
 import {
   Bar,
+  Cell,
   ComposedChart,
   Line,
   Tooltip,
@@ -84,6 +85,37 @@ export function rankPeople(people, rankBy) {
     .map((person, index) => ({ person, index, value: personRankValue(person, rankBy) }))
     .sort((left, right) => right.value - left.value || left.index - right.index)
     .map(({ person }) => person);
+}
+
+/** Limit exceptional buckets on the shared display scale without changing source counts. */
+export function getActivityDisplayScale(people) {
+  const values = people.flatMap((person) => person.buckets
+    .map((bucket) => bucket.activity)
+    .filter((value) => value > 0))
+    .sort((left, right) => left - right);
+  const fullPeak = values.at(-1) ?? 0;
+  if (values.length < 4) {
+    const previousPeak = values.at(-2) ?? fullPeak;
+    const isolatedOutlier = fullPeak > Math.max(10, previousPeak * 4);
+    return Math.max(1, isolatedOutlier ? previousPeak : fullPeak);
+  }
+
+  const upperQuartile = values[Math.floor((values.length - 1) * 0.75)];
+  const cutoff = Math.max(10, upperQuartile * 4);
+  const typicalPeak = values.filter((value) => value <= cutoff).at(-1) ?? fullPeak;
+  return Math.max(1, typicalPeak);
+}
+
+/** Keep the plotted stack within the scale while retaining exact counts on the point. */
+export function capActivityForDisplay(point, peak) {
+  const ratio = point.activity > peak ? peak / point.activity : 1;
+  return {
+    ...point,
+    isCapped: ratio < 1,
+    chartAgent: point.agent * ratio,
+    chartSubagent: point.subagent * ratio,
+    chartUnclassified: point.unclassified * ratio,
+  };
 }
 
 async function apiFailure(response, fallback) {
@@ -262,7 +294,7 @@ export function BucketTooltip({ active, bucketCount = BUCKET_COUNT, laneRef, pay
       })
     : null;
   const activityLabel = formatSessionCount(point.activity);
-  const description = `${personName}, ${formatTime(point.startMs)} to ${formatTime(point.endMs)}: ${activityLabel}; ${point.agent} agent, ${point.subagent} subagent, ${point.unclassified} unclassified; ${point.prompts} prompts`;
+  const description = `${personName}, ${formatTime(point.startMs)} to ${formatTime(point.endMs)}: ${activityLabel}; ${point.agent} agent, ${point.subagent} subagent, ${point.unclassified} unclassified; ${point.prompts} prompts${point.isCapped ? "; bar shortened to fit scale" : ""}`;
 
   return (
     <output
@@ -283,10 +315,12 @@ export function BucketTooltip({ active, bucketCount = BUCKET_COUNT, laneRef, pay
         </time>
       </span>
       <strong className="flame-tooltip-activity">{activityLabel}</strong>
+      {point.isCapped && <span className="flame-tooltip-capped">Bar shortened to fit scale</span>}
       <span className="flame-tooltip-count"><span>Agent</span> {point.agent}</span>
       <span className="flame-tooltip-count"><span>Subagent</span> {point.subagent}</span>
       <span className="flame-tooltip-count"><span>Unclassified</span> {point.unclassified}</span>
       <span className="flame-tooltip-count"><span>Prompts</span> {point.prompts}</span>
+      {point.automatedRuns > 0 && <span className="flame-tooltip-count" title="Included in activity sessions"><span>Automated runs</span> {point.automatedRuns}</span>}
     </output>
   );
 }
@@ -455,20 +489,20 @@ function IntervalOverview({
     : primaryWork;
 
   function workRow(work) {
-    const label = work.summary ?? `${roleLabel(work.role)} session`;
+    const label = work.summary ?? (work.automatedRun ? "Automated run" : `${roleLabel(work.role)} session`);
     const contents = (
       <>
         <i className={`flame-key flame-key--${work.role}`} aria-hidden="true" />
         <span className="flame-detail__work-copy">
           <strong className={work.summary ? undefined : "flame-detail__work-generic"}>{label}</strong>
           <span>
-            <b>{roleLabel(work.role)}</b>
+            <b>{work.automatedRun ? "Automated run" : roleLabel(work.role)}</b>
             <span aria-hidden="true">·</span>
             <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
             <span aria-hidden="true">–</span>
             <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
             <span aria-hidden="true">·</span>
-            <small>{work.eventCount} {work.eventCount === 1 ? "event" : "events"}</small>
+            <small>{work.evidenceSource === "observed_ongoing_turn_interval" ? "Recorded ongoing turn window" : work.evidenceSource === "completed_turn_interval" ? "Recorded turn timing · transcript detail unavailable" : `${work.eventCount} ${work.eventCount === 1 ? "event" : "events"}`}</small>
           </span>
         </span>
         <span className="flame-detail__chevron" aria-hidden="true">›</span>
@@ -476,7 +510,7 @@ function IntervalOverview({
     );
     return (
       <li key={work.id}>
-        <button type="button" onClick={() => onOpenWork(work)}>{contents}</button>
+        <button type="button" disabled={["completed_turn_interval", "observed_ongoing_turn_interval"].includes(work.evidenceSource)} onClick={() => onOpenWork(work)}>{contents}</button>
         {work.pullRequest && (
           <PullRequestLink pullRequest={work.pullRequest} />
         )}
@@ -607,7 +641,7 @@ function WorkDetail({
       </header>
       <div className="flame-detail__work-heading">
         <p className="flame-detail__eyebrow">Session evidence</p>
-        <h2 id={headingId}>{roleLabel(work.role)} session</h2>
+        <h2 id={headingId}>{work.automatedRun ? "Automated run" : `${roleLabel(work.role)} session`}</h2>
         <div className="flame-detail__work-meta">
           <p>
             <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
@@ -746,10 +780,10 @@ const PersonLane = memo(function PersonLane({
   const headingId = `flame-person-${id}`;
   const points = useMemo(
     () => person.buckets.map((point) => ({
-      ...point,
+      ...capActivityForDisplay(point, peak),
       promptMarker: point.prompts > 0 ? 0 : null,
     })),
-    [person.buckets],
+    [person.buckets, peak],
   );
 
   const select = (point) => {
@@ -865,28 +899,49 @@ const PersonLane = memo(function PersonLane({
           />
           <Bar
             yAxisId="activity"
-            dataKey="agent"
+            dataKey="chartAgent"
             name="Agent"
             stackId="activity"
             fill="var(--flame-agent)"
             isAnimationActive={false}
-          />
+          >
+            {points.map((point) => (
+              <Cell
+                key={point.index}
+                fill={point.isCapped ? "var(--flame-capped)" : "var(--flame-agent)"}
+              />
+            ))}
+          </Bar>
           <Bar
             yAxisId="activity"
-            dataKey="subagent"
+            dataKey="chartSubagent"
             name="Subagent"
             stackId="activity"
             fill="var(--flame-subagent)"
             isAnimationActive={false}
-          />
+          >
+            {points.map((point) => (
+              <Cell
+                key={point.index}
+                fill={point.isCapped ? "var(--flame-capped)" : "var(--flame-subagent)"}
+              />
+            ))}
+          </Bar>
           <Bar
             yAxisId="activity"
-            dataKey="unclassified"
+            dataKey="chartUnclassified"
             name="Unclassified"
             stackId="activity"
             fill="var(--flame-unclassified)"
             isAnimationActive={false}
-          />
+          >
+            {points.map((point) => (
+              <Cell
+                key={point.index}
+                fill={point.isCapped ? "var(--flame-capped)" : "var(--flame-unclassified)"}
+              />
+            ))}
+          </Bar>
           <Line
             yAxisId="prompts"
             dataKey="promptMarker"
@@ -940,6 +995,7 @@ export default function FlameGraph({
   stale = false,
   onRefresh,
   rankBy = DEFAULT_PERSON_RANK,
+  showFullScale = false,
   timelineMeta,
 }) {
   const peopleScrollRef = useRef(null);
@@ -960,7 +1016,9 @@ export default function FlameGraph({
     state: "idle", items: [], nextCursor: null,
   });
   const width = useSharedChartWidth(peopleScrollRef, chartWidth);
-  const peak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
+  const typicalPeak = useMemo(() => getActivityDisplayScale(data.people), [data.people]);
+  const fullPeak = Math.max(1, data.globalPeak ?? getGlobalPeak(data.people));
+  const peak = showFullScale ? fullPeak : typicalPeak;
   const promptPeak = data.people.reduce(
     (peoplePeak, person) => person.buckets.reduce(
       (personPeak, { prompts }) => Math.max(personPeak, prompts),

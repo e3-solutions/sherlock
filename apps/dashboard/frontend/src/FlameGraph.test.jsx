@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import FlameGraph, {
   BucketCursor,
   BucketTooltip,
+  capActivityForDisplay,
   getAvailableChartWidth,
   getBucketCenterX,
   getBucketTooltipPlacement,
   formatActiveTime,
+  getActivityDisplayScale,
   rankPeople,
 } from "./FlameGraph.jsx";
 import { adaptFlamePayload, BUCKET_COUNT } from "./flame-data.js";
@@ -202,6 +204,46 @@ describe("bucket hover geometry", () => {
 });
 
 describe("FlameGraph", () => {
+  it("recognizes an isolated outlier when only two buckets have activity", () => {
+    expect(getActivityDisplayScale([{
+      buckets: [{ activity: 2 }, { activity: 800 }],
+    }])).toBe(2);
+  });
+
+  it("caps mixed-role stacks proportionally and leaves normal buckets alone", () => {
+    const extreme = { agent: 200, subagent: 600, unclassified: 0, activity: 800 };
+    const capped = capActivityForDisplay(extreme, 8);
+    expect([capped.chartAgent, capped.chartSubagent, capped.chartUnclassified]).toEqual([2, 6, 0]);
+    expect(capped.isCapped).toBe(true);
+    expect(extreme).toEqual({ agent: 200, subagent: 600, unclassified: 0, activity: 800 });
+    expect(capActivityForDisplay({ agent: 2, subagent: 1, unclassified: 0, activity: 3 }, 8))
+      .toMatchObject({ chartAgent: 2, chartSubagent: 1, chartUnclassified: 0, isCapped: false });
+  });
+
+  it("toggles between a shortened outlier bar and its full height without changing its count", () => {
+    const data = model();
+    data.people[0].buckets[1] = {
+      ...data.people[0].buckets[1], subagent: 800, activity: 800,
+    };
+    data.people[0].buckets[2] = {
+      ...data.people[0].buckets[2], agent: 2, activity: 2,
+    };
+    data.globalPeak = 800;
+
+    expect(getActivityDisplayScale(data.people)).toBe(4);
+    const capped = capActivityForDisplay(data.people[0].buckets[1], 4);
+    expect(capped.chartSubagent).toBe(4);
+    expect(capped.subagent).toBe(800);
+    expect(capActivityForDisplay(data.people[0].buckets[1], 800).chartSubagent).toBe(800);
+    const { container, rerender } = render(<FlameGraph data={data} chartWidth={1008} showFullScale={false} />);
+    expect(container.querySelectorAll('[fill="var(--flame-capped)"]').length).toBeGreaterThan(0);
+    expect(container.querySelector('[aria-label="Ada Lovelace activity timeline, 144 ten-minute buckets"]'))
+      .toBeInTheDocument();
+    rerender(<FlameGraph data={data} chartWidth={1008} showFullScale />);
+    expect(container.querySelectorAll('[fill="var(--flame-capped)"]')).toHaveLength(0);
+    expect(data.people[0].buckets[1].subagent).toBe(800);
+  });
+
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn((url) => {
       const request = new URL(url, "http://dashboard.test");
@@ -512,6 +554,18 @@ describe("FlameGraph", () => {
       "datetime",
       new Date(point.startMs).toISOString(),
     );
+  });
+
+  it("explains a shortened bar while retaining its exact observed count", () => {
+    const point = capActivityForDisplay({
+      ...model().people[0].buckets[0], activity: 800, agent: 200, subagent: 600,
+    }, 8);
+    render(<BucketTooltip active personName="Ada Lovelace" payload={[{ payload: point }]} />);
+
+    const tooltip = screen.getByRole("status");
+    expect(tooltip).toHaveTextContent("800 observed sessions");
+    expect(tooltip).toHaveTextContent("Bar shortened to fit scale");
+    expect(tooltip).toHaveAttribute("aria-label", expect.stringContaining("bar shortened to fit scale"));
   });
 
   it("anchors the tooltip to the same indexed bucket center as the hover guide", () => {
@@ -1114,4 +1168,24 @@ describe("FlameGraph", () => {
     expect(container.querySelector(".flame-graph")).toHaveAttribute("data-state", "stale");
     expect(screen.getByRole("heading", { name: "Ada Lovelace" })).toBeInTheDocument();
   });
+});
+
+describe("recovered timing evidence",()=>{
+ afterEach(()=>vi.unstubAllGlobals());
+ it.each([["completed_turn_interval", /Recorded turn timing/], ["observed_ongoing_turn_interval", /Recorded ongoing turn window/]])("shows %s without inventing transcript events or opening unavailable detail",async(evidenceSource,label)=>{
+  const data=model();data.people[0].buckets[0].prompts=0;
+  const fetchMock=vi.fn(async(url)=>{const u=new URL(url,"http://dashboard.test");const start=u.searchParams.get("start");return {ok:true,json:async()=>({personId:u.searchParams.get("personId"),start,snapshot:u.searchParams.get("snapshot"),work:[{id:"recovery:worker",sessionId:"worker",role:"subagent",firstAt:start,lastAt:new Date(Date.parse(start)+599999).toISOString(),eventCount:null,summary:"Recovered cloud turn activity",evidenceSource}],prompts:[]})};});
+  vi.stubGlobal("fetch",fetchMock);
+  const {container}=render(<FlameGraph data={data} chartWidth={1008}/>);
+  const wrapper=container.querySelector(".flame-person .recharts-wrapper");vi.spyOn(wrapper,"getBoundingClientRect").mockReturnValue(chartBounds);fireEvent.click(wrapper,{clientX:3,clientY:34});
+  const row=await screen.findByRole("button",{name:/Recovered cloud turn activity/});expect(row).toBeDisabled();expect(screen.getByText(label)).toBeInTheDocument();fireEvent.click(row);expect(fetchMock.mock.calls.some(([url])=>String(url).includes("/api/flame/work"))).toBe(false);expect(screen.queryByText("Recovered cloud usage")).not.toBeInTheDocument();
+ });
+});
+
+it("labels automated activity in the tooltip without claiming human prompts", () => {
+  const point = { ...model().people[0].buckets[0], prompts: 0, automatedRuns: 2 };
+  render(<BucketTooltip active personName="Ada Lovelace" payload={[{ payload: point }]} />);
+  expect(screen.getByRole("status")).toHaveTextContent("Automated runs 2");
+  expect(screen.getByRole("status")).toHaveTextContent("Prompts 0");
+  expect(screen.getByRole("status")).toHaveTextContent("4 observed sessions");
 });

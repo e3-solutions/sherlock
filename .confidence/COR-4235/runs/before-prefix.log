@@ -1,0 +1,54 @@
+
+ RUN  v4.1.10 /Users/aryagm/.codex/worktrees/7c79/sherlock/apps/dashboard/frontend
+
+ ❯ ../src/server/mcp-query-source.test.js (14 tests | 1 failed | 13 skipped) 5ms
+     × keeps a measured prefix separate from unknown totals after a discontinuity 4ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  ../src/server/mcp-query-source.test.js > Sherlock MCP query source > keeps a measured prefix separate from unknown totals after a discontinuity
+AssertionError: expected { …(7) } to match object { tokens: { input: null, …(4) }, …(2) }
+(6 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+-   "coverage": {
+-     "excludedUsageEvents": 2,
+-     "regressedCumulativeStreams": 1,
+-     "state": "partial",
+-   },
+-   "knownTokens": {
++   "tokens": {
+      "cachedInput": 0,
+      "input": 20,
+      "output": 0,
+      "reasoning": 0,
+      "total": 20,
+-   },
+-   "tokens": {
+-     "cachedInput": null,
+-     "input": null,
+-     "output": null,
+-     "reasoning": null,
+-     "total": null,
+    },
+  }
+
+ ❯ ../src/server/mcp-query-source.test.js:27:30
+     25|       excluded_usage_events: 2, missing_token_components: [],
+     26|     }], {}, { groupBy: "person_model", startAt: START, endAt: NOW, rea…
+     27|     expect(result.groups[0]).toMatchObject({
+       |                              ^
+     28|       tokens: { input: null, cachedInput: null, output: null, reasonin…
+     29|       knownTokens: { input: 20, cachedInput: 0, output: 0, reasoning: …
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 13 skipped (14)
+   Start at  17:22:37
+   Duration  668ms (transform 42ms, setup 122ms, import 42ms, tests 5ms, environment 419ms)
+

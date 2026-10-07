@@ -5,6 +5,7 @@ const chartRenderCounts = vi.hoisted(() => new Map());
 
 vi.mock("recharts", () => ({
   Bar: () => null,
+  Cell: () => null,
   ComposedChart: ({ "aria-label": ariaLabel }) => {
     chartRenderCounts.set(ariaLabel, (chartRenderCounts.get(ariaLabel) ?? 0) + 1);
     return (

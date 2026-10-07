@@ -1,0 +1,88 @@
+{
+  "version": 3,
+  "task_title": "Codex source discovery and durable ingestion receipts",
+  "mode": "standard",
+  "outcome": "Collector implementation verified locally; historical remote recovery and client installation remain unverified.",
+  "changes": [
+    "Discover automated, archived and exact continuing native IDs without product-source filtering.",
+    "Persist validated source receipts and token-payload presence before deleting uploaded spool bytes; preserve dead-letter evidence.",
+    "Add read-only byte/hash/native-ID receipt inventory and exact-session backfill with explicit incomplete status."
+  ],
+  "evidence": [
+    {
+      "obligation_id": "P1",
+      "status": "pass",
+      "details": "Real SQLite and native rollout fixtures exercise source categories, archived/exact IDs beyond recency/database limits, timestamp schema drift and no-hook backfill.",
+      "artifacts": [
+        ".confidence/collection-inventory/runs/collector-release.log"
+      ],
+      "run_ids": [
+        "collector-release"
+      ],
+      "diagnostic_run_ids": [
+        "discovery-before"
+      ]
+    },
+    {
+      "obligation_id": "P2",
+      "status": "pass",
+      "details": "Receipt ordering, retry, mismatch, malformed metadata, token fragments, semantic conflict and immutable dead-letter filesystem tests pass.",
+      "artifacts": [
+        ".confidence/collection-inventory/runs/collector-release.log"
+      ],
+      "run_ids": [
+        "collector-release"
+      ],
+      "diagnostic_run_ids": []
+    },
+    {
+      "obligation_id": "P3",
+      "status": "pass",
+      "details": "Discovery/capture/drain/inventory tests cover appended and changed bytes, missing identity, conflicting native rows, unsupported/missing roots and empty discovery.",
+      "artifacts": [
+        ".confidence/collection-inventory/runs/collector-release.log"
+      ],
+      "run_ids": [
+        "collector-release"
+      ],
+      "diagnostic_run_ids": []
+    }
+  ],
+  "tests": {
+    "passed": [
+      "153 collector tests passed in captured final run.",
+      "Python compilation and diff checks passed."
+    ],
+    "failed": [],
+    "not_run": []
+  },
+  "simplicity": {
+    "code_gate": "pass",
+    "test_gate": "pass",
+    "notes": "Reuses capture, spool and validated server receipt contract; no server schema, raw telemetry or normalization change. Tests cross SQLite/filesystem/capture/drain boundaries."
+  },
+  "review": {
+    "required": true,
+    "reason": "Standard-mode ingestion evidence and durable data change.",
+    "roles": [
+      "critic",
+      "adversarial_reviewer"
+    ],
+    "findings": [
+      "Receipt reviewer findings fixed: semantic conflicts, malformed evidence, durable filesystem transitions and dead-letter preservation.",
+      "Inventory reviewer findings fixed: empty discovery, absent native attribution, shared-path native IDs, unsupported root completion, per-candidate limits and empty CLI selector.",
+      "Source path inode is rechecked after reading to detect replacement.",
+      "Final independent verdict: no blockers. Added exact rollout source-kind receipt guard."
+    ]
+  },
+  "risks": [
+    "Vansh supplied native ID had zero matching Sherlock sessions and ingest batches at direct Supabase inspection. This does not establish why his remote collector missed it. Source file and collector upload diagnostics are not accessible here.",
+    "Sharad native ID is still unavailable. No remote sessions have been claimed recovered or remotely installed.",
+    "Collector runtime must be reinstalled on source machines; dashboard deployment alone does not update copied runtimes.",
+    "Older acknowledged batches have no retained local receipt. Existing cursors are never rewound and historical receipts are not fabricated.",
+    "Inventory is bounded and trigger-driven. Index truncation conservatively prevents complete even when filesystem discovery might overlap; omitted_sources_or_databases is not a verified count of missing sessions.",
+    "Token payload presence is scoped raw evidence, not a token amount or billing fact."
+  ],
+  "rollback": "Revert this collector change and reinstall previous runtime; preserve queue, receipts and raw source files.",
+  "user_decisions": []
+}

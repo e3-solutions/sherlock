@@ -4,6 +4,7 @@ import {
   capacityRetryMilliseconds,
   chooseLane,
   chooseOverloadJobKind,
+  claimNormalJob,
   claimOverloadJob,
   DatabaseRecoveryCircuit,
   databaseRetryMilliseconds,
@@ -851,6 +852,83 @@ Deno.test("live capacity is reserved and backfill remains bounded", () => {
   );
 });
 
+Deno.test("short jobs in both saturated lanes receive bounded admissions", () => {
+  for (const liveReserved of [11, 6]) {
+    const config = { concurrency: 12, liveReserved };
+    let previous: "live" | "backfill" | undefined;
+    const admissions: string[] = [];
+    // Both queues stay nonempty, but every job finishes before the next poll.
+    for (let pass = 0; pass < 20; pass++) {
+      const lane = chooseLane(0, 0, config, previous);
+      admissions.push(lane);
+      previous = lane;
+    }
+    for (let pass = 1; pass < admissions.length; pass++) {
+      assert(admissions[pass] !== admissions[pass - 1]);
+    }
+    assert(chooseLane(0, 12 - liveReserved, config, "live") === "live");
+    assert(chooseLane(liveReserved, 0, config, "backfill") === "backfill");
+  }
+});
+
+Deno.test("normal admission falls back to the actual lane and respects its cap", async () => {
+  const calls: string[] = [];
+  const liveJob = {
+    workload_class: "live",
+    job_kind: "normalize",
+  } as TelemetryJob;
+  const queue = {
+    claim(lane: string) {
+      calls.push(lane);
+      return Promise.resolve(lane === "live" ? liveJob : null);
+    },
+  };
+  const config = {
+    concurrency: 12,
+    liveReserved: 11,
+    workerId: "test",
+    leaseSeconds: 120,
+  } as WorkerConfig;
+  const actual = await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    "live",
+  );
+  assert(actual === liveJob);
+  assert(calls.join(",") === "backfill,live");
+  calls.length = 0;
+  await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    actual!.workload_class,
+  );
+  assert(calls.join(",") === "backfill,live");
+  const active = new Map<
+    Promise<void>,
+    Pick<TelemetryJob, "job_kind" | "workload_class">
+  >();
+  active.set(Promise.resolve(), {
+    workload_class: "backfill",
+    job_kind: "normalize",
+  });
+  calls.length = 0;
+  const empty = {
+    claim(lane: string) {
+      calls.push(lane);
+      return Promise.resolve(null);
+    },
+  };
+  assert(
+    await claimNormalJob(empty as never, active, config, () => {}, "live") ===
+      null,
+  );
+  assert(calls.join(",") === "live,live");
+});
+
 Deno.test("retry backoff grows exponentially and caps", () => {
   assert(retryDelaySeconds(1, 5, 300) === 5);
   assert(retryDelaySeconds(4, 5, 300) === 40);
@@ -1019,4 +1097,129 @@ Deno.test("targeted scheduling has no fifty-session ceiling", async () => {
     },
   );
   assert(reduced === 75 && result.session_count === 75);
+});
+
+Deno.test("short jobs receive bounded kind fairness in normal and overload modes", async () => {
+  const config = {
+    concurrency: 12,
+    liveReserved: 11,
+    normalizeReserved: 11,
+    workerId: "fair",
+    leaseSeconds: 120,
+  } as WorkerConfig;
+  for (const overloaded of [false, true]) {
+    let previousKind: "normalize" | "reduce" | undefined;
+    let previousLane: "live" | "backfill" | undefined;
+    const admitted: string[] = [];
+    const queue = {
+      claim(
+        lane: "live" | "backfill",
+        _owner: string,
+        _lease: number,
+        kind: "normalize" | "reduce",
+      ) {
+        assert(kind !== undefined, "kind must be explicit");
+        return Promise.resolve(
+          { job_kind: kind, workload_class: lane } as TelemetryJob,
+        );
+      },
+      claimLiveNormalizationFrontier() {
+        return Promise.resolve(
+          { job_kind: "normalize", workload_class: "live" } as TelemetryJob,
+        );
+      },
+    };
+    for (let pass = 0; pass < 20; pass++) {
+      // Every previous job finishes before the next admission; occupancy is zero.
+      const job = overloaded
+        ? await claimOverloadJob(
+          queue as never,
+          new Map(),
+          config,
+          () => {},
+          previousKind,
+        )
+        : await claimNormalJob(
+          queue as never,
+          new Map(),
+          config,
+          () => {},
+          previousLane,
+          previousKind,
+        );
+      assert(job !== null);
+      previousKind = job.job_kind;
+      previousLane = job.workload_class;
+      admitted.push(job.job_kind);
+    }
+    assert(admitted.filter((kind) => kind === "normalize").length === 10);
+    assert(admitted.filter((kind) => kind === "reduce").length === 10);
+  }
+});
+
+Deno.test("overload fallback cannot exceed the single reduction reservation", async () => {
+  let ordinaryClaims = 0;
+  const queue = {
+    claimLiveNormalizationFrontier: () => Promise.resolve(null),
+    claim: () => {
+      ordinaryClaims++;
+      return Promise.resolve(null);
+    },
+  };
+  const active = new Map<
+    Promise<void>,
+    Pick<TelemetryJob, "job_kind" | "workload_class">
+  >();
+  active.set(Promise.resolve(), { job_kind: "reduce", workload_class: "live" });
+  const job = await claimOverloadJob(
+    queue as never,
+    active,
+    {
+      normalizeReserved: 11,
+      workerId: "test",
+      leaseSeconds: 120,
+    } as WorkerConfig,
+  );
+  assert(job === null);
+  assert(ordinaryClaims === 0);
+});
+
+Deno.test("kind fallback accounts for the actual admission across both lanes", async () => {
+  const calls: string[] = [];
+  const config = {
+    concurrency: 12,
+    liveReserved: 11,
+    workerId: "test",
+    leaseSeconds: 120,
+  } as WorkerConfig;
+  const queue = {
+    claim(lane: string, _owner: string, _lease: number, kind: string) {
+      calls.push(`${lane}:${kind}`);
+      return Promise.resolve(
+        kind === "normalize"
+          ? { job_kind: kind, workload_class: lane } as TelemetryJob
+          : null,
+      );
+    },
+  };
+  const actual = await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    "live",
+    "normalize",
+  );
+  assert(actual?.job_kind === "normalize");
+  assert(calls.join(",") === "backfill:reduce,live:reduce,backfill:normalize");
+  calls.length = 0;
+  await claimNormalJob(
+    queue as never,
+    new Map(),
+    config,
+    () => {},
+    actual!.workload_class,
+    actual!.job_kind,
+  );
+  assert(calls[0] === "live:reduce");
 });

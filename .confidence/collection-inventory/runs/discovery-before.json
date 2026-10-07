@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "id": "discovery-before",
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests/collector",
+    "-p",
+    "test_codex_inventory.py"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/7c79/sherlock",
+  "started_at": "2026-09-15T04:22:36.730182Z",
+  "ended_at": "2026-09-15T04:22:36.896561Z",
+  "exit_code": 1,
+  "termination_reason": null,
+  "resolved_executable": "/opt/homebrew/bin/python3",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/7c79/sherlock",
+    "sha256": "180f24af1d33b03464d5af4e4d803114c32db1c6a69706dd4fd080005f08ffef"
+  },
+  "log": "runs/discovery-before.log",
+  "log_sha256": "46a7ca7cb7a5188c84190402cc5c3c20e3c84d9c3b9a2951aeb0eba1a69e2799"
+}

@@ -167,7 +167,7 @@ Deno.test({
            actor_role, occurred_at, observed_at, server_received_at,
            message_role, message_origin, content_sha256, content_byte_size,
            content_excerpt
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',0,100,'message',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v3',0,100,'message',
            'user_message','unknown',$4,$4,$4,'user','human',$5,12,'Visible prompt')
          returning id::text id`,
         [
@@ -203,7 +203,7 @@ Deno.test({
            projection_index, canonical_scope_key, logical_event_key,
            source_priority, event_kind, event_subtype, actor_role,
            occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',1,'micro-scope',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v3',1,'micro-scope',
            'micro-logical',100,'reasoning','reasoning','unknown',
            $4::text::timestamptz,$4::text::timestamptz,$4::text::timestamptz)
          returning id::text id`,
@@ -221,7 +221,7 @@ Deno.test({
            projection_index, canonical_scope_key, logical_event_key,
            source_priority, event_kind, event_subtype, actor_role,
            occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',2,'micro-scope',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v3',2,'micro-scope',
            'micro-logical',100,'reasoning','reasoning','unknown',
            $4::text::timestamptz,$4::text::timestamptz,$4::text::timestamptz)
          returning id::text id`,
@@ -340,6 +340,7 @@ Deno.test({
         workspaceId,
         activate: false,
         windowStart: proofWindowStart,
+        windowEnd: now,
       });
       await sql.unsafe(
         `insert into telemetry.sessions (
@@ -359,7 +360,7 @@ Deno.test({
            workspace_id, session_id, source_record_id, normalizer_version,
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',8,100,'lifecycle',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v3',8,100,'lifecycle',
            'turn_complete','primary',$4,$4,$4)`,
         [workspaceId, oldSessionId, nativeRows[0], "2026-08-18T18:01:00Z"],
       );
@@ -367,6 +368,7 @@ Deno.test({
         workspaceId,
         activate: false,
         windowStart: new Date("2026-08-19T18:00:00Z"),
+        windowEnd: now,
       });
       const oldReceipts = await sql.unsafe(
         `select count(*)::int count
@@ -402,6 +404,7 @@ Deno.test({
             workspaceId,
             activate: true,
             windowStart: proofWindowStart,
+            windowEnd: now,
           }),
         "session metadata changes must make activation proof fail",
       );
@@ -421,6 +424,7 @@ Deno.test({
         workspaceId,
         activate: false,
         windowStart: proofWindowStart,
+        windowEnd: now,
       });
 
       await sql.unsafe(
@@ -429,7 +433,7 @@ Deno.test({
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
          ) overriding system value values (
-           $1,$2,$3,$4,'sherlock.codex-rollout.v2',0,100,'lifecycle',
+           $1,$2,$3,$4,'sherlock.codex-rollout.v3',0,100,'lifecycle',
            'turn_started','unknown',$5,$5,$5
          )`,
         [
@@ -446,6 +450,7 @@ Deno.test({
             workspaceId,
             activate: true,
             windowStart: proofWindowStart,
+            windowEnd: now,
           }),
         "a committed lower-id source event must make activation proof fail",
       );
@@ -471,6 +476,7 @@ Deno.test({
         workspaceId,
         activate: true,
         windowStart: proofWindowStart,
+        windowEnd: now,
       });
       const activations = await sql.unsafe(
         `select count(*)::int count
@@ -538,7 +544,7 @@ Deno.test({
            workspace_id, session_id, source_record_id, normalizer_version,
            projection_index, source_priority, event_kind, event_subtype,
            actor_role, occurred_at, observed_at, server_received_at
-         ) values ($1,$2,$3,'sherlock.codex-rollout.v2',9,100,'lifecycle',
+         ) values ($1,$2,$3,'sherlock.codex-rollout.v3',9,100,'lifecycle',
            'turn_complete','worker',$4,$4,$4)`,
         [workspaceId, sessionId, nativeRows[0], "2026-08-21T20:00:00Z"],
       );

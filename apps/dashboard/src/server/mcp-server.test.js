@@ -12,7 +12,7 @@ function payload() {
   return {
     start: START,
     read: "2026-08-19T03:30:08.000Z",
-    snapshot: "v1.snapshot",
+    snapshot: `v4.${Buffer.from(JSON.stringify(["100:100:", "2026-08-19T03:30:08.000Z"])).toString("base64url")}`,
     nextCursor: null,
     coverage: {
       evidence: "observed_events",
@@ -165,4 +165,13 @@ describe("Bonaparte MCP tools", () => {
     expect(protocol.handler).toBeTypeOf("function");
     await expect(protocol.close()).resolves.toBeUndefined();
   });
+});
+
+it("exposes and documents provider usage separately from token queries", async () => {
+ const data={schemaVersion:"provider-plan-usage-v1",snapshots:[{weeklyLimitPercent:19.44527799749026,tokenCountsAvailable:false}]};
+ const fetchProviderUsage=vi.fn().mockResolvedValue(data);const tools=registeredTools({fetchProviderUsage});
+ const signal=new AbortController().signal;
+ expect((await tools.get("list_provider_usage").handler({}, {signal})).structuredContent).toEqual(data);
+ expect(fetchProviderUsage).toHaveBeenCalledWith({signal});
+ expect((await tools.get("documentation").handler({})).structuredContent.tools.map(x=>x.name)).toContain("list_provider_usage");
 });

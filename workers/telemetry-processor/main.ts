@@ -270,7 +270,9 @@ export function chooseOverloadJobKind(
   activeNormalize: number,
   activeReduce: number,
   normalizeReserved: number,
+  previousAdmission?: JobKind,
 ): JobKind {
+  if (activeReduce === 0 && previousAdmission === "normalize") return "reduce";
   if (activeNormalize < normalizeReserved) return "normalize";
   if (activeReduce < 1) return "reduce";
   return "normalize";
@@ -464,11 +466,13 @@ export function chooseLane(
   activeLive: number,
   activeBackfill: number,
   config: Pick<WorkerConfig, "concurrency" | "liveReserved">,
+  previousAdmission?: WorkloadClass,
 ): WorkloadClass {
-  if (activeLive < config.liveReserved) return "live";
   const backfillReserved = config.concurrency - config.liveReserved;
-  if (activeBackfill < backfillReserved) return "backfill";
-  return "live";
+  if (activeBackfill >= backfillReserved) return "live";
+  if (activeLive >= config.liveReserved) return "backfill";
+  // Occupancy alone cannot ensure progress when jobs finish between polls.
+  return previousAdmission === "live" ? "backfill" : "live";
 }
 
 export function alternateLane(
@@ -512,6 +516,8 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     )
     : null;
   let processor: TelemetryProcessor | null = null;
+  let previousNormalAdmission: WorkloadClass | undefined;
+  let previousKindAdmission: JobKind | undefined;
   const active = new Map<
     Promise<void>,
     Pick<TelemetryJob, "job_kind" | "workload_class">
@@ -764,14 +770,19 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
               active,
               config,
               () => progressWatchdog.touch(),
+              previousKindAdmission,
             )
             : await claimNormalJob(
               queue,
               active,
               config,
               () => progressWatchdog.touch(),
+              previousNormalAdmission,
+              previousKindAdmission,
             );
           if (!job) break;
+          previousKindAdmission = job.job_kind;
+          if (!overload.active) previousNormalAdmission = job.workload_class;
           admissions += 1;
           claimedAny = true;
           const task = runJob(
@@ -864,32 +875,47 @@ export async function superviseWorker(
   }
 }
 
-async function claimNormalJob(
+export async function claimNormalJob(
   queue: PostgresJobQueue,
   active: Map<Promise<void>, Pick<TelemetryJob, "job_kind" | "workload_class">>,
   config: WorkerConfig,
   onProgress: () => void = () => {},
+  previousAdmission?: WorkloadClass,
+  previousKindAdmission?: JobKind,
 ): Promise<TelemetryJob | null> {
   const activeLive =
     [...active.values()].filter((job) => job.workload_class === "live").length;
   const activeBackfill = active.size - activeLive;
-  const preferred = chooseLane(activeLive, activeBackfill, config);
-  const preferredJob = await queue.claim(
-    preferred,
-    config.workerId,
-    config.leaseSeconds,
+  const preferred = chooseLane(
+    activeLive,
+    activeBackfill,
+    config,
+    previousAdmission,
   );
-  onProgress();
-  if (preferredJob) return preferredJob;
   const alternate = alternateLane(preferred, activeBackfill, config);
-  if (!alternate) return null;
-  const alternateJob = await queue.claim(
-    alternate,
-    config.workerId,
-    config.leaseSeconds,
-  );
-  onProgress();
-  return alternateJob;
+  const preferredKind = previousKindAdmission === "normalize"
+    ? "reduce"
+    : "normalize";
+  // Try both eligible lanes before falling back to the other kind. Otherwise
+  // continuously available short normalization jobs can hide all reductions.
+  for (
+    const kind of [
+      preferredKind,
+      preferredKind === "normalize" ? "reduce" : "normalize",
+    ] as JobKind[]
+  ) {
+    for (const lane of alternate ? [preferred, alternate] : [preferred]) {
+      const job = await queue.claim(
+        lane,
+        config.workerId,
+        config.leaseSeconds,
+        kind,
+      );
+      onProgress();
+      if (job) return job;
+    }
+  }
+  return null;
 }
 
 export async function claimOverloadJob(
@@ -897,6 +923,7 @@ export async function claimOverloadJob(
   active: Map<Promise<void>, Pick<TelemetryJob, "job_kind" | "workload_class">>,
   config: WorkerConfig,
   onProgress: () => void = () => {},
+  previousKindAdmission?: JobKind,
 ): Promise<TelemetryJob | null> {
   const jobs = [...active.values()];
   const activeNormalize =
@@ -906,6 +933,7 @@ export async function claimOverloadJob(
     activeNormalize,
     activeReduce,
     config.normalizeReserved,
+    previousKindAdmission,
   );
   const claim = (jobKind: JobKind): Promise<TelemetryJob | null> =>
     jobKind === "normalize"
@@ -922,9 +950,9 @@ export async function claimOverloadJob(
   const preferredJob = await claim(preferred);
   onProgress();
   if (preferredJob) return preferredJob;
-  const alternateJob = await claim(
-    preferred === "normalize" ? "reduce" : "normalize",
-  );
+  const alternateKind = preferred === "normalize" ? "reduce" : "normalize";
+  if (alternateKind === "reduce" && activeReduce >= 1) return null;
+  const alternateJob = await claim(alternateKind);
   onProgress();
   return alternateJob;
 }

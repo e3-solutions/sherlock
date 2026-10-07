@@ -86,7 +86,7 @@ def create_threads_database(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class DiscoveryTests(unittest.TestCase):
-    def test_discovers_recent_unarchived_rollouts_without_history_scan(self):
+    def test_discovers_recent_rollouts_including_archived_without_history_scan(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             codex_home = root / "codex"
@@ -122,8 +122,8 @@ class DiscoveryTests(unittest.TestCase):
 
             result = discover_rollouts(codex_home)
 
-            self.assertEqual(result.paths, (recent.resolve(),))
-            self.assertEqual(len(result.native_session_ids), 1)
+            self.assertEqual(set(result.paths), {recent.resolve(), archived.resolve()})
+            self.assertEqual(len(result.native_session_ids), 2)
             self.assertEqual(result.errors, ())
 
     def test_history_scan_discovers_recent_unindexed_and_archived_rollouts(self):

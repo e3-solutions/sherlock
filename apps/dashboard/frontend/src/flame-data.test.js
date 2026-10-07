@@ -463,3 +463,26 @@ describe("chart helpers", () => {
     expect(adapted.globalPeak).toBe(6);
   });
 });
+
+it.each(["completed_turn_interval", "observed_ongoing_turn_interval"])("accepts %s rows with explicitly unknown event counts",(evidenceSource)=>{
+ const start="2026-10-05T05:30:00.000Z";
+ const row={id:"recovery:worker",sessionId:"worker",role:"subagent",firstAt:start,lastAt:"2026-10-05T05:39:59.999Z",eventCount:null,summary:"Recovered cloud turn activity",evidenceSource};
+ const input={personId:"owner",start,snapshot:"snapshot",work:[row],prompts:[]};
+ const expected={personId:"owner",startMs:Date.parse(start),snapshot:"snapshot",promptCount:0};
+ expect(adaptIntervalEvidence(input,expected).work[0]).toMatchObject({eventCount:null,evidenceSource});
+ expect(()=>adaptIntervalEvidence({...input,work:[{...row,eventCount:2}]},expected)).toThrow();
+});
+
+it("keeps automated runs within activity and leaves their human prompt stems absent", () => {
+  const dayBuckets = buckets();
+  dayBuckets[0] = [2, 1, 0, 0];
+  const automatic = Array(BUCKET_COUNT).fill(0);
+  automatic[0] = 2;
+  const source = payload({ people: [person({ activeSeconds: 600, buckets: dayBuckets, automatedRuns: automatic, automatedRunSessionCount: 2 })] });
+  const view = adaptFlamePayload(source).people[0];
+  expect(view.buckets[0]).toMatchObject({ activity: 3, prompts: 0, automatedRuns: 2 });
+  expect(view.automatedRunSessionCount).toBe(2);
+  expect(view.activeSeconds).toBe(600);
+  source.people[0].automatedRuns[1] = 1;
+  expect(() => adaptFlamePayload(source)).toThrow("a subset of activity sessions");
+});

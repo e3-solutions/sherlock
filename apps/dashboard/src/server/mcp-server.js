@@ -3,7 +3,7 @@ import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 
 import { FlameSourceError } from "./flame-source.js";
-import { MCP_QUERY_SCHEMA_VERSION } from "./mcp-query-source.js";
+import { MCP_QUERY_SCHEMA_VERSION, USAGE_DERIVATION_VERSION } from "./mcp-query-source.js";
 import {
   MCP_PROMPT_SCHEMA_VERSION,
   MCP_USAGE_SCHEMA_VERSION,
@@ -46,11 +46,14 @@ const usageOutputSchema = z.object({
     readAt: ISO_TIMESTAMP,
   }).strict(),
   provenance: z.object({
-    projectionVersion: z.literal("sherlock.codex-rollout.v2"),
+    recovery: z.object({basis:z.enum(["recovered_completed_turn_intervals", "recovered_observed_turn_intervals"]),sourceHashes:z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(100),latestCompletedAt:ISO_TIMESTAMP.optional(),latestObservedAt:ISO_TIMESTAMP.optional()}).strict().optional(),
+    projectionVersion: z.enum(["frame-evidence-v2", "frame-evidence-v4", "frame-evidence-v5",
+      "raw-snapshot-v1", "raw-snapshot-v3", "raw-snapshot-v4", "raw-snapshot-v5"]),
+    originClassificationVersion: z.literal("bonaparte-origin-v1").optional(),
   }).strict(),
   coverage: z.object({
     state: z.literal("partial"),
-    basis: z.literal("observed_canonical_events"),
+    basis: z.enum(["observed_canonical_events", "observed_canonical_events_and_recovered_completed_turns", "observed_canonical_events_and_recovered_observed_turns"]),
     limitations: z.array(z.literal("event_presence_not_continuous_attention")),
   }).strict(),
   people: z.array(z.object({
@@ -61,6 +64,8 @@ const usageOutputSchema = z.object({
     unclassifiedSessionCount: z.number().int().nonnegative(),
     primaryHumanPromptCount: z.number().int().nonnegative(),
     promptBuckets: z.array(promptBucketSchema).max(144),
+    automatedRunSessionCount: z.number().int().nonnegative().optional().describe("Distinct automated runs, already included in activity session counts."),
+    automatedRunBuckets: z.array(z.object({ start: ISO_TIMESTAMP, automatedRunSessionCount: z.number().int().nonnegative() }).strict()).max(144).optional(),
   }).strict()).max(20),
   nextCursor: CURSOR.nullable(),
 }).strict();
@@ -228,10 +233,33 @@ const usageGroupSchema = z.object({
   }).strict(),
   sessionCount: z.number().int().nonnegative(),
   usageEventCount: z.number().int().nonnegative(),
+  knownTokens: z.object({
+    input: z.number().int().nonnegative(),
+    cachedInput: z.number().int().nonnegative(),
+    output: z.number().int().nonnegative(),
+    reasoning: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  }).strict(),
+  coverage: z.object({
+    state: z.enum(["complete", "partial"]),
+    reasons: z.array(z.enum([
+      "cumulative_baseline_missing", "cumulative_counter_regressed", "token_component_missing",
+      "source_record_conflict", "model_context_missing",
+    ])).max(5),
+    excludedUsageEvents: z.number().int().nonnegative(),
+    missingCumulativeBaselines: z.number().int().nonnegative(),
+    regressedCumulativeStreams: z.number().int().nonnegative(),
+    missingTokenComponents: z.array(z.enum([
+      "input", "cachedInput", "output", "reasoning", "total",
+    ])).max(5),
+    conflictingSourceEvents: z.number().int().nonnegative(),
+    missingModelObservations: z.number().int().nonnegative(),
+  }).strict(),
 }).strict();
 
 const queryUsageOutputSchema = z.object({
   schemaVersion: z.literal(MCP_QUERY_SCHEMA_VERSION),
+  usageDerivationVersion: z.literal(USAGE_DERIVATION_VERSION),
   window: queryWindowOutputSchema,
   groupBy: z.enum(["person", "model", "person_model"]),
   groups: z.array(usageGroupSchema).max(200),
@@ -282,8 +310,11 @@ const QUERY_DOCUMENTATION = Object.freeze({
   ],
   guidance: [
     "Call coverage before interpreting an empty or incomplete usage result.",
+    "Activity evidence can include recovered completed turn intervals. These are distinct-thread counts per bucket, not simultaneous peak counts or token observations. Pauses and unfinished turns are excluded; already-imported native sessions are excluded to avoid double counting.",
     "Query v1 currently reports observed data as partial because terminal normalization failures are not yet included in its freshness receipt.",
     "Use query_usage for token/model questions and list_sessions/get_session for metadata drill-down.",
+    "Usage groups carry arithmetic/model coverage. Null tokens mean the total is unknown; knownTokens retains only accepted contributions, and zero knownTokens is not proof of no usage. No post-regression recovery is counted without a verified counter epoch.",
+    "Codex model attribution follows preceding native turn context, not batch or session model hints. Missing context is grouped as unknown. Group coverage complete is not collector completeness or billing evidence.",
   ],
 });
 
@@ -370,6 +401,15 @@ function failure(error, { query = false } = {}) {
 }
 
 export function registerBonaparteTools(server, source) {
+  if (typeof source.fetchProviderUsage === "function") server.registerTool("list_provider_usage", {
+    title: "Recovered provider plan usage",
+    description: "Read immutable provider billing snapshots. Weekly allowance percentages are separate from token counts. Check dataStatus and dataAsOf; allowance windows and descendant inclusion are unknown. Never add these percentages to token totals or across threads.",
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY_ANNOTATIONS,
+  }, async (_args, context = {}) => {
+    try { return success(await source.fetchProviderUsage({ signal: context.signal })); }
+    catch (error) { return failure(error, { query: true }); }
+  });
+
   server.registerTool(
     "documentation",
     {
@@ -379,7 +419,11 @@ export function registerBonaparteTools(server, source) {
       outputSchema: documentationOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => success(QUERY_DOCUMENTATION),
+    async () => success(typeof source.fetchProviderUsage === "function" ? {
+      ...QUERY_DOCUMENTATION,
+      tools: [...QUERY_DOCUMENTATION.tools, { name: "list_provider_usage", purpose: "Read recovered provider plan percentages with cutoff and coverage; separate from tokens." }],
+      guidance: [...QUERY_DOCUMENTATION.guidance, "Provider snapshots may be partial or stale. Allowance window and descendant inclusion are unknown; do not sum percentages across threads or convert them to tokens."],
+    } : QUERY_DOCUMENTATION),
   );
 
   server.registerTool(

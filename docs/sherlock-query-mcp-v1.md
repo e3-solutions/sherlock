@@ -63,13 +63,48 @@ Claude message-scoped usage is incremental and is summed. Codex session-scoped
 usage is cumulative and is differenced within each independent usage stream.
 Normalizer version is projection provenance, not a separate native counter, so
 an active pre-cutover v2 fallback continues the same v1 cumulative stream.
-The last pre-window observation is the baseline. A session beginning inside the
-window has an implicit zero baseline. A missing older baseline contributes only
-subsequent provable non-negative deltas. A cumulative stream that regresses is
-omitted from the token totals for that window. Both conditions force `partial`
-coverage; neither is silently represented as a complete zero-usage result.
-Regression coverage counts distinct streams across model groups: one stream
-spanning two models remains one regressed stream.
+Usage derivation `sherlock.usage-reconciliation.v1` reads the history of sessions
+with in-window usage so uncertainty cannot disappear when a window moves. It
+collapses repeated native occurrences by session scope, native byte range, full
+record hash, event kind, and projection index. Upload batch/transport identifiers
+and normalizer versions do not create additional native observations. Distinct
+source positions remain distinct even when their bytes match. Conflicting hashes
+at the same native range, or partially overlapping native record ranges, make
+subsequent attribution/arithmetic uncertain. The full available source history
+is reconciled before applying both timestamp bounds, including observations
+whose timestamps run backward relative to their native positions. Each delta
+belongs to the timestamp window of its current observation; that does not prove
+when the underlying work occurred.
+
+Codex models come from the preceding `turn_context` in native source order,
+including context from earlier uploads and before the window. Batch-final and
+session-current model hints are not attribution evidence. Without a preceding
+context, usage is grouped as `unknown`. Existing immutable projections are not
+rewritten; the response records `usageDerivationVersion`.
+
+A session beginning inside the window has an implicit zero baseline. A missing
+older baseline makes the affected group's `tokens` unknown (`null`), while
+subsequent measurable differences remain in `knownTokens`. At the first decrease
+in any cumulative component, retain only the known prefix and exclude that
+observation and the remainder of the stream. No clean counter reset or new epoch
+is inferred from a decrease alone. In particular, 100 → 40 → 110 must not become
+100 + 70. A later model group affected by the discontinuity returns null tokens;
+an earlier unaffected group retains its measured tokens. Regrouping by person
+preserves both uncertainty and the summed known prefixes. Window totals are
+additive only when every participating total is non-null and has complete
+arithmetic coverage. `knownTokens` must not be added across windows whose
+baseline coverage differs: a narrow window may exclude an initial cumulative
+value that a wider window containing the session start can include.
+
+Each group has `knownTokens` and `coverage`. Group coverage describes arithmetic
+and model attribution only: `complete` is not collector completeness. Reasons
+include `cumulative_baseline_missing`, `cumulative_counter_regressed`,
+`token_component_missing`, `source_record_conflict`, and `model_context_missing`.
+`excludedUsageEvents` counts observations with at least one excluded token
+contribution; `conflictingSourceEvents` counts observations affected by a source
+position conflict, including its suffix. A numeric zero in `knownTokens` means
+no accepted contribution, not zero work. Never replace null `tokens` with
+`knownTokens` and present the result as a complete total.
 
 Token fields are reported separately as `input`, `cachedInput`, `output`,
 `reasoning`, and provider-reported `total`. Callers must not assume the component
@@ -105,10 +140,11 @@ health probing.
 - A native session can have multiple file streams and repeated identical
   records. File identity alone cannot prove independent counters or distinguish
   a copied transcript from a new lineage; never sum per-file totals as a repair.
-- Codex v1/v2 event models may inherit the final context in a transport batch;
-  the query can also fall back to session-level model metadata. Model-group
-  attribution is not yet invariant to batching. Correcting that requires a new
-  derivation version and validated reprocessing, not mutation of old facts.
+- Codex v1/v2 stored event models remain batch-level hints. The versioned usage
+  derivation corrects the query using native turn context; other consumers must
+  not treat those stored hints as historical per-event model facts.
+- Recovering post-discontinuity usage requires a provenance-backed counter epoch.
+  Until then, known prefixes are intentionally incomplete rather than guessed.
 - Cross-system comparisons must align interval bounds, provider coverage,
   identity mappings, component semantics, and exclusions. Neither source's
   partial aggregate is a completeness oracle or a productivity ranking.

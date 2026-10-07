@@ -360,7 +360,7 @@ Deno.test({
       await sql.unsafe(
         `insert into processing.telemetry_jobs (
            workspace_id, job_kind, batch_id, normalizer_version, workload_class
-         ) values ($1, 'normalize', $2, 'sherlock.codex-rollout.v2', 'live')
+         ) values ($1, 'normalize', $2, 'sherlock.codex-rollout.v3', 'live')
          on conflict (workspace_id, batch_id, normalizer_version)
            where job_kind = 'normalize' do nothing`,
         [workspaceId, batchId],
@@ -557,7 +557,7 @@ Deno.test({
       assert(claimed !== null, "one worker must claim the job");
       assert(
         claimed.job_kind === "normalize" &&
-          claimed.normalizer_version === "sherlock.codex-rollout.v2",
+          claimed.normalizer_version === "sherlock.codex-rollout.v3",
         "claims must preserve the versioned provider normalization target",
       );
       assert(

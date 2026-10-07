@@ -336,7 +336,7 @@ class CollectorDrainTests(unittest.TestCase):
             [("stream-a", 0), ("stream-b", 0)],
         )
 
-    def test_success_removes_stale_matching_dead_letter(self):
+    def test_success_preserves_matching_dead_letter_evidence(self):
         manifest, pending = self.enqueue()
         stale = self.spool.dead_letter / pending.name
         stale.write_bytes(pending.read_bytes())
@@ -344,7 +344,7 @@ class CollectorDrainTests(unittest.TestCase):
         result = Drain(self.spool, SuccessTransport()).run()
 
         self.assertEqual(result.uploaded, 1)
-        self.assertFalse(stale.exists())
+        self.assertTrue(stale.exists())
         self.assertEqual(manifest.source_stream_key, "stream-a")
 
     def test_items_enqueued_during_upload_are_drained_before_return(self):

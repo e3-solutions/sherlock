@@ -1,7 +1,7 @@
 import {
   BUCKET_COUNT,
   BUCKET_MS,
-  NORMALIZER_VERSION,
+  decodeSnapshotToken,
 } from "./flame-source.js";
 
 export const MCP_USAGE_SCHEMA_VERSION = "bonaparte.usage-evidence.v1";
@@ -46,6 +46,20 @@ function usagePerson(person, start) {
   });
   const totals = Array.isArray(person.total) ? person.total.map(finiteCount) : [];
   if (totals.length !== 3) throw new McpEvidenceError("evidence_invalid");
+  const automatedRunSessionCount = finiteCount(person.automatedRunSessionCount ?? 0);
+  const automatedRuns = person.automatedRuns ?? Array(BUCKET_COUNT).fill(0);
+  if (!Array.isArray(automatedRuns) || automatedRuns.length !== BUCKET_COUNT ||
+      automatedRunSessionCount > totals.reduce((sum, n) => sum + n, 0)) {
+    throw new McpEvidenceError("evidence_invalid");
+  }
+  const automatedRunBuckets = [];
+  automatedRuns.forEach((value, index) => {
+    const n = finiteCount(value);
+    if (n > automatedRunSessionCount || n > person.buckets[index].slice(0, 3).reduce((sum, v) => sum + finiteCount(v), 0)) {
+      throw new McpEvidenceError("evidence_invalid");
+    }
+    if (n > 0) automatedRunBuckets.push({ start: new Date(startMs + index * BUCKET_MS).toISOString(), automatedRunSessionCount: n });
+  });
   return {
     personId: String(person.id),
     displayName: String(person.name),
@@ -54,6 +68,7 @@ function usagePerson(person, start) {
     unclassifiedSessionCount: totals[2],
     primaryHumanPromptCount,
     promptBuckets,
+    ...(automatedRunSessionCount > 0 ? { automatedRunSessionCount, automatedRunBuckets } : {}),
   };
 }
 
@@ -73,10 +88,16 @@ export function listUsageEvidence(payload) {
       endExclusive: new Date(startMs + BUCKET_COUNT * BUCKET_MS).toISOString(),
       readAt: readAt.toISOString(),
     },
-    provenance: { projectionVersion: NORMALIZER_VERSION },
+    provenance: {
+      ...(payload.recovery ? { recovery: payload.recovery } : {}),
+      ...(decodeSnapshotToken(payload.snapshot).originClassificationVersion
+        ? { originClassificationVersion: decodeSnapshotToken(payload.snapshot).originClassificationVersion } : {}),
+      projectionVersion: decodeSnapshotToken(payload.snapshot).frameVersion ??
+        `raw-snapshot-${payload.snapshot.split(".")[0]}`,
+    },
     coverage: {
       state: "partial",
-      basis: "observed_canonical_events",
+      basis: payload.recovery?.basis === "recovered_observed_turn_intervals" ? "observed_canonical_events_and_recovered_observed_turns" : payload.recovery ? "observed_canonical_events_and_recovered_completed_turns" : "observed_canonical_events",
       limitations: ["event_presence_not_continuous_attention"],
     },
     people: people.map((person) => usagePerson(person, payload.start)),

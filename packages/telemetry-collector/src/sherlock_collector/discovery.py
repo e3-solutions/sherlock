@@ -39,6 +39,7 @@ class DiscoveryResult:
     excluded_by_cutoff: int = 0
     selected_bytes: int = 0
     source_snapshots: Mapping[str, SourceSnapshot] = field(default_factory=dict)
+    source_statuses: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,7 @@ class _CodexCandidate:
 def native_database_candidates(
     codex_home: Path | str | None = None,
     *,
-    limit: int = DEFAULT_DATABASE_LIMIT,
+    limit: int | None = DEFAULT_DATABASE_LIMIT,
 ) -> list[Path]:
     home = Path(codex_home or default_codex_home()).expanduser().resolve()
     candidates: dict[Path, int] = {}
@@ -86,7 +87,7 @@ def native_database_candidates(
         key=lambda item: (candidates[item], str(item)),
         reverse=True,
     )
-    return ordered[: max(1, limit)]
+    return ordered if limit is None else ordered[: max(1, limit)]
 
 
 def _columns(connection: sqlite3.Connection) -> set[str]:
@@ -120,18 +121,12 @@ def _recent_rows(database: Path, cutoff_ms: int, limit: int) -> list[dict[str, o
         required = {"id", "rollout_path"}
         if not required.issubset(columns):
             raise ValueError("threads is missing id or rollout_path")
-        archived = "coalesce(archived, 0) = 0" if "archived" in columns else "1 = 1"
-        thread_source = (
-            "coalesce(thread_source, '') in ('', 'user', 'subagent')"
-            if "thread_source" in columns
-            else "1 = 1"
-        )
         rows: dict[str, dict[str, object]] = {}
         for selected_updated, indexed_updated, divisor in _timestamps(columns):
             query = f"""
                 select id, rollout_path, {selected_updated} as updated_at_ms
                   from threads
-                 where {indexed_updated} >= ? and {archived} and {thread_source}
+                 where {indexed_updated} >= ?
                  order by {indexed_updated} desc, id desc
                  limit ?
             """
@@ -150,6 +145,53 @@ def _recent_rows(database: Path, cutoff_ms: int, limit: int) -> list[dict[str, o
         connection.close()
 
 
+def _matching_rows(database: Path, native_ids: set[str]) -> list[dict[str, object]]:
+    """Resolve active hook/replay identity independently of recency and UI source."""
+    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=0.05)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("pragma query_only = on")
+        if not {"id", "rollout_path"}.issubset(_columns(connection)):
+            raise ValueError("threads is missing id or rollout_path")
+        placeholders = ",".join("?" for _ in native_ids)
+        return [dict(row) for row in connection.execute(
+            f"select id, rollout_path, 0 as updated_at_ms from threads where id in ({placeholders})",
+            tuple(sorted(native_ids)),
+        )]
+    finally:
+        connection.close()
+
+
+def rollout_path_reason(codex_home: Path, value: object) -> tuple[Path | None, str | None]:
+    """Keep exclusions and missing files distinguishable without widening roots."""
+    if not isinstance(value, str) or not value:
+        return None, "rollout_path_missing"
+    path = Path(os.path.abspath(Path(value).expanduser()))
+    # Normalize aliases of the configured root (e.g. macOS /var -> /private/var)
+    # without resolving symlinks inside the source tree.
+    try:
+        for parent in path.parents:
+            if parent.resolve() == codex_home:
+                path = codex_home / path.relative_to(parent)
+                break
+    except (OSError, RuntimeError):
+        return None, "source_unreadable_or_unsafe"
+    if not path.name.startswith("rollout-") or path.suffix != ".jsonl":
+        return None, "unsupported_file_kind"
+    if not any(path.is_relative_to(root) for root in (
+        codex_home / "sessions", codex_home / "archived_sessions"
+    )):
+        return None, "unsupported_root"
+    try:
+        with open_regular_under_root(codex_home, path):
+            pass
+    except FileNotFoundError:
+        return None, "source_file_missing"
+    except (OSError, ValueError):
+        return None, "source_unreadable_or_unsafe"
+    return path, None
+
+
 def discover_rollouts(
     codex_home: Path | str | None = None,
     *,
@@ -160,9 +202,10 @@ def discover_rollouts(
     recent_file_parent_native_session_id: object | None = None,
     recent_file_native_session_id: object | None = None,
     only_matching_recent_files: bool = False,
+    replay_session_id: str | None = None,
 ) -> DiscoveryResult:
     home = Path(codex_home or default_codex_home()).expanduser().resolve()
-    cutoff_ms = int(time.time() * 1000) - max(1, lookback_seconds) * 1000
+    cutoff_ms = 0 if replay_session_id else int(time.time() * 1000) - max(1, lookback_seconds) * 1000
     discovered: dict[Path, tuple[int, str | None]] = {}
     payload_paths: list[Path] = []
     errors: list[str] = []
@@ -172,6 +215,14 @@ def discover_rollouts(
     priority_parent = _native_session_id(recent_file_parent_native_session_id)
     priority_native = _native_session_id(recent_file_native_session_id)
     source_snapshots: dict[str, SourceSnapshot] = {}
+    source_statuses: list[Mapping[str, object]] = []
+    exact_ids = {value for value in (
+        _native_session_id(replay_session_id), _native_session_id(payload_session),
+        _native_session_id(payload_agent),
+    ) if value is not None}
+    if replay_session_id is not None and _native_session_id(replay_session_id) is None:
+        raise ValueError("replay_session_id must be a native UUID")
+    omitted_count = 0
     invalid_count = 0
     selected_bytes = 0
     for key, native_id in (
@@ -191,39 +242,56 @@ def discover_rollouts(
                     payload_paths.append(path)
             except OSError:
                 continue
-    for database in native_database_candidates(home):
+    databases = native_database_candidates(home, limit=None)
+    selected_databases = databases if exact_ids else databases[:DEFAULT_DATABASE_LIMIT]
+    if not exact_ids:
+        omitted_count += max(0, len(databases) - len(selected_databases))
+    for database in selected_databases:
+        rows = []
         try:
-            rows = _recent_rows(database, cutoff_ms, rows_per_database)
+            rows.extend(_matching_rows(database, exact_ids) if exact_ids else [])
+        except (OSError, sqlite3.Error, ValueError) as error:
+            errors.append(f"{database.name}: exact lookup: {error}")
+        try:
+            recent_rows = [] if replay_session_id else _recent_rows(database, cutoff_ms, rows_per_database + 1)
+            omitted_count += max(0, len(recent_rows) - rows_per_database)
+            rows.extend(recent_rows[:rows_per_database])
         except (OSError, sqlite3.Error, ValueError) as error:
             errors.append(f"{database.name}: {error}")
-            continue
         for row in rows:
-            raw_path = row.get("rollout_path")
-            if not isinstance(raw_path, str) or not raw_path:
+            native_id = _native_session_id(row.get("id"))
+            path, reason = rollout_path_reason(home, row.get("rollout_path"))
+            if native_id is None:
+                reason = "invalid_native_session_id"
+            source_statuses.append({
+                "native_session_id": native_id,
+                "rollout_path": str(path) if path is not None else str(row.get("rollout_path") or ""),
+                "reason": reason,
+            })
+            if reason is not None or path is None:
+                invalid_count += 1
                 continue
-            try:
-                path = _rollout_path(home, raw_path)
-                if path is None:
-                    continue
-            except OSError:
-                continue
+            if native_id in exact_ids:
+                payload_paths.append(path)
             updated = int(row.get("updated_at_ms") or 0)
-            session_id = _native_session_id(row.get("id"))
             previous = discovered.get(path)
             if previous is None or updated > previous[0]:
-                discovered[path] = (updated, session_id)
+                discovered[path] = (updated, native_id)
     if scan_recent_files:
         cutoff_ns = cutoff_ms * 1_000_000
         try:
-            candidates, invalid_count = _recent_codex_candidates(
+            candidates, scan_invalid_count = _recent_codex_candidates(
                 home,
                 cutoff_ns,
                 active_sessions_only=only_matching_recent_files,
             )
+            invalid_count += scan_invalid_count
         except OSError as error:
             errors.append(f"sessions discovery: {error}")
             candidates = []
         for candidate in candidates:
+            if replay_session_id and candidate.native_id != replay_session_id:
+                continue
             matches_priority = (
                 candidate.native_id == priority_native
                 if priority_native is not None
@@ -249,6 +317,10 @@ def discover_rollouts(
             selected_bytes += candidate.snapshot.end_offset
             if matches_priority:
                 payload_paths.append(candidate.path)
+    if replay_session_id and not discovered and not source_statuses:
+        source_statuses.append({"native_session_id": replay_session_id, "rollout_path": "",
+                                "reason": "source_not_found"})
+        invalid_count += 1
     ordered = sorted(
         discovered,
         key=lambda item: (discovered[item][0], str(item)),
@@ -267,8 +339,10 @@ def discover_rollouts(
         priority_count=len(set(payload_paths)),
         errors=tuple(errors),
         invalid_count=invalid_count,
+        omitted_count=omitted_count,
         selected_bytes=selected_bytes,
         source_snapshots=source_snapshots,
+        source_statuses=tuple(source_statuses),
     )
 
 

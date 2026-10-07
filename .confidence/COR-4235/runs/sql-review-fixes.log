@@ -1,0 +1,96 @@
+
+ RUN  v4.1.10 /Users/aryagm/.codex/worktrees/7c79/sherlock/apps/dashboard/frontend
+
+stdout | ../src/server/usage-reconciliation.postgres.test.js > usage reconciliation PostgreSQL regressions
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'role "postgres" has already been granted membership in role "sherlock_reader" by role "supabase_admin"',
+  file: 'user.c',
+  line: '1888',
+  routine: 'AddRoleMems'
+}
+
+ ❯ ../src/server/usage-reconciliation.postgres.test.js (11 tests | 2 failed) 581ms
+     × conserves cumulative usage across adjacent windows when timestamps run backward 65ms
+     × keeps the accepted prefix but nulls totals after partially overlapping source ranges 51ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  ../src/server/usage-reconciliation.postgres.test.js > usage reconciliation PostgreSQL regressions > conserves cumulative usage across adjacent windows when timestamps run backward
+AssertionError: expected { …(9) } to match object { tokens: { input: 100, …(4) }, …(2) }
+(14 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+    "knownTokens": {
+      "cachedInput": 0,
+-     "input": 100,
++     "input": 0,
+      "output": 0,
+      "reasoning": 0,
+-     "total": 100,
++     "total": 0,
+    },
+    "tokens": {
+-     "cachedInput": 0,
+-     "input": 100,
+-     "output": 0,
+-     "reasoning": 0,
+-     "total": 100,
++     "cachedInput": null,
++     "input": null,
++     "output": null,
++     "reasoning": null,
++     "total": null,
+    },
+    "usageEventCount": 1,
+  }
+
+ ❯ ../src/server/usage-reconciliation.postgres.test.js:515:22
+    513|         usageEventCount: 1,
+    514|       });
+    515|       expect(second).toMatchObject({
+       |                      ^
+    516|         tokens: { input: 100, cachedInput: 0, output: 0, reasoning: 0,…
+    517|         knownTokens: { input: 100, cachedInput: 0, output: 0, reasonin…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  ../src/server/usage-reconciliation.postgres.test.js > usage reconciliation PostgreSQL regressions > keeps the accepted prefix but nulls totals after partially overlapping source ranges
+AssertionError: expected { …(8) } to match object { …(5) }
+(7 matching properties omitted from actual)
+
+- Expected
++ Received
+
+@@ -1,8 +1,8 @@
+  {
+    "coverage": {
+-     "conflictingSourceEvents": 2,
++     "conflictingSourceEvents": 3,
+      "excludedUsageEvents": 3,
+      "reasons": [
+        "source_record_conflict",
+        "model_context_missing",
+      ],
+
+ ❯ ../src/server/usage-reconciliation.postgres.test.js:587:32
+    585|       const result = await fetchUsage(fixture.querySource, "person");
+    586|       expect(result.groups).toHaveLength(1);
+    587|       expect(result.groups[0]).toMatchObject({
+       |                                ^
+    588|         personId: fixture.personId,
+    589|         tokens: { input: null, cachedInput: null, output: null, reason…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed | 2 passed (3)
+      Tests  2 failed | 31 passed (33)
+   Start at  17:32:44
+   Duration  1.65s (transform 226ms, setup 346ms, import 294ms, tests 2.07s, environment 0ms)
+

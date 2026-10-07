@@ -953,7 +953,7 @@ select ok(
     where workspace_id = '00000000-0000-0000-0000-000000000001'
       and batch_id = '00000000-0000-0000-0000-000000000301'
       and job_kind = 'normalize'
-      and normalizer_version = 'sherlock.codex-rollout.v2'
+      and normalizer_version = 'sherlock.codex-rollout.v3'
       and workload_class = 'live' and status = 'queued'),
   'ingest trigger creates one live job without a session scan'
 );
@@ -979,7 +979,7 @@ select ok(
     where workspace_id = '00000000-0000-0000-0000-000000000001'
       and batch_id = '00000000-0000-0000-0000-000000000302'
       and job_kind = 'normalize'
-      and normalizer_version = 'sherlock.codex-rollout.v2'
+      and normalizer_version = 'sherlock.codex-rollout.v3'
       and workload_class = 'backfill'),
   'explicit backfill transport fact isolates recent and timestampless history'
 );
@@ -1054,16 +1054,12 @@ insert into telemetry.ingest_batches (
   );
 
 select ok(
-  exists (
-    select 1 from processing.telemetry_jobs
-     where batch_id = '00000000-0000-0000-0000-000000000304'
-       and normalizer_version = 'sherlock.codex-rollout.v1'
-  ) and exists (
-    select 1 from processing.telemetry_jobs
-     where batch_id = '00000000-0000-0000-0000-000000000305'
-       and normalizer_version = 'sherlock.codex-rollout.v2'
-  ),
-  'new batches keep pre-cutover sessions on v1 and post-cutover sessions on v2'
+  (select count(*) = 2 and bool_and(normalizer_version = 'sherlock.codex-rollout.v3')
+     from processing.telemetry_jobs
+    where batch_id in ('00000000-0000-0000-0000-000000000304',
+                       '00000000-0000-0000-0000-000000000305')
+      and job_kind = 'normalize'),
+  'new uploads get exactly one v3 job each regardless of session cutover'
 );
 
 create temporary table constraint_results (

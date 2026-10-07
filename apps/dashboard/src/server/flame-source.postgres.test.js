@@ -7,6 +7,10 @@ import {
   BUCKET_MS,
   CLAUDE_NORMALIZER_VERSION,
   decodeSnapshotToken,
+  classificationSnapshotQuery,
+  INTERVAL_PROMPTS_SQL,
+  INTERVAL_WORK_SQL,
+  NORMALIZER_VERSIONS,
   DirectFlameSource,
   FRAME_VERSION,
   INTERVAL_PULL_REQUESTS_SQL,
@@ -32,14 +36,15 @@ function bucketIndex(at) {
   return Math.floor((at.getTime() - start) / BUCKET_MS);
 }
 
-function collectPlanRelations(value, relations = new Set()) {
+function collectPlanRelations(value, relations = new Set(), excludedSubplan = null) {
   if (Array.isArray(value)) {
-    for (const item of value) collectPlanRelations(item, relations);
+    for (const item of value) collectPlanRelations(item, relations, excludedSubplan);
   } else if (value && typeof value === "object") {
+    if (excludedSubplan !== null && value["Subplan Name"] === excludedSubplan) return relations;
     if (typeof value["Relation Name"] === "string") {
       relations.add(value["Relation Name"]);
     }
-    for (const child of Object.values(value)) collectPlanRelations(child, relations);
+    for (const child of Object.values(value)) collectPlanRelations(child, relations, excludedSubplan);
   }
   return relations;
 }
@@ -904,7 +909,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         snapshot: legacyDay.snapshot,
         now: partialRead,
       });
-      expect(legacyDay.snapshot).toMatch(/^v3\./);
+      expect(legacyDay.snapshot).toMatch(/^v5\./);
       expect(legacyDay.latest).toBe(partialActivityAt.toISOString());
       expect(legacyDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),
@@ -924,8 +929,44 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         now: partialRead,
       });
 
-      expect(projectedDay.snapshot).toMatch(/^v2\./);
+      expect(projectedDay.snapshot).toMatch(/^v6\./);
       expect(projectedDay.people).toEqual(legacyDay.people);
+      const annotationRollback = new Error("annotation interpretation proof rollback");
+      await expect(sql.begin(async (tx) => {
+        await tx.unsafe(`insert into analytics.bonaparte_run_classifications
+          (workspace_id, session_id, effective_start, effective_end, classification, reason, evidence_sha256, request_reference)
+          values ($1, $2, $3, $4, 'automated_run', 'Synthetic supervisor evidence', $5, 'integration interpretation test')`,
+          [workspaceId, sessionId, bucketStart.toISOString(), new Date(bucketStart.getTime() + BUCKET_MS).toISOString(), "d".repeat(64)]);
+        const [{ visible }] = await tx.unsafe("select ((xmin::text::bigint + 1)::text || ':' || (xmin::text::bigint + 1)::text || ':')::pg_snapshot::text visible from analytics.bonaparte_run_classifications where workspace_id = $1 limit 1", [workspaceId]);
+        await tx.unsafe("set local role sherlock_reader");
+        for (const projected of [false, true]) {
+          const start = projectedDay.start;
+          const end = new Date(Date.parse(start) + 86400000).toISOString();
+          const bucketEnd = new Date(bucketStart.getTime() + BUCKET_MS).toISOString();
+          const args = projected
+            ? [workspaceId, FRAME_VERSION, visible, personId, start, end, bucketStart.toISOString(), bucketEnd, "e3group.ai", 201]
+            : [workspaceId, start, end, tx.array(NORMALIZER_VERSIONS), partialRead.toISOString(), visible, personId, bucketStart.toISOString(), bucketEnd, "e3group.ai", 201];
+          const query = projected ? PROJECTION_INTERVAL_PROMPTS_SQL : INTERVAL_PROMPTS_SQL;
+          const workQuery = projected ? PROJECTION_INTERVAL_WORK_SQL : INTERVAL_WORK_SQL;
+          const body = Buffer.from(JSON.stringify(projected
+            ? [visible, partialRead.toISOString(), FRAME_VERSION]
+            : [visible, partialRead.toISOString()])).toString("base64url");
+          const oldReceipt = decodeSnapshotToken(`${projected ? "v2" : "v4"}.${body}`);
+          const newReceipt = decodeSnapshotToken(`${projected ? "v6" : "v5"}.${body}`);
+          const oldPrompts = await tx.unsafe(classificationSnapshotQuery(query, oldReceipt), args);
+          const newPrompts = await tx.unsafe(classificationSnapshotQuery(query, newReceipt), args);
+          expect(oldPrompts).toHaveLength(1);
+          expect(newPrompts).toHaveLength(0);
+          const oldWork = await tx.unsafe(classificationSnapshotQuery(workQuery, oldReceipt), args);
+          const newWork = await tx.unsafe(classificationSnapshotQuery(workQuery, newReceipt), args);
+          const facts = (rows) => rows.map(({ session_id, semantic_role, event_count, first_at, last_at }) => ({ session_id, semantic_role, event_count, first_at, last_at }));
+          expect(facts(newWork)).toEqual(facts(oldWork));
+          expect(oldWork.some((row) => row.is_automated_run)).toBe(false);
+          expect(newWork.some((row) => row.is_automated_run)).toBe(true);
+        }
+        throw annotationRollback;
+      })).rejects.toBe(annotationRollback);
+
       expect(projectedDay.latest).toBe(partialActivityAt.toISOString());
       expect(projectedDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),
@@ -1040,7 +1081,10 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       expect(relations.has("frame_evidence_revisions")).toBe(true);
       expect(relations.has("frame_projection_receipts")).toBe(false);
       expect(relations.has("events")).toBe(true);
-      expect(relations.has("sessions")).toBe(false);
+      // Source-session RLS authorizes origin metadata once in its materialized
+      // CTE. Projected activity itself must still avoid mutable session joins.
+      expect(relations.has("bonaparte_run_classifications")).toBe(true);
+      expect(collectPlanRelations(plan, new Set(), "CTE run_classifications").has("sessions")).toBe(false);
       expect(relations.has("native_records")).toBe(false);
       expect(relations.has("ingest_batches")).toBe(false);
       expect([...indexes].some((name) =>
@@ -2465,7 +2509,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         total: 999,
       });
 
-      // A regressed cumulative stream is entirely omitted, not clamped.
+      // This separate stream has no baseline before the window, then regresses;
+      // neither its first snapshot nor the ambiguous recovery can be counted.
       for (const [record, total] of [[5, 100], [6, 90], [7, 110]]) {
         await insertUsage({
           record, at: `2026-08-18T11:${40 + (record - 5) * 5}:00.000Z`,
@@ -2498,18 +2543,17 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
       const session = await querySource.fetchSession({ sessionId });
 
-      expect(usage.groups).toHaveLength(2);
+      // This fixture has no native turn_context; neither event nor session model
+      // hints are valid historical attribution evidence.
+      expect(usage.groups).toHaveLength(1);
       expect(usage.groups[0]).toMatchObject({
         personId,
         provider: "codex",
-        model: "gpt-5.6-sol",
-        tokens: { input: 87, cachedInput: 0, output: null, reasoning: 0, total: 87 },
-        usageEventCount: 5,
-      });
-      expect(usage.groups[1]).toMatchObject({
-        model: "model-B",
-        tokens: { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 },
-        usageEventCount: 2,
+        model: "unknown",
+        tokens: { input: null, cachedInput: null, output: null, reasoning: null, total: null },
+        knownTokens: { input: 87, cachedInput: 0, output: 0, reasoning: 0, total: 87 },
+        usageEventCount: 7,
+        coverage: { excludedUsageEvents: 4, missingCumulativeBaselines: 1, regressedCumulativeStreams: 1, missingModelObservations: 7 },
       });
       expect(usage.coverage).toMatchObject({
         state: "partial",
@@ -2537,4 +2581,59 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       }
     }
   }, 30_000);
+});
+
+// Rolled-back synthetic evidence exercises real RLS and MVCC without changing
+// telemetry or leaving mutable cleanup exceptions for append-only annotations.
+describePostgres("Bonaparte automated run annotations", () => {
+  it("bounds classification, preserves old snapshots, and reverses by appending", async () => {
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    const workspace = crypto.randomUUID();
+    const person = crypto.randomUUID();
+    const session = crypto.randomUUID();
+    const other = crypto.randomUUID();
+    const rollback = new Error("synthetic annotation rollback");
+    try {
+      const [{ snapshot }] = await sql.unsafe("select pg_current_snapshot()::text snapshot");
+      await expect(sql.begin(async (tx) => {
+        await tx.unsafe("insert into telemetry.workspaces (id, slug, name) values ($1, $2, 'Synthetic automation')", [workspace, workspace]);
+        await tx.unsafe("insert into telemetry.people (id, workspace_id, identity_key, email) values ($1::uuid, $2::uuid, $1::uuid::text, 'synthetic@e3group.ai')", [person, workspace]);
+        for (const id of [session, other]) await tx.unsafe(`insert into telemetry.sessions
+          (id, workspace_id, person_id, collector_key, native_session_id, actor_role, role_version, started_at)
+          values ($1::uuid, $2::uuid, $3::uuid, 'synthetic', $1::uuid::text, 'primary', 'synthetic.v1', '2026-10-05T13:00:00Z')`, [id, workspace, person]);
+        const append = (classification, evidence) => tx.unsafe(`insert into analytics.bonaparte_run_classifications
+          (workspace_id, session_id, effective_start, effective_end, classification, reason, evidence_sha256, request_reference)
+          values ($1, $2, '2026-10-05T13:00:00Z', '2026-10-05T14:00:00Z', $3, 'Synthetic supervisor provenance', $4, 'integration test')`, [workspace, session, classification, evidence.repeat(64)]);
+        await append("automated_run", "a");
+        const check = async (id, at, visible = null) => (await tx.unsafe("select analytics.bonaparte_is_automated_run($1, $2, $3, $4::pg_snapshot) automated", [workspace, id, at, visible]))[0].automated;
+        expect(await check(session, "2026-10-05T13:00:00Z")).toBe(true);
+        expect(await check(session, "2026-10-05T12:59:59Z")).toBe(false);
+        expect(await check(session, "2026-10-05T14:00:00Z")).toBe(false);
+        expect(await check(other, "2026-10-05T13:30:00Z")).toBe(false);
+        expect(await check(session, "2026-10-05T13:30:00Z", snapshot)).toBe(false);
+        // A post-commit-style snapshot sees this transaction ID; the old one does not.
+        const [{ visible }] = await tx.unsafe("select ((xmin::text::bigint + 1)::text || ':' || (xmin::text::bigint + 1)::text || ':')::pg_snapshot::text visible from analytics.bonaparte_run_classifications where workspace_id = $1 limit 1", [workspace]);
+        // Reader visibility of origin annotations must follow the source session.
+        await tx.unsafe(`insert into analytics.bonaparte_run_classifications
+          (workspace_id, session_id, effective_start, effective_end, classification, reason, evidence_sha256, request_reference)
+          values ($1, $2, '2026-10-05T13:00:00Z', '2026-10-05T14:00:00Z', 'automated_run', 'Synthetic private run', $3, 'integration test')`, [workspace, other, "c".repeat(64)]);
+        await tx.unsafe("alter table telemetry.sessions enable row level security");
+        await tx.unsafe("create policy synthetic_annotation_visibility on telemetry.sessions for select to sherlock_reader using (true)");
+        await tx.unsafe(`create policy synthetic_annotation_private_session on telemetry.sessions as restrictive for select to sherlock_reader using (id <> '${other}'::uuid)`);
+        await tx.unsafe("set local role sherlock_reader");
+        expect(await check(other, "2026-10-05T13:30:00Z")).toBe(false);
+        expect((await tx.unsafe("select count(*)::int n from analytics.bonaparte_run_classifications where workspace_id = $1 and session_id = $2", [workspace, other]))[0].n).toBe(0);
+        expect(await check(session, "2026-10-05T13:30:00Z", visible)).toBe(true);
+        await tx.unsafe("reset role");
+        await expect(tx.savepoint((sp) => sp.unsafe("update analytics.bonaparte_run_classifications set reason = 'changed' where workspace_id = $1", [workspace]))).rejects.toThrow("append-only");
+        await expect(tx.savepoint((sp) => sp.unsafe("delete from analytics.bonaparte_run_classifications where workspace_id = $1", [workspace]))).rejects.toThrow("append-only");
+        await append("default", "b");
+        expect(await check(session, "2026-10-05T13:30:00Z")).toBe(false);
+        expect((await tx.unsafe("select count(*)::int n from analytics.bonaparte_run_classifications where workspace_id = $1 and session_id = $2", [workspace, session]))[0].n).toBe(2);
+        throw rollback;
+      })).rejects.toBe(rollback);
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
 });

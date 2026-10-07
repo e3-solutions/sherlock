@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "id": "verified-build",
+  "argv": [
+    "/Users/aryagm/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
+    "node_modules/vite/bin/vite.js",
+    "build",
+    "--config",
+    "frontend/vite.config.js"
+  ],
+  "cwd": "/Users/aryagm/.codex/worktrees/7c79/sherlock/apps/dashboard",
+  "started_at": "2026-09-14T21:36:32.261286Z",
+  "ended_at": "2026-09-14T21:36:32.635583Z",
+  "exit_code": 0,
+  "termination_reason": null,
+  "resolved_executable": "/Users/aryagm/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
+  "workspace": {
+    "kind": "git",
+    "root": "/Users/aryagm/.codex/worktrees/7c79/sherlock",
+    "sha256": "decca1f65d229cd778094aab33211f07227024dcbc8f9c36b44e873b39e08a55"
+  },
+  "log": "runs/verified-build.log",
+  "log_sha256": "2a3613a75e48774a33d3889d2bb6b309e3140b18ce9958192dc6c94118b9014e"
+}

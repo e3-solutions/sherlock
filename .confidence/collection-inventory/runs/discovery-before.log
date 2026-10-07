@@ -1,0 +1,39 @@
+/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/email/_parseaddr.py:215: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x10a6da110>
+  class AddrlistClass:
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+FFE
+======================================================================
+ERROR: test_explicit_reconciliation_finds_old_automation_without_any_hook (test_codex_inventory.CodexInventoryTests.test_explicit_reconciliation_finds_old_automation_without_any_hook)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/aryagm/.codex/worktrees/7c79/sherlock/tests/collector/test_codex_inventory.py", line 76, in test_explicit_reconciliation_finds_old_automation_without_any_hook
+    result = discover_rollouts(home, replay_session_id=native_id, scan_recent_files=True)
+TypeError: discover_rollouts() got an unexpected keyword argument 'replay_session_id'
+
+======================================================================
+FAIL: test_all_native_source_categories_and_archived_tasks_are_collected (test_codex_inventory.CodexInventoryTests.test_all_native_source_categories_and_archived_tasks_are_collected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/aryagm/.codex/worktrees/7c79/sherlock/tests/collector/test_codex_inventory.py", line 44, in test_all_native_source_categories_and_archived_tasks_are_collected
+    self.assertEqual(set(result.native_session_ids.values()), {row[0] for row in rows})
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Items in the second set but not the first:
+'2579fe8d-7cc6-44af-8e06-720a209ffe31'
+'94726d7f-67e9-4374-806b-f702bf689625'
+'88b2dadf-a5f6-4006-bc20-3c78cc38d35f'
+'8b46c58a-7f7d-442a-988b-6b0fb10a77bc'
+'57e60650-a367-4a7d-ba50-c0afbff1af2f'
+
+======================================================================
+FAIL: test_exact_continuing_id_bypasses_age_row_and_database_limits (test_codex_inventory.CodexInventoryTests.test_exact_continuing_id_bypasses_age_row_and_database_limits)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/aryagm/.codex/worktrees/7c79/sherlock/tests/collector/test_codex_inventory.py", line 63, in test_exact_continuing_id_bypasses_age_row_and_database_limits
+    self.assertEqual(result.paths[0], target.resolve())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[79 chars]x/sessions/rollout-de828888-2fd3-47ca-87d8-a004434a4e66.jsonl') != Posix[79 chars]x/sessions/rollout-db05de96-9097-4928-bf30-12aa8f731fae.jsonl')
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.029s
+
+FAILED (failures=2, errors=1)

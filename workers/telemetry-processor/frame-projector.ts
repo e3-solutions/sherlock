@@ -9,6 +9,7 @@ import {
 import {
   FRAME_CLAUDE_NORMALIZER_VERSION,
   FRAME_CODEX_NORMALIZER_VERSION,
+  FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
   FRAME_VERSION,
@@ -177,6 +178,14 @@ export function frameSourceNormalizerPredicateSql(
     and ${eventAlias}.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
     or ${batchAlias}.source_provider = 'codex'
     and (
+      ${eventAlias}.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+      or not exists (
+        select 1 from telemetry.events corrected
+         where corrected.workspace_id = ${eventAlias}.workspace_id
+           and corrected.source_record_id = ${eventAlias}.source_record_id
+           and corrected.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+           and not corrected.is_replay
+      ) and (
       (${cutoverAlias}.cutover_at is null
        or ${sessionAlias}.started_at >= ${cutoverAlias}.cutover_at)
       and ${eventAlias}.normalizer_version = '${FRAME_CODEX_NORMALIZER_VERSION}'
@@ -191,6 +200,7 @@ export function frameSourceNormalizerPredicateSql(
              and legacy.normalizer_version = '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}'
              and not legacy.is_replay
         )
+      )
       )
     )
   )`;
@@ -477,6 +487,7 @@ export class PostgresFrameEvidenceProjector {
             and source_event_count = $5 and source_state_sha256 = $6
             and request_generation = $7
             and session_updated_at = $8::text::timestamptz
+            and covered_from <= $9::timestamptz and covered_through >= $10::timestamptz
           order by id desc limit 1`,
             [
               options.workspaceId,
@@ -487,6 +498,8 @@ export class PostgresFrameEvidenceProjector {
               sourceStateSha256,
               options.requestGeneration.toString(),
               sessionUpdatedAt,
+              coveredFrom.toISOString(),
+              coveredThrough.toISOString(),
             ],
           );
           if (exact.length > 0) {
@@ -703,7 +716,7 @@ function canonicalPrompts(
       ...event,
       prompt_identity: keyedNativeItemId
         ? `native:${keyedNativeItemId}`
-        : `logical:${event.canonical_scope_key}:${event.normalizer_version}:` +
+        : `logical:${event.canonical_scope_key}:${semanticNormalizer(event)}:` +
           `${event.logical_event_key}:${event.event_kind}`,
       prompt_observed_at: keyedNativeItemId
         ? nativeItemObservedAt(keyedNativeItemId) ?? event.source_observed_at
@@ -826,11 +839,18 @@ function semanticGroups(
   return groups;
 }
 
+// Classification versions share native message identity across the upload cutover.
+function semanticNormalizer(event: SourceEvent): string {
+  return event.normalizer_version.startsWith("sherlock.codex-rollout.")
+    ? "codex"
+    : event.normalizer_version;
+}
+
 function semanticKey(event: SourceEvent): string {
   return JSON.stringify([
     event.session_id,
     event.canonical_scope_key,
-    event.normalizer_version,
+    semanticNormalizer(event),
     event.logical_event_key,
     event.event_kind,
   ]);
