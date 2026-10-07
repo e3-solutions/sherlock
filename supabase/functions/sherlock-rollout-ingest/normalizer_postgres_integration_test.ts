@@ -743,12 +743,12 @@ Deno.test({
           undefined,
           undefined,
           undefined,
-          async (_tx, changed) => {
+          (_tx, changed) => {
             assert(
               changed.includes(childSessionId),
               "repair must invalidate child",
             );
-            throw new Error("injected enqueue failure");
+            return Promise.reject(new Error("injected enqueue failure"));
           },
         );
       } catch (error) {
@@ -780,8 +780,9 @@ Deno.test({
         undefined,
         undefined,
         undefined,
-        async (_tx, changed) => {
+        (_tx, changed) => {
           repairedIds = changed;
+          return Promise.resolve();
         },
       );
       const parentSessionId = parentResult.session_ids[0];
@@ -791,9 +792,9 @@ Deno.test({
         "retry must invalidate parent and repaired child",
       );
 
-      async function changedBy(
+      const changedBy = async (
         fixture: BatchFixture,
-      ): Promise<readonly string[]> {
+      ): Promise<readonly string[]> => {
         let changedIds: readonly string[] = [];
         await firstNormalizer.normalize(
           fixture.receipt,
@@ -802,12 +803,13 @@ Deno.test({
           undefined,
           undefined,
           undefined,
-          async (_tx, changed) => {
+          (_tx, changed) => {
             changedIds = changed;
+            return Promise.resolve();
           },
         );
         return changedIds;
-      }
+      };
       assert(
         (await changedBy(childFirstParent)).length === 0,
         "identical parent replay must not enqueue already resolved children",
