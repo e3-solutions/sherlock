@@ -16,6 +16,10 @@ for one person and one ten-minute bucket. Message content is limited to
 `telemetry.events.content_excerpt`; the dashboard never reads full raw Storage
 objects.
 
+The reader privacy migration excludes Aqil's pinned identity from shared reads.
+A separate private viewer admits only Aqil and Caleb through individual credentials
+and a dedicated database principal. See [private thread access](../../docs/private-thread-access.md).
+
 ## Data contract
 
 - `telemetry.people` is the roster, so real people with zero activity remain

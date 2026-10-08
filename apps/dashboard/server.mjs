@@ -21,6 +21,7 @@ import {
   selectJsonRepresentation,
 } from "./src/server/http-delivery.js";
 import { FreshnessCache } from "./src/server/freshness-cache.js";
+import { createPrivateAccessGate } from "./src/server/private-access.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -29,6 +30,10 @@ const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
 const dashboardEmailDomain = process.env.SHERLOCK_DASHBOARD_EMAIL_DOMAIN ?? "";
 const databaseUrl = process.env.SUPABASE_DB_URL ?? "";
 const mcpToken = process.env.SHERLOCK_MCP_TOKEN ?? "";
+const privateAccess = createPrivateAccessGate({
+  enabled: process.env.SHERLOCK_PRIVATE_VIEW,
+  accountsJson: process.env.SHERLOCK_PRIVATE_ACCOUNTS,
+});
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
 const projectionEnabled = process.env.SHERLOCK_FRAME_PROJECTION_ENABLED !== "false";
 const validWorkspaceId =
@@ -49,6 +54,7 @@ const source = databaseUrl && validWorkspaceId && validMaxPeople && validDashboa
       expectedEmailDomain: dashboardEmailDomain,
       maxPeople,
       projectionEnabled,
+      privateView: privateAccess.enabled,
     })
   : null;
 
@@ -113,6 +119,7 @@ function sendJson(response, status, body, headers = {}) {
     "Cache-Control": "no-store",
     "Content-Type": "application/json; charset=utf-8",
     ...headers,
+    ...(privateAccess.enabled ? { "Cache-Control": "no-store", Vary: "Authorization, Accept-Encoding" } : {}),
   });
   response.end(JSON.stringify(body));
 }
@@ -147,7 +154,8 @@ async function sendFile(response, filePath, cacheControl) {
     if (!info.isFile()) throw new Error("not_file");
     response.writeHead(200, {
       ...SECURITY_HEADERS,
-      "Cache-Control": cacheControl,
+      "Cache-Control": privateAccess.enabled ? "no-store" : cacheControl,
+      ...(privateAccess.enabled ? { Vary: "Authorization" } : {}),
       "Content-Length": info.size,
       "Content-Type": mimeTypeForPath(filePath),
     });
@@ -170,6 +178,16 @@ function configurationStatus() {
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", "http://dashboard.internal");
+  const access = privateAccess.apply(request, response);
+  if (!access.ok) return;
+  if (privateAccess.enabled && url.pathname === "/mcp") {
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (privateAccess.enabled && url.pathname.startsWith("/api/")) {
+    console.log(JSON.stringify({ event: "private_read", email: access.email,
+      path: url.pathname, at: new Date().toISOString() }));
+  }
   if (url.pathname === "/mcp") {
     await mcpRoute(request, response);
     return;
@@ -211,6 +229,7 @@ const server = createServer(async (request, response) => {
         ...SECURITY_HEADERS,
         "Cache-Control": "no-store",
         ...flameRepresentationHeaders(representation, result.state),
+        ...(privateAccess.enabled ? { Vary: "Authorization, Accept-Encoding" } : {}),
       });
       response.end(representation.bytes);
     } catch (error) {
