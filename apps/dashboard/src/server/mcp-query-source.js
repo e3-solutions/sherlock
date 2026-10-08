@@ -8,6 +8,7 @@ export const MCP_QUERY_DEFAULT_LIMIT = 20;
 export const MCP_QUERY_MAX_LIMIT = 100;
 export const MCP_QUERY_MAX_GROUPS = 200;
 export const MCP_QUERY_HISTORY_START = "1970-01-01T00:00:00.000Z";
+export const MCP_SEARCH_MAX_WINDOW_MS = 31 * 24 * 60 * 60 * 1000;
 
 const SESSION_CURSOR_VERSION = "s1";
 const LEGACY_QUERY_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -725,6 +726,41 @@ select selected.id::text session_id, selected.person_id::text,
   from selected cross join facts
 `;
 
+// Search the indexed, bounded excerpt only. A hit is a candidate, not a
+// verified reconstruction of the immutable native record.
+export const SEARCH_SESSIONS_SQL = `
+select e.session_id::text session_id, s.person_id::text person_id,
+       coalesce(nullif(btrim(pe.display_name), ''), 'Unknown') display_name,
+       e.id::text event_id, e.occurred_at, e.content_excerpt,
+       e.normalizer_version
+  from telemetry.events e
+  join telemetry.sessions s
+    on s.workspace_id = e.workspace_id and s.id = e.session_id
+  join telemetry.people pe
+    on pe.workspace_id = s.workspace_id and pe.id = s.person_id
+  join telemetry.native_records nr
+    on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
+  join telemetry.ingest_batches ib
+    on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
+  left join analytics.normalizer_cutovers c
+    on c.workspace_id = e.workspace_id
+   and c.source_provider = ib.source_provider
+   and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
+ where e.workspace_id = $1 and e.event_kind = 'message'
+   and e.message_search @@ plainto_tsquery('simple', $2::text)
+   and e.occurred_at >= $3 and e.occurred_at < $4
+   and e.server_received_at <= $5
+   and e.normalizer_version = any($6::text[])
+   and not e.is_replay and e.content_excerpt is not null
+   and pe.github_id is distinct from 'sherlock-smoke'
+   and split_part(pe.email, '@', 2) = $7 and split_part(pe.email, '@', 3) = ''
+   and ($8::uuid is null or s.person_id = $8)
+   and ${activeNormalizerPredicate("e", "s", "ib", "c")}
+   and ${canonicalWinnerPredicate("e", "s")}
+ order by e.occurred_at desc, e.id desc
+ limit $9
+`;
+
 export const COVERAGE_SQL = `
 with roster as materialized (
   select pe.id person_id
@@ -903,6 +939,53 @@ export function createSherlockQuerySource(source) {
           state: "partial",
           basis: "observed_events",
           reasons: ["content_omitted", "collector_presence_not_proven"],
+        },
+      };
+    },
+
+    async searchSessions({ query, start, end, personId, limit, signal, now } = {}) {
+      if (typeof query !== "string" || query.trim().length < 2 || query.length > 160 ||
+          !/[\p{L}\p{N}]/u.test(query) ||
+          (personId !== undefined && !UUID_PATTERN.test(personId))) {
+        throw new FlameSourceError("flame_mcp_query_request_invalid");
+      }
+      const readAt = asDate(now ?? new Date());
+      const endAt = end === undefined ? readAt : asDate(end);
+      const startAt = start === undefined
+        ? new Date(endAt.getTime() - 7 * 24 * 60 * 60 * 1000)
+        : asDate(start);
+      if (endAt > readAt || endAt <= startAt ||
+          endAt.getTime() - startAt.getTime() > MCP_SEARCH_MAX_WINDOW_MS) {
+        throw new FlameSourceError("flame_mcp_query_request_invalid");
+      }
+      const pageSize = Math.min(parseLimit(limit), 20);
+      const rows = await source.transaction(async (tx) => {
+        await ensureRosterBound(tx, source, signal);
+        return await runQuery(tx, SEARCH_SESSIONS_SQL, [
+          source.workspaceId, query.trim(), startAt.toISOString(), endAt.toISOString(),
+          readAt.toISOString(), PROVIDER_VERSIONS, source.expectedEmailDomain,
+          personId ?? null, pageSize,
+        ], signal);
+      }, { signal, statementTimeoutMs: 20_000 });
+      return {
+        schemaVersion: MCP_QUERY_SCHEMA_VERSION,
+        window: {
+          startInclusive: startAt.toISOString(),
+          endExclusive: endAt.toISOString(),
+          readAt: readAt.toISOString(),
+        },
+        matches: rows.map((row) => ({
+          sessionId: String(row.session_id),
+          personId: String(row.person_id),
+          displayName: String(row.display_name),
+          eventId: String(row.event_id),
+          occurredAt: asDate(row.occurred_at).toISOString(),
+          provider: providerFromVersion(row.normalizer_version),
+          excerpt: String(row.content_excerpt),
+        })),
+        coverage: {
+          state: "partial",
+          limitations: ["stored_excerpts_only", "raw_source_unverified", "result_capped"],
         },
       };
     },

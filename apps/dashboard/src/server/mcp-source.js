@@ -71,6 +71,7 @@ export function createCachedMcpSource({ cache, source, querySource, providerUsag
     "fetchCoverage",
     "fetchSessions",
     "fetchSession",
+    "searchSessions",
     "fetchUsage",
   ].some((method) => typeof querySource?.[method] !== "function")) {
     throw new TypeError("A complete Sherlock query source is required");
@@ -89,6 +90,7 @@ export function createCachedMcpSource({ cache, source, querySource, providerUsag
       fetchCoverage: (request) => querySource.fetchCoverage(request),
       fetchSessions: (request) => querySource.fetchSessions(request),
       fetchSession: (request) => querySource.fetchSession(request),
+      searchSessions: (request) => querySource.searchSessions(request),
       fetchUsage: (request) => querySource.fetchUsage(request),
     }),
   });

@@ -42,6 +42,7 @@ describe("Bonaparte MCP tools", () => {
       "coverage",
       "list_sessions",
       "get_session",
+      "search_sessions",
       "query_usage",
       "list_usage_evidence",
       "list_prompt_evidence",
