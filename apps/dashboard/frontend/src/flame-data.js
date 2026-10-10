@@ -192,8 +192,8 @@ export function adaptFlamePayload(value) {
     fail("coverage.state", '"complete" or "partial"');
   }
 
-  if (!Array.isArray(payload.people) || payload.people.length === 0) {
-    fail("people", "a nonempty array");
+  if (!Array.isArray(payload.people)) {
+    fail("people", "an array");
   }
 
   const ids = new Set();
