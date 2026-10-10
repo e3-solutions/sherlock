@@ -8,6 +8,7 @@ from typing import Any
 
 from .contract import (
     RECEIPT_FIELDS,
+    RFC3339_RE,
     SHA256_RE,
     BatchManifest,
     ContractError,
@@ -206,7 +207,10 @@ def build_collection_receipt(
 
 
 def _validate_timestamp(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not RFC3339_RE.fullmatch(value):
+        raise ContractError(f"{field} must be an ISO-8601 timestamp")
+    offset = value[-6:]
+    if value[-1] != "Z" and (int(offset[1:3]) > 23 or int(offset[4:6]) > 59):
         raise ContractError(f"{field} must be an ISO-8601 timestamp")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
