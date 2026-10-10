@@ -84,6 +84,8 @@ Deno.test("unknown collector domain is rejected before backend initialization", 
       environment: (name) =>
         ({
           SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
+          SHERLOCK_BIGBALLER_WORKSPACE_ID:
+            "00000000-0000-4000-8000-000000000004",
           SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
             "00000000-0000-4000-8000-000000000002",
         })[name],
@@ -105,6 +107,7 @@ Deno.test("handler passes the server-selected workspace for each approved domain
     const [email, expectedWorkspaceId] of [
       ["USER@E3GROUP.AI", "00000000-0000-4000-8000-000000000001"],
       ["user@sixtyfour.ai", "00000000-0000-4000-8000-000000000002"],
+      ["ARSH@BIGBALLERBRANDWHEELS.COM", "00000000-0000-4000-8000-000000000004"],
     ]
   ) {
     let selectedWorkspaceId = "";
@@ -112,6 +115,8 @@ Deno.test("handler passes the server-selected workspace for each approved domain
       environment: (name) =>
         ({
           SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
+          SHERLOCK_BIGBALLER_WORKSPACE_ID:
+            "00000000-0000-4000-8000-000000000004",
           SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
             "00000000-0000-4000-8000-000000000002",
         })[name],
@@ -136,5 +141,35 @@ Deno.test("handler passes the server-selected workspace for each approved domain
     assert(response.status === 200);
     assert(selectedWorkspaceId === expectedWorkspaceId);
     assert((await response.json()).workspace_id === expectedWorkspaceId);
+  }
+});
+
+Deno.test("Big Baller routing rejects a missing, malformed, or reused workspace", async () => {
+  for (
+    const workspace of [
+      undefined,
+      "invalid",
+      "00000000-0000-4000-8000-000000000001",
+    ]
+  ) {
+    let backendCalls = 0;
+    const response = await handleRequest(
+      await requestFor("user@bigballerbrandwheels.com"),
+      {
+        environment: (name) =>
+          ({
+            SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
+            SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
+              "00000000-0000-4000-8000-000000000002",
+            SHERLOCK_BIGBALLER_WORKSPACE_ID: workspace,
+          })[name],
+        backendFactory: (() => {
+          backendCalls++;
+          throw new Error("must not initialize");
+        }) as never,
+      },
+    );
+    assert(response.status === (workspace === undefined ? 403 : 500));
+    assert(backendCalls === 0);
   }
 });

@@ -520,6 +520,8 @@ describe("Sherlock Flame payload", () => {
     expect(SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN).toBe("sixtyfour.ai");
     expect(validateDashboardEmailDomain("e3group.ai")).toBe("e3group.ai");
     expect(validateDashboardEmailDomain("sixtyfour.ai")).toBe("sixtyfour.ai");
+    expect(validateDashboardEmailDomain("bigballerbrandwheels.com")).toBe("bigballerbrandwheels.com");
+    expect(() => validateDashboardEmailDomain("sub.bigballerbrandwheels.com")).toThrow(TypeError);
     expect(() => validateDashboardEmailDomain("example.com")).toThrow(TypeError);
     expect(() => validateDashboardEmailDomain("sub.e3group.ai")).toThrow(TypeError);
   });
