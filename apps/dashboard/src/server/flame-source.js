@@ -85,8 +85,8 @@ const INTERNAL_CONTEXT_PREFIXES = Object.freeze([
   "The configured soft phase budget has expired.",
 ]);
 export function validateDashboardEmailDomain(value) {
-  if (![PREFERRED_DASHBOARD_EMAIL_DOMAIN, SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN].includes(value)) {
-    throw new TypeError("SHERLOCK_DASHBOARD_EMAIL_DOMAIN must be e3group.ai or sixtyfour.ai");
+  if (![PREFERRED_DASHBOARD_EMAIL_DOMAIN, SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN, "bigballerbrandwheels.com"].includes(value)) {
+    throw new TypeError("SHERLOCK_DASHBOARD_EMAIL_DOMAIN must be e3group.ai, sixtyfour.ai or bigballerbrandwheels.com");
   }
   return value;
 }
