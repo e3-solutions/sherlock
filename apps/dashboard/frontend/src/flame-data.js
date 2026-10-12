@@ -1,3 +1,4 @@
+import { decodeFrameOverview } from "../../src/shared/frame-overview.js";
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
 
@@ -271,7 +272,12 @@ export function adaptFlamePayload(value) {
       );
     }
 
-    return { id, name, activeSeconds, lastActivityMs, total, buckets, ...(automatedRunSessionCount > 0 ? { automatedRunSessionCount } : {}) };
+    const overviews = person.overview === undefined ? null : decodeFrameOverview(person.overview, {
+      startMs, counts: person.buckets, automatedRuns,
+    });
+    return { id, name, activeSeconds, lastActivityMs, total, buckets,
+      ...(overviews ? { overviews } : {}),
+      ...(automatedRunSessionCount > 0 ? { automatedRunSessionCount } : {}) };
   });
 
   return {

@@ -1,3 +1,4 @@
+import { overviewMatchesEvidence } from "../../src/shared/frame-overview.js";
 import {
   memo,
   useCallback,
@@ -484,7 +485,7 @@ function IntervalOverview({
   const additionalWork = evidence.work.filter(({ summary, pullRequest }) =>
     summary === null && pullRequest === null
   );
-  const visibleWork = showAdditionalWork
+  const visibleWork = showAdditionalWork || primaryWork.length === 0
     ? [...primaryWork, ...additionalWork]
     : primaryWork;
 
@@ -560,6 +561,19 @@ function IntervalOverview({
         </div>
       ) : evidence.state === "ready" && (
         <div className="flame-detail__body">
+          {evidence.enrichment === "loading" && (
+            <p className="flame-detail__partial" role="status">Loading prompt excerpts and PR links…</p>
+          )}
+          {["error", "mismatch"].includes(evidence.enrichment) && (
+            <div className="flame-detail__partial" role="status">
+              <p>{evidence.enrichment === "mismatch"
+                ? "Detailed evidence changed after this timeline. Refresh the timeline to reconcile it."
+                : evidenceErrorCopy("frame", evidence.reason)}</p>
+              <button type="button" onClick={evidence.enrichment === "mismatch" || needsTimelineRefresh(evidence.reason) ? onRefresh : onRetry}>
+                {evidence.enrichment === "mismatch" || needsTimelineRefresh(evidence.reason) ? "Refresh timeline" : "Retry details"}
+              </button>
+            </div>
+          )}
           {evidence.prompts.length > 0 && (
             <details className="flame-detail__prompts">
               <summary>{evidence.prompts.length} human {evidence.prompts.length === 1 ? "prompt" : "prompts"}</summary>
@@ -592,7 +606,7 @@ function IntervalOverview({
                 {visibleWork.length > 0 && (
                   <ul className="flame-detail__work">{visibleWork.map(workRow)}</ul>
                 )}
-                {additionalWork.length > 0 && (
+                {additionalWork.length > 0 && primaryWork.length > 0 && (
                   <button
                     type="button"
                     className="flame-detail__work-expander"
@@ -999,6 +1013,9 @@ export default function FlameGraph({
   timelineMeta,
 }) {
   const peopleScrollRef = useRef(null);
+  const inputStartRef = useRef(null);
+  const pendingPaintRef = useRef(null);
+  const interactionSequenceRef = useRef(0);
   const detailRef = useRef(null);
   const detailClosingRef = useRef(false);
   const workRequestRef = useRef(null);
@@ -1044,6 +1061,41 @@ export default function FlameGraph({
   const selectionKey = selectedPerson && selectedPoint
     ? `${selectedPerson.id}:${selectedPoint.startMs}`
     : null;
+
+  const previewWork = selectedPerson?.overviews?.[selectedPoint?.index] ?? null;
+  const currentInterval = intervalEvidence.requestKey === selectionKey && intervalEvidence.snapshot === data.snapshot
+    ? intervalEvidence : null;
+  const displayIntervalEvidence = previewWork === null
+    ? (currentInterval ?? { state: "loading", work: [], prompts: [], workIncomplete: false })
+    : currentInterval?.state === "ready" && overviewMatchesEvidence(previewWork, currentInterval.work)
+      ? currentInterval
+      : { state: "ready", work: currentInterval?.state === "ready" || currentInterval?.reason?.endsWith("_request_not_found")
+          ? previewWork.map(row => ({ ...row, summary: null })) : previewWork,
+        prompts: [], workIncomplete: false,
+        enrichment: currentInterval?.state === "error" ? "error"
+          : currentInterval?.state === "ready" ? "mismatch" : "loading",
+        reason: currentInterval?.reason };
+
+  useLayoutEffect(() => {
+    const pending = pendingPaintRef.current;
+    const detail = detailRef.current;
+    if (!detail || !pending || drawerView.screen !== "overview" ||
+        pending.key !== selectionKey || pending.snapshot !== data.snapshot ||
+        displayIntervalEvidence.state !== "ready") return undefined;
+    delete detail.dataset.sessionRowsPaintMs;
+    // Double RAF measures an upper bound on the first paint of useful rows.
+    // DOM-only numeric markers allow browser benchmarks without logging content.
+    let secondFrame;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        if (pendingPaintRef.current !== pending) return;
+        detail.dataset.sessionRowsPaintMs = (performance.now() - pending.started).toFixed(2);
+        detail.dataset.sessionRowsSource = previewWork === null ? "interval" : "timeline";
+        pendingPaintRef.current = null;
+      });
+    });
+    return () => { cancelAnimationFrame(firstFrame); if (secondFrame !== undefined) cancelAnimationFrame(secondFrame); };
+  }, [selection, selectionKey, data.snapshot, drawerView.screen, displayIntervalEvidence.state, displayIntervalEvidence.work]);
 
   const beginCloseDetail = useCallback(() => {
     if (!selection || detailClosingRef.current) return;
@@ -1096,6 +1148,7 @@ export default function FlameGraph({
     const controller = new AbortController();
     setIntervalEvidence({
       state: "loading", work: [], prompts: [], workIncomplete: false,
+      requestKey: selectionKey, snapshot: data.snapshot,
     });
     const query = new URLSearchParams({
       personId: selectedPerson.id,
@@ -1124,7 +1177,7 @@ export default function FlameGraph({
         }
         setIntervalEvidence({
           state: "ready",
-          snapshot: data.snapshot,
+          requestKey: selectionKey, snapshot: data.snapshot,
           ...evidence,
           workIncomplete: evidence.work.length < selectedPoint.activity,
         });
@@ -1133,6 +1186,7 @@ export default function FlameGraph({
         if (!controller.signal.aborted) {
           setIntervalEvidence({
             state: "error", work: [], prompts: [], workIncomplete: false,
+            requestKey: selectionKey, snapshot: data.snapshot,
             reason: evidenceFailureReason(error),
           });
         }
@@ -1200,12 +1254,16 @@ export default function FlameGraph({
   ]);
 
   const selectInterval = useCallback((person, point) => {
+    pendingPaintRef.current = { key: `${person.id}:${point.startMs}`, snapshot: data.snapshot,
+      started: inputStartRef.current ?? performance.now() };
+    inputStartRef.current = null;
+    interactionSequenceRef.current++;
     detailClosingRef.current = false;
     setDetailClosing(false);
     setShowAdditionalWork(false);
     setDrawerView({ screen: "overview" });
     setSelection({ personId: person.id, startMs: point.startMs });
-  }, []);
+  }, [data.snapshot]);
 
   const deactivateTooltip = useCallback((personId) => {
     setActiveTooltipPersonId((activePersonId) => (
@@ -1329,6 +1387,8 @@ export default function FlameGraph({
       <div
         ref={peopleScrollRef}
         className="flame-people-scroll"
+        onPointerDownCapture={() => { inputStartRef.current = performance.now(); }}
+        onKeyDownCapture={event => { if (["Enter", " ", "Spacebar"].includes(event.key)) inputStartRef.current = performance.now(); }}
         role="region"
         aria-label={`People activity timelines, ${data.people.length} people`}
         tabIndex={0}
@@ -1353,10 +1413,11 @@ export default function FlameGraph({
       {selectedPerson && selectedPoint && (
         <aside
           ref={detailRef}
+          data-click-sequence={interactionSequenceRef.current}
           className={`flame-detail${detailClosing ? " flame-detail--closing" : ""}`}
           aria-busy={drawerView.screen === "work"
             ? workEvidence.state === "loading" || workEvidence.loadingMore === true
-            : intervalEvidence.state === "loading"}
+            : displayIntervalEvidence.state === "loading"}
           aria-labelledby={drawerView.screen === "work"
             ? `flame-work-${drawerView.workId.replace(/[^a-zA-Z0-9_-]/g, "")}`
             : `flame-detail-${selectedPerson.id.replace(/[^a-zA-Z0-9_-]/g, "")}`}
@@ -1382,7 +1443,7 @@ export default function FlameGraph({
               person={selectedPerson}
               point={selectedPoint}
               transition={drawerView.transition}
-              evidence={intervalEvidence}
+              evidence={displayIntervalEvidence}
               stale={stale}
               closing={detailClosing}
               onClose={beginCloseDetail}

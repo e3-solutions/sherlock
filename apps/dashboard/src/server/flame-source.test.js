@@ -277,8 +277,12 @@ describe("Sherlock Flame payload", () => {
         .mockResolvedValueOnce(second),
     };
 
+    const authConnections = [first, second].map(() => ({ unsafe: vi.fn().mockResolvedValue([]), release: vi.fn() }));
+    source.overviewSql = { reserve: vi.fn().mockResolvedValueOnce(authConnections[0]).mockResolvedValueOnce(authConnections[1]) };
     await source.reserveCapacity();
 
+    expect(source.overviewSql.reserve).toHaveBeenCalledTimes(2);
+    authConnections.forEach(c => { expect(c.unsafe).toHaveBeenCalledWith("select 1"); expect(c.release).toHaveBeenCalledOnce(); });
     expect(source.sql.reserve).toHaveBeenCalledTimes(2);
     expect(first.unsafe).toHaveBeenCalledWith("select 1");
     expect(second.unsafe).toHaveBeenCalledWith("select 1");
@@ -320,9 +324,7 @@ describe("Sherlock Flame payload", () => {
     await source.transaction(async () => "ok");
 
     expect(unsafe.mock.calls).toEqual([
-      ["set transaction isolation level repeatable read, read only"],
-      ["select set_config('statement_timeout', $1, true)", ["20000"]],
-      ["set local role sherlock_reader"],
+      ["set transaction isolation level repeatable read, read only; set local statement_timeout = '20000ms'; set local role sherlock_reader"],
     ]);
   });
 
@@ -333,9 +335,8 @@ describe("Sherlock Flame payload", () => {
 
     await source.transaction(async () => "ok", { statementTimeoutMs: 30_000 });
 
-    expect(unsafe.mock.calls[1]).toEqual([
-      "select set_config('statement_timeout', $1, true)",
-      ["30000"],
+    expect(unsafe.mock.calls).toEqual([
+      ["set transaction isolation level repeatable read, read only; set local statement_timeout = '30000ms'; set local role sherlock_reader"],
     ]);
   });
 
@@ -1024,7 +1025,10 @@ describe("Sherlock Flame payload", () => {
   it("keeps projection reads bounded, snapshot-visible, and semantically exact", () => {
     expect(PROJECTION_FLAME_SQL).toContain("analytics.frame_evidence_revisions");
     expect(PROJECTION_FLAME_SQL).not.toContain("analytics.frame_projection_receipts");
-    expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.events");
+    expectSqlInOrder(PROJECTION_FLAME_SQL,
+      "latest_frame_evidence as materialized", "bucket_work as materialized",
+      "day_overview_summaries as materialized", "join telemetry.events source");
+    expect(PROJECTION_FLAME_SQL).toContain("where evidence.observed_at < p.end_at and evidence.is_summary_candidate");
     expect(PROJECTION_FLAME_SQL).not.toContain("telemetry.sessions");
     expect(PROJECTION_FLAME_SQL).toContain(
       "frame_revision_candidates as materialized",
@@ -1405,8 +1409,6 @@ describe("Sherlock Flame payload", () => {
     };
     const unsafe = vi.fn().mockResolvedValue([])
       .mockImplementationOnce(() => resolved([]))
-      .mockImplementationOnce(() => resolved([]))
-      .mockImplementationOnce(() => resolved([]))
       .mockImplementationOnce(() => resolved([{
         now: READ,
         snapshot: PG_SNAPSHOT,
@@ -1422,7 +1424,7 @@ describe("Sherlock Flame payload", () => {
     const controller = new AbortController();
 
     const request = source.fetchDay({ signal: controller.signal });
-    await vi.waitFor(() => expect(unsafe).toHaveBeenCalledTimes(6));
+    await vi.waitFor(() => expect(unsafe).toHaveBeenCalledTimes(4));
     controller.abort();
 
     await expect(request).rejects.toMatchObject({ code: "flame_request_aborted" });

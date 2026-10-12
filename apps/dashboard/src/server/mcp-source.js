@@ -57,7 +57,7 @@ export function pageCachedUsageEvidence(payload, cursor = "") {
   const selected = hasMore ? page.slice(0, MCP_USAGE_PAGE_LIMIT) : page;
   return {
     ...payload,
-    people: selected,
+    people: selected.map(({ overview, ...person }) => person),
     nextCursor: hasMore ? encodeUsageCursor(selected.at(-1).id) : null,
   };
 }

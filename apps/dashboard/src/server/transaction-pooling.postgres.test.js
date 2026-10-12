@@ -34,7 +34,7 @@ describe("dashboard transaction checkout cancellation", () => {
       begin: (beginCallback) => {
         transactionFinished = beginCallback({
           unsafe: (text) => {
-            if (text === "set local role sherlock_reader") {
+            if (text.includes("set local role sherlock_reader")) {
               reachedRole();
               // Model a completed query whose cancellation arrived too late.
               return roleResult;

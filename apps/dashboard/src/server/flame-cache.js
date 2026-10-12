@@ -29,15 +29,23 @@ function payloadEnd(payload) {
   return { end, read };
 }
 
-function cacheEntry(payload, end, read) {
+// Authorization must finish before choosing either cached encoding.
+export async function authorizedFlameRepresentation(source, result, options) {
+  const payload = await source.authorizeFrameOverviews(result.payload, options);
+  return payload === result.payload ? result : { ...result, ...flamePayloadRepresentation(payload) };
+}
+
+export function flamePayloadRepresentation(payload) {
   const identity = Buffer.from(JSON.stringify(payload), "utf8");
   return Object.freeze({
     payload,
     identity,
     gzip: gzipSync(identity),
-    end,
-    read,
   });
+}
+
+function cacheEntry(payload, end, read) {
+  return Object.freeze({ ...flamePayloadRepresentation(payload), end, read });
 }
 
 function abortError() {

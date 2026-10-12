@@ -23,6 +23,14 @@ function payload(people, snapshot = "v1.snapshot") {
 }
 
 describe("cached MCP usage evidence", () => {
+  it("does not send dashboard summary previews to MCP usage consumers", () => {
+    const item = { ...person(1), overview: { summaries: ["private preview sentinel"] } };
+    const page = pageCachedUsageEvidence(payload([item]));
+    expect(page.people[0]).toEqual(person(1));
+    expect(JSON.stringify(page)).not.toContain("private preview sentinel");
+    expect(item.overview).toBeDefined();
+  });
+
   it("keyset-pages shuffled cached people without overlap", () => {
     const people = Array.from({ length: 23 }, (_, index) => person(index + 1)).reverse();
 
