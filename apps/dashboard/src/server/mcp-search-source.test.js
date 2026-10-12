@@ -362,7 +362,7 @@ describe("searchSessions", () => {
       .rejects.toThrow("flame_mcp_query_request_invalid");
   });
 
-  it("selects the representative using the requested order and preserves raw session match counts", async () => {
+  it("selects strongest representatives before display ordering and preserves raw session match counts", async () => {
     const rows = [eventRow(1, { content_excerpt: "OCR copy" }),
       eventRow(2, { content_excerpt: "OCR copy" }), eventRow(3)];
     const { source } = searchSource([
@@ -372,8 +372,25 @@ describe("searchSessions", () => {
     expect(relevant.results.map((hit) => hit.eventId)).toEqual(["1", "3"]);
     expect(relevant.results[0].sessionMatchCount).toBe(3);
     const recent = await source.searchSessions({ query: "ocr", order: "recent", now: NOW });
-    expect(recent.results.map((hit) => hit.eventId)).toEqual(["3", "2"]);
-    expect(recent.results[1].excerptGroup.alternativeSources[0].eventId).toBe("1");
+    expect(recent.results.map((hit) => hit.eventId)).toEqual(["3", "1"]);
+    expect(recent.results[1].excerptGroup.alternativeSources[0].eventId).toBe("2");
+  });
+
+  it("preserves occurrence selection for distinct excerpts under either order and session cap", async () => {
+    const rows = Array.from({ length: 12 }, (_, i) => eventRow(i + 1, {
+      session_id: i % 2 ? OTHER_SESSION : SESSION,
+      content_excerpt: `distinct OCR evidence ${i}`,
+    }));
+    const { source } = searchSource(rows.map((r, i) => ({ event_id: r.event_id, score: 1 / (i + 1) })), rows);
+    for (const order of ["recent", "relevance"]) {
+      for (const perSessionLimit of [1, 2, 3, 5]) {
+        const request = { query: "ocr", order, perSessionLimit, limit: 20, now: NOW };
+        const grouped = await source.searchSessions(request);
+        const individual = await source.searchSessions({ ...request, groupIdenticalExcerpts: false });
+        expect(grouped.results.map(x => x.eventId)).toEqual(individual.results.map(x => x.eventId));
+        expect(grouped.coverage.groupedOccurrences).toBe(0);
+      }
+    }
   });
 
   it("does not group a complete message with an identical truncated prefix or normalize near matches", async () => {

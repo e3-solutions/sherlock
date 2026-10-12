@@ -33,7 +33,9 @@ Client-specific skills can still request a different search tool explicitly.
 Identical unredacted displayed excerpts occupy one discovery slot per person,
 role, origin and truncation state. Grouping runs only after normal reader and
 canonical-source verification and exposes bounded alternate locations. The
-occurrence view remains available with `groupIdenticalExcerpts: false`.
+occurrence view remains available with `groupIdenticalExcerpts: false`. Both views
+select strongest occurrences within each session before applying the requested
+display order; recent ordering does not change session-slot eligibility.
 
 Full-message tails and nearby context can differ despite matching prefixes.
 Grouping does not delete telemetry, merge source facts, hide repeated events from
@@ -78,3 +80,13 @@ access. These remain important follow-ups:
 Until these follow-ups are measured, report limitations in investigations and
 retain an explicit fallback. Switching the preferred database is distinct from
 demonstrating a universal retrieval-quality or latency advantage.
+
+## Standalone release
+
+The direct hosted MCP can be released independently of the Cosmos default
+preference. Origin-free Claude Code and Codex clients use the existing operator
+bearer at `https://bonaparte.e3g.ai/mcp`. Reconnect and rediscover tools after the
+v2 upgrade; pre-existing clients may retain strict v1 schemas. Cosmos opens a
+fresh downstream client session for each forwarded request, but existing upstream
+clients should still refresh their gateway tool catalogs. Verify the live forwarded
+person/search/evidence flow after deployment without merging the default change.

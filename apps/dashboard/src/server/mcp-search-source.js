@@ -487,7 +487,7 @@ function groupMatches(matches, enabled, compare, perSessionLimit) {
   }
   const groups = new Map();
   const sessionCounts = new Map();
-  const ordered = [...matches].sort(compare);
+  const ordered = [...matches].sort(bySessionRank);
   const membership = new Map();
   for (const match of ordered) {
     sessionCounts.set(match.sessionId, (sessionCounts.get(match.sessionId) ?? 0) + 1);
