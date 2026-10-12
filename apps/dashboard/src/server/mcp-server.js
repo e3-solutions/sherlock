@@ -630,7 +630,7 @@ export function createBonaparteMcpProtocol(source) {
     : INSTRUCTIONS;
   const handler = createMcpHandler(() => {
     const server = new McpServer(
-      { name: "bonaparte-usage", version: "1.2.0" },
+      { name: "bonaparte-usage", version: "1.3.0" },
       { instructions },
     );
     registerBonaparteTools(server, source);

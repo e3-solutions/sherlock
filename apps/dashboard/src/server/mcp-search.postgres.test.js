@@ -446,12 +446,26 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       expect(person.matches.map(x => x.personId)).toEqual([f.people.alice.id]);
       expect((await api.resolvePerson({ name: 'bob' })).matches).toEqual([]);
       const hits = await api.searchSessions({ query: 'zebrafind', personId: f.people.alice.id,
-        start: START, end: END, now: new Date(READ_AT), limit: 20, perSessionLimit: 5 });
+        start: START, end: END, now: new Date(READ_AT), limit: 20, perSessionLimit: 5,
+        groupIdenticalExcerpts: false });
       expect(sortIds(hits.results.map(x => x.eventId))).toEqual(sortIds([
         f.events.visible, f.events.agentMessage, f.events.otherSession, f.events.relatedVisible,
         f.events.atStart, f.events.atReadAt,
       ]));
       expect(hits.results.every(x => x.source.recordSha256 === SHA)).toBe(true);
+      const grouped = await api.searchSessions({ query: 'zebrafind', personId: f.people.alice.id,
+        start: START, end: END, now: new Date(READ_AT), limit: 20 });
+      expect(grouped.matchCount).toBe(6);
+      expect(grouped.results).toHaveLength(1);
+      expect(grouped.results[0].excerptGroup.occurrences).toBe(6);
+      const reachable = [grouped.results[0], ...grouped.results[0].excerptGroup.alternativeSources];
+      expect(sortIds(reachable.map(x => x.eventId))).toEqual(sortIds(hits.results.map(x => x.eventId)));
+      for (const location of reachable) {
+        const evidence = await api.readSessionEvidence({ sessionId: location.sessionId,
+          anchorEventId: location.eventId, limit: 1, now: new Date(READ_AT) });
+        expect(evidence.events[0]).toMatchObject({ eventId: location.eventId, isAnchor: true,
+          canonicalAtRead: true });
+      }
       for (const sessionId of [f.sessions.bob.id, f.sessions.bobChild.id, f.sessions.foreigner.id]) {
         await expect(api.readSessionEvidence({ sessionId })).rejects.toMatchObject({ code: 'flame_mcp_query_not_found' });
       }
