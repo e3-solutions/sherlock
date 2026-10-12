@@ -12,12 +12,13 @@ import {
   runQuery,
 } from "./mcp-query-source.js";
 
-export const SEARCH_SCHEMA_VERSION = "sherlock.search.v1";
+export const SEARCH_SCHEMA_VERSION = "sherlock.search.v2";
 export const SEARCH_CANDIDATE_BUDGET = 500;
 export const SEARCH_DEFAULT_LIMIT = 10;
 export const SEARCH_MAX_LIMIT = 20;
 export const SEARCH_DEFAULT_PER_SESSION_LIMIT = 2;
 export const SEARCH_MAX_PER_SESSION_LIMIT = 5;
+export const SEARCH_MAX_ALTERNATIVE_SOURCES = 5;
 export const SEARCH_MAX_QUERY_TOKENS = 8;
 export const PERSON_DEFAULT_LIMIT = 10;
 export const PERSON_MAX_LIMIT = 10;
@@ -436,9 +437,7 @@ function byRecency(left, right) {
     compareIds(right.eventId, left.eventId);
 }
 
-// Keep the strongest hits per session. Identical text is not merged: repeated
-// instructions are legitimate evidence and transport duplicates are already
-// removed by the canonical rules.
+// The occurrence view preserves the previous strongest-hits-per-session rule.
 function diversify(matches, perSessionLimit) {
   const sessions = new Map();
   for (const match of matches) {
@@ -450,6 +449,77 @@ function diversify(matches, perSessionLimit) {
     .sort(bySessionRank)
     .slice(0, perSessionLimit)
     .map((hit) => ({ ...hit, sessionMatchCount: hits.length })));
+}
+
+function describeExcerptGroup(group, representative) {
+  const others = group.filter((match) => match !== representative);
+  return {
+    kind: "identical_visible_excerpt",
+    occurrences: group.length,
+    sessionCount: new Set(group.map((match) => match.sessionId)).size,
+    alternativeSources: others.slice(0, SEARCH_MAX_ALTERNATIVE_SOURCES).map((match) => ({
+      eventId: match.eventId,
+      sessionId: match.sessionId,
+      occurredAt: match.occurredAt,
+      fullContentBytes: match.fullContentBytes,
+      contentSha256: match.contentSha256,
+      excerptTruncated: match.excerptTruncated,
+      source: match.source,
+    })),
+    alternativesTruncated: others.length > SEARCH_MAX_ALTERNATIVE_SOURCES,
+  };
+}
+
+// A product-view transform over already authorized canonical rows. Identical
+// displayed prefixes can have different full-message tails and context; retain
+// source locations and never assert full-message equality. Redacted rows stay
+// separate rather than merging messages whose hidden text may differ.
+function groupMatches(matches, enabled, compare, perSessionLimit) {
+  if (matches.length > SEARCH_CANDIDATE_BUDGET) throw resultInvalid();
+  if (!enabled) {
+    return {
+      results: diversify(matches, perSessionLimit).sort(compare).map((match) => ({
+        ...match, excerptGroup: describeExcerptGroup([match], match),
+      })),
+      excerptGroups: matches.length,
+      groupedOccurrences: 0,
+    };
+  }
+  const groups = new Map();
+  const sessionCounts = new Map();
+  const ordered = [...matches].sort(bySessionRank);
+  const membership = new Map();
+  for (const match of ordered) {
+    sessionCounts.set(match.sessionId, (sessionCounts.get(match.sessionId) ?? 0) + 1);
+    const key = match.excerptRedacted ? JSON.stringify(["event", match.eventId]) : JSON.stringify([
+      match.personId, match.role, match.origin, match.excerptTruncated, match.contentExcerpt,
+    ]);
+    const group = groups.get(key);
+    if (group) group.push(match);
+    else groups.set(key, [match]);
+    membership.set(match.eventId, key);
+  }
+  const sessionShown = new Map();
+  const results = [];
+  const represented = new Set();
+  // Walk actual occurrence ranks, not group-best ranks. A weak alternate must
+  // not consume a session slot ahead of stronger, distinct evidence.
+  for (const match of ordered) {
+    const key = membership.get(match.eventId);
+    if (represented.has(key) || (sessionShown.get(match.sessionId) ?? 0) >= perSessionLimit) continue;
+    represented.add(key);
+    sessionShown.set(match.sessionId, (sessionShown.get(match.sessionId) ?? 0) + 1);
+    results.push({
+      ...match,
+      sessionMatchCount: sessionCounts.get(match.sessionId),
+      excerptGroup: describeExcerptGroup(groups.get(key), match),
+    });
+  }
+  return {
+    results: results.sort(compare),
+    excerptGroups: groups.size,
+    groupedOccurrences: matches.length - groups.size,
+  };
 }
 
 function readCandidates(rows) {
@@ -615,7 +685,7 @@ export function createSherlockSearchSource(source) {
 
     async searchSessions({
       query, personId, sessionId, start, end, limit, order = "relevance",
-      perSessionLimit, signal, now,
+      perSessionLimit, groupIdenticalExcerpts = true, signal, now,
     } = {}) {
       const text = parseQuery(query);
       const person = optionalUuid(personId);
@@ -625,6 +695,7 @@ export function createSherlockSearchSource(source) {
         perSessionLimit, SEARCH_DEFAULT_PER_SESSION_LIMIT, 1, SEARCH_MAX_PER_SESSION_LIMIT,
       );
       if (order !== "relevance" && order !== "recent") throw invalid();
+      if (typeof groupIdenticalExcerpts !== "boolean") throw invalid();
       const window = queryWindow({ start, end }, now);
       const bounds = [
         window.startAt.toISOString(), window.endAt.toISOString(), window.readAt.toISOString(),
@@ -654,8 +725,9 @@ export function createSherlockSearchSource(source) {
           if (score === undefined || row.occurred_at_us === null) throw resultInvalid();
           return { ...excerptFromRow(row), score };
         });
-      const diverse = diversify(matches, perSession)
-        .sort(order === "recent" ? byRecency : bySessionRank);
+      const grouped = groupMatches(matches, groupIdenticalExcerpts,
+        order === "recent" ? byRecency : bySessionRank, perSession);
+      const diverse = grouped.results;
       const results = diverse.slice(0, pageSize);
       const reasons = [
         "stored_excerpts_only",
@@ -666,6 +738,7 @@ export function createSherlockSearchSource(source) {
       ];
       if (budgetReached) reasons.push("candidate_budget_exceeded");
       if (diverse.length > pageSize) reasons.push("result_capped");
+      if (grouped.groupedOccurrences > 0) reasons.push("identical_excerpts_grouped");
       return {
         schemaVersion: SEARCH_SCHEMA_VERSION,
         window: {
@@ -687,6 +760,9 @@ export function createSherlockSearchSource(source) {
           returnedMatches: results.length,
           limit: pageSize,
           perSessionLimit: perSession,
+          groupIdenticalExcerpts,
+          excerptGroups: grouped.excerptGroups,
+          groupedOccurrences: grouped.groupedOccurrences,
         },
       };
     },

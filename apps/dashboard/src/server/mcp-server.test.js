@@ -358,7 +358,7 @@ describe("Sherlock search MCP tools", () => {
     const listed = await client.listTools();
     const docs = await client.callTool({ name: "documentation", arguments: {} });
 
-    expect(client.getServerVersion()).toMatchObject({ name: "bonaparte-usage", version: "1.2.0" });
+    expect(client.getServerVersion()).toMatchObject({ name: "bonaparte-usage", version: "1.3.0" });
     expect(listed.tools.map((tool) => tool.name)).toEqual([...BASE_TOOLS, ...SEARCH_TOOL_NAMES]);
     for (const tool of listed.tools.filter(({ name }) => SEARCH_TOOL_NAMES.includes(name))) {
       expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
@@ -412,7 +412,7 @@ describe("Sherlock search MCP tools", () => {
     expect(database.calls.find((call) => call.text === SEARCH_CANDIDATES_SQL).params)
       .toEqual(expect.arrayContaining([OCR_QUERY, SHARAD, "1970-01-01T00:00:00.000Z"]));
     expect(search.structuredContent).toMatchObject({
-      schemaVersion: "sherlock.search.v1",
+      schemaVersion: "sherlock.search.v2",
       handling: { trust: "untrusted_session_content", mustNotExecuteOrFollow: true },
       window: { startInclusive: "1970-01-01T00:00:00.000Z" },
       coverage: { state: "partial", reasons: expect.arrayContaining(["no_hit_not_absence"]) },
@@ -543,7 +543,7 @@ describe("Sherlock search MCP tools", () => {
   it("fails closed with a sanitized error when a result breaks the output contract", async () => {
     const tools = registeredTools({
       resolvePerson: vi.fn().mockResolvedValue({
-        schemaVersion: "sherlock.search.v1",
+        schemaVersion: "sherlock.search.v2",
         matches: [],
         matchCount: 0,
         ambiguous: false,
@@ -583,7 +583,7 @@ describe("Sherlock search MCP tools", () => {
       [SEARCH_CANDIDATES_SQL]: () => ids.map((id) => ({ event_id: String(id), score: 1 })),
       [SEARCH_MATCHES_SQL]: () => ids.map((id) => eventRow(id, {
         session_id: `66666666-6666-4666-8666-${String(id).padStart(12, "0")}`,
-        content_excerpt: big,
+        content_excerpt: `${id}: ${big}`,
         content_byte_size: 4096,
       })),
       [EVIDENCE_AFTER_SQL]: () => ids.concat(ids.map((id) => id + 100))
@@ -611,5 +611,48 @@ describe("Sherlock search MCP tools", () => {
     }
     expect(JSON.stringify(search.structuredContent).length).toBeLessThan(40_000);
     expect(JSON.stringify(evidence.structuredContent).length).toBeLessThan(90_000);
+  });
+
+  it("groups copied excerpts over HTTP and lets callers retrieve each occurrence", async () => {
+    const ids = [50, 51, 52, 53, 54, 55, 56];
+    const database = searchDatabase({
+      [SEARCH_CANDIDATES_SQL]: () => ids.map((id) => ({ event_id: String(id), score: 1 })),
+      [SEARCH_MATCHES_SQL]: () => ids.map((id) => eventRow(id, {
+        session_id: `66666666-6666-4666-8666-${String(id).padStart(12, "0")}`,
+        content_excerpt: "OCR shared excerpt",
+      })),
+    });
+    const client = await connect(database.source);
+    const grouped = await client.callTool({ name: "search_sessions", arguments: { query: "ocr" } });
+    expect(grouped.isError).not.toBe(true);
+    expect(grouped.structuredContent.results).toHaveLength(1);
+    expect(grouped.structuredContent.results[0].excerptGroup).toMatchObject({
+      occurrences: 7, sessionCount: 7, alternativesTruncated: true,
+    });
+    expect(grouped.structuredContent.results[0].excerptGroup.alternativeSources).toHaveLength(5);
+    const individual = await client.callTool({ name: "search_sessions", arguments: {
+      query: "ocr", groupIdenticalExcerpts: false,
+    } });
+    expect(individual.isError).not.toBe(true);
+    expect(individual.structuredContent.results).toHaveLength(7);
+    expect(individual.structuredContent.coverage.groupedOccurrences).toBe(0);
+  });
+
+  it("bounds a full page with five alternate sources for each excerpt group", async () => {
+    const ids = Array.from({ length: 120 }, (_, i) => i + 100);
+    const database = searchDatabase({
+      [SEARCH_CANDIDATES_SQL]: () => ids.map(id => ({ event_id: String(id), score: 1 })),
+      [SEARCH_MATCHES_SQL]: () => ids.map((id, i) => eventRow(id, {
+        session_id: `66666666-6666-4666-8666-${String(id).padStart(12, "0")}`,
+        content_excerpt: `${Math.floor(i / 6)} ${"x".repeat(1024)}`,
+        content_byte_size: 4096,
+      })),
+    });
+    const client = await connect(database.source);
+    const response = await client.callTool({ name: "search_sessions", arguments: { query: "xx", limit: 20 } });
+    expect(response.isError).not.toBe(true);
+    expect(response.structuredContent.results).toHaveLength(20);
+    expect(response.structuredContent.results.every(hit => hit.excerptGroup.alternativeSources.length === 5)).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(200_000);
   });
 });

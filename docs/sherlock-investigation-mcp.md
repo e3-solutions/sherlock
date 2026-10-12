@@ -10,9 +10,16 @@ The existing metadata tools (`diagnostics`, `coverage`, `list_sessions`,
 `get_session`, `query_usage`) and the Bonaparte evidence tools keep their
 contracts in [`sherlock-query-mcp-v1.md`](sherlock-query-mcp-v1.md) and
 [`bonaparte-mcp-v1.md`](bonaparte-mcp-v1.md). `get_session` remains
-metadata-only. The server identifies as `bonaparte-usage` version `1.2.0`; the
+metadata-only. The server identifies as `bonaparte-usage` version `1.3.0`; the
 search tools, their documentation entries, and their server instructions are
 advertised only when the search source is configured.
+
+All three investigation tools (`resolve_person`, `search_sessions`, and
+`get_session_evidence`) now return `sherlock.search.v2`. Grouped discovery adds
+required result and coverage fields to `search_sessions`; the other two tools
+retain their shapes with the new shared version. Refresh gateway/client tool discovery after upgrading
+or rolling back; cached strict schemas can reject responses across these versions.
+The previous server does not accept `groupIdenticalExcerpts` input.
 
 ## What the search can and cannot see
 
@@ -34,6 +41,19 @@ advertised only when the search source is configured.
   more verified hits exist than were returned.
 - **All history by default.** Without `start`/`end`, search covers
   `1970-01-01T00:00:00.000Z` through the server read time.
+- **Grouped discovery.** By default, identical unredacted visible excerpts from
+  the same person, role, origin and truncation state occupy one result slot.
+  `excerptGroup` retains up to five alternate source locations, their individual
+  hashes and sizes, and whether additional locations were omitted. Counts describe
+  only verified candidates in this window; they are not corpus-wide counts.
+  Matching prefixes do not prove full-message equality. Open each relevant
+  alternate with its own `sessionId` and `eventId`; context and hidden tails can
+  differ. Set `groupIdenticalExcerpts: false` and narrow the query to inspect
+  individual occurrences. Exact evidence reads remain ungrouped.
+  `coverage.excerptGroups` counts groups before per-session/page limits; when
+  grouping is disabled it counts individual occurrences. Per-session caps can
+  still omit whole groups. `sessionMatchCount` remains the raw verified count for
+  a returned representative's session, so it can exceed the number shown.
 - **Context can shift.** Search and evidence reads are not snapshot-frozen. Late
   corrections or late-arriving events can change surrounding context between
   calls. Each anchor reports `canonicalAtRead`.
@@ -62,6 +82,10 @@ advertised only when the search source is configured.
 5. If the search reports `candidate_budget_exceeded` or `result_capped`, narrow
    the query with `personId`, `sessionId`, a shorter `start`/`end` window, or more
    specific terms. Do not treat the returned page as exhaustive.
+6. Inspect relevant `excerptGroup.alternativeSources` when the same displayed
+   text appears in several sessions. Grouping happens after reader verification
+   and before page limits. It adds no SQL query and cannot recover distinct
+   evidence that duplicates crowded out of the candidate budget.
 
 ### Example: Sharad's OCR work
 
@@ -128,6 +152,13 @@ only timings, sizes and counts; no excerpts or credentials. Four concurrent
 read calls also exercise the two-connection pool; observed burst throughput is
 not sustainable throughput. An optional `SHERLOCK_BENCH_EXPECT_SESSION` checks
 an independently labelled experiment session in the Google Vision case.
+
+To compare discovery grouping through the same transport, person filter, fixed
+end time, query and budget, run the benchmark with `--local --compare-grouping`.
+It interleaves grouping off/on, reports distinct displayed excerpts and alternate
+source counts, and uses ten results per page. This measures the current code's
+grouping cost, not old Cosmos speed or answer relevance. Live corrections can
+still change the nominated set; the comparison is not a frozen corpus snapshot.
 
 ## Errors
 

@@ -280,6 +280,7 @@ describe("searchSessions", () => {
           "context_not_snapshot_frozen",
           "product_view_omissions",
           "result_capped",
+          "identical_excerpts_grouped",
         ],
         candidateBudget: SEARCH_CANDIDATE_BUDGET,
         candidatesExamined: 6,
@@ -289,7 +290,7 @@ describe("searchSessions", () => {
     });
 
     const recent = await source.searchSessions({
-      query: "eval", order: "recent", perSessionLimit: 3, now: NOW,
+      query: "eval", order: "recent", perSessionLimit: 3, groupIdenticalExcerpts: false, now: NOW,
     });
     expect(recent.results.map((hit) => hit.eventId)).toEqual(["4", "3", "2", "1"]);
     expect(recent.results.filter((hit) => hit.contentExcerpt === "repeat the eval")).toHaveLength(2);
@@ -297,6 +298,137 @@ describe("searchSessions", () => {
     const diverse = await source.searchSessions({ query: "eval", perSessionLimit: 1, now: NOW });
     expect(diverse.results.map((hit) => hit.eventId)).toEqual(["4", "1"]);
     expect(diverse.coverage.reasons).not.toContain("result_capped");
+  });
+
+  it("groups copied excerpts before page limits and retains source locations with different full-message tails", async () => {
+    const rows = Array.from({ length: 6 }, (_, i) => eventRow(i + 1, {
+      session_id: `11111111-1111-4111-8111-${String(i + 1).padStart(12, "0")}`,
+      content_excerpt: "OCR experiment question",
+      content_byte_size: 2000 + i,
+      content_sha256: String(i).repeat(64),
+    }));
+    rows.push(eventRow(7, { content_excerpt: "OCR experiment results" }));
+    const candidates = rows.map((row, i) => ({ event_id: row.event_id, score: 1 - i / 10 }));
+    const { source, calls } = searchSource(candidates, rows);
+    const grouped = await source.searchSessions({ query: "ocr", limit: 2, now: NOW });
+    expect(grouped.results.map((hit) => hit.eventId)).toEqual(["1", "7"]);
+    expect(grouped.results[0].excerptGroup).toMatchObject({
+      kind: "identical_visible_excerpt", occurrences: 6, sessionCount: 6,
+      alternativeSources: [
+        { eventId: "2", sessionId: rows[1].session_id, fullContentBytes: 2001, contentSha256: "1".repeat(64), source: { sourceRecordId: "9002" } },
+        { eventId: "3" }, { eventId: "4" }, { eventId: "5" }, { eventId: "6" },
+      ],
+      alternativesTruncated: false,
+    });
+    expect(grouped).toMatchObject({ matchCount: 7, matchedSessions: 7,
+      coverage: { groupIdenticalExcerpts: true, excerptGroups: 2, groupedOccurrences: 5 } });
+    expect(grouped.coverage.reasons).toContain("identical_excerpts_grouped");
+    expect(calls).toHaveLength(2);
+    const ungrouped = await source.searchSessions({ query: "ocr", limit: 10,
+      groupIdenticalExcerpts: false, now: NOW });
+    expect(ungrouped.results).toHaveLength(7);
+    expect(ungrouped.results.every((hit) => hit.excerptGroup.occurrences === 1)).toBe(true);
+    expect(ungrouped.coverage.groupedOccurrences).toBe(0);
+  });
+
+  it("keeps identical excerpts from different people, roles and origins separate", async () => {
+    const rows = [
+      eventRow(1, { content_excerpt: "same OCR text" }),
+      eventRow(2, { content_excerpt: "same OCR text", person_id: OTHER_SESSION }),
+      eventRow(3, { content_excerpt: "same OCR text", message_role: "assistant" }),
+      eventRow(4, { content_excerpt: "same OCR text", message_origin: "worker" }),
+    ];
+    const { source } = searchSource(rows.map((r) => ({ event_id: r.event_id, score: 1 })), rows);
+    const result = await source.searchSessions({ query: "ocr", perSessionLimit: 5, now: NOW });
+    expect(result.results).toHaveLength(4);
+    expect(result.coverage.groupedOccurrences).toBe(0);
+  });
+
+  it("does not merge redaction collisions and bounds alternative source output", async () => {
+    const rows = [1, 2].map((id) => eventRow(id, {
+      content_excerpt: `OCR token ghp_${String(id).repeat(30)}`,
+    }));
+    rows.push(...Array.from({ length: 9 }, (_, i) => eventRow(i + 3, {
+      session_id: OTHER_SESSION, content_excerpt: "copied OCR evidence",
+    })));
+    const { source } = searchSource(rows.map((r) => ({ event_id: r.event_id, score: 1 })), rows);
+    const result = await source.searchSessions({ query: "ocr", perSessionLimit: 5, now: NOW });
+    expect(result.results.filter((hit) => hit.excerptRedacted)).toHaveLength(2);
+    expect(result.results.find((hit) => !hit.excerptRedacted).excerptGroup).toMatchObject({
+      occurrences: 9, sessionCount: 1, alternativesTruncated: true,
+    });
+    expect(result.results.find((hit) => !hit.excerptRedacted).excerptGroup.alternativeSources).toHaveLength(5);
+    await expect(source.searchSessions({ query: "ocr", groupIdenticalExcerpts: "yes", now: NOW }))
+      .rejects.toThrow("flame_mcp_query_request_invalid");
+  });
+
+  it("selects strongest representatives before display ordering and preserves raw session match counts", async () => {
+    const rows = [eventRow(1, { content_excerpt: "OCR copy" }),
+      eventRow(2, { content_excerpt: "OCR copy" }), eventRow(3)];
+    const { source } = searchSource([
+      { event_id: "1", score: 1 }, { event_id: "2", score: 0.5 }, { event_id: "3", score: 0.4 },
+    ], rows);
+    const relevant = await source.searchSessions({ query: "ocr", now: NOW });
+    expect(relevant.results.map((hit) => hit.eventId)).toEqual(["1", "3"]);
+    expect(relevant.results[0].sessionMatchCount).toBe(3);
+    const recent = await source.searchSessions({ query: "ocr", order: "recent", now: NOW });
+    expect(recent.results.map((hit) => hit.eventId)).toEqual(["3", "1"]);
+    expect(recent.results[1].excerptGroup.alternativeSources[0].eventId).toBe("2");
+  });
+
+  it("preserves occurrence selection for distinct excerpts under either order and session cap", async () => {
+    const rows = Array.from({ length: 12 }, (_, i) => eventRow(i + 1, {
+      session_id: i % 2 ? OTHER_SESSION : SESSION,
+      content_excerpt: `distinct OCR evidence ${i}`,
+    }));
+    const { source } = searchSource(rows.map((r, i) => ({ event_id: r.event_id, score: 1 / (i + 1) })), rows);
+    for (const order of ["recent", "relevance"]) {
+      for (const perSessionLimit of [1, 2, 3, 5]) {
+        const request = { query: "ocr", order, perSessionLimit, limit: 20, now: NOW };
+        const grouped = await source.searchSessions(request);
+        const individual = await source.searchSessions({ ...request, groupIdenticalExcerpts: false });
+        expect(grouped.results.map(x => x.eventId)).toEqual(individual.results.map(x => x.eventId));
+        expect(grouped.coverage.groupedOccurrences).toBe(0);
+      }
+    }
+  });
+
+  it("does not group a complete message with an identical truncated prefix or normalize near matches", async () => {
+    const rows = [
+      eventRow(1, { content_excerpt: "OCR text", content_byte_size: 8 }),
+      eventRow(2, { content_excerpt: "OCR text", content_byte_size: 100 }),
+      eventRow(3, { content_excerpt: "OCR text\n", content_byte_size: 9 }),
+    ];
+    const { source } = searchSource(rows.map((r) => ({ event_id: r.event_id, score: 1 })), rows);
+    const result = await source.searchSessions({ query: "ocr", perSessionLimit: 5, now: NOW });
+    expect(result.results).toHaveLength(3);
+    expect(result.coverage.groupedOccurrences).toBe(0);
+  });
+
+  it("uses an alternate session when the strongest copy's session has filled its slots", async () => {
+    const rows = [eventRow(1), eventRow(2),
+      eventRow(3, { content_excerpt: "OCR copied evidence" }),
+      eventRow(4, { content_excerpt: "OCR copied evidence", session_id: OTHER_SESSION })];
+    const candidates = rows.map((r, i) => ({ event_id: r.event_id, score: 1 - i / 10 }));
+    const { source } = searchSource(candidates, rows);
+    const result = await source.searchSessions({ query: "ocr", now: NOW });
+    expect(result.results.map((hit) => hit.eventId)).toEqual(["1", "2", "4"]);
+    expect(result.results[2].excerptGroup.alternativeSources[0].eventId).toBe("3");
+    const shuffled = searchSource([...candidates].reverse(), [...rows].reverse());
+    expect(await shuffled.source.searchSessions({ query: "ocr", now: NOW })).toEqual(result);
+  });
+
+  it("does not let a weak copy displace stronger distinct evidence in an alternate session", async () => {
+    const rows = [eventRow(1), eventRow(2, { content_excerpt: "OCR copy" }),
+      eventRow(3, { content_excerpt: "OCR copy", session_id: OTHER_SESSION }),
+      eventRow(4, { content_excerpt: "OCR distinct result", session_id: OTHER_SESSION })];
+    const candidates = [
+      { event_id: "1", score: 0.95 }, { event_id: "2", score: 0.9 },
+      { event_id: "3", score: 0.3 }, { event_id: "4", score: 0.8 },
+    ];
+    const { source } = searchSource(candidates, rows);
+    const result = await source.searchSessions({ query: "ocr", perSessionLimit: 1, now: NOW });
+    expect(result.results.map((hit) => hit.eventId)).toEqual(["1", "4"]);
   });
 
   it("keeps canonical predicates and query-independent filters in the verification SQL", () => {
