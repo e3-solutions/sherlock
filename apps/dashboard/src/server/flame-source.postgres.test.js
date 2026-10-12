@@ -1,4 +1,4 @@
-import { decodeFrameOverview, getOverviewAuthorization, previewSummary } from "../shared/frame-overview.js";
+import { buildFrameOverview, decodeFrameOverview, getOverviewAuthorization, previewSummary } from "../shared/frame-overview.js";
 import postgres from "postgres";
 import { readFileSync } from "node:fs";
 import { URL as FileURL } from "node:url";
@@ -17,6 +17,7 @@ import {
   INTERVAL_PULL_REQUESTS_SQL,
   LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
+  PROJECTION_FLAME_SQL,
   PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
 } from "./flame-source.js";
@@ -974,6 +975,25 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         summary: summary === null ? null : previewSummary(summary), evidenceSource: null,
       })));
       expect(await source.authorizeFrameOverviews(projectedDay)).toBe(projectedDay);
+      const rawOverviewRows = await source.transaction(tx => tx.unsafe(PROJECTION_FLAME_SQL, [
+        workspaceId, projectedDay.start, new Date(Date.parse(projectedDay.start) + 86400000).toISOString(),
+        FRAME_VERSION, partialRead.toISOString(), 'e3group.ai',
+      ]));
+      const otherRevision = rawOverviewRows.flatMap(row => row.work_rows)
+        .find(row => row.session_id === workerSessionId).frame_revision_id;
+      const wrongRevisionRows = Array.from(rawOverviewRows, row => ({ ...row,
+        work_rows: row.work_rows.map(work => work.session_id === sessionId
+          ? { ...work, frame_revision_id: otherRevision } : work),
+      }));
+      const wrongRevisionOverview = buildFrameOverview({
+        personId, rows: wrongRevisionRows, counts: projectedDay.people[0].buckets,
+        automatedRuns: projectedDay.people[0].automatedRuns,
+        summaries: wrongRevisionRows[0].day_summaries,
+      });
+      expect(wrongRevisionOverview).not.toBeNull();
+      expect((await source.authorizeFrameOverviews({ ...projectedDay,
+        people: [{ ...projectedDay.people[0], overview: wrongRevisionOverview }],
+      })).people[0].overview).toBeUndefined();
       const protectedSummary = getOverviewAuthorization(personOverview).summaryEventIds[0];
       const previewPolicy = `preview_private_${workspaceId.replaceAll("-", "")}`;
       const [securityBefore] = await sql.unsafe("select relrowsecurity from pg_class where oid = 'telemetry.events'::regclass");

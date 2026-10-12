@@ -80,6 +80,8 @@ describe('snapshot frame overview', () => {
     const view = buildFrameOverview(populated());
     expect(getOverviewAuthorization(view)).toEqual({ personId: PERSON, frameRevisionIds: ['77'], recoveryHashes: [], sessionIds: [SESSION], summaryEventIds: ['42'] });
     expect(JSON.stringify(view)).not.toContain('summaryEventIds');
+    expect(JSON.stringify(view)).not.toContain('frameRevisionIds');
+    expect(JSON.stringify(view)).not.toContain('frame_revision_id');
     expect(getOverviewAuthorization(JSON.parse(JSON.stringify(view)))).toBeNull();
     expect(filterAuthorizedOverview(view, { personId: PERSON, recoveryHashes: [], sessionIds: [SESSION], summaryEventIds: ['42'] })).toBe(view);
     expect(filterAuthorizedOverview(view, { personId: PERSON, recoveryHashes: [], sessionIds: [], summaryEventIds: ['42'] })).toBeNull();
