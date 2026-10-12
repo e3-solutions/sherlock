@@ -16,7 +16,7 @@ RUN addgroup -g 10001 app && adduser -D -u 10001 -G app app
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/server.mjs ./
-COPY --from=build /app/src/server ./src/server
+COPY --from=build /app/src ./src
 COPY --from=build /app/dist ./dist
 USER app
 EXPOSE 8080
