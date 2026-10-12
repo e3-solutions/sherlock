@@ -1040,11 +1040,36 @@ function projectedEvidenceCte({
   sessionScoped = false,
   activityThroughReadAt = false,
   splitEvidenceWindows = false,
+  evidenceKind = null,
 } = {}) {
   const visibility = snapshotVisible
     ? "and pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)"
     : "";
   const activityEnd = activityThroughReadAt ? "p.read_at" : "p.end_at";
+  // RLS can keep non-leakproof timestamp arithmetic out of index conditions.
+  // Scoped queries materialize expanded bounds in p before comparing columns.
+  const activityStartBound = personScoped ? "p.activity_start"
+    : `p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`;
+  const activityEndBound = personScoped ? "p.activity_end"
+    : `${activityEnd} + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`;
+  const promptStartBound = personScoped ? "p.prompt_start"
+    : `p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`;
+  const promptEndBound = personScoped ? "p.prompt_end"
+    : `p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`;
+  const candidatePersonJoin = personScoped
+    ? `join telemetry.people evidence_person
+      on evidence_person.workspace_id = revision.workspace_id
+     and evidence_person.id = revision.person_id`
+    : `join roster evidence_person
+      on evidence_person.person_id = revision.person_id`;
+  const candidateScope = `
+     ${evidenceKind ? `and revision.evidence_kind = '${evidenceKind}'` : ""}
+     ${personScoped ? "and revision.person_id = p.person_id" : ""}
+     ${sessionScoped ? "and revision.session_id = p.session_id" : ""}
+     ${personScoped ? `and evidence_person.github_id is distinct from 'sherlock-smoke'
+     and split_part(evidence_person.email, '@', 2) = p.expected_email_domain
+     and split_part(evidence_person.email, '@', 3) = ''` : ""}
+     ${visibility}`;
   const splitCandidates = splitEvidenceWindows
     ? `
 frame_revision_candidates as materialized (
@@ -1052,49 +1077,52 @@ frame_revision_candidates as materialized (
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, null::text prompt_identity,
-         revision.is_tombstone
+         revision.is_tombstone, revision.is_summary_candidate
+         ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
-    join roster evidence_person
-      on evidence_person.person_id = revision.person_id
+    ${candidatePersonJoin}
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     ${candidateScope}
      and revision.evidence_kind = 'activity'
-     and revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
-     and revision.observed_at < ${activityEnd} + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+     and revision.observed_at >= ${activityStartBound}
+     and revision.observed_at < ${activityEndBound}
   union all
   select revision.id, revision.session_id, revision.person_id,
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, revision.prompt_identity,
-         revision.is_tombstone
+         revision.is_tombstone, revision.is_summary_candidate
+         ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
-    join roster evidence_person
-      on evidence_person.person_id = revision.person_id
+    ${candidatePersonJoin}
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     ${candidateScope}
      and revision.evidence_kind = 'prompt'
-     and revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-     and revision.anchor_observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+     and revision.anchor_observed_at >= ${promptStartBound}
+     and revision.anchor_observed_at < ${promptEndBound}
   union all
   select revision.id, revision.session_id, revision.person_id,
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, revision.prompt_identity,
-         revision.is_tombstone
+         revision.is_tombstone, revision.is_summary_candidate
+         ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
-    join roster evidence_person
-      on evidence_person.person_id = revision.person_id
+    ${candidatePersonJoin}
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     ${candidateScope}
      and revision.evidence_kind = 'prompt'
-     and revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-     and revision.observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+     and revision.observed_at >= ${promptStartBound}
+     and revision.observed_at < ${promptEndBound}
      and not coalesce(
-       revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-       and revision.anchor_observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds',
+       revision.anchor_observed_at >= ${promptStartBound}
+       and revision.anchor_observed_at < ${promptEndBound},
        false
      )
 ), `
@@ -1268,11 +1296,17 @@ with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
          $3::pg_snapshot snapshot, $4::uuid person_id,
          $5::timestamptz start_at, $6::timestamptz end_at,
+         $5::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_start,
+         $6::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_end,
+         $5::timestamptz - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_start,
+         $6::timestamptz + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_end,
          $7::timestamptz bucket_start, $8::timestamptz bucket_end,
          $9::text expected_email_domain
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  splitEvidenceWindows: true,
+  evidenceKind: "activity",
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
@@ -1323,11 +1357,17 @@ with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
          $3::pg_snapshot snapshot, $4::uuid person_id,
          $5::timestamptz start_at, $6::timestamptz end_at,
+         $5::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_start,
+         $6::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_end,
+         $5::timestamptz - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_start,
+         $6::timestamptz + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_end,
          $7::timestamptz bucket_start, $8::timestamptz bucket_end,
          $9::text expected_email_domain
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  splitEvidenceWindows: true,
+  evidenceKind: "prompt",
 })}, selected as materialized (
   select projected_prompts.*,
          count(*) over ()::bigint eligible_prompt_count
@@ -1351,12 +1391,18 @@ with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
          $3::pg_snapshot snapshot, $4::uuid person_id,
          $5::timestamptz start_at, $6::timestamptz end_at,
+         $5::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_start,
+         $6::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_end,
+         $5::timestamptz - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_start,
+         $6::timestamptz + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_end,
          $7::uuid session_id, $8::text semantic_role,
          $9::bigint cursor_at_microseconds, $10::bigint cursor_id,
          $11::text expected_email_domain
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  splitEvidenceWindows: true,
+  evidenceKind: "activity",
   // Session identity is stable across revisions and matches the reader index.
   // Actor role is revisioned, so role filtering must remain after latest-rank selection.
   sessionScoped: true,

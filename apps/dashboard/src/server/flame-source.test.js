@@ -1059,16 +1059,25 @@ describe("Sherlock Flame payload", () => {
     ]) {
       expect(query).toContain("revision.evidence_kind = 'activity'");
       expect(query).toContain(
-        `revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`,
+        "revision.observed_at >= p.activity_start",
       );
       expect(query).toContain("revision.evidence_kind = 'prompt'");
       expect(query).toContain(
-        `revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`,
+        "revision.anchor_observed_at >= p.prompt_start",
       );
       expect(query).toContain(
-        `or revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`,
+        "revision.observed_at >= p.prompt_start",
       );
       expect(query).toContain("pg_visible_in_snapshot(revision.xmin::text::xid8");
+      const arms = query.split("frame_revision_candidates as materialized (")[1]
+        .split("), ranked_frame_revisions")[0].split("union all");
+      expect(arms).toHaveLength(3);
+      for (const arm of arms) {
+        expect(arm).toContain("and revision.person_id = p.person_id");
+        expect(arm).toContain("pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)");
+        expect(arm).toContain("revision.is_summary_candidate");
+        expect(arm).toContain("evidence_person.github_id is distinct from 'sherlock-smoke'");
+      }
       expect(query).not.toContain("frame_projection_receipts");
       expect(query).not.toContain("telemetry.sessions");
       expect(query).not.toContain("telemetry.native_records");
@@ -1098,7 +1107,7 @@ describe("Sherlock Flame payload", () => {
       "and revision.session_id = p.session_id",
     );
     expect(detailRevisionScope).toBeGreaterThan(
-      PROJECTION_WORK_DETAIL_SQL.indexOf("ranked_frame_revisions as materialized"),
+      PROJECTION_WORK_DETAIL_SQL.indexOf("frame_revision_candidates as materialized"),
     );
     expect(detailRevisionScope).toBeLessThan(
       PROJECTION_WORK_DETAIL_SQL.indexOf("), latest_frame_evidence as materialized"),
@@ -1144,7 +1153,7 @@ describe("Sherlock Flame payload", () => {
         sql,
         "ranked_frame_revisions as materialized",
         "latest_frame_evidence as materialized",
-        "where latest_rank = 1 and not is_tombstone",
+        "where not is_tombstone",
         "projected_activity as materialized",
         "and actor_role <> 'guardian'",
         "projected_prompt_candidates as materialized",
