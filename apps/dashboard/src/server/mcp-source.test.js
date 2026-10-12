@@ -105,4 +105,37 @@ describe("cached MCP usage evidence", () => {
     expect((await mcpSource.fetchUsageEvidence()).snapshot).toBe("v1.first");
     expect((await mcpSource.fetchUsageEvidence()).snapshot).toBe("v1.second");
   });
+
+  it("delegates excerpt search only when a complete search source is supplied", async () => {
+    const cache = { read: vi.fn() };
+    const source = { fetchPromptEvidence: vi.fn() };
+    const without = createCachedMcpSource({ cache, source });
+    for (const method of ["resolvePerson", "searchSessions", "readSessionEvidence"]) {
+      expect(without).not.toHaveProperty(method);
+    }
+
+    const signal = new AbortController().signal;
+    const searchSource = {
+      resolvePerson: vi.fn().mockResolvedValue({ matches: [] }),
+      searchSessions: vi.fn().mockResolvedValue({ results: [] }),
+      readSessionEvidence: vi.fn().mockResolvedValue({ events: [] }),
+    };
+    const withSearch = createCachedMcpSource({ cache, source, searchSource });
+    await expect(withSearch.resolvePerson({ name: "Ada", signal }))
+      .resolves.toEqual({ matches: [] });
+    await expect(withSearch.searchSessions({ query: "ocr", signal }))
+      .resolves.toEqual({ results: [] });
+    await expect(withSearch.readSessionEvidence({ sessionId: person(1).id, signal }))
+      .resolves.toEqual({ events: [] });
+    expect(searchSource.resolvePerson).toHaveBeenCalledWith({ name: "Ada", signal });
+    expect(searchSource.searchSessions).toHaveBeenCalledWith({ query: "ocr", signal });
+    expect(searchSource.readSessionEvidence)
+      .toHaveBeenCalledWith({ sessionId: person(1).id, signal });
+
+    expect(() => createCachedMcpSource({
+      cache,
+      source,
+      searchSource: { resolvePerson: vi.fn(), searchSessions: vi.fn() },
+    })).toThrow("A complete Sherlock search source is required");
+  });
 });

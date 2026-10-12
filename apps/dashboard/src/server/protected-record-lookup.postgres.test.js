@@ -6,10 +6,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const DATABASE_URL = process.env.SHERLOCK_TEST_DATABASE_URL;
 const describePostgres = DATABASE_URL ? describe : describe.skip;
-const MIGRATION = readFileSync(new FileURL(
+const MIGRATION = DATABASE_URL ? readFileSync(new FileURL(
   "../../../../supabase/migrations/20261012065436_bound_protected_record_lookup.sql",
   import.meta.url,
-), "utf8");
+), "utf8") : null;
 const SHA = "0".repeat(64);
 const FUNCTION = "sherlock_access.protected_record_ids()";
 

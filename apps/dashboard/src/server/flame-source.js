@@ -84,6 +84,13 @@ const INTERNAL_CONTEXT_PREFIXES = Object.freeze([
   "# Bonaparte Implementation",
   "The configured soft phase budget has expired.",
 ]);
+// Product discovery and work labels may omit new runtime envelopes without
+// changing the canonical prompt universe of already-issued snapshot tokens.
+export const WORK_CONTEXT_PREFIXES = Object.freeze([
+  ...INTERNAL_CONTEXT_PREFIXES,
+  "<external_codex_apps_open_page>",
+  "The following is the Codex agent history",
+]);
 export function validateDashboardEmailDomain(value) {
   if (![PREFERRED_DASHBOARD_EMAIL_DOMAIN, SIXTYFOUR_DASHBOARD_EMAIL_DOMAIN].includes(value)) {
     throw new TypeError("SHERLOCK_DASHBOARD_EMAIL_DOMAIN must be e3group.ai or sixtyfour.ai");
@@ -101,8 +108,8 @@ function nativeItemTimestamp(column) {
   end`;
 }
 
-function internalContextPrefixExclusion(column) {
-  return INTERNAL_CONTEXT_PREFIXES.map((prefix) =>
+function internalContextPrefixExclusion(column, prefixes = INTERNAL_CONTEXT_PREFIXES) {
+  return prefixes.map((prefix) =>
     `left(btrim(${column}), ${prefix.length}) <> '${
       prefix.replaceAll("'", "''")
     }'`
@@ -118,7 +125,7 @@ function nativePromptContentPredicate(column) {
 
 function dashboardSummaryContentPredicate(column) {
   return `${column} is not null and btrim(${column}) <> ''
-       and ${internalContextPrefixExclusion(column)}`;
+       and ${internalContextPrefixExclusion(column, WORK_CONTEXT_PREFIXES)}`;
 }
 
 // Raw v4 tokens share Codex identity across the upload cutover. Older token
@@ -1663,7 +1670,7 @@ function pullRequestFromRow(row) {
 export function dashboardWorkSummary(value) {
   if (value === null || value === undefined) return null;
   const summary = String(value).trim();
-  if (summary === "" || INTERNAL_CONTEXT_PREFIXES.some((prefix) =>
+  if (summary === "" || WORK_CONTEXT_PREFIXES.some((prefix) =>
     summary.startsWith(prefix)
   )) return null;
   return summary;
