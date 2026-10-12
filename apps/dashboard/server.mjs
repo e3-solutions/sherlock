@@ -13,6 +13,7 @@ import {
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createSherlockQuerySource } from "./src/server/mcp-query-source.js";
+import { createSherlockSearchSource } from "./src/server/mcp-search-source.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
 import { FlameDayCache } from "./src/server/flame-cache.js";
 import {
@@ -92,6 +93,7 @@ const mcpSource = source && cache ? createCachedMcpSource({
   source,
   querySource: createSherlockQuerySource(source),
   providerUsageSource,
+  searchSource: createSherlockSearchSource(source),
 }) : null;
 const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
 

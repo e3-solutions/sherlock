@@ -260,16 +260,21 @@ least 32 characters and configure the MCP client to send it as
 `Authorization: Bearer <token>`. Browser-origin requests are rejected; the
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
-The endpoint exposes six bounded Sherlock query tools plus the two existing
-Bonaparte evidence tools. Their complete input, output, pagination, error, and
+The endpoint exposes bounded Sherlock metadata and usage tools, the existing
+Bonaparte evidence tools, and three colleague-work investigation tools. Their complete input, output, pagination, error, and
 limitation contracts are documented in
 [`docs/sherlock-query-mcp-v1.md`](../../docs/sherlock-query-mcp-v1.md) and
-[`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md).
+[`docs/bonaparte-mcp-v1.md`](../../docs/bonaparte-mcp-v1.md), and
+[`docs/sherlock-investigation-mcp.md`](../../docs/sherlock-investigation-mcp.md).
 
 - `documentation`, `diagnostics`, and `coverage` describe the live contract and
   distinguish observed, partial, and missing data.
 - `list_sessions` and `get_session` expose a strict metadata allowlist without
   titles, transcripts, prompts, paths, branches, or repository remotes.
+- `resolve_person`, `search_sessions`, and `get_session_evidence` resolve names,
+  rank diverse canonical excerpt matches, and open exact-source conversation
+  context with microsecond keyset cursors. These use a bounded indexed candidate
+  function that fails closed on privacy-policy drift and rechecks facts under RLS.
 - `query_usage` aggregates active Codex/Claude projections by person and model,
   differencing cumulative Codex streams and surfacing missing baselines or
   regressions as partial coverage.

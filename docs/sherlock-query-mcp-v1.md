@@ -3,8 +3,10 @@
 Sherlock query v1 adds bounded, read-only telemetry analysis to the existing
 Bonaparte evidence endpoint. It is intentionally smaller than the raw
 TimeTracker surface: it answers session, model, token, and coverage questions
-without exposing transcripts, message search, raw Storage, filesystem paths,
-repository remotes, arbitrary SQL, or write operations.
+without exposing transcripts, message content, raw Storage, filesystem paths,
+repository remotes, arbitrary SQL, or write operations. Bounded excerpt search
+is a separate surface, described in
+[`sherlock-investigation-mcp.md`](sherlock-investigation-mcp.md).
 
 ## Recommended flow
 
@@ -43,6 +45,12 @@ window and filters from the preceding page.
 
 The existing `list_usage_evidence` and `list_prompt_evidence` tools remain
 available with their v1 contract in `bonaparte-mcp-v1.md`.
+
+When the search source is configured, the endpoint also exposes the separate
+excerpt-search tools `resolve_person`, `search_sessions`, and
+`get_session_evidence`. Their contract and investigation workflow are in
+[`sherlock-investigation-mcp.md`](sherlock-investigation-mcp.md). The query v1
+tools above are unchanged and remain metadata-only.
 
 ## Token semantics
 
@@ -149,5 +157,6 @@ health probing.
   identity mappings, component semantics, and exclusions. Neither source's
   partial aggregate is a completeness oracle or a productivity ranking.
 - This patch changes read-time selection only. It does not recover uncollected
-  source files, reproject history, deploy collector upgrades, or grant content
-  search to the shared organization-wide MCP bearer.
+  source files, reproject history, or deploy collector upgrades. Bounded
+  excerpt search for the shared organization-wide MCP bearer is a separate
+  surface; see [`sherlock-investigation-mcp.md`](sherlock-investigation-mcp.md).

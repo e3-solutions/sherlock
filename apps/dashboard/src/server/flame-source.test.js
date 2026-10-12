@@ -110,6 +110,14 @@ describe("Sherlock Flame payload", () => {
       .toBeNull();
     expect(dashboardWorkSummary("<environment_context>machine context"))
       .toBeNull();
+    for (const prefix of [
+      "<external_codex_apps_open_page>",
+      "The following is the Codex agent history added since your last approval assessment.",
+    ]) {
+      expect(dashboardWorkSummary(`${prefix}machine context`)).toBeNull();
+      // Product labels change; the immutable raw prompt selection does not.
+      expect(INTERVAL_PROMPTS_SQL).not.toContain(prefix);
+    }
     expect(dashboardWorkSummary("<order>human-authored XML</order>"))
       .toBe("<order>human-authored XML</order>");
   });

@@ -26,7 +26,7 @@ const FRAME_CLAUDE_VERSION = "sherlock.claude-code-transcript.v1";
 
 // Match the canonical frame projector, including its pre-cutover v2 fallback
 // for an immutable source record that has no non-replay v1 projection.
-function activeNormalizerPredicate(event, session, batch, cutover) {
+export function activeNormalizerPredicate(event, session, batch, cutover) {
   return `(
     ${batch}.source_provider = 'claude_code'
     and ${event}.normalizer_version = '${FRAME_CLAUDE_VERSION}'
@@ -68,7 +68,7 @@ function canonicalNormalizer(event) {
 
 // Resolve canonical identity against all visible projections, not only those
 // inside a reporting window. The partial canonical index bounds this lookup.
-function canonicalWinnerPredicate(event, session) {
+export function canonicalWinnerPredicate(event, session) {
   return `not exists (
     select 1 from telemetry.events winner
     join telemetry.native_records winner_record
@@ -367,7 +367,7 @@ export function buildUsageResult(rows, receipt, { groupBy, startAt, endAt, readA
   };
 }
 
-async function runQuery(tx, text, params, signal) {
+export async function runQuery(tx, text, params, signal) {
   if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
   const query = params === undefined ? tx.unsafe(text) : tx.unsafe(text, params);
   const cancel = () => {

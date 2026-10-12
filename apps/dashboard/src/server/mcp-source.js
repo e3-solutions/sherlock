@@ -62,7 +62,9 @@ export function pageCachedUsageEvidence(payload, cursor = "") {
   };
 }
 
-export function createCachedMcpSource({ cache, source, querySource, providerUsageSource }) {
+export function createCachedMcpSource({
+  cache, source, querySource, providerUsageSource, searchSource,
+}) {
   if (typeof cache?.read !== "function" || typeof source?.fetchPromptEvidence !== "function") {
     throw new TypeError("A timeline cache and prompt evidence source are required");
   }
@@ -74,6 +76,13 @@ export function createCachedMcpSource({ cache, source, querySource, providerUsag
     "fetchUsage",
   ].some((method) => typeof querySource?.[method] !== "function")) {
     throw new TypeError("A complete Sherlock query source is required");
+  }
+  if (searchSource !== undefined && [
+    "resolvePerson",
+    "searchSessions",
+    "readSessionEvidence",
+  ].some((method) => typeof searchSource?.[method] !== "function")) {
+    throw new TypeError("A complete Sherlock search source is required");
   }
   return Object.freeze({
     ...(providerUsageSource ? { fetchProviderUsage: (request) => providerUsageSource.fetchProviderUsage(request) } : {}),
@@ -90,6 +99,11 @@ export function createCachedMcpSource({ cache, source, querySource, providerUsag
       fetchSessions: (request) => querySource.fetchSessions(request),
       fetchSession: (request) => querySource.fetchSession(request),
       fetchUsage: (request) => querySource.fetchUsage(request),
+    }),
+    ...(searchSource === undefined ? {} : {
+      resolvePerson: (request) => searchSource.resolvePerson(request),
+      searchSessions: (request) => searchSource.searchSessions(request),
+      readSessionEvidence: (request) => searchSource.readSessionEvidence(request),
     }),
   });
 }
