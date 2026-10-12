@@ -1,3 +1,4 @@
+import { buildFrameOverview, decodeFrameOverview, getOverviewAuthorization, previewSummary } from "../shared/frame-overview.js";
 import postgres from "postgres";
 import { readFileSync } from "node:fs";
 import { URL as FileURL } from "node:url";
@@ -16,6 +17,7 @@ import {
   INTERVAL_PULL_REQUESTS_SQL,
   LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
+  PROJECTION_FLAME_SQL,
   PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
 } from "./flame-source.js";
@@ -897,6 +899,33 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         ],
       );
 
+      // This worker is active in the ended bucket, but its only human summary
+      // arrives in the read-time tail. The timeline preview must match the
+      // interval's ended-day summary, not the later recent-activity window.
+      const tailSummary = "Tail-only summary must stay out.";
+      const [tailEvent] = await sql.unsafe(`insert into telemetry.events (
+        workspace_id, session_id, source_record_id, normalizer_version,
+        projection_index, source_priority, event_kind, event_subtype, actor_role,
+        occurred_at, observed_at, server_received_at, message_role, message_origin,
+        content_sha256, content_byte_size, content_excerpt
+      ) values ($1,$2,$3,$4,6,100,'message','user_message','worker',$5,$5,$5,
+        'user','human',$6,$7,$8) returning id::text id`, [workspaceId, workerSessionId,
+        sourceRecordId(1), NORMALIZER_VERSION, partialActivityAt.toISOString(),
+        "3".repeat(64), Buffer.byteLength(tailSummary), tailSummary]);
+      const [tailReceipt] = await sql.unsafe(`insert into analytics.frame_projection_receipts (
+        workspace_id, session_id, person_id, frame_version, covered_from, covered_through,
+        through_event_id, source_event_count, source_state_sha256, request_generation, session_updated_at
+      ) values ($1,$2,$3,$4,$5,$6,$7,2,$8,2,
+        (select updated_at from telemetry.sessions where workspace_id=$1 and id=$2)) returning id::text id`,
+      [workspaceId, workerSessionId, personId, FRAME_VERSION, bucketStart.toISOString(),
+        partialRead.toISOString(), tailEvent.id, "3".repeat(64)]);
+      await sql.unsafe(`insert into analytics.frame_evidence_revisions (
+        receipt_id,workspace_id,session_id,person_id,frame_version,evidence_kind,source_event_id,
+        anchor_observed_at,observed_at,actor_role,event_kind,event_subtype,message_role,message_origin,
+        is_summary_candidate,is_tombstone
+      ) values ($1,$2,$3,$4,$5,'activity',$6,$7,$7,'worker','message','user_message','user','human',true,false)`,
+      [tailReceipt.id,workspaceId,workerSessionId,personId,FRAME_VERSION,tailEvent.id,partialActivityAt.toISOString()]);
+
       source = new DirectFlameSource({
         databaseUrl: DATABASE_URL,
         workspaceId,
@@ -930,7 +959,97 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       });
 
       expect(projectedDay.snapshot).toMatch(/^v6\./);
-      expect(projectedDay.people).toEqual(legacyDay.people);
+      expect(projectedDay.people.map(({ overview, ...person }) => person)).toEqual(legacyDay.people);
+      const personOverview = projectedDay.people[0].overview;
+      expect(personOverview).toBeDefined();
+      expect(personOverview.summaries).not.toContain(tailSummary);
+      expect(JSON.stringify(personOverview)).not.toContain("summary_event_id");
+      const overviewBuckets = decodeFrameOverview(personOverview, {
+        startMs: Date.parse(projectedDay.start), counts: projectedDay.people[0].buckets,
+        automatedRuns: projectedDay.people[0].automatedRuns,
+      });
+      expect(overviewBuckets).not.toBeNull();
+      const previewWork = overviewBuckets[bucketIndex(observedAt)];
+      expect(previewWork.map(({ pullRequest, ...row }) => row)).toEqual(projectedInterval.work.map(({ pullRequest, firstAt, lastAt, summary, ...row }) => ({
+        ...row, firstAtMs: Date.parse(firstAt), lastAtMs: Date.parse(lastAt),
+        summary: summary === null ? null : previewSummary(summary), evidenceSource: null,
+      })));
+      expect(await source.authorizeFrameOverviews(projectedDay)).toBe(projectedDay);
+      const rawOverviewRows = await source.transaction(tx => tx.unsafe(PROJECTION_FLAME_SQL, [
+        workspaceId, projectedDay.start, new Date(Date.parse(projectedDay.start) + 86400000).toISOString(),
+        FRAME_VERSION, partialRead.toISOString(), 'e3group.ai',
+      ]));
+      const otherRevision = rawOverviewRows.flatMap(row => row.work_rows)
+        .find(row => row.session_id === workerSessionId).frame_revision_id;
+      const wrongRevisionRows = Array.from(rawOverviewRows, row => ({ ...row,
+        work_rows: row.work_rows.map(work => work.session_id === sessionId
+          ? { ...work, frame_revision_id: otherRevision } : work),
+      }));
+      const wrongRevisionOverview = buildFrameOverview({
+        personId, rows: wrongRevisionRows, counts: projectedDay.people[0].buckets,
+        automatedRuns: projectedDay.people[0].automatedRuns,
+        summaries: wrongRevisionRows[0].day_summaries,
+      });
+      expect(wrongRevisionOverview).not.toBeNull();
+      expect((await source.authorizeFrameOverviews({ ...projectedDay,
+        people: [{ ...projectedDay.people[0], overview: wrongRevisionOverview }],
+      })).people[0].overview).toBeUndefined();
+      const protectedSummary = getOverviewAuthorization(personOverview).summaryEventIds[0];
+      const previewPolicy = `preview_private_${workspaceId.replaceAll("-", "")}`;
+      const [securityBefore] = await sql.unsafe("select relrowsecurity from pg_class where oid = 'telemetry.events'::regclass");
+      // Local schema intentionally has no product RLS until a privacy fixture installs it.
+      // Enable it with a broad fixture policy, then restrict only this fixture's event.
+      const permitPolicy = `${previewPolicy}_permit`;
+      try {
+        if (!securityBefore.relrowsecurity) {
+          await sql.unsafe(`alter table telemetry.events enable row level security`);
+          await sql.unsafe(`create policy ${permitPolicy} on telemetry.events for select to sherlock_reader using (true)`);
+        }
+        await sql.unsafe(`create policy ${previewPolicy} on telemetry.events as restrictive
+          for select to sherlock_reader using (workspace_id <> '${workspaceId}'::uuid or id <> ${BigInt(protectedSummary)})`);
+        const gated = await source.authorizeFrameOverviews(projectedDay);
+        expect(gated.people[0].overview).toBeUndefined();
+        expect(gated.people.map(({ overview, ...p }) => p)).toEqual(projectedDay.people.map(({ overview, ...p }) => p));
+        expect(projectedDay.people[0].overview).toBe(personOverview);
+      } finally {
+        await sql.unsafe(`drop policy if exists ${previewPolicy} on telemetry.events`);
+        if (!securityBefore.relrowsecurity) {
+          await sql.unsafe(`drop policy if exists ${permitPolicy} on telemetry.events`);
+          await sql.unsafe("alter table telemetry.events disable row level security");
+        }
+      }
+      for (const table of ['telemetry.sessions', 'analytics.frame_evidence_revisions']) {
+        const policy = `preview_revoke_${workspaceId.replaceAll('-', '')}`;
+        const permit = `${policy}_permit`;
+        const [before] = await sql.unsafe(`select relrowsecurity from pg_class where oid = '${table}'::regclass`);
+        try {
+          if (!before.relrowsecurity) {
+            await sql.unsafe(`alter table ${table} enable row level security`);
+            await sql.unsafe(`create policy ${permit} on ${table} for select to sherlock_reader using (true)`);
+          }
+          await sql.unsafe(`create policy ${policy} on ${table} as restrictive for select to sherlock_reader
+            using (workspace_id <> '${workspaceId}'::uuid)`);
+          const gated = await source.authorizeFrameOverviews(projectedDay);
+          expect(gated.people[0].overview).toBeUndefined();
+          expect(gated.people[0].buckets).toEqual(projectedDay.people[0].buckets);
+          expect(projectedDay.people[0].overview).toBe(personOverview);
+        } finally {
+          await sql.unsafe(`drop policy if exists ${policy} on ${table}`);
+          if (!before.relrowsecurity) {
+            await sql.unsafe(`drop policy if exists ${permit} on ${table}`);
+            await sql.unsafe(`alter table ${table} disable row level security`);
+          }
+        }
+      }
+      const [ownerBefore] = await sql.unsafe('select email from telemetry.people where workspace_id=$1 and id=$2', [workspaceId, personId]);
+      try {
+        await sql.unsafe("update telemetry.people set email='fixture@excluded.example' where workspace_id=$1 and id=$2", [workspaceId, personId]);
+        const gated = await source.authorizeFrameOverviews(projectedDay);
+        expect(gated.people[0].overview).toBeUndefined();
+        expect(gated.people[0].buckets).toEqual(projectedDay.people[0].buckets);
+      } finally {
+        await sql.unsafe('update telemetry.people set email=$3 where workspace_id=$1 and id=$2', [workspaceId, personId, ownerBefore.email]);
+      }
       const annotationRollback = new Error("annotation interpretation proof rollback");
       await expect(sql.begin(async (tx) => {
         await tx.unsafe(`insert into analytics.bonaparte_run_classifications
@@ -1038,6 +1157,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         "update telemetry.people set github_id = 'sherlock-smoke' where workspace_id = $1 and id = $2",
         [workspaceId, personId],
       );
+      expect((await source.authorizeFrameOverviews(projectedDay)).people[0].overview).toBeUndefined();
       for (const snapshot of [legacyDay.snapshot, projectedDay.snapshot]) {
         await expect(source.fetchWork({
           personId,

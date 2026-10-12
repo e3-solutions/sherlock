@@ -1,5 +1,6 @@
 import { readRecovery, mergeRecoveredTimeline, recoveredIntervalWork } from "./thread-activity-recovery.js";
 import postgres from "postgres";
+import { buildFrameOverview, getOverviewAuthorization, filterAuthorizedOverview, limitFrameOverviewPayload } from "../shared/frame-overview.js";
 
 export const BUCKET_COUNT = 144;
 export const BUCKET_MS = 10 * 60 * 1000;
@@ -1040,11 +1041,36 @@ function projectedEvidenceCte({
   sessionScoped = false,
   activityThroughReadAt = false,
   splitEvidenceWindows = false,
+  evidenceKind = null,
 } = {}) {
   const visibility = snapshotVisible
     ? "and pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)"
     : "";
   const activityEnd = activityThroughReadAt ? "p.read_at" : "p.end_at";
+  // RLS can keep non-leakproof timestamp arithmetic out of index conditions.
+  // Scoped queries materialize expanded bounds in p before comparing columns.
+  const activityStartBound = personScoped ? "p.activity_start"
+    : `p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`;
+  const activityEndBound = personScoped ? "p.activity_end"
+    : `${activityEnd} + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`;
+  const promptStartBound = personScoped ? "p.prompt_start"
+    : `p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`;
+  const promptEndBound = personScoped ? "p.prompt_end"
+    : `p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`;
+  const candidatePersonJoin = personScoped
+    ? `join telemetry.people evidence_person
+      on evidence_person.workspace_id = revision.workspace_id
+     and evidence_person.id = revision.person_id`
+    : `join roster evidence_person
+      on evidence_person.person_id = revision.person_id`;
+  const candidateScope = `
+     ${evidenceKind ? `and revision.evidence_kind = '${evidenceKind}'` : ""}
+     ${personScoped ? "and revision.person_id = p.person_id" : ""}
+     ${sessionScoped ? "and revision.session_id = p.session_id" : ""}
+     ${personScoped ? `and evidence_person.github_id is distinct from 'sherlock-smoke'
+     and split_part(evidence_person.email, '@', 2) = p.expected_email_domain
+     and split_part(evidence_person.email, '@', 3) = ''` : ""}
+     ${visibility}`;
   const splitCandidates = splitEvidenceWindows
     ? `
 frame_revision_candidates as materialized (
@@ -1052,49 +1078,52 @@ frame_revision_candidates as materialized (
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, null::text prompt_identity,
-         revision.is_tombstone
+         revision.is_tombstone, revision.is_summary_candidate
+         ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
-    join roster evidence_person
-      on evidence_person.person_id = revision.person_id
+    ${candidatePersonJoin}
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     ${candidateScope}
      and revision.evidence_kind = 'activity'
-     and revision.observed_at >= p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
-     and revision.observed_at < ${activityEnd} + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'
+     and revision.observed_at >= ${activityStartBound}
+     and revision.observed_at < ${activityEndBound}
   union all
   select revision.id, revision.session_id, revision.person_id,
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, revision.prompt_identity,
-         revision.is_tombstone
+         revision.is_tombstone, revision.is_summary_candidate
+         ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
-    join roster evidence_person
-      on evidence_person.person_id = revision.person_id
+    ${candidatePersonJoin}
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     ${candidateScope}
      and revision.evidence_kind = 'prompt'
-     and revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-     and revision.anchor_observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+     and revision.anchor_observed_at >= ${promptStartBound}
+     and revision.anchor_observed_at < ${promptEndBound}
   union all
   select revision.id, revision.session_id, revision.person_id,
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, revision.prompt_identity,
-         revision.is_tombstone
+         revision.is_tombstone, revision.is_summary_candidate
+         ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
-    join roster evidence_person
-      on evidence_person.person_id = revision.person_id
+    ${candidatePersonJoin}
     cross join p
    where revision.workspace_id = p.workspace_id
      and revision.frame_version = p.frame_version
+     ${candidateScope}
      and revision.evidence_kind = 'prompt'
-     and revision.observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-     and revision.observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
+     and revision.observed_at >= ${promptStartBound}
+     and revision.observed_at < ${promptEndBound}
      and not coalesce(
-       revision.anchor_observed_at >= p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'
-       and revision.anchor_observed_at < p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds',
+       revision.anchor_observed_at >= ${promptStartBound}
+       and revision.anchor_observed_at < ${promptEndBound},
        false
      )
 ), `
@@ -1200,7 +1229,53 @@ with p as materialized (
 ), ${projectedEvidenceCte({
   activityThroughReadAt: true,
   splitEvidenceWindows: true,
-})}, bucket_activity as materialized (
+})}, bucket_work as materialized (
+  select evidence.person_id, evidence.session_id,
+         date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
+         case when evidence.actor_role = 'primary' then 'agent'
+              when evidence.actor_role = 'worker' then 'subagent'
+              else 'unclassified' end semantic_role,
+         min(evidence.observed_at) first_at, max(evidence.observed_at) last_at,
+         min(evidence.id)::text frame_revision_id,
+         count(*)::bigint event_count, bool_or(evidence.is_automated_run) is_automated_run
+    from projected_activity evidence cross join p
+   where evidence.observed_at < p.end_at
+   group by evidence.person_id, evidence.session_id, bucket_start, semantic_role
+), ranked_bucket_work as materialized (
+  select bucket_work.*, row_number() over (
+    partition by person_id, bucket_start order by first_at, session_id, semantic_role
+  ) ordinal
+    from bucket_work
+), bucket_overviews as materialized (
+  select person_id, bucket_start,
+         jsonb_agg(jsonb_build_object(
+           'session_id', session_id::text, 'semantic_role', semantic_role,
+           'first_at', first_at, 'last_at', last_at, 'event_count', event_count,
+           'is_automated_run', is_automated_run, 'frame_revision_id', frame_revision_id
+         ) order by first_at, session_id, semantic_role) work_rows
+    from ranked_bucket_work where ordinal <= ${INTERVAL_WORK_LIMIT + 1}
+   group by person_id, bucket_start
+), day_overview_summaries as materialized (
+  select distinct on (evidence.person_id, evidence.session_id, semantic_role)
+         evidence.person_id, evidence.session_id,
+         case when evidence.actor_role = 'primary' then 'agent'
+              when evidence.actor_role = 'worker' then 'subagent'
+              else 'unclassified' end semantic_role,
+         source.id::text summary_event_id, source.content_excerpt summary
+    from projected_activity evidence cross join p
+    join telemetry.events source
+      on source.workspace_id = p.workspace_id and source.id = evidence.source_event_id
+   where evidence.observed_at < p.end_at and evidence.is_summary_candidate
+     and ${dashboardSummaryContentPredicate("source.content_excerpt")}
+   order by evidence.person_id, evidence.session_id, semantic_role,
+            evidence.observed_at, evidence.source_event_id
+), person_overview_summaries as materialized (
+  select person_id, jsonb_agg(jsonb_build_object(
+    'session_id', session_id::text, 'semantic_role', semantic_role,
+    'summary_event_id', summary_event_id, 'summary', summary
+  ) order by session_id, semantic_role) day_summaries
+    from day_overview_summaries group by person_id
+), bucket_activity as materialized (
   select evidence.person_id,
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
@@ -1251,13 +1326,19 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(pc.prompts, 0)::bigint prompts,
        d.day_agent, d.day_subagent, d.day_other, d.day_automated_runs,
        coalesce(ba.automated_runs, 0)::bigint automated_runs, l.latest,
-       ra.latest_activity
+       ra.latest_activity,
+       coalesce(bo.work_rows, '[]'::jsonb) work_rows,
+       case when b.bucket_start = p.start_at then ps.day_summaries end day_summaries
   from roster r cross join buckets b
   join day_activity d using (person_id)
   join recent_activity ra using (person_id)
+  cross join p
   cross join latest_observation l
   left join bucket_activity ba
     on ba.person_id = r.person_id and ba.bucket_start = b.bucket_start
+  left join bucket_overviews bo
+    on bo.person_id = r.person_id and bo.bucket_start = b.bucket_start
+  left join person_overview_summaries ps on ps.person_id = r.person_id
   left join prompt_counts pc
     on pc.person_id = r.person_id and pc.bucket_start = b.bucket_start
  order by lower(r.display_name), r.person_id, b.bucket_start
@@ -1268,11 +1349,17 @@ with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
          $3::pg_snapshot snapshot, $4::uuid person_id,
          $5::timestamptz start_at, $6::timestamptz end_at,
+         $5::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_start,
+         $6::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_end,
+         $5::timestamptz - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_start,
+         $6::timestamptz + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_end,
          $7::timestamptz bucket_start, $8::timestamptz bucket_end,
          $9::text expected_email_domain
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  splitEvidenceWindows: true,
+  evidenceKind: "activity",
 })}, bucket_events as materialized (
   select evidence.*,
          case when actor_role = 'primary' then 'agent'
@@ -1323,11 +1410,17 @@ with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
          $3::pg_snapshot snapshot, $4::uuid person_id,
          $5::timestamptz start_at, $6::timestamptz end_at,
+         $5::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_start,
+         $6::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_end,
+         $5::timestamptz - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_start,
+         $6::timestamptz + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_end,
          $7::timestamptz bucket_start, $8::timestamptz bucket_end,
          $9::text expected_email_domain
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  splitEvidenceWindows: true,
+  evidenceKind: "prompt",
 })}, selected as materialized (
   select projected_prompts.*,
          count(*) over ()::bigint eligible_prompt_count
@@ -1351,12 +1444,18 @@ with p as materialized (
   select $1::uuid workspace_id, $2::text frame_version,
          $3::pg_snapshot snapshot, $4::uuid person_id,
          $5::timestamptz start_at, $6::timestamptz end_at,
+         $5::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_start,
+         $6::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_end,
+         $5::timestamptz - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_start,
+         $6::timestamptz + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_end,
          $7::uuid session_id, $8::text semantic_role,
          $9::bigint cursor_at_microseconds, $10::bigint cursor_id,
          $11::text expected_email_domain
 ), ${projectedEvidenceCte({
   snapshotVisible: true,
   personScoped: true,
+  splitEvidenceWindows: true,
+  evidenceKind: "activity",
   // Session identity is stable across revisions and matches the reader index.
   // Actor role is revisioned, so role filtering must remain after latest-rank selection.
   sessionScoped: true,
@@ -1819,7 +1918,13 @@ export function buildFlamePayload({
       const observed = asDate(first.latest);
       latest = latest === null || observed > latest ? observed : latest;
     }
+    const overview = frameVersion === null || !personRows.every(row => Array.isArray(row.work_rows))
+      ? null : buildFrameOverview({
+        personId: String(person.person_id), automatedRuns, rows: personRows, counts: buckets,
+        summaries: (first.day_summaries ?? []).map(row => ({ ...row, summary: dashboardWorkSummary(row.summary) })),
+      });
     return {
+      ...(overview ? { overview } : {}),
       id: String(person.person_id),
       name: String(person.display_name).slice(0, 160),
       lastActivity: first.latest_activity === null || first.latest_activity === undefined
@@ -1921,6 +2026,33 @@ export function dashboardDatabaseUrl(databaseUrl) {
   return url.toString();
 }
 
+export const OVERVIEW_AUTHORIZATION_SQL = `
+select 'person' kind, pe.id::text id, pe.id::text person_id
+  from telemetry.people pe
+ where pe.workspace_id = $1 and pe.id = any($2::uuid[])
+   and pe.github_id is distinct from 'sherlock-smoke'
+   and split_part(pe.email, '@', 2) = $5 and split_part(pe.email, '@', 3) = ''
+union all
+select distinct 'session' kind, s.id::text id, s.person_id::text person_id
+  from analytics.frame_evidence_revisions revision
+  join telemetry.sessions s
+    on s.workspace_id = revision.workspace_id and s.id = revision.session_id
+   and s.person_id = revision.person_id
+ where revision.id = any($8::bigint[]) and revision.workspace_id = $1
+   and revision.frame_version = $6 and s.id = any($3::uuid[])
+union all
+select 'summary' kind, e.id::text id, null::text person_id from telemetry.events e
+ where e.workspace_id = $1 and e.id = any($4::bigint[])
+union all
+select 'recovery' kind, b.manifest_sha256 id, b.person_id::text person_id
+  from telemetry.thread_activity_recovery_batches b
+ where b.workspace_id = $1 and b.manifest_sha256 = any($7::text[])
+`;
+
+function withoutFrameOverviews(payload) {
+  return { ...payload, people: payload.people.map(({ overview, ...person }) => person) };
+}
+
 export class DirectFlameSource {
   constructor({
     databaseUrl,
@@ -1934,6 +2066,11 @@ export class DirectFlameSource {
     this.maxPeople = maxPeople;
     this.projectionEnabled = projectionEnabled;
     this.applicationName = `sherlock-dashboard:${workspaceId}`;
+    this.overviewAuthorizationRequests = 0;
+    this.overviewSql = postgres(dashboardDatabaseUrl(databaseUrl), {
+      prepare: false, max: 2, idle_timeout: null, connect_timeout: 10, max_lifetime: null,
+      connection: { application_name: `${this.applicationName}:ov` },
+    });
     this.sql = postgres(dashboardDatabaseUrl(databaseUrl), {
       prepare: false,
       max: 2,
@@ -1945,11 +2082,12 @@ export class DirectFlameSource {
   }
 
   async reserveCapacity() {
-    // Warm both client connections. With transaction pooling, a successful
+    // Warm the query and authorization clients. With transaction pooling, a successful
     // probe does not reserve PostgreSQL backends between transactions.
     const reservations = await Promise.allSettled([
       this.sql.reserve(),
       this.sql.reserve(),
+      ...(this.overviewSql ? [this.overviewSql.reserve(), this.overviewSql.reserve()] : []),
     ]);
     const connections = reservations
       .filter((result) => result.status === "fulfilled")
@@ -1970,27 +2108,35 @@ export class DirectFlameSource {
   }
 
   async close() {
-    await this.sql.end({ timeout: 5 });
+    await Promise.all([this.sql.end({ timeout: 5 }), this.overviewSql?.end({ timeout: 5 })]);
   }
 
   async transaction(callback, {
     signal,
     statementTimeoutMs = DEFAULT_STATEMENT_TIMEOUT_MS,
+    pool = this.sql,
   } = {}) {
     try {
       if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
-      const transaction = this.sql.begin(async (tx) => {
-        await runQuery(tx, "set transaction isolation level repeatable read, read only", undefined, signal);
-        await runQuery(
-          tx,
-          "select set_config('statement_timeout', $1, true)",
-          [String(statementTimeoutMs)],
-          signal,
-        );
-        await runQuery(tx, `set local role ${DATABASE_ROLE}`, undefined, signal);
+      if (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 1 || statementTimeoutMs > 2_147_483_647) {
+        throw new FlameSourceError("flame_database_timeout_invalid");
+      }
+      const transaction = pool.begin(async (tx) => {
+        // No parameters means postgres.js uses the simple protocol. PostgreSQL
+        // runs these transaction-local settings together on the pinned backend.
+        await runQuery(tx,
+          `set transaction isolation level repeatable read, read only; ` +
+          `set local statement_timeout = '${statementTimeoutMs}ms'; set local role ${DATABASE_ROLE}`,
+          undefined, signal);
         if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
         return await callback(tx);
       });
+      if (pool === this.overviewSql) {
+        // Keep queued transactions counted until PostgreSQL actually settles,
+        // even when an HTTP deadline has already returned the counts fallback.
+        this.overviewTransactions = (this.overviewTransactions ?? 0) + 1;
+        transaction.then(() => { this.overviewTransactions--; }, () => { this.overviewTransactions--; });
+      }
       return await waitForTransaction(transaction, signal);
     } catch (error) {
       if (error instanceof FlameSourceError) throw error;
@@ -2102,8 +2248,98 @@ export class DirectFlameSource {
         frameVersion: selectedFrameVersion,
       });
       const recovery = await readRecovery(tx, { workspaceId:this.workspaceId, read, snapshot:receipt.snapshot, expectedEmailDomain:this.expectedEmailDomain });
-      return mergeRecoveredTimeline(payload, recovery);
+      const merged = mergeRecoveredTimeline(payload, recovery);
+      if (selectedFrameVersion === null || !recovery.length) return limitFrameOverviewPayload(merged);
+      const recoveryByPerson = new Map();
+      for (const interval of recovery) {
+        const owned = recoveryByPerson.get(interval.personId) ?? [];
+        owned.push(interval);
+        recoveryByPerson.set(interval.personId, owned);
+      }
+      const rowsByPerson = new Map();
+      for (const row of rows) {
+        const owned = rowsByPerson.get(String(row.person_id)) ?? [];
+        owned.push(row);
+        rowsByPerson.set(String(row.person_id), owned);
+      }
+      return limitFrameOverviewPayload({ ...merged, people: merged.people.map(person => {
+        const owned = recoveryByPerson.get(person.id);
+        if (!owned) return person;
+        if (!rowsByPerson.has(person.id)) {
+          const { overview, ...plain } = person;
+          return plain;
+        }
+        const nativeRows = rowsByPerson.get(person.id).sort((a, b) => asDate(a.bucket_start) - asDate(b.bucket_start));
+        const overviewRows = nativeRows.map(row => ({ ...row,
+          work_rows: [...(row.work_rows ?? []), ...recoveredIntervalWork(owned, person.id, asDate(row.bucket_start).getTime())],
+        }));
+        const overview = buildFrameOverview({
+          personId: person.id, automatedRuns: person.automatedRuns ?? [], counts: person.buckets,
+          recoveryHashes: owned.map(interval => interval.sourceHash), rows: overviewRows,
+          summaries: (nativeRows[0].day_summaries ?? []).map(row => ({ ...row, summary: dashboardWorkSummary(row.summary) })),
+        });
+        const { overview: discarded, ...plain } = person;
+        return overview ? { ...plain, overview } : plain;
+      }) });
+
     }, { signal, statementTimeoutMs: TIMELINE_STATEMENT_TIMEOUT_MS });
+  }
+
+  async authorizeFrameOverviews(payload, { signal } = {}) {
+    const people = payload.people.filter(person => person.overview);
+    if (!people.length) return payload;
+    const metadata = people.map(person => getOverviewAuthorization(person.overview));
+    // Only server-built, memory-resident previews may reach this cached path.
+    if (metadata.some((value, i) => value === null || value.personId !== people[i].id)) {
+      console.warn(JSON.stringify({ event: "overview_untrusted" }));
+      return withoutFrameOverviews(payload);
+    }
+    if (Math.max(this.overviewAuthorizationRequests ?? 0, this.overviewTransactions ?? 0) >= 8) {
+      console.warn(JSON.stringify({ event: "overview_auth_capacity" }));
+      return withoutFrameOverviews(payload);
+    }
+    this.overviewAuthorizationRequests = (this.overviewAuthorizationRequests ?? 0) + 1;
+    try {
+      const authorizationSignal = signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(1500)]) : AbortSignal.timeout(1500);
+      const sessionIds = [...new Set(metadata.flatMap(value => value.sessionIds))];
+      const summaryIds = [...new Set(metadata.flatMap(value => value.summaryEventIds))];
+      const grants = await this.transaction(tx => runQuery(tx, OVERVIEW_AUTHORIZATION_SQL, [
+        this.workspaceId, tx.array(people.map(person => person.id)),
+        tx.array(sessionIds), tx.array(summaryIds), this.expectedEmailDomain,
+        decodeSnapshotToken(payload.snapshot).frameVersion,
+        tx.array([...new Set(metadata.flatMap(value => value.recoveryHashes))]),
+        tx.array([...new Set(metadata.flatMap(value => value.frameRevisionIds))]),
+      ], authorizationSignal), { signal: authorizationSignal, statementTimeoutMs: 1000, pool: this.overviewSql ?? this.sql });
+      const allowed = { person: new Set(), summary: new Set() };
+      const sessionsByPerson = new Map(), recoveryByPerson = new Map();
+      for (const grant of grants) {
+        if (grant.kind === "session" || grant.kind === "recovery") {
+          const grouped = grant.kind === "session" ? sessionsByPerson : recoveryByPerson;
+          const ids = grouped.get(grant.person_id) ?? new Set();
+          ids.add(String(grant.id)); grouped.set(grant.person_id, ids);
+        } else allowed[grant.kind].add(String(grant.id));
+      }
+      let changed = false;
+      const authorizedPeople = payload.people.map(person => {
+        if (!person.overview) return person;
+        if (allowed.person.has(person.id) && filterAuthorizedOverview(person.overview, {
+          personId: person.id, recoveryHashes: recoveryByPerson.get(person.id) ?? new Set(),
+          sessionIds: sessionsByPerson.get(person.id) ?? new Set(), summaryEventIds: allowed.summary,
+        })) return person;
+        changed = true;
+        const { overview, ...plain } = person;
+        return plain;
+      });
+      return changed ? { ...payload, people: authorizedPeople } : payload;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      console.warn(JSON.stringify({ event: "overview_auth_failed" }));
+      // Counts remain available when fresh excerpt authorization cannot be proved.
+      return withoutFrameOverviews(payload);
+    } finally {
+      this.overviewAuthorizationRequests--;
+    }
   }
 
   async fetchFreshness({ signal } = {}) {
@@ -2216,7 +2452,7 @@ export class DirectFlameSource {
       if (nativeWork.length + recovered.length > INTERVAL_WORK_LIMIT) throw new FlameSourceError("flame_interval_work_result_too_large");
       return {
         personId, start: startAt.toISOString(), snapshot,
-        work: [...nativeWork, ...recovered].sort((a,b)=>Date.parse(a.firstAt)-Date.parse(b.firstAt) || a.id.localeCompare(b.id)),
+        work: [...nativeWork, ...recovered].sort((a,b)=>Date.parse(a.firstAt)-Date.parse(b.firstAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
         prompts: prompts.map(promptFromRow),
       };
     }, { signal });
