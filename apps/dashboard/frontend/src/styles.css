@@ -614,7 +614,7 @@ input { font: inherit; }
 .flame-tooltip-count span { color: rgb(9 12 10 / 65%); }
 
 .flame-detail {
-  --flame-detail-motion-duration: 260ms;
+  --flame-detail-motion-duration: 80ms;
   --flame-detail-motion-easing: cubic-bezier(.22, 1, .36, 1);
 
   position: fixed;
@@ -661,8 +661,8 @@ input { font: inherit; }
 
 @keyframes flame-detail-enter-x {
   from {
-    opacity: 0;
-    transform: translateX(24px);
+    opacity: 1;
+    transform: translateX(8px);
   }
   to {
     opacity: 1;
@@ -672,8 +672,8 @@ input { font: inherit; }
 
 @keyframes flame-detail-enter-y {
   from {
-    opacity: 0;
-    transform: translateY(24px);
+    opacity: 1;
+    transform: translateY(8px);
   }
   to {
     opacity: 1;

@@ -15,7 +15,7 @@ import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createSherlockQuerySource } from "./src/server/mcp-query-source.js";
 import { createSherlockSearchSource } from "./src/server/mcp-search-source.js";
 import { createCachedMcpSource } from "./src/server/mcp-source.js";
-import { FlameDayCache } from "./src/server/flame-cache.js";
+import { authorizedFlameRepresentation, FlameDayCache } from "./src/server/flame-cache.js";
 import {
   flameRepresentationHeaders,
   mimeTypeForPath,
@@ -201,8 +201,9 @@ const server = createServer(async (request, response) => {
         forceRefresh: refresh === "force",
         waitForRefresh: refresh === "wait",
       });
+      const authorizedResult = await authorizedFlameRepresentation(source, result, { signal });
       const representation = selectJsonRepresentation(
-        result,
+        authorizedResult,
         request.headers["accept-encoding"],
       );
       if (!representation) {
@@ -211,7 +212,7 @@ const server = createServer(async (request, response) => {
       }
       response.writeHead(200, {
         ...SECURITY_HEADERS,
-        "Cache-Control": "no-store",
+        "Cache-Control": "private, no-store",
         ...flameRepresentationHeaders(representation, result.state),
       });
       response.end(representation.bytes);

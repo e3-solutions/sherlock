@@ -968,7 +968,7 @@ describe("FlameGraph", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps prompt text out of busy frame overviews and resets extra sessions by frame", async () => {
+  it("shows generic sessions directly while keeping prompt excerpts collapsed", async () => {
     const busyModel = model();
     busyModel.people[0].buckets[0].prompts = 7;
     Object.assign(busyModel.people[0].buckets[1], {
@@ -1014,25 +1014,15 @@ describe("FlameGraph", () => {
     });
 
     fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
-    const expander = await screen.findByRole("button", { name: "Show 4 more sessions" });
+    expect(await screen.findAllByText("Agent session")).toHaveLength(4);
     expect(screen.getByText("7 human prompts").closest("details")).not.toHaveAttribute("open");
     expect(screen.queryByText("What happened")).not.toBeInTheDocument();
-
-    fireEvent.click(expander);
-    expect(screen.getByRole("button", { name: "Hide 4 more sessions" })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
-    expect(screen.getAllByText("Agent session")).toHaveLength(4);
 
     const chart = screen.getByRole("application", { name: "Ada Lovelace activity timeline" });
     fireEvent.keyDown(chart, { key: "ArrowRight" });
     fireEvent.keyDown(chart, { key: "Enter" });
-    expect(await screen.findByRole("button", { name: "Show 4 more sessions" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    expect(screen.queryByText("Agent session")).not.toBeInTheDocument();
+    expect(await screen.findAllByText("Agent session")).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Show 4 more sessions" })).not.toBeInTheDocument();
   });
 
   it("drills into a session conversation and returns to the frame", async () => {
