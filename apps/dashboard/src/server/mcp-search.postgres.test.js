@@ -8,7 +8,7 @@ import { createSherlockSearchSource } from "./mcp-search-source.js";
 
 const DATABASE_URL = process.env.SHERLOCK_TEST_DATABASE_URL;
 const describePostgres = DATABASE_URL ? describe : describe.skip;
-const migration = (name) => readFileSync(new FileURL(`../../../../supabase/migrations/${name}`, import.meta.url), "utf8");
+const migration = (name) => DATABASE_URL ? readFileSync(new FileURL(`../../../../supabase/migrations/${name}`, import.meta.url), "utf8") : null;
 const MIGRATION = migration("20261012135923_add_bounded_excerpt_search.sql");
 const PRODUCT_ROLE_MIGRATION = migration("20261012140548_filter_excerpt_search_product_roles.sql");
 const BOUNDED_LOOKUP_MIGRATION = migration("20261012065436_bound_protected_record_lookup.sql");
