@@ -397,13 +397,44 @@ def discover_claude_transcripts(
         if parent_id is not None and parent_id != native_id:
             parent_ids[str(path)] = parent_id
 
-    priority_count = len(paths)
     errors: list[str] = []
     invalid_count = 0
     omitted_count = 0
     excluded_by_cutoff = 0
     selected_bytes = 0
     source_snapshots: dict[str, SourceSnapshot] = {}
+    # Start/tool hooks normally name only the main transcript. Capture its
+    # children while they run, including after the parent finishes its turn.
+    # Use the native filename rather than cwd or an untrusted agent_id as a path.
+    main_path = _claude_transcript_path(home, str(payload.get("transcript_path", "")))
+    if (
+        main_path is not None
+        and session_id is not None
+        and _native_session_id(main_path.stem) == session_id
+    ):
+        subagents = main_path.with_suffix("") / "subagents"
+        family: list[_ClaudeCandidate] = []
+        try:
+            if not subagents.is_symlink() and subagents.is_dir():
+                with os.scandir(subagents) as entries:
+                    for entry in entries:
+                        child_id = _agent_filename_identity(entry.name)
+                        if child_id is None or not entry.is_file(follow_symlinks=False):
+                            continue
+                        invalid, _ = _append_recent_claude_candidate(
+                            family, home / "projects", entry, 0, (child_id, session_id)
+                        )
+                        invalid_count += invalid
+        except OSError as error:
+            errors.append(f"subagent discovery: {error}")
+        for child in sorted(family, key=lambda candidate: str(candidate.path)):
+            path = child.path
+            if path not in paths:
+                paths.append(path)
+                native_ids[str(path)] = child.native_id
+                parent_ids[str(path)] = session_id
+                source_snapshots[str(path)] = child.snapshot
+    priority_count = len(paths)
     if selectors:
         cutoff_ns = (
             time.time_ns() - max(1, lookback_seconds) * 1_000_000_000

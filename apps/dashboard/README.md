@@ -18,6 +18,13 @@ objects.
 
 ## Data contract
 
+Frame work rows and session conversation details include an optional `provider`
+(`claude`, `codex`, or `unknown`) and display its label alongside the semantic
+role. Raw readers use immutable batch provider identity; projected readers use
+one indexed immutable source event per row. Old responses and recovered timing
+without provider evidence display **Provider unknown**. Provider labels do not
+change activity counts, prompt classification, or token accounting.
+
 - `telemetry.people` is the roster, so real people with zero activity remain
   visible. The stable synthetic identity `github_id = 'sherlock-smoke'` is
   excluded; display names are never used as the filter.

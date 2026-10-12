@@ -99,6 +99,26 @@ that Sherlock did not observe.
 
 ## Verify
 
+### Claude Code background sessions
+
+Install Sherlock on each machine that runs Claude Code, including remote
+hosts used for unattended CLI tasks. A laptop installation cannot observe a
+remote host's transcripts. Start new Claude sessions after installing or
+updating so the plugin hooks load.
+
+Live capture discovers the current session's nested `subagents/` transcripts
+on capture hooks, even when the hook supplies only the main transcript path.
+Children keep their own native identity and parent link; newly appended usage
+is queued incrementally, and retries do not count it twice. Capture remains
+hook-driven (tool hooks are debounced), so silent runs do not imply continuous
+live observation. Stop hooks and the history backfill recover completed bytes.
+
+Dashboard frame and conversation rows show **Claude Code** or **Codex** beside
+the agent role. A Claude subagent is counted as a subagent, including when it
+runs in the background. Automated-run labels require existing classification
+evidence; running in the background alone does not prove automation or a new
+human prompt. Missing provider evidence is shown as **Provider unknown**.
+
 For missing Codex sessions, see [collector inventory and receipt recovery](docs/collector-receipts.md).
 It distinguishes local capture from acknowledged delivery and records raw token-payload presence.
 
