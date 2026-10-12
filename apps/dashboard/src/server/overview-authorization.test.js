@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import postgres from 'postgres';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { gunzipSync } from 'node:zlib';
 import { DirectFlameSource, encodeProjectionSnapshotToken, FRAME_VERSION } from './flame-source.js';
 import { authorizedFlameRepresentation, flamePayloadRepresentation } from './flame-cache.js';
@@ -12,8 +13,8 @@ function payload(recovery = false) {
   const overview = buildFrameOverview({ personId: PERSON, counts, recoveryHashes: recovery ? ['a'.repeat(64)] : [],
     rows: counts.map((_, i) => ({ person_id: PERSON, bucket_start: new Date(START + i * 600000).toISOString(), work_rows: i ? [] : recovery ? [{ id: `recovery:${SESSION}:agent`, sessionId: SESSION, role: 'agent',
       firstAt: new Date(START + 1).toISOString(), lastAt: new Date(START + 9).toISOString(), eventCount: null, summary: 'Recovered cloud turn activity', evidenceSource: 'completed_turn_interval' }] : [{
-      session_id: SESSION, semantic_role: 'agent', first_at: new Date(START + 1).toISOString(), last_at: new Date(START + 9).toISOString(), event_count: 3, is_automated_run: false,
-    }] })), summaries: [{ session_id: SESSION, semantic_role: 'agent', summary_event_id: '42', summary: 'Private preview sentinel' }] });
+      frame_revision_id: '77', session_id: SESSION, semantic_role: 'agent', first_at: new Date(START + 1).toISOString(), last_at: new Date(START + 9).toISOString(), event_count: 3, is_automated_run: false,
+    }] })), summaries: [{ frame_revision_id: '77', session_id: SESSION, semantic_role: 'agent', summary_event_id: '42', summary: 'Private preview sentinel' }] });
   expect(overview).not.toBeNull();
   return { snapshot: encodeProjectionSnapshotToken({ snapshot: '730:741:733,739', read: new Date(START + 86400000), frameVersion: FRAME_VERSION }),
     people: [{ id: PERSON, buckets: counts, overview }] };
@@ -28,7 +29,12 @@ function source(grants = []) {
     expect(options.pool).toBe(source.overviewSql);
     expect(options.statementTimeoutMs).toBe(1000);
     expect(options.signal).toBeInstanceOf(AbortSignal);
-    return callback({ unsafe: vi.fn().mockResolvedValue(grants), array: x => x });
+    return callback({ unsafe: vi.fn(async (text, params) => {
+      expect(text).toContain('revision.id = any($8::bigint[])');
+      expect(text).not.toContain('join lateral');
+      expect(params[7]).toBeInstanceOf(Array);
+      return grants;
+    }), array: x => x });
   });
   return source;
 }
@@ -78,6 +84,11 @@ describe('fresh cached overview authorization', () => {
 
 const describeDatabase = process.env.SHERLOCK_TEST_DATABASE_URL ? describe : describe.skip;
 describeDatabase('authorization pool saturation', () => {
+  beforeAll(async () => {
+    const sql = postgres(process.env.SHERLOCK_TEST_DATABASE_URL, { max: 1, prepare: false });
+    try { await sql.unsafe('grant sherlock_reader to postgres'); }
+    finally { await sql.end({ timeout: 5 }); }
+  });
   it('bounds response latency and retains queued transaction accounting until rollback', async () => {
     const s = new DirectFlameSource({ databaseUrl: process.env.SHERLOCK_TEST_DATABASE_URL, workspaceId: PERSON, expectedEmailDomain: 'e3group.ai' });
     try {
@@ -88,13 +99,14 @@ describeDatabase('authorization pool saturation', () => {
         occupied++; if (occupied === 2) ready();
         await tx.unsafe('select pg_sleep(2)');
       }, { pool: s.overviewSql }));
-      await bothOccupied;
+      const completed = Promise.all(blockers);
+      await Promise.race([bothOccupied, completed]);
       const t = performance.now(), p = payload();
       const gated = await s.authorizeFrameOverviews(p);
       expect(performance.now() - t).toBeLessThan(1900);
       expect(gated.people[0].overview).toBeUndefined();
       expect(s.overviewTransactions).toBeGreaterThanOrEqual(3);
-      await Promise.all(blockers);
+      await completed;
       // A probe queues behind the aborted authorization's rollback.
       await s.transaction(tx => tx.unsafe('select 1'), { pool: s.overviewSql });
       expect(s.overviewTransactions).toBe(0);

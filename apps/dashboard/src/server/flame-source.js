@@ -1236,6 +1236,7 @@ with p as materialized (
               when evidence.actor_role = 'worker' then 'subagent'
               else 'unclassified' end semantic_role,
          min(evidence.observed_at) first_at, max(evidence.observed_at) last_at,
+         min(evidence.id)::text frame_revision_id,
          count(*)::bigint event_count, bool_or(evidence.is_automated_run) is_automated_run
     from projected_activity evidence cross join p
    where evidence.observed_at < p.end_at
@@ -1250,7 +1251,7 @@ with p as materialized (
          jsonb_agg(jsonb_build_object(
            'session_id', session_id::text, 'semantic_role', semantic_role,
            'first_at', first_at, 'last_at', last_at, 'event_count', event_count,
-           'is_automated_run', is_automated_run
+           'is_automated_run', is_automated_run, 'frame_revision_id', frame_revision_id
          ) order by first_at, session_id, semantic_role) work_rows
     from ranked_bucket_work where ordinal <= ${INTERVAL_WORK_LIMIT + 1}
    group by person_id, bucket_start
@@ -2032,14 +2033,13 @@ select 'person' kind, pe.id::text id, pe.id::text person_id
    and pe.github_id is distinct from 'sherlock-smoke'
    and split_part(pe.email, '@', 2) = $5 and split_part(pe.email, '@', 3) = ''
 union all
-select 'session' kind, s.id::text id, s.person_id::text person_id
-  from telemetry.sessions s
-  join lateral (
-    select 1 from analytics.frame_evidence_revisions revision
-     where revision.workspace_id = $1 and revision.frame_version = $6
-       and revision.person_id = s.person_id and revision.session_id = s.id limit 1
-  ) visible on true
- where s.workspace_id = $1 and s.id = any($3::uuid[])
+select distinct 'session' kind, s.id::text id, s.person_id::text person_id
+  from analytics.frame_evidence_revisions revision
+  join telemetry.sessions s
+    on s.workspace_id = revision.workspace_id and s.id = revision.session_id
+   and s.person_id = revision.person_id
+ where revision.id = any($8::bigint[]) and revision.workspace_id = $1
+   and revision.frame_version = $6 and s.id = any($3::uuid[])
 union all
 select 'summary' kind, e.id::text id, null::text person_id from telemetry.events e
  where e.workspace_id = $1 and e.id = any($4::bigint[])
@@ -2069,7 +2069,7 @@ export class DirectFlameSource {
     this.overviewAuthorizationRequests = 0;
     this.overviewSql = postgres(dashboardDatabaseUrl(databaseUrl), {
       prepare: false, max: 2, idle_timeout: null, connect_timeout: 10, max_lifetime: null,
-      connection: { application_name: `${this.applicationName}:overview-authorization` },
+      connection: { application_name: `${this.applicationName}:ov` },
     });
     this.sql = postgres(dashboardDatabaseUrl(databaseUrl), {
       prepare: false,
@@ -2309,6 +2309,7 @@ export class DirectFlameSource {
         tx.array(sessionIds), tx.array(summaryIds), this.expectedEmailDomain,
         decodeSnapshotToken(payload.snapshot).frameVersion,
         tx.array([...new Set(metadata.flatMap(value => value.recoveryHashes))]),
+        tx.array([...new Set(metadata.flatMap(value => value.frameRevisionIds))]),
       ], authorizationSignal), { signal: authorizationSignal, statementTimeoutMs: 1000, pool: this.overviewSql ?? this.sql });
       const allowed = { person: new Set(), summary: new Set() };
       const sessionsByPerson = new Map(), recoveryByPerson = new Map();

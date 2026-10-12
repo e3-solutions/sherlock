@@ -120,11 +120,11 @@ function readWork(work, startMs) {
     };
   }
 
-  check(typeof work.is_automated_run === 'boolean');
+  check(typeof work.is_automated_run === 'boolean' && isDecimalId(work.frame_revision_id));
   return {
     id: `${sessionId}:${role}`, sessionId, role, firstMs, lastMs,
     count: toCount(work.event_count, 1), automated: work.is_automated_run ? 1 : 0,
-    evidenceSource: null, summary: null,
+    evidenceSource: null, summary: null, frameRevisionId: work.frame_revision_id,
   };
 }
 
@@ -155,6 +155,7 @@ function build(rows, summaries, counts, workLimit, personId, automatedRuns, reco
   const sessionRefs = new Map();
   const previewRefs = new Map();
   const nativeSessionIds = new Set();
+  const frameBySession = new Map();
   const summaryEventIds = new Set();
 
   const previewIndex = (text) => {
@@ -177,6 +178,7 @@ function build(rows, summaries, counts, workLimit, personId, automatedRuns, reco
     let summary = null;
     if (w.evidenceSource === null) {
       nativeSessionIds.add(w.sessionId);
+      if (!frameBySession.has(w.sessionId)) frameBySession.set(w.sessionId, w.frameRevisionId);
       summary = summaryByWorkId.get(w.id) ?? null;
       if (summary) summaryEventIds.add(summary.eventId);
     } else if (w.summary !== null) {
@@ -232,7 +234,7 @@ function build(rows, summaries, counts, workLimit, personId, automatedRuns, reco
   deepFreeze(overview);
   check(!sessions.some(entry => entry[3]) || recoveryHashes.length > 0);
   authorizationByOverview.set(overview, Object.freeze({
-    personId, recoveryHashes: Object.freeze([...new Set(recoveryHashes)]),
+    personId, frameRevisionIds: Object.freeze([...frameBySession.values()]), recoveryHashes: Object.freeze([...new Set(recoveryHashes)]),
     // Recovered sessions are excluded: they have no native session rows, and the
     // caller gates them by person while the recovered manifest already holds that scope.
     sessionIds: Object.freeze([...nativeSessionIds]),
@@ -253,7 +255,7 @@ export function getOverviewAuthorization(overview) {
   // WeakMap ownership is the only trust signal; unknown objects and primitives get null.
   const auth = authorizationByOverview.get(overview);
   if (!auth) return null;
-  return { personId: auth.personId, recoveryHashes: [...auth.recoveryHashes], sessionIds: [...auth.sessionIds], summaryEventIds: [...auth.summaryEventIds] };
+  return { personId: auth.personId, frameRevisionIds: [...auth.frameRevisionIds], recoveryHashes: [...auth.recoveryHashes], sessionIds: [...auth.sessionIds], summaryEventIds: [...auth.summaryEventIds] };
 }
 
 // Accept arrays or Sets from the caller's fresh query; non-string ids never match.

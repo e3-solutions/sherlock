@@ -11,7 +11,7 @@ const bounds = { left: 0, right: 1008, top: 0, bottom: 82, width: 1008, height: 
 function model({ snapshot = 'v6.one', prefix = '', omit = false } = {}) {
   const counts = Array.from({ length: 144 }, (_, i) => [i < 2 ? 1 : 0, 0, 0, 0]);
   const rows = counts.map((_, i) => ({ person_id: PERSON, bucket_start: new Date(START + i * 600000).toISOString(), work_rows: i < 2 ? [{
-    session_id: SESSIONS[i], semantic_role: 'agent', first_at: new Date(START + i * 600000 + 1).toISOString(),
+    frame_revision_id: String(i + 1), session_id: SESSIONS[i], semantic_role: 'agent', first_at: new Date(START + i * 600000 + 1).toISOString(),
     last_at: new Date(START + i * 600000 + 9).toISOString(), event_count: 3, is_automated_run: false,
   }] : [] }));
   if (omit) rows[0].work_rows = [];

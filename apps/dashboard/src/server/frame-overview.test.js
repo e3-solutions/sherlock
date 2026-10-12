@@ -9,12 +9,12 @@ function fixture() {
   return {
     personId: PERSON,
     rows: Array.from({ length: 144 }, (_, i) => ({ person_id: PERSON, bucket_start: new Date(START + i * 600000).toISOString(), work_rows: [] })),
-    summaries: [{ session_id: SESSION, semantic_role: 'agent', summary_event_id: '42', summary: 'Experiment with OCR' }],
+    summaries: [{ frame_revision_id: '77', session_id: SESSION, semantic_role: 'agent', summary_event_id: '42', summary: 'Experiment with OCR' }],
     counts: Array.from({ length: 144 }, () => [0, 0, 0, 0]),
   };
 }
 function native(i = 0, extra = {}) {
-  return { session_id: SESSION, semantic_role: 'agent', first_at: new Date(START + i * 600000 + 1).toISOString(),
+  return { frame_revision_id: '77', session_id: SESSION, semantic_role: 'agent', first_at: new Date(START + i * 600000 + 1).toISOString(),
     last_at: new Date(START + i * 600000 + 9).toISOString(), event_count: 3, is_automated_run: false, ...extra };
 }
 function populated() {
@@ -78,7 +78,7 @@ describe('snapshot frame overview', () => {
   });
   it('requires fresh session and source-event authorization and does not serialize its references', () => {
     const view = buildFrameOverview(populated());
-    expect(getOverviewAuthorization(view)).toEqual({ personId: PERSON, recoveryHashes: [], sessionIds: [SESSION], summaryEventIds: ['42'] });
+    expect(getOverviewAuthorization(view)).toEqual({ personId: PERSON, frameRevisionIds: ['77'], recoveryHashes: [], sessionIds: [SESSION], summaryEventIds: ['42'] });
     expect(JSON.stringify(view)).not.toContain('summaryEventIds');
     expect(getOverviewAuthorization(JSON.parse(JSON.stringify(view)))).toBeNull();
     expect(filterAuthorizedOverview(view, { personId: PERSON, recoveryHashes: [], sessionIds: [SESSION], summaryEventIds: ['42'] })).toBe(view);
