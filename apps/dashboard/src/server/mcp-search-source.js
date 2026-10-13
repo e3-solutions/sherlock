@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { expandSearchAliases } from "./search-aliases.js";
 
 import {
   FlameSourceError,
@@ -269,19 +270,57 @@ select candidate.event_id::text event_id, candidate.score
  limit ${SEARCH_CANDIDATE_BUDGET + 1}
 `;
 
+const SEARCH_EXCERPT_RESULT_FIELDS = Object.freeze([
+  "event_id", "session_id", "person_id", "display_name", "source_provider", "event_kind",
+  "message_role", "message_origin", "occurred_at_us", "content_excerpt", "content_byte_size",
+  "content_sha256", "source_record_id", "record_sha256", "normalizer_version",
+]);
+const SEARCH_RESULT_COLUMNS = Object.freeze([
+  "candidate_event_id", "candidate_score", "candidate_ordinal", ...SEARCH_EXCERPT_RESULT_FIELDS,
+].sort());
+
+const SEARCH_CANONICAL_PREDICATES = (idPredicate) => `
+  where e.workspace_id = $1 and ${idPredicate}
+    and e.event_kind in ${MESSAGE_KINDS} and not e.is_replay
+    and e.content_excerpt is not null
+    and e.occurred_at >= $3::timestamptz and e.occurred_at < $4::timestamptz
+    and e.server_received_at <= $5::timestamptz
+    and ${roster("pe", "$6")}
+    and ($7::uuid is null or s.person_id = $7::uuid)
+    and ($8::uuid is null or e.session_id = $8::uuid)
+    and s.actor_role not in ('guardian', 'automation')
+    and ${CANONICAL}
+`;
+
 export const SEARCH_MATCHES_SQL = `
 select ${EXCERPT_COLUMNS}
   from telemetry.events e ${EXCERPT_JOINS}
- where e.workspace_id = $1 and e.id = any($2::bigint[])
-   and e.event_kind in ${MESSAGE_KINDS} and not e.is_replay
-   and e.content_excerpt is not null
-   and e.occurred_at >= $3::timestamptz and e.occurred_at < $4::timestamptz
-   and e.server_received_at <= $5::timestamptz
-   and ${roster("pe", "$6")}
-   and ($7::uuid is null or s.person_id = $7::uuid)
-   and ($8::uuid is null or e.session_id = $8::uuid)
-   and s.actor_role not in ('guardian', 'automation')
-   and ${CANONICAL}
+${SEARCH_CANONICAL_PREDICATES("e.id = any($2::bigint[])")}
+`;
+
+// Re-read only the first candidate-budget rows through the caller's reader
+// role. The materialized candidate set preserves the helper's overflow row
+// and its score even when no canonical row survives verification.
+export const SEARCH_SQL = `
+with candidates as materialized (
+  select candidate.event_id candidate_event_id, candidate.score candidate_score,
+         (row_number() over ())::integer candidate_ordinal
+    from analytics.search_excerpt_candidates(
+      $1::uuid, $2::text, $3::timestamptz, $4::timestamptz, $5::timestamptz,
+      $6::text, $7::uuid, $8::uuid, $9::integer
+    ) candidate
+   limit ${SEARCH_CANDIDATE_BUDGET + 1}
+)
+select candidate_row.candidate_event_id::text candidate_event_id,
+       candidate_row.candidate_score, candidate_row.candidate_ordinal,
+       verified.*
+  from candidates candidate_row
+  left join lateral (
+    select ${EXCERPT_COLUMNS}
+      from telemetry.events e ${EXCERPT_JOINS}
+    ${SEARCH_CANONICAL_PREDICATES(`e.id = candidate_row.candidate_event_id and candidate_row.candidate_ordinal <= ${SEARCH_CANDIDATE_BUDGET}`)}
+  ) verified on true
+ order by candidate_row.candidate_ordinal
 `;
 
 export const EVIDENCE_SESSION_SQL = `
@@ -522,16 +561,80 @@ function groupMatches(matches, enabled, compare, perSessionLimit) {
   };
 }
 
+function readSearchRows(rows) {
+  if (!Array.isArray(rows) || rows.length > SEARCH_CANDIDATE_BUDGET + 1) throw resultInvalid();
+  const scores = new Map();
+  const matches = [];
+  const matchedIds = new Set();
+  for (const [index, row] of rows.entries()) {
+    if (!row || typeof row !== "object" ||
+        Object.keys(row).sort().join("\0") !== SEARCH_RESULT_COLUMNS.join("\0")) {
+      throw resultInvalid();
+    }
+    const eventId = String(row.candidate_event_id);
+    if ((typeof row.candidate_score !== "number" && typeof row.candidate_score !== "string") ||
+        (typeof row.candidate_score === "string" && row.candidate_score.trim() === "") ||
+        (typeof row.candidate_ordinal !== "number" &&
+          typeof row.candidate_ordinal !== "string") || row.candidate_ordinal === "") {
+      throw resultInvalid();
+    }
+    const score = Number(row.candidate_score);
+    const ordinal = Number(row.candidate_ordinal);
+    if (!EVENT_ID_PATTERN.test(eventId) || BigInt(eventId) > MAX_BIGINT ||
+        !Number.isFinite(score) || scores.has(eventId) || ordinal !== index + 1) {
+      throw resultInvalid();
+    }
+    scores.set(eventId, score);
+
+    if (row.event_id === null) {
+      if (SEARCH_EXCERPT_RESULT_FIELDS.some((field) => field !== "event_id" && row[field] !== null)) {
+        throw resultInvalid();
+      }
+      continue;
+    }
+    if (ordinal > SEARCH_CANDIDATE_BUDGET || String(row.event_id) !== eventId ||
+        row.occurred_at_us === null || matchedIds.has(eventId)) {
+      throw resultInvalid();
+    }
+    matchedIds.add(eventId);
+    matches.push({ ...row, score });
+  }
+  return {
+    scores,
+    examined: Math.min(scores.size, SEARCH_CANDIDATE_BUDGET),
+    matches,
+  };
+}
+
 function readCandidates(rows) {
+  if (!Array.isArray(rows) || rows.length > SEARCH_CANDIDATE_BUDGET + 1) throw resultInvalid();
   const scores = new Map();
   for (const row of rows) {
+    if (!row || typeof row !== "object" ||
+        Object.keys(row).sort().join("\0") !== "event_id\0score" ||
+        (typeof row.score !== "number" && typeof row.score !== "string") ||
+        (typeof row.score === "string" && row.score.trim() === "")) throw resultInvalid();
     const eventId = String(row.event_id);
     const score = Number(row.score);
     if (!EVENT_ID_PATTERN.test(eventId) || BigInt(eventId) > MAX_BIGINT ||
         !Number.isFinite(score) || scores.has(eventId)) throw resultInvalid();
     scores.set(eventId, score);
   }
-  return scores;
+  return { scores, examined: Math.min(scores.size, SEARCH_CANDIDATE_BUDGET) };
+}
+
+function readCanonicalMatches(rows, scores) {
+  if (!Array.isArray(rows) || rows.length > SEARCH_CANDIDATE_BUDGET) throw resultInvalid();
+  const matchedIds = new Set();
+  return rows.map((row) => {
+    if (!row || typeof row !== "object") throw resultInvalid();
+    const eventId = String(row.event_id);
+    const score = scores.get(eventId);
+    if (score === undefined || row.occurred_at_us === null || row.occurred_at_us === undefined ||
+        matchedIds.has(eventId)) throw resultInvalid();
+    matchedIds.add(eventId);
+    return { ...row, score };
+  });
 }
 
 function evidenceFingerprint(source, sessionId) {
@@ -685,9 +788,11 @@ export function createSherlockSearchSource(source) {
 
     async searchSessions({
       query, personId, sessionId, start, end, limit, order = "relevance",
-      perSessionLimit, groupIdenticalExcerpts = true, signal, now,
+      perSessionLimit, groupIdenticalExcerpts = true, expandAliases = false, signal, now,
     } = {}) {
-      const text = parseQuery(query);
+      const rawText = parseQuery(query);
+      if (typeof expandAliases !== "boolean") throw invalid();
+      const text = expandSearchAliases(rawText, expandAliases);
       const person = optionalUuid(personId);
       const session = optionalUuid(sessionId);
       const pageSize = boundedInteger(limit, SEARCH_DEFAULT_LIMIT, 1, SEARCH_MAX_LIMIT);
@@ -700,32 +805,35 @@ export function createSherlockSearchSource(source) {
       const bounds = [
         window.startAt.toISOString(), window.endAt.toISOString(), window.readAt.toISOString(),
       ];
+      const fused = person !== null || session !== null;
       const { candidates, rows } = await read(signal, async (tx) => {
-        let candidateRows;
+        let rows;
         try {
-          candidateRows = await runQuery(tx, SEARCH_CANDIDATES_SQL, [
+          const params = [
             source.workspaceId, text, ...bounds, source.expectedEmailDomain,
             person, session, SEARCH_CANDIDATE_BUDGET,
+          ];
+          if (fused) {
+            rows = await runQuery(tx, SEARCH_SQL, params, signal);
+            const result = readSearchRows(rows);
+            return { candidates: { scores: result.scores, examined: result.examined }, rows: result.matches };
+          }
+          const candidateRows = await runQuery(tx, SEARCH_CANDIDATES_SQL, params, signal);
+          const parsed = readCandidates(candidateRows);
+          const ids = [...parsed.scores.keys()].slice(0, SEARCH_CANDIDATE_BUDGET);
+          const matchRows = ids.length === 0 ? [] : await runQuery(tx, SEARCH_MATCHES_SQL, [
+            source.workspaceId, ids, ...bounds, source.expectedEmailDomain, person, session,
           ], signal);
+          return { candidates: parsed, rows: readCanonicalMatches(matchRows, parsed.scores) };
         } catch (error) {
           throw helperError(error);
         }
-        const scores = readCandidates(candidateRows);
-        const ids = [...scores.keys()].slice(0, SEARCH_CANDIDATE_BUDGET);
-        const matchRows = ids.length === 0 ? [] : await runQuery(tx, SEARCH_MATCHES_SQL, [
-          source.workspaceId, ids, ...bounds, source.expectedEmailDomain, person, session,
-        ], signal);
-        return { candidates: { scores, examined: ids.length }, rows: matchRows };
       });
       const budgetReached = candidates.scores.size > SEARCH_CANDIDATE_BUDGET;
-      const matches = rows
+      const visibleMatches = rows
         .filter((row) => !isRuntimeContext(row))
-        .map((row) => {
-          const score = candidates.scores.get(String(row.event_id));
-          if (score === undefined || row.occurred_at_us === null) throw resultInvalid();
-          return { ...excerptFromRow(row), score };
-        });
-      const grouped = groupMatches(matches, groupIdenticalExcerpts,
+        .map((row) => ({ ...excerptFromRow(row), score: row.score }));
+      const grouped = groupMatches(visibleMatches, groupIdenticalExcerpts,
         order === "recent" ? byRecency : bySessionRank, perSession);
       const diverse = grouped.results;
       const results = diverse.slice(0, pageSize);
@@ -748,15 +856,15 @@ export function createSherlockSearchSource(source) {
         },
         order,
         results,
-        matchCount: matches.length,
-        matchedSessions: new Set(matches.map((match) => match.sessionId)).size,
+        matchCount: visibleMatches.length,
+        matchedSessions: new Set(visibleMatches.map((match) => match.sessionId)).size,
         budgetReached,
         coverage: {
           state: "partial",
           reasons,
           candidateBudget: SEARCH_CANDIDATE_BUDGET,
           candidatesExamined: candidates.examined,
-          canonicalMatches: matches.length,
+          canonicalMatches: visibleMatches.length,
           returnedMatches: results.length,
           limit: pageSize,
           perSessionLimit: perSession,

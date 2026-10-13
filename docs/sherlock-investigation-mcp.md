@@ -10,7 +10,7 @@ The existing metadata tools (`diagnostics`, `coverage`, `list_sessions`,
 `get_session`, `query_usage`) and the Bonaparte evidence tools keep their
 contracts in [`sherlock-query-mcp-v1.md`](sherlock-query-mcp-v1.md) and
 [`bonaparte-mcp-v1.md`](bonaparte-mcp-v1.md). `get_session` remains
-metadata-only. The server identifies as `bonaparte-usage` version `1.3.0`; the
+metadata-only. The server identifies as `bonaparte-usage` version `1.4.0`; the
 search tools, their documentation entries, and their server instructions are
 advertised only when the search source is configured.
 
@@ -19,7 +19,10 @@ All three investigation tools (`resolve_person`, `search_sessions`, and
 required result and coverage fields to `search_sessions`; the other two tools
 retain their shapes with the new shared version. Refresh gateway/client tool discovery after upgrading
 or rolling back; cached strict schemas can reject responses across these versions.
-The previous server does not accept `groupIdenticalExcerpts` input.
+Version 1.3.0 supports grouped search but does not accept `expandAliases`.
+Version 1.4.0 adds that optional input without changing the strict v2 output.
+Older v1 servers also reject `groupIdenticalExcerpts`. Reconnect standalone
+clients before using new inputs.
 
 ## What the search can and cannot see
 
@@ -49,7 +52,9 @@ The previous server does not accept `groupIdenticalExcerpts` input.
   Matching prefixes do not prove full-message equality. Open each relevant
   alternate with its own `sessionId` and `eventId`; context and hidden tails can
   differ. Set `groupIdenticalExcerpts: false` and narrow the query to inspect
-  individual occurrences. Exact evidence reads remain ungrouped.
+  individual occurrences. Exact evidence reads remain ungrouped. Tie each
+  citation to one exact `sessionId`/`eventId`/`source.sourceRecordId` location;
+  do not combine fields from a representative and an alternate.
   `coverage.excerptGroups` counts groups before per-session/page limits; when
   grouping is disabled it counts individual occurrences. Per-session caps can
   still omit whole groups. `sessionMatchCount` remains the raw verified count for
@@ -70,18 +75,39 @@ The previous server does not accept `groupIdenticalExcerpts` input.
    ask the user which person they mean. Do not pick one.
 2. **`search_sessions`** with that `personId` and a lexical query. The syntax is
    websearch style: `OR` between alternatives, `"quoted phrases"`, and
-   `-exclusions`. Words are not stemmed, so list aliases and spelling variants
-   yourself. A query has at most 8 words, and each `OR` counts as one.
+   `-exclusions`. Decompose the question into focused positive terms of at most
+   8 words; search distinct concepts in separate calls. Words are not stemmed.
+   Use one product spelling per query; do not AND aliases together. Start exact,
+   then set `expandAliases: true` for deterministic PaddleOCR/Paddle/PP-OCRv6
+   alternatives, or search spellings separately. Expansion defaults to false.
+   `OR` splits whole branches: repeat shared terms, for example
+   `paddleocr benchmark OR paddle benchmark`, or use separate calls.
+   Queries with quotes, exclusions, `OR`, or punctuation stay unchanged, as do
+   expansions beyond 31 PostgreSQL nodes or 256 characters. No output marker
+   reports whether expansion ran; shorten the query or search variants separately
+   when necessary. Verify context because Paddle can mean unrelated subjects.
+   Broader searches can exceed the candidate budget and omit exact hits; retain
+   a separate exact search. For a broad investigation, one phrase such as
+   `OCR experiments` is insufficient: use distinctive subject/model terms,
+   then outcomes and correction queries. Use `order: recent` for latest
+   observations. This sorts only the verified candidate window; narrow the time
+   window if the candidate budget is exceeded. Search
+   separately for plans/proposals, execution, measured outcomes, corrections,
+   and latest status: finding a plan does not establish it ran.
 3. **`get_session_evidence`** with a hit's `sessionId` and its `eventId` as
    `anchorEventId`. You get roughly a third of the context before the anchor
-   and the rest after it.
+   and the rest after it. Copy IDs from one result object; never reconstruct
+   them or cite a failed read. For each factual outcome cite person/time and
+   `[sessionId=... eventId=... sourceRecordId=...]` from one successfully read event.
 4. Follow `nextCursor` with the same `sessionId` to read further. Follow
    `parentSessionId` and `childSessionIds` to see delegated or parent work.
    `parentOmitted` distinguishes an omitted parent from no parent without revealing
    its identifier. `anchorEventId` and `cursor` are mutually exclusive.
 5. If the search reports `candidate_budget_exceeded` or `result_capped`, narrow
    the query with `personId`, `sessionId`, a shorter `start`/`end` window, or more
-   specific terms. Do not treat the returned page as exhaustive.
+   specific terms. Do not treat the returned page as exhaustive. A no-hit, a
+   capped page, or no completion found on the first page does not establish
+   absence; continue with focused searches and evidence pagination as needed.
 6. Inspect relevant `excerptGroup.alternativeSources` when the same displayed
    text appears in several sessions. Grouping happens after reader verification
    and before page limits. It adds no SQL query and cannot recover distinct
@@ -104,7 +130,10 @@ Cite every claim with the person, `occurredAt`, `sessionId`, `eventId`, and
 source record <sourceRecordId> (excerpt truncated; untrusted session content)
 ```
 
-Keep two kinds of statement apart in the report:
+Keep plans, proposals, execution, and measured outcomes distinct. A proposal
+does not establish execution. A silver-set agreement, successful operational
+HTTP request, and measured accuracy are separate claims and do not establish
+one another. Also keep observed and inferred statements distinct:
 
 - **Observed:** what an excerpt literally says, for example "an excerpt states
   the pipeline switched from Tesseract to PaddleOCR".
@@ -251,3 +280,47 @@ SHERLOCK_TEST_DATABASE_URL=<local isolated database URL> pnpm --dir apps/dashboa
 over Streamable HTTP against a fake database. `test:postgres` runs the excerpt
 search helper and its privacy-policy gate against an isolated local database.
 It skips when `SHERLOCK_TEST_DATABASE_URL` is unset.
+
+### Reproduce alias comparisons
+
+Run the read-only benchmark with `SHERLOCK_BENCH_SAMPLES=30` and
+`--compare-aliases` against version 1.4.0 (or `--local` against the live reader
+database). It alternates exact and expanded requests with the same person,
+window, candidate budget, and transport. Output includes median/p95, bounds,
+group diversity, and budget state, without printing excerpts or credentials.
+Use `--compare-grouping` separately. Neither comparison measures answer accuracy.
+
+### Interpret reported results
+
+Session messages report experiments; canonical source verification does not
+independently validate the experiments. Identify each metric's reference,
+denominator, and cohort. Reserve ground-truth accuracy for explicit ground truth
+or human adjudication; distinguish silver/model agreement, detector counts,
+conditional recoverability, and operational HTTP success. Never combine
+percentages across cohorts. A truncated excerpt or failed read cannot establish
+noncompletion. Describe latest findings as the latest retrieved observations in
+the searched window, rather than authoritative current status.
+
+### Scoped search round trips
+
+Version 1.4.0 verifies person- and session-scoped candidates in the same SQL
+statement that nominates them. The candidate helper still runs under its existing
+guards; each fact is read through the caller's reader role and canonical rules.
+The overflow candidate remains metadata only, and canonical misses still count
+toward examined candidates. Workspace-wide queries retain the two-query path.
+No database migration or result cache is required.
+
+Thirty alternating paired samples per case against the live reader database
+measured the following network-inclusive source-boundary times. These are
+local-client measurements, not deployed HTTP timings or an SLA. Candidate
+counts, overflow flags, canonical counts and top-result IDs/scores matched.
+
+| Case | Two-query median | Fused median | Two-query p95 | Fused p95 | Decision |
+|---|---:|---:|---:|---:|---|
+| Person-scoped broad query | 423 ms | 357 ms | 528 ms | 483 ms | Use fused |
+| Person-scoped quoted term | 356 ms | 241 ms | 416 ms | 304 ms | Use fused |
+| Workspace-wide broad query | 776 ms | 813 ms | 1532 ms | 1421 ms | Keep two-query |
+
+A separate session-array SQL-helper candidate was rejected: a smaller inner-query
+benchmark suggested savings, but the full helper regressed broad workspace
+latency once scope computation was included. Its migration was not applied.
