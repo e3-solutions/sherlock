@@ -1501,11 +1501,21 @@ class ClaudePluginTests(unittest.TestCase):
             transcript.write_bytes(source)
             state_root = claude_home / "sherlock" / "telemetry"
 
+            # This test verifies durable chunk publication and byte reconstruction.
+            # Leave delivery outside its scope and prevent the detached drain from
+            # racing the TemporaryDirectory cleanup after the assertions complete.
+            cli_runner = textwrap.dedent("""
+                from unittest.mock import patch
+                from sherlock_collector.cli import main
+
+                with patch("sherlock_collector.hook._spawn_drain"):
+                    raise SystemExit(main())
+            """)
             completed = subprocess.run(
                 [
                     sys.executable,
-                    "-m",
-                    "sherlock_collector.cli",
+                    "-c",
+                    cli_runner,
                     "--provider",
                     "claude_code",
                     "--claude-home",
