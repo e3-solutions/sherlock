@@ -15,6 +15,7 @@ import {
   SEARCH_CANDIDATES_SQL,
   SEARCH_CANDIDATE_BUDGET,
   SEARCH_MATCHES_SQL,
+  SEARCH_SQL,
   SEARCH_SCHEMA_VERSION,
   createSherlockSearchSource,
   decodeEvidenceCursor,
@@ -195,11 +196,67 @@ describe("resolvePerson", () => {
 
 describe("searchSessions", () => {
   function searchSource(candidates, matches) {
+    const getCandidates = typeof candidates === "function" ? candidates : () => candidates;
+    const empty = Object.fromEntries(["event_id", "session_id", "person_id", "display_name",
+      "source_provider", "event_kind", "message_role", "message_origin", "occurred_at_us",
+      "content_excerpt", "content_byte_size", "content_sha256", "source_record_id",
+      "record_sha256", "normalizer_version"].map((key) => [key, null]));
+    const matchesForIds = (ids) => matches.filter((row) => ids.includes(String(row.event_id)));
     return fakeSource(new Map([
-      [SEARCH_CANDIDATES_SQL, typeof candidates === "function" ? candidates : () => candidates],
-      [SEARCH_MATCHES_SQL, () => matches],
+      [SEARCH_CANDIDATES_SQL, (params) => getCandidates(params)],
+      [SEARCH_MATCHES_SQL, (params) => matchesForIds(params[1])],
+      [SEARCH_SQL, (params) => {
+      const candidateRows = getCandidates(params).map((row) => ({
+        candidate_event_id: String(row.event_id), candidate_score: row.score,
+      }));
+      const byId = new Map(matches.map((row) => [String(row.event_id), row]));
+      return candidateRows.map((candidate, index) => ({
+        ...candidate, candidate_ordinal: index + 1,
+        ...(index < SEARCH_CANDIDATE_BUDGET
+          ? (byId.get(candidate.candidate_event_id) ?? empty) : empty),
+      }));
+    }],
     ]));
   }
+
+  it("keeps alias expansion opt-in and passes complete AND branches when enabled", async () => {
+    const defaultSource = searchSource([], []);
+    await defaultSource.source.searchSessions({ query: "ocr paddleocr logs", now: NOW });
+    expect(defaultSource.calls[0].params[1]).toBe("ocr paddleocr logs");
+
+    const expanded = searchSource([], []);
+    await expanded.source.searchSessions({
+      query: "ocr paddleocr logs", expandAliases: true, now: NOW,
+    });
+    expect(expanded.calls[0].params[1]).toBe(
+      'ocr paddleocr logs OR ocr paddle logs OR ocr "PP-OCRv6" logs',
+    );
+
+    const exact = searchSource([], []);
+    await exact.source.searchSessions({
+      query: "ocr paddleocr logs", expandAliases: false, now: NOW,
+    });
+    expect(exact.calls[0].params[1]).toBe("ocr paddleocr logs");
+  });
+
+  it("rejects a nonboolean alias option before querying", async () => {
+    const { source, calls } = searchSource([], []);
+    await expect(source.searchSessions({ query: "paddleocr logs", expandAliases: "false", now: NOW }))
+      .rejects.toThrow("flame_mcp_query_request_invalid");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("uses one fused read for person or session scope and two reads for workspace scope", async () => {
+    const person = searchSource([], []);
+    await person.source.searchSessions({ query: "test", personId: PERSON, now: NOW });
+    expect(person.calls.map((call) => call.text)).toEqual([SEARCH_SQL]);
+    const session = searchSource([], []);
+    await session.source.searchSessions({ query: "test", sessionId: SESSION, now: NOW });
+    expect(session.calls.map((call) => call.text)).toEqual([SEARCH_SQL]);
+    const workspace = searchSource([], []);
+    await workspace.source.searchSessions({ query: "test", now: NOW });
+    expect(workspace.calls.map((call) => call.text)).toEqual([SEARCH_CANDIDATES_SQL]);
+  });
 
   it("rejects invalid input without querying or echoing the query", async () => {
     const { source, calls } = searchSource([], []);
@@ -253,10 +310,8 @@ describe("searchSessions", () => {
       WORKSPACE, "eval or \"ocr accuracy\" -pdf", "2026-01-01T00:00:00.000Z",
       NOW.toISOString(), NOW.toISOString(), "e3group.ai", PERSON, null, SEARCH_CANDIDATE_BUDGET,
     ]);
-    expect(calls[1].params).toEqual([
-      WORKSPACE, ["1", "2", "3", "4", "5", "6"], "2026-01-01T00:00:00.000Z",
-      NOW.toISOString(), NOW.toISOString(), "e3group.ai", PERSON, null,
-    ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].text).toBe(SEARCH_SQL);
     expect(result.results.map((hit) => [hit.eventId, hit.score, hit.sessionMatchCount]))
       .toEqual([["4", 0.95, 1], ["1", 0.9, 3]]);
     expect(result.results[0]).toMatchObject({
@@ -432,13 +487,17 @@ describe("searchSessions", () => {
   });
 
   it("keeps canonical predicates and query-independent filters in the verification SQL", () => {
-    expect(SEARCH_MATCHES_SQL).toContain(activeNormalizerPredicate("e", "s", "ib", "c"));
-    expect(SEARCH_MATCHES_SQL).toContain(canonicalWinnerPredicate("e", "s"));
-    expect(SEARCH_MATCHES_SQL).toContain("e.event_kind in ('message', 'agent_message')");
-    expect(SEARCH_MATCHES_SQL).toContain("not e.is_replay");
+    for (const sql of [SEARCH_SQL, SEARCH_MATCHES_SQL]) {
+      expect(sql).toContain(activeNormalizerPredicate("e", "s", "ib", "c"));
+      expect(sql).toContain(canonicalWinnerPredicate("e", "s"));
+      expect(sql).toContain("e.event_kind in ('message', 'agent_message')");
+      expect(sql).toContain("not e.is_replay");
+      expect(sql).toContain("split_part(pe.email, '@', 3) = ''");
+      expect(sql).not.toMatch(/websearch_to_tsquery|message_search|usage/);
+    }
     expect(SEARCH_MATCHES_SQL).toContain("e.id = any($2::bigint[])");
-    expect(SEARCH_MATCHES_SQL).toContain("split_part(pe.email, '@', 3) = ''");
-    expect(SEARCH_MATCHES_SQL).not.toMatch(/websearch_to_tsquery|message_search|usage/);
+    expect(SEARCH_SQL).not.toContain("any($2::bigint[])");
+    expect(SEARCH_SQL).toContain("candidate_row.candidate_ordinal <= 500");
     expect(EVIDENCE_AFTER_SQL).toContain(canonicalWinnerPredicate("e", "s"));
     expect(EVIDENCE_AFTER_SQL).toContain(`limit ${EVIDENCE_SCAN_BUDGET}`);
     // Driver timestamptz binding rounds to milliseconds; keyset times stay text.
@@ -446,16 +505,42 @@ describe("searchSessions", () => {
     expect(EVIDENCE_BEFORE_SQL).toContain("($3::text::timestamptz, $4::bigint)");
   });
 
-  it("caps examined candidates at the budget and flags overflow", async () => {
-    const candidates = Array.from({ length: SEARCH_CANDIDATE_BUDGET + 1 }, (_, index) => ({
-      event_id: String(index + 1), score: 0.1,
-    }));
-    const { source, calls } = searchSource(candidates, []);
-    const result = await source.searchSessions({ query: "test", now: NOW });
-    expect(calls[1].params[1]).toHaveLength(SEARCH_CANDIDATE_BUDGET);
-    expect(calls[1].params[1].at(-1)).toBe(String(SEARCH_CANDIDATE_BUDGET));
-    expect(result).toMatchObject({ budgetReached: true, matchCount: 0, results: [] });
-    expect(result.coverage.reasons).toContain("candidate_budget_exceeded");
+  it.each([SEARCH_CANDIDATE_BUDGET, SEARCH_CANDIDATE_BUDGET + 1])(
+    "preserves candidate budget metadata for %i candidates when canonical verification is empty",
+    async (candidateCount) => {
+      const candidates = Array.from({ length: candidateCount }, (_, index) => ({
+        event_id: String(index + 1), score: 0.1,
+      }));
+      const { source, calls } = searchSource(candidates, []);
+      const result = await source.searchSessions({ query: "test", now: NOW });
+      expect(calls.map((call) => call.text)).toEqual([SEARCH_CANDIDATES_SQL, SEARCH_MATCHES_SQL]);
+      expect(calls[0].params.at(-1)).toBe(SEARCH_CANDIDATE_BUDGET);
+      expect(result).toMatchObject({
+        budgetReached: candidateCount > SEARCH_CANDIDATE_BUDGET,
+        matchCount: 0, matchedSessions: 0, results: [],
+        coverage: {
+          candidatesExamined: SEARCH_CANDIDATE_BUDGET,
+          canonicalMatches: 0,
+        },
+      });
+      expect(result.coverage.reasons.includes("candidate_budget_exceeded"))
+        .toBe(candidateCount > SEARCH_CANDIDATE_BUDGET);
+    },
+  );
+
+  it.each([
+    [{ personId: PERSON }, [SEARCH_SQL]],
+    [{ sessionId: SESSION }, [SEARCH_SQL]],
+    [{}, [SEARCH_CANDIDATES_SQL, SEARCH_MATCHES_SQL]],
+  ])("keeps a single noncanonical candidate and no-hit coverage for scope %o", async (scope, expectedSql) => {
+    const { source, calls } = searchSource([{ event_id: "88", score: 0.73 }], []);
+    const result = await source.searchSessions({ query: "test", ...scope, now: NOW });
+    expect(calls.map((call) => call.text)).toEqual(expectedSql);
+    expect(calls).toHaveLength(expectedSql.length);
+    expect(result).toMatchObject({
+      matchCount: 0, matchedSessions: 0, budgetReached: false, results: [],
+      coverage: { candidatesExamined: 1, canonicalMatches: 0 },
+    });
   });
 
   it("skips verification for no candidates and rejects unsafe helper rows", async () => {
@@ -468,11 +553,47 @@ describe("searchSessions", () => {
       { event_id: "9223372036854775808", score: 1 },
       { event_id: "0", score: 1 },
       { event_id: "1", score: "NaN" },
+      { event_id: "1", score: null },
     ]) {
       const { source } = searchSource([row], []);
       await expect(source.searchSessions({ query: "test", now: NOW }))
         .rejects.toThrow("flame_database_result_invalid");
     }
+    const duplicated = searchSource([
+      { event_id: "1", score: 1 }, { event_id: "1", score: 0.5 },
+    ], []);
+    await expect(duplicated.source.searchSessions({ query: "test", now: NOW }))
+      .rejects.toThrow("flame_database_result_invalid");
+  });
+
+  it("rejects mismatched canonical rows and any canonical data on the overflow candidate", async () => {
+    const nullExcerpt = Object.fromEntries(["event_id", "session_id", "person_id", "display_name",
+      "source_provider", "event_kind", "message_role", "message_origin", "occurred_at_us",
+      "content_excerpt", "content_byte_size", "content_sha256", "source_record_id",
+      "record_sha256", "normalizer_version"].map((key) => [key, null]));
+    const rawCandidate = (id, ordinal, canonical = null) => ({
+      candidate_event_id: String(id), candidate_score: 1, candidate_ordinal: ordinal,
+      ...nullExcerpt, ...(canonical ?? {}),
+    });
+    const mismatched = fakeSource(new Map([[SEARCH_SQL, () => [rawCandidate(1, 1, {
+      ...eventRow(2),
+    })]]]));
+    await expect(mismatched.source.searchSessions({ query: "test", personId: PERSON, now: NOW }))
+      .rejects.toThrow("flame_database_result_invalid");
+
+    const overflowRows = Array.from({ length: SEARCH_CANDIDATE_BUDGET + 1 }, (_, i) =>
+      rawCandidate(i + 1, i + 1));
+    overflowRows.at(-1).event_id = overflowRows.at(-1).candidate_event_id;
+    overflowRows.at(-1).session_id = SESSION;
+    const overflow = fakeSource(new Map([[SEARCH_SQL, () => overflowRows]]));
+    await expect(overflow.source.searchSessions({ query: "test", personId: PERSON, now: NOW }))
+      .rejects.toThrow("flame_database_result_invalid");
+
+    const nullScore = fakeSource(new Map([[SEARCH_SQL, () => [{
+      ...rawCandidate(1, 1), candidate_score: null,
+    }]]]));
+    await expect(nullScore.source.searchSessions({ query: "test", personId: PERSON, now: NOW }))
+      .rejects.toThrow("flame_database_result_invalid");
   });
 
   it("maps helper errors to safe codes and never turns failures into empty results", async () => {

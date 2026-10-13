@@ -5,6 +5,7 @@ import { URL as FileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { WORK_CONTEXT_PREFIXES } from "./flame-source.js";
 import { createSherlockSearchSource } from "./mcp-search-source.js";
+import { expandSearchAliases } from "./search-aliases.js";
 
 const DATABASE_URL = process.env.SHERLOCK_TEST_DATABASE_URL;
 const describePostgres = DATABASE_URL ? describe : describe.skip;
@@ -397,6 +398,122 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
           "relatedHidden", "childOfHidden", "bobSession", "atEnd"]);
       await expectEquivalent(tx, fixture, { query: "zebrafind -alpha" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { query: "\"unrelated synthetic\" or nothinghere" }, ["noHit"]);
+    });
+  });
+
+  it("matches the exact PP-OCRv6 spelling through expanded real PostgreSQL lexemes", async () => {
+    await inRollback(sql, async (tx) => {
+      const expanded = expandSearchAliases("paddleocr 500", true);
+      const [{ ocr, paddle, exact }] = await tx`
+        select
+          to_tsvector('simple', '500 PP-OCRv6 completed') @@ websearch_to_tsquery('simple', ${expanded}) as ocr,
+          to_tsvector('simple', 'Paddle 200 completed') @@ websearch_to_tsquery('simple', ${expanded}) as paddle,
+          to_tsvector('simple', '500 PP-OCRv6 completed') @@ websearch_to_tsquery('simple', ${"paddleocr 500"}) as exact`;
+      expect({ ocr, paddle, exact }).toEqual({ ocr: true, paddle: false, exact: false });
+    });
+  });
+
+  it("expands the exact 27-node alias within SQL limits and falls back above them", async () => {
+    await inRollback(sql, async (tx) => {
+      await installMigration(tx);
+      const f = await seedFixture(tx);
+      await tx`update telemetry.ingest_batches set source_provider = 'codex' where workspace_id = ${f.home}`;
+      await tx`update telemetry.events set normalizer_version = 'sherlock.codex-rollout.v3' where workspace_id = ${f.home}`;
+      const [event] = await tx`insert into telemetry.events (
+        workspace_id, session_id, source_record_id, normalizer_version, projection_index,
+        source_priority, event_kind, message_role, content_excerpt, occurred_at, server_received_at
+      ) values (${f.home}, ${f.sessions.alice.id}, ${f.people.alice.records[30]},
+        'sherlock.codex-rollout.v3', 8100, 0, 'message', 'assistant',
+        'PP-OCRv6 alpha beta gamma', ${START}, ${READ_AT}) returning id`;
+
+      let transactions = 0;
+      const api = createSherlockSearchSource({
+        workspaceId: f.home, expectedEmailDomain: 'e3group.ai', maxPeople: 100,
+        async transaction(callback) {
+          transactions += 1;
+          const outcome = await asReader(tx, callback);
+          if (outcome.error) throw outcome.error;
+          return outcome.value;
+        },
+      });
+      const common = { personId: f.people.alice.id, start: START, end: END, now: new Date(READ_AT),
+        expandAliases: true, groupIdenticalExcerpts: false };
+      const expanded = expandSearchAliases('paddleocr alpha beta gamma', true);
+      expect(expanded).toContain('"PP-OCRv6" alpha beta gamma');
+      const [{ expanded_nodes: expandedNodes }] = await tx`
+        select numnode(websearch_to_tsquery('simple', ${expanded})) expanded_nodes`;
+      expect(Number(expandedNodes)).toBe(27);
+      const hit = await api.searchSessions({ ...common, query: 'paddleocr alpha beta gamma' });
+      expect(hit.results.map((row) => row.eventId)).toEqual([String(event.id)]);
+
+      const overNode = 'paddleocr alpha beta gamma delta';
+      expect(expandSearchAliases(overNode, true)).toBe(overNode);
+      const [{ raw_nodes: rawNodes }] = await tx`
+        select numnode(websearch_to_tsquery('simple', ${overNode})) raw_nodes`;
+      expect(Number(rawNodes)).toBe(9);
+      const fallback = await api.searchSessions({ ...common, query: overNode });
+      expect(fallback.results).toEqual([]);
+      const rawTokenOverflow = 'paddleocr alpha beta gamma delta epsilon zeta eta theta';
+      await expect(api.searchSessions({ ...common, query: rawTokenOverflow }))
+        .rejects.toMatchObject({ code: 'flame_mcp_query_request_invalid' });
+      expect(transactions).toBe(2);
+    });
+  });
+
+  it("reports fused 501-candidate budgets after verifying current and obsolete projections", async () => {
+    await inRollback(sql, async (tx) => {
+      await installPrivacyShape(tx);
+      await installMigration(tx);
+      const f = await seedFixture(tx);
+      const records = await seedRecords(tx, f.home, f.people.alice.id, 501);
+      await tx`update telemetry.ingest_batches set source_provider = 'codex' where workspace_id = ${f.home}`;
+      await tx`update telemetry.events set normalizer_version = 'sherlock.codex-rollout.v3' where workspace_id = ${f.home}`;
+
+      const recordArray = tx.array(records);
+      await tx`
+        insert into telemetry.events (
+          workspace_id, session_id, source_record_id, normalizer_version, projection_index,
+          source_priority, canonical_scope_key, logical_event_key, event_kind, message_role,
+          content_excerpt, occurred_at, server_received_at
+        )
+        select ${f.home}, ${f.sessions.alice.id}, source_id, 'sherlock.codex-rollout.v3',
+          50000 + ordinal::integer, 1, 'fused-budget', 'projection-' || ordinal,
+          'message', 'assistant', 'currentfuse current ' || ordinal, ${START}, ${READ_AT}
+        from unnest(${recordArray}::bigint[]) with ordinality as records(source_id, ordinal)`;
+      await tx`
+        insert into telemetry.events (
+          workspace_id, session_id, source_record_id, normalizer_version, projection_index,
+          source_priority, canonical_scope_key, logical_event_key, event_kind, message_role,
+          content_excerpt, occurred_at, server_received_at
+        )
+        select ${f.home}, ${f.sessions.alice.id}, source_id, 'sherlock.codex-rollout.v2',
+          60000 + ordinal::integer, 0, 'fused-budget', 'projection-' || ordinal,
+          'message', 'assistant', 'obsoletefuse old ' || ordinal, ${START}, ${READ_AT}
+        from unnest(${recordArray}::bigint[]) with ordinality as records(source_id, ordinal)`;
+
+      const api = createSherlockSearchSource({
+        workspaceId: f.home, expectedEmailDomain: 'e3group.ai', maxPeople: 100,
+        async transaction(callback) {
+          const outcome = await asReader(tx, callback);
+          if (outcome.error) throw outcome.error;
+          return outcome.value;
+        },
+      });
+      const common = { personId: f.people.alice.id, start: START, end: END,
+        now: new Date(READ_AT), limit: 20, perSessionLimit: 5, groupIdenticalExcerpts: false };
+      const current = await api.searchSessions({ ...common, query: 'currentfuse' });
+      expect(current).toMatchObject({
+        budgetReached: true,
+        matchCount: 500,
+        coverage: { candidateBudget: 500, candidatesExamined: 500, canonicalMatches: 500, returnedMatches: 5 },
+      });
+      const obsolete = await api.searchSessions({ ...common, query: 'obsoletefuse' });
+      expect(obsolete).toMatchObject({
+        budgetReached: true,
+        matchCount: 0,
+        results: [],
+        coverage: { candidateBudget: 500, candidatesExamined: 500, canonicalMatches: 0, returnedMatches: 0 },
+      });
     });
   });
 

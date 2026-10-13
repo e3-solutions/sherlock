@@ -9,8 +9,10 @@ import { createBonaparteMcpProtocol } from "../src/server/mcp-server.js";
 
 const local = process.argv.includes("--local");
 const compareGrouping = process.argv.includes("--compare-grouping");
+const compareAliases = process.argv.includes("--compare-aliases");
+assert(!(compareGrouping && compareAliases), "Compare one feature at a time");
 const samples = Number(process.env.SHERLOCK_BENCH_SAMPLES ?? 5);
-assert(Number.isInteger(samples) && samples >= 1 && samples <= 20, "Use 1-20 samples");
+assert(Number.isInteger(samples) && samples >= 1 && samples <= 60, "Use 1-60 samples");
 const token = process.env.SHERLOCK_MCP_TOKEN;
 assert(token?.length >= 32, "Set SHERLOCK_MCP_TOKEN from the secret manager");
 let source, protocol, server, client;
@@ -69,18 +71,26 @@ try {
     ["broad_workspace", { query: "latency" }],
     ["no_hit", { query: "nonexistentzxqv491" }],
   ];
-  if (compareGrouping) {
+  if (compareAliases) {
+    assert(discovery.tools.find(tool => tool.name === "search_sessions")?.inputSchema?.properties?.expandAliases,
+      "Refresh discovery against Sherlock 1.4.0 before comparing aliases");
+    cases.push(["checkpoint_identifier", { query: "ppocrv6", personId }],
+      ["completed_benchmark", { query: "500 paddleocr", personId }]);
+  }
+  if (compareGrouping || compareAliases) {
     // Same transport, identity, query, window and budget. Alternate first mode
     // to reduce cache-order bias. Corrections can still change the candidate set.
     const end = new Date().toISOString();
     for (const [name, request] of cases) {
-      const modes = { individual: [], grouped: [] };
+      const modes = compareAliases ? { exact: [], aliases: [] } : { individual: [], grouped: [] };
+      const modeNames = Object.keys(modes);
       for (let i = 0; i < samples; i++) {
-        for (const mode of i % 2 ? ["grouped", "individual"] : ["individual", "grouped"]) {
+        for (const mode of i % 2 ? [...modeNames].reverse() : modeNames) {
           const value = await call("search_sessions", { ...request, end, limit: 10,
-            groupIdenticalExcerpts: mode === "grouped" });
+            ...(compareAliases ? { expandAliases: mode === "aliases" }
+              : { groupIdenticalExcerpts: mode === "grouped" }) });
           const r = value.result;
-          assert(r.coverage.groupIdenticalExcerpts === (mode === "grouped"), "Grouping mode ignored");
+          if (!compareAliases) assert(r.coverage.groupIdenticalExcerpts === (mode === "grouped"), "Grouping mode ignored");
           assert(r.coverage.state === "partial", "Comparison overclaims coverage");
           assert(r.coverage.candidatesExamined <= 500 && r.results.length <= 10 && value.bytes <= 200_000,
             "Unbounded comparison output");
@@ -105,8 +115,8 @@ try {
     }
     console.log(JSON.stringify({ measuredAt: new Date().toISOString(), fixedEnd: end,
       transport: local ? "local_http_live_reader" : "deployed_http", samples,
-      comparison: "current_code_grouping_off_vs_on",
-      limitations: ["not_a_frozen_snapshot", "small_sample_not_an_sla", "diversity_not_answer_relevance"], measurements }));
+      comparison: compareAliases ? "current_code_aliases_off_vs_on" : "current_code_grouping_off_vs_on",
+      limitations: ["not_a_frozen_snapshot", "small_sample_not_an_sla", "diversity_not_answer_relevance", "broader_queries_can_exclude_exact_hits_when_budget_exceeded"], measurements }));
   } else {
     let anchor;
     for (const [name, request] of cases) {
