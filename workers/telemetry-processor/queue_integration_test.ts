@@ -1,6 +1,7 @@
 import postgres from "./postgres.ts";
 import {
   ADMISSION_HEADROOM_SQL,
+  buildClaimQuery,
   enqueueReductionsInTransaction,
   GITHUB_PENDING_QUERY_TIMEOUT_MILLISECONDS,
   PostgresJobQueue,
@@ -309,10 +310,11 @@ Deno.test({
           "telemetry_jobs_kind_claim_idx",
           "telemetry_jobs_kind_expired_lease_idx",
           "telemetry_jobs_live_normalize_age_idx",
+          "telemetry_jobs_pending_normalize_idx",
         ]],
       );
       assert(
-        schedulerIndexes.length === 3,
+        schedulerIndexes.length === 4,
         "scheduler claim indexes must be installed",
       );
       await sql.begin(async (tx) => {
@@ -469,57 +471,39 @@ Deno.test({
           Number(eligibleOffsets[0].leased) === 2,
         "same-offset expired leases must remain concurrently eligible",
       );
-      const explained = await sql.unsafe(
-        `explain (analyze, buffers, format json)
-         with pending_normalize as (
-           select pending_job.id,
-                  min(pending_batch.start_offset) over (
-                    partition by pending_batch.workspace_id,
-                                 pending_batch.collector_key,
-                                 pending_batch.source_kind,
-                                 pending_batch.source_stream_key,
-                                 pending_batch.generation_seq,
-                                 pending_batch.generation_key
-                  ) as earliest_start
-             from processing.telemetry_jobs pending_job
-             join telemetry.ingest_batches pending_batch
-               on pending_batch.workspace_id = pending_job.workspace_id
-              and pending_batch.id = pending_job.batch_id
-            where pending_job.job_kind = 'normalize'
-              and pending_job.status in ('queued', 'leased')
-         )
-         select job.id
-           from processing.telemetry_jobs job
-           left join telemetry.ingest_batches batch
-             on job.job_kind = 'normalize'
-            and batch.workspace_id = job.workspace_id
-            and batch.id = job.batch_id
-           left join pending_normalize pending on pending.id = job.id
-          where job.workload_class = 'backfill'
-            and job.job_kind = 'normalize'
-            and job.attempt_count < job.attempt_limit
-            and (
-              (job.status = 'queued' and job.available_at <= now()) or
-              (job.status = 'leased' and job.lease_expires_at <= now())
-            )
-            and (batch.id is null or batch.start_offset = pending.earliest_start)
-          order by case when job.status = 'queued' then job.available_at
-                        else job.lease_expires_at end,
-                   job.id
-          for update of job skip locked limit 1`,
-      );
-      const planNodes = explainPlanNodes(Object.values(explained[0])[0]);
-      assert(
-        planNodes.some((node) => node["Node Type"] === "WindowAgg"),
-        "claim planning must rank pending stream offsets once",
-      );
-      assert(
-        !planNodes.some((node) =>
-          node["Index Name"] === "telemetry_jobs_batch_key" &&
-          Number(node["Actual Loops"] ?? 0) > 64
-        ),
-        "claim planning must not probe queue state once per earlier range",
-      );
+      // Run the actual production claims under the nested-loop plan that a
+      // sudden backlog can cause with stale statistics. Rolling back each
+      // probe preserves leases and ordering for the behavioral checks below.
+      for (const frontier of [false, true]) {
+        await sql.begin(async (tx) => {
+          await tx.unsafe("set local role sherlock_processor");
+          await tx.unsafe("set local enable_hashjoin = off");
+          await tx.unsafe("set local enable_mergejoin = off");
+          await tx.unsafe("set local enable_material = off");
+          await tx.unsafe("savepoint claim_probe");
+          const explained = await tx.unsafe(
+            `explain (analyze, buffers, format json) ${
+              buildClaimQuery(frontier)
+            }`,
+            [frontier ? "live" : "backfill", "plan-probe", 60, "normalize"],
+          );
+          const planNodes = explainPlanNodes(Object.values(explained[0])[0]);
+          const windows = planNodes.filter((node) =>
+            node["Node Type"] === "WindowAgg"
+          );
+          assert(
+            windows.length === 1 && windows[0]["Actual Loops"] === 1,
+            `${
+              frontier ? "frontier" : "normal"
+            } claim must rank pending streams exactly once even with nested loops`,
+          );
+          assert(
+            planNodes.some((node) => node["CTE Name"] === "pending_normalize"),
+            "claims must materialize pending stream ranks before joining candidates",
+          );
+          await tx.unsafe("rollback to savepoint claim_probe");
+        });
+      }
       await sql.unsafe(
         `delete from processing.telemetry_jobs job
           using telemetry.ingest_batches batch

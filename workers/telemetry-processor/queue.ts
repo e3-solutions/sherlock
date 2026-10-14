@@ -135,6 +135,98 @@ export function coalesceReductionTargets(
   );
 }
 
+// Compute stream frontiers once per claim, even when a sudden backlog makes
+// PostgreSQL underestimate the number of pending jobs.
+export function buildClaimQuery(liveNormalizationFrontier: boolean): string {
+  const liveDemandProjection = liveNormalizationFrontier
+    ? `,
+                min(pending_job.created_at) filter (
+                  where pending_job.workload_class = 'live'
+                    and pending_job.attempt_count < pending_job.attempt_limit
+                    and (
+                      (pending_job.status = 'queued'
+                        and pending_job.available_at <= now()) or
+                      (pending_job.status = 'leased'
+                        and pending_job.lease_expires_at <= now())
+                    )
+                ) over (
+                  partition by pending_batch.workspace_id,
+                               pending_batch.collector_key,
+                               pending_batch.source_kind,
+                               pending_batch.source_stream_key,
+                               pending_batch.generation_seq,
+                               pending_batch.generation_key
+                ) as oldest_ready_live_created_at`
+    : "";
+  const workloadPredicate = liveNormalizationFrontier
+    ? "$1::text = 'live' and pending.oldest_ready_live_created_at is not null"
+    : "j.workload_class = $1";
+  const liveDemandOrder = liveNormalizationFrontier
+    ? "pending.oldest_ready_live_created_at,"
+    : "";
+  return `with pending_normalize as materialized (
+           select pending_job.id,
+                  min(pending_batch.start_offset) over (
+                    partition by pending_batch.workspace_id,
+                                 pending_batch.collector_key,
+                                 pending_batch.source_kind,
+                                 pending_batch.source_stream_key,
+                                 pending_batch.generation_seq,
+                                 pending_batch.generation_key
+                  ) as earliest_start${liveDemandProjection}
+             from processing.telemetry_jobs pending_job
+             join telemetry.ingest_batches pending_batch
+               on pending_batch.workspace_id = pending_job.workspace_id
+              and pending_batch.id = pending_job.batch_id
+            where pending_job.job_kind = 'normalize'
+              and pending_job.status in ('queued', 'leased')
+         ), candidate as (
+           select j.id
+             from processing.telemetry_jobs j
+             left join telemetry.ingest_batches batch
+               on j.job_kind = 'normalize'
+              and batch.workspace_id = j.workspace_id
+              and batch.id = j.batch_id
+             left join pending_normalize pending
+               on pending.id = j.id
+            where ${workloadPredicate}
+              and ($4::text is null or j.job_kind = $4)
+              and j.attempt_count < j.attempt_limit
+              and (
+                (j.status = 'queued' and j.available_at <= now()) or
+                (j.status = 'leased' and j.lease_expires_at <= now())
+              )
+              and (
+                j.job_kind <> 'normalize' or batch.id is null
+                or batch.start_offset = pending.earliest_start
+              )
+            order by ${liveDemandOrder}
+                     case when j.status = 'queued' then j.available_at
+                          else j.lease_expires_at end,
+                     j.id
+            for update of j skip locked
+            limit 1
+         )
+         update processing.telemetry_jobs j
+            set status = 'leased',
+                attempt_count = j.attempt_count + 1,
+                lease_token = gen_random_uuid(),
+                lease_owner = $2,
+                lease_started_at = now(),
+                lease_expires_at = now() + make_interval(secs => $3),
+                completed_at = null,
+                updated_at = now()
+           from candidate
+          where j.id = candidate.id
+        returning j.id::text as id, j.workspace_id::text as workspace_id,
+                  j.job_kind, j.batch_id::text as batch_id,
+                  j.session_id::text as session_id, j.normalizer_version,
+                  j.activity_version, j.target_event_id::text as target_event_id,
+                  j.request_generation::text as request_generation,
+                  j.workload_class, j.attempt_count, j.attempt_limit,
+                  j.lease_token::text as lease_token`;
+}
+
 export class PostgresJobQueue {
   private handoffConnection: ReservedSql | null = null;
 
@@ -354,96 +446,10 @@ export class PostgresJobQueue {
     jobKind: JobKind | null,
     liveNormalizationFrontier: boolean,
   ): Promise<TelemetryJob | null> {
-    const liveDemandProjection = liveNormalizationFrontier
-      ? `,
-                  min(pending_job.created_at) filter (
-                    where pending_job.workload_class = 'live'
-                      and pending_job.attempt_count < pending_job.attempt_limit
-                      and (
-                        (pending_job.status = 'queued'
-                          and pending_job.available_at <= now()) or
-                        (pending_job.status = 'leased'
-                          and pending_job.lease_expires_at <= now())
-                      )
-                  ) over (
-                    partition by pending_batch.workspace_id,
-                                 pending_batch.collector_key,
-                                 pending_batch.source_kind,
-                                 pending_batch.source_stream_key,
-                                 pending_batch.generation_seq,
-                                 pending_batch.generation_key
-                  ) as oldest_ready_live_created_at`
-      : "";
-    const workloadPredicate = liveNormalizationFrontier
-      ? "$1::text = 'live' and pending.oldest_ready_live_created_at is not null"
-      : "j.workload_class = $1";
-    const liveDemandOrder = liveNormalizationFrontier
-      ? "pending.oldest_ready_live_created_at,"
-      : "";
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_processor");
       const rows = await tx.unsafe(
-        `with pending_normalize as (
-           select pending_job.id,
-                  min(pending_batch.start_offset) over (
-                    partition by pending_batch.workspace_id,
-                                 pending_batch.collector_key,
-                                 pending_batch.source_kind,
-                                 pending_batch.source_stream_key,
-                                 pending_batch.generation_seq,
-                                 pending_batch.generation_key
-                  ) as earliest_start${liveDemandProjection}
-             from processing.telemetry_jobs pending_job
-             join telemetry.ingest_batches pending_batch
-               on pending_batch.workspace_id = pending_job.workspace_id
-              and pending_batch.id = pending_job.batch_id
-            where pending_job.job_kind = 'normalize'
-              and pending_job.status in ('queued', 'leased')
-         ), candidate as (
-           select j.id
-             from processing.telemetry_jobs j
-             left join telemetry.ingest_batches batch
-               on j.job_kind = 'normalize'
-              and batch.workspace_id = j.workspace_id
-              and batch.id = j.batch_id
-             left join pending_normalize pending
-               on pending.id = j.id
-            where ${workloadPredicate}
-              and ($4::text is null or j.job_kind = $4)
-              and j.attempt_count < j.attempt_limit
-              and (
-                (j.status = 'queued' and j.available_at <= now()) or
-                (j.status = 'leased' and j.lease_expires_at <= now())
-              )
-              and (
-                j.job_kind <> 'normalize' or batch.id is null
-                or batch.start_offset = pending.earliest_start
-              )
-            order by ${liveDemandOrder}
-                     case when j.status = 'queued' then j.available_at
-                          else j.lease_expires_at end,
-                     j.id
-            for update of j skip locked
-            limit 1
-         )
-         update processing.telemetry_jobs j
-            set status = 'leased',
-                attempt_count = j.attempt_count + 1,
-                lease_token = gen_random_uuid(),
-                lease_owner = $2,
-                lease_started_at = now(),
-                lease_expires_at = now() + make_interval(secs => $3),
-                completed_at = null,
-                updated_at = now()
-           from candidate
-          where j.id = candidate.id
-        returning j.id::text as id, j.workspace_id::text as workspace_id,
-                  j.job_kind, j.batch_id::text as batch_id,
-                  j.session_id::text as session_id, j.normalizer_version,
-                  j.activity_version, j.target_event_id::text as target_event_id,
-                  j.request_generation::text as request_generation,
-                  j.workload_class, j.attempt_count, j.attempt_limit,
-                  j.lease_token::text as lease_token`,
+        buildClaimQuery(liveNormalizationFrontier),
         [workloadClass, owner, leaseSeconds, jobKind],
       );
       return rows.length === 0 ? null : jobFromRow(rows[0]);
