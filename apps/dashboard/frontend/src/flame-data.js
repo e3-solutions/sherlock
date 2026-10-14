@@ -426,6 +426,7 @@ export function adaptIntervalEvidence(value, expected) {
         : requirePositiveCount(item.eventCount, `${path}.eventCount`),
       role: requireEnum(item.role, SEMANTIC_ROLES, `${path}.role`),
       summary,
+      provider: item.provider === undefined ? "unknown" : requireEnum(item.provider, ["codex", "claude", "unknown"], `${path}.provider`),
       ...(item.automatedRun === undefined ? {} : { automatedRun: requireBoolean(item.automatedRun, `${path}.automatedRun`) }),
       pullRequest: requirePullRequest(item.pullRequest, `${path}.pullRequest`),
     };
@@ -498,6 +499,7 @@ export function adaptWorkEvidence(value, expected) {
     firstAtMs,
     lastAtMs,
     eventCount: requirePositiveCount(payload.eventCount, "work evidence.eventCount"),
+    provider: payload.provider === undefined ? "unknown" : requireEnum(payload.provider, ["codex", "claude", "unknown"], "work evidence.provider"),
     ...(payload.automatedRun === undefined ? {} : { automatedRun: requireBoolean(payload.automatedRun, "work evidence.automatedRun") }),
     role: (() => {
       const role = requireEnum(payload.role, SEMANTIC_ROLES, "work evidence.role");

@@ -352,7 +352,7 @@ describe("interval and work evidence adapters", () => {
         id: "s1:agent", sessionId: "s1", role: "agent",
         firstAt: new Date(startMs + 1000).toISOString(),
         lastAt: new Date(startMs + 5000).toISOString(), eventCount: 2,
-        summary: "Investigate the cursor",
+        summary: "Investigate the cursor", provider: "claude",
         pullRequest: {
           number: 54,
           url: "https://github.com/e3-solutions/sherlock/pull/54",
@@ -367,7 +367,7 @@ describe("interval and work evidence adapters", () => {
     const result = adaptIntervalEvidence(value, expected);
 
     expect(result.work[0]).toMatchObject({
-      id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2,
+      id: "s1:agent", sessionId: "s1", role: "agent", eventCount: 2, provider: "claude",
       pullRequest: {
         number: 54,
         url: "https://github.com/e3-solutions/sherlock/pull/54",
@@ -376,6 +376,10 @@ describe("interval and work evidence adapters", () => {
     expect(result.prompts).toEqual([expect.objectContaining({
       id: "native:msg-1", content: "Investigate the cursor",
     })]);
+    value.work[0].provider = "other";
+    expect(() => adaptIntervalEvidence(value, expected)).toThrow(/provider/);
+    delete value.work[0].provider;
+    expect(adaptIntervalEvidence(value, expected).work[0].provider).toBe("unknown");
     value.work[0].pullRequest.url = "https://github.com/../sherlock/pull/54";
     expect(() => adaptIntervalEvidence(value, expected)).toThrow(FlameDataError);
   });
