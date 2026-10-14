@@ -99,12 +99,20 @@ that Sherlock did not observe.
 
 ## Verify
 
-For missing Codex sessions, see [collector inventory and receipt recovery](docs/collector-receipts.md).
-It distinguishes local capture from acknowledged delivery and records raw token-payload presence.
+Verify that both Sherlock and the required legacy Codex session logger are
+installed, enabled, trusted, and discovered from Codex's executable cache:
 
 ```sh
-codex plugin list --marketplace sherlock
+./sherlock verify
 ```
+
+The command does not issue plugin add, remove, enable, or disable operations.
+Codex may still refresh its own local metadata while listing plugins. A
+successful result covers local plugin readiness only; it does not prove upload,
+normalization, or dashboard delivery. For missing Codex sessions, see
+[collector inventory and receipt recovery](docs/collector-receipts.md). It
+distinguishes local capture from acknowledged delivery and records raw
+token-payload presence.
 
 For Claude Code, run the complete local verification:
 
