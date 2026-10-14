@@ -12,6 +12,7 @@ from sherlock_collector.collection_receipt import (
     record_token_payload,
     scan_token_payload,
     scan_token_records,
+    validate_collection_receipt,
 )
 from sherlock_collector.contract import (
     FRAGMENT_BYTES,
@@ -399,6 +400,29 @@ class CollectionReceiptTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ContractError, "presence is unsupported"):
             self.spool.load_collection_receipt(path)
+
+    def test_receipts_reject_malformed_rfc3339_timezone_offsets(self):
+        manifest, stored = codex_batch(b'{"type":"event_msg"}\n')
+        pending = self.spool.enqueue(manifest, stored)
+        receipt = self.spool.record_collection_receipt(
+            self.spool.load(pending),
+            committed_receipt(manifest),
+            scan_token_payload(manifest, stored),
+        )
+        valid = self.spool.load_collection_receipt(receipt)
+
+        for recorded_at in (
+            "2026-09-15T00:00:00+00:60",
+            "2026-09-15T00:00:00+01:99",
+        ):
+            with self.subTest(recorded_at=recorded_at):
+                invalid = json.loads(json.dumps(valid))
+                invalid["recorded_at"] = recorded_at
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "recorded_at must be an ISO-8601 timestamp",
+                ):
+                    validate_collection_receipt(invalid)
 
     def test_local_receipt_write_failure_requeues_unchanged_artifact(self):
         source = b'{"type":"event_msg"}\n'
