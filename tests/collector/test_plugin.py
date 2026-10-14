@@ -295,12 +295,15 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_install_email_domain_accepts_only_e3_and_sixtyfour(self):
+    def test_install_email_domain_accepts_only_approved_organizations(self):
         self.assertEqual(validate_install_email("Ada@E3GROUP.AI"), "ada@e3group.ai")
         self.assertEqual(
             validate_install_email("Dev@SixtyFour.AI"), "dev@sixtyfour.ai"
         )
+        self.assertEqual(validate_install_email("Arsh@BigBallerBrandWheels.COM"), "arsh@bigballerbrandwheels.com")
         for email in (
+            "user@sub.bigballerbrandwheels.com",
+            "user@bigballerbrandwheels.com.example",
             "outsider@example.com",
             "user@sub.e3group.ai",
             "user@e3group.ai.example",
