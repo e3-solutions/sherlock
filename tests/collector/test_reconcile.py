@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
+import subprocess
+import sys
 import time
 import unittest
 import uuid
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sherlock_collector.cli import main
 from sherlock_collector.contract import MAX_SOURCE_BYTES, validate_stored_payload
-from sherlock_collector.drain import Drain, PermanentUploadError, TransientUploadError
+from sherlock_collector.drain import (
+    CollectorUploadError,
+    Drain,
+    PermanentUploadError,
+    TransientUploadError,
+)
 from sherlock_collector.hook import run_hook
 from sherlock_collector.inventory import collection_inventory
 from sherlock_collector.reconcile import reconcile
@@ -109,6 +118,36 @@ class ReconcileTests(unittest.TestCase):
                 ledger["sources"][str(path)]["status"], "source_missing_or_invalid"
             )
 
+    def test_collector_outage_is_reported_and_new_capture_stays_queued(self):
+        with TemporaryDirectory() as directory:
+            home, state = Path(directory) / "home", Path(directory) / "state"
+            native_file(home, "codex")
+
+            class Forbidden:
+                def upload(self, item):
+                    raise CollectorUploadError(
+                        "HTTP 401", error_code="invalid_jwt", http_status=401
+                    )
+
+            failed = reconcile(home, state, "codex", Forbidden())
+            self.assertEqual(failed["status"], "partial")
+            self.assertEqual(failed["drain"]["collector_failure"]["http_status"], 401)
+            native_file(home, "codex")
+            transport = SuccessTransport()
+            delayed = reconcile(home, state, "codex", transport)
+            self.assertEqual(delayed["pending_uploads"], 2)
+            self.assertEqual(
+                delayed["drain"]["collector_failure"]["error_code"], "invalid_jwt"
+            )
+            self.assertEqual(transport.items, [])
+            self.assertEqual(delayed["dead_letters"], 0)
+            with patch(
+                "sherlock_collector.drain.time.time", return_value=time.time() + 3600
+            ):
+                recovered = reconcile(home, state, "codex", transport)
+            self.assertEqual(recovered["status"], "complete")
+            self.assertEqual(recovered["drain"]["uploaded"], 2)
+
     def test_abandoned_processing_is_recovered_on_idle_machine(self):
         with TemporaryDirectory() as directory:
             home, state = Path(directory) / "home", Path(directory) / "state"
@@ -135,7 +174,11 @@ class ReconcileTests(unittest.TestCase):
             class RejectFirst(SuccessTransport):
                 def upload(self, item):
                     if item.manifest == first:
-                        raise PermanentUploadError("HTTP 422: unsupported evidence")
+                        raise PermanentUploadError(
+                            "HTTP 400: invalid manifest",
+                            error_code="invalid_manifest",
+                            http_status=400,
+                        )
                     return super().upload(item)
 
             result = reconcile(home, state, "codex", RejectFirst())
@@ -145,7 +188,10 @@ class ReconcileTests(unittest.TestCase):
             evidence = spool.load(next(spool.dead_letter.glob("*.json")))
             self.assertEqual(evidence.manifest, first)
             self.assertEqual(evidence.stored_payload, stored)
-            self.assertIn("422", evidence.metadata["dead_letter"]["reason"])
+            self.assertEqual(
+                evidence.metadata["dead_letter"]["error_code"], "invalid_manifest"
+            )
+            self.assertEqual(evidence.metadata["dead_letter"]["http_status"], 400)
 
     def test_hook_capture_and_drain_lock_contention_are_respected(self):
         for provider in ("codex", "claude_code"):
@@ -251,7 +297,127 @@ class ReconcileTests(unittest.TestCase):
                 path.read_bytes(),
             )
 
-    def test_legacy_partial_cursor_recaptures_new_generation_without_rewriting_evidence(
+    def test_codex_stop_tail_is_captured_by_next_hook_in_same_generation(self):
+        with TemporaryDirectory() as directory:
+            home, state = Path(directory) / "home", Path(directory) / "state"
+            path = native_file(
+                home, "codex", tail=b'{"type":"response_item","payload":'
+            )
+            payload = {"transcript_path": str(path), "rollout_path": str(path)}
+            with patch("sherlock_collector.hook._spawn_drain"):
+                initial = run_hook(
+                    "Stop",
+                    payload,
+                    codex_home=home,
+                    state_root=state,
+                    drain_command=["unused"],
+                )
+                with path.open("ab") as handle:
+                    handle.write(
+                        b'{"type":"message","role":"assistant","content":[]}}\n'
+                    )
+                completed = run_hook(
+                    "Stop",
+                    payload,
+                    codex_home=home,
+                    state_root=state,
+                    drain_command=["unused"],
+                )
+            self.assertGreater(completed.captured_bytes, 0)
+            self.assertEqual(
+                initial.captured_bytes + completed.captured_bytes, path.stat().st_size
+            )
+            spool = DurableSpool(state / "queue")
+            items = [spool.load(p) for p in spool.list_pending()]
+            self.assertEqual(len({i.manifest.generation_key for i in items}), 1)
+            self.assertEqual(sum(i.manifest.record_count for i in items), 2)
+
+    def test_install_verifiers_surface_persisted_collector_failure(self):
+        repository = Path(__file__).resolve().parents[2]
+        for provider, plugin, variable in (
+            ("codex", "sherlock", "CODEX_HOME"),
+            ("claude_code", "sherlock-claude-code", "CLAUDE_CONFIG_DIR"),
+        ):
+            with self.subTest(provider=provider), TemporaryDirectory() as directory:
+                home = Path(directory)
+                config = home / "sherlock" / "collector.json"
+                config.parent.mkdir()
+                config.write_text(
+                    json.dumps(
+                        {
+                            "name": "Test User",
+                            "github_id": "test-user",
+                            "email": "test@e3group.ai",
+                            "endpoint": "https://example.test/ingest",
+                            "installation_id": "00000000-0000-4000-8000-000000000001",
+                        }
+                    )
+                )
+                config.chmod(0o600)
+                (home / "settings.json").write_text(
+                    json.dumps(
+                        {"enabledPlugins": {"sherlock-claude-code@sherlock": True}}
+                    )
+                )
+                (home / "sherlock" / "scheduler.json").write_text(
+                    '{"status":"disabled"}'
+                )
+                spool = DurableSpool(home / "sherlock" / "telemetry" / "queue")
+                spool.defer_uploads(
+                    CollectorUploadError(
+                        "HTTP 403",
+                        error_code="collector_domain_forbidden",
+                        http_status=403,
+                    )
+                )
+                output = io.StringIO()
+                home_flag = (
+                    "--claude-home" if provider == "claude_code" else "--codex-home"
+                )
+                with redirect_stdout(output):
+                    exit_code = main(
+                        ["--provider", provider, home_flag, str(home), "reconcile"]
+                    )
+                self.assertEqual(exit_code, 75)
+                self.assertEqual(
+                    json.loads(output.getvalue())["drain"]["collector_failure"][
+                        "http_status"
+                    ],
+                    403,
+                )
+                script = (
+                    repository / "plugins" / plugin / "scripts" / "verify_install.py"
+                )
+                failed = subprocess.run(
+                    [sys.executable, str(script)],
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, variable: str(home)},
+                    check=False,
+                )
+                self.assertEqual(failed.returncode, 1, failed.stderr)
+                report = json.loads(failed.stdout)
+                self.assertEqual(report["status"], "degraded")
+                self.assertEqual(
+                    report["upload"]["error_code"], "collector_domain_forbidden"
+                )
+                self.assertEqual(report["upload"]["http_status"], 403)
+                spool.clear_upload_failure()
+                recovered = subprocess.run(
+                    [sys.executable, str(script)],
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, variable: str(home)},
+                    check=False,
+                )
+                self.assertEqual(
+                    recovered.returncode, 0, recovered.stdout + recovered.stderr
+                )
+                self.assertEqual(
+                    json.loads(recovered.stdout)["upload"]["status"], "ready"
+                )
+
+    def test_legacy_partial_cursor_continues_same_generation_without_rewriting_evidence(
         self,
     ):
         with TemporaryDirectory() as directory:
@@ -262,24 +428,47 @@ class ReconcileTests(unittest.TestCase):
                 [path]
             )
             original = {p: p.read_bytes() for p in spool.list_pending()}
+            original_end = path.stat().st_size
+            original_item = spool.load(next(iter(original)))
+            # Mark the legacy condition even before the writer grows the file.
+            reconcile(home, state, "codex", None)
             with path.open("ab") as handle:
-                handle.write(b'lo"}\n')
+                handle.write(b'lo"}')
+            waiting = reconcile(home, state, "codex", None)
+            self.assertEqual(waiting["capture"]["enqueued"], 0)
+            with path.open("ab") as handle:
+                handle.write(b'\n{"next":"record"}\n')
             reconcile(home, state, "codex", None)
             self.assertEqual({p: p.read_bytes() for p in original}, original)
-            items = [spool.load(p) for p in spool.list_pending()]
-            repaired = [i for i in items if i.manifest.generation_seq == 1]
-            self.assertEqual(len(repaired), 1)
+            items = sorted(
+                [spool.load(p) for p in spool.list_pending()],
+                key=lambda i: i.manifest.start_offset,
+            )
+            self.assertEqual(len(items), 2)
+            self.assertTrue(all(i.manifest.generation_seq == 0 for i in items))
+            self.assertTrue(
+                all(
+                    i.manifest.generation_key == original_item.manifest.generation_key
+                    for i in items
+                )
+            )
+            self.assertEqual(items[1].manifest.start_offset, original_end)
             self.assertEqual(
-                validate_stored_payload(
-                    repaired[0].manifest, repaired[0].stored_payload
+                validate_stored_payload(items[1].manifest, items[1].stored_payload),
+                b'lo"}\n{"next":"record"}\n',
+            )
+            self.assertEqual(
+                b"".join(
+                    validate_stored_payload(i.manifest, i.stored_payload) for i in items
                 ),
                 path.read_bytes(),
             )
             ledger = json.loads((state / "codex-reconcile.json").read_text())["sources"]
             self.assertEqual(
                 ledger[str(path)]["recovery_reason"],
-                "legacy_unterminated_cursor_recaptured",
+                "legacy_unterminated_cursor_continued",
             )
+            self.assertEqual(ledger[str(path)]["status"], "captured")
 
     def test_drain_run_upload_budget_is_enforced(self):
         with TemporaryDirectory() as directory:
@@ -359,7 +548,11 @@ class ReconcileTests(unittest.TestCase):
 
             class Rejected:
                 def upload(self, item):
-                    raise PermanentUploadError("HTTP 422")
+                    raise PermanentUploadError(
+                        "HTTP 409: range overlap",
+                        error_code="range_overlap",
+                        http_status=409,
+                    )
 
             self.assertEqual(Drain(spool, Rejected()).run().dead_lettered, 1)
             self.assertEqual(historical.read_bytes(), b"prior raw evidence")

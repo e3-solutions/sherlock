@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import plistlib
@@ -11,12 +12,15 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sherlock_collector.scheduler import (
+    _ScheduledLog,
     install_scheduler,
     scheduler_files,
     scheduler_id,
     scheduler_status,
     uninstall_scheduler,
 )
+
+from sherlock_collector.spool import secure_lock
 
 
 class SchedulerTests(unittest.TestCase):
@@ -35,6 +39,7 @@ class SchedulerTests(unittest.TestCase):
                 )
                 self.assertEqual(plist["StartInterval"], 900)
                 self.assertEqual(plist["Nice"], 10)
+                self.assertEqual(plist["ProcessType"], "Background")
                 self.assertTrue(plist["LowPriorityIO"])
                 self.assertTrue(plist["RunAtLoad"])
                 self.assertEqual(plist["ProgramArguments"][0], "/path/to/python3")
@@ -63,6 +68,9 @@ class SchedulerTests(unittest.TestCase):
                 data.decode() for path, data in files.items() if path.suffix == ".timer"
             )
             self.assertIn("Nice=10", service)
+            self.assertIn("IOSchedulingClass=idle", service)
+            self.assertIn("StandardInput=null", service)
+            self.assertIn("Type=oneshot", service)
             self.assertIn('%%h $$value \\"quoted\\"', service)
             self.assertIn("OnUnitInactiveSec=15m", timer)
             self.assertIn("Persistent=true", timer)
@@ -146,6 +154,7 @@ class SchedulerTests(unittest.TestCase):
                 self.assertIn("keep-me", cron)
                 self.assertIn(r"\%", cron)
                 self.assertIn("/usr/bin/nice -n 10", cron)
+                self.assertIn("</dev/null", cron)
                 self.assertEqual(
                     len(list((user / ".config" / "systemd" / "user").glob("*"))), 0
                 )
@@ -252,7 +261,10 @@ class SchedulerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 78, result.stderr)
-            report = json.loads(result.stdout)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
+            log = home / "sherlock" / "telemetry" / "claude_code-reconcile.log"
+            report = json.loads("{" + log.read_text().split("{", 1)[1])
             self.assertEqual(report["provider"], "claude_code")
             self.assertEqual(report["status"], "partial")
             self.assertTrue(
@@ -260,3 +272,70 @@ class SchedulerTests(unittest.TestCase):
                     home / "sherlock" / "telemetry" / "claude_code-reconcile.json"
                 ).is_file()
             )
+
+            with secure_lock(
+                home / "sherlock" / "telemetry" / "claude_code-scheduled.lock"
+            ) as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                busy = subprocess.run(
+                    [sys.executable, "-I", str(runner)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(busy.returncode, 75)
+            self.assertEqual(log.read_text().count('"provider": "claude_code"'), 1)
+
+    def test_scheduled_log_bounds_even_a_single_large_unicode_write(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "codex-reconcile.log"
+            with patch("sherlock_collector.scheduler.LOG_MAX_BYTES", 32768):
+                with _ScheduledLog(path) as log:
+                    log.write("🙂" * 100000)
+                    log.write("final status\n")
+            files = list(Path(directory).glob("*.log*"))
+            self.assertEqual(len(files), 4)
+            self.assertTrue(all(p.stat().st_size <= 32768 for p in files))
+            self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in files))
+            self.assertIn("final status", path.read_text())
+
+    def test_scheduled_process_has_no_input_and_logs_failures(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = """
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from sherlock_collector.scheduler import run_scheduled
+
+def check_input(args):
+    assert not sys.stdin.isatty()
+    assert not sys.stdout.isatty()
+    assert sys.stdin.read() == ''
+    assert sys.stdin.buffer.read() == b''
+    print('noninteractive check passed')
+    raise RuntimeError('scheduled test failure')
+
+with patch('sherlock_collector.cli.main', check_input):
+    raise SystemExit(run_scheduled([], state_root=Path(sys.argv[1]), provider='codex'))
+"""
+            source = str(
+                Path(__file__).resolve().parents[2]
+                / "packages"
+                / "telemetry-collector"
+                / "src"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(root)],
+                input="must not reach the collector",
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "PYTHONPATH": source},
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
+            text = (root / "codex-reconcile.log").read_text()
+            self.assertIn("noninteractive check passed", text)
+            self.assertIn("RuntimeError: scheduled test failure", text)

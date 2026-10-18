@@ -177,7 +177,9 @@ def main(argv: list[str] | None = None) -> int:
         if config_error:
             result["configuration_error"] = config_error
         print(json.dumps(result, sort_keys=True))
-        return 75 if result["locked"] else 78 if config_error else 0
+        if result["locked"] or (result.get("drain") or {}).get("collector_failure"):
+            return 75
+        return 78 if config_error else 0
     if args.command == "backfill":
         has_range = args.start is not None or args.end is not None
         if not is_claude and has_range:
@@ -447,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     ).run()
     print(json.dumps(asdict(outcome), sort_keys=True))
-    return 0 if not outcome.locked else 75
+    return 75 if outcome.locked or outcome.collector_failure else 0
 
 
 if __name__ == "__main__":

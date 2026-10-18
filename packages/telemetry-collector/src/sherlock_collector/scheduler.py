@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import io
+import logging
+import logging.handlers
 import hashlib
 import json
 import os
@@ -11,12 +16,90 @@ import plistlib
 import shlex
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 from .config import default_claude_home, default_codex_home
-from .spool import _atomic_json
+from .spool import _atomic_json, secure_lock
 
 INTERVAL_SECONDS = 15 * 60
+LOG_MAX_BYTES = 1024 * 1024
+LOG_BACKUPS = 3
+
+
+class _ByteRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def _open(self):
+        descriptor = os.open(
+            self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
+        )
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(
+            descriptor, self.mode, encoding=self.encoding, errors=self.errors
+        )
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        if self.stream is None:
+            self.stream = self._open()
+        self.stream.seek(0, os.SEEK_END)
+        size = len((self.format(record) + "\n").encode("utf-8"))
+        return self.stream.tell() + size >= self.maxBytes
+
+
+class _ScheduledLog(io.TextIOBase):
+    """Chunk even a single large print so rotation always bounds disk usage."""
+
+    def __init__(self, path: Path):
+        self.handler = _ByteRotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"
+        )
+        self.handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+
+    def write(self, value: str) -> int:
+        for start in range(0, len(value), 4096):
+            chunk = value[start : start + 4096].rstrip("\n")
+            if chunk:
+                self.handler.emit(
+                    logging.LogRecord(
+                        "sherlock.reconcile", logging.INFO, "", 0, chunk, (), None
+                    )
+                )
+        return len(value)
+
+    def flush(self) -> None:
+        self.handler.flush()
+
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+            self.handler.close()
+
+
+def run_scheduled(args: list[str], *, state_root: Path, provider: str) -> int:
+    """Dedicated scheduler entrypoint: no stdin, bounded private logs, one writer."""
+    from .cli import main as collector_main
+
+    # Serialize log rotation too. The reconcile and drain locks independently
+    # serialize manual invocations and hooks against the scheduled capture/drain.
+    with secure_lock(state_root / f"{provider}-scheduled.lock") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 75
+        with (
+            open(os.devnull) as stdin,
+            _ScheduledLog(state_root / f"{provider}-reconcile.log") as log,
+        ):
+            os.dup2(stdin.fileno(), 0)
+            previous_stdin, sys.stdin = sys.stdin, stdin
+            try:
+                with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                    try:
+                        return collector_main(args)
+                    except Exception:
+                        traceback.print_exc()
+                        return 1
+            finally:
+                sys.stdin = previous_stdin
 
 
 def scheduler_id(home: Path, provider: str) -> str:
@@ -59,8 +142,10 @@ def scheduler_files(
     script = (
         "import sys\n"
         + f"sys.path.insert(0, {str(runtime)!r})\n"
-        + "from sherlock_collector.cli import main\n"
-        + f"raise SystemExit(main({args!r}))\n"
+        + "from pathlib import Path\n"
+        + "from sherlock_collector.scheduler import run_scheduled\n"
+        + f"raise SystemExit(run_scheduled({args!r}, "
+        + f"state_root=Path({str(home / 'sherlock' / 'telemetry')!r}), provider={provider!r}))\n"
     )
     files = {runner: script.encode()}
     command = [python, "-I", str(runner)]
@@ -96,7 +181,7 @@ def scheduler_files(
 
         unit_root = user_home / ".config" / "systemd" / "user"
         files[unit_root / f"{label}.service"] = (
-            "[Unit]\nDescription=Sherlock telemetry reconciliation\n[Service]\nType=oneshot\nNice=10\n"
+            "[Unit]\nDescription=Sherlock telemetry reconciliation\n[Service]\nType=oneshot\nNice=10\nIOSchedulingClass=idle\nStandardInput=null\n"
             + "ExecStart="
             + " ".join(quote(arg) for arg in command)
             + "\n"
@@ -140,7 +225,7 @@ def _cron(home: Path, provider: str, python: str, *, remove: bool = False) -> No
         command = command.replace("%", r"\%")
         if "\n" in command or "\r" in command:
             raise ValueError("scheduler paths must not contain newlines")
-        lines.append(f"*/15 * * * * {command} {marker}")
+        lines.append(f"*/15 * * * * {command} </dev/null {marker}")
     result = _run(["crontab", "-"], input="\n".join(lines) + "\n")
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "cannot update crontab")
