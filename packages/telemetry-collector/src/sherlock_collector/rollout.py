@@ -51,6 +51,7 @@ class StreamState:
     generation_seq: int
     generation_key: str
     offset: int
+    recovery_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -158,8 +159,9 @@ class RolloutCapturer:
         source_kind: str = "rollout",
         source_version: str | None = None,
         state_name: str = "rollout",
-        capture_unterminated_tail: bool = True,
+        capture_unterminated_tail: bool = False,
         allowed_root: Path | str | None = None,
+        enforce_sync_budget: bool = False,
     ):
         if not (
             0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES
@@ -179,6 +181,10 @@ class RolloutCapturer:
         self.source_provider = source_provider
         self.source_kind = source_kind
         self.source_version = source_version
+        self.enforce_sync_budget = enforce_sync_budget
+        self.source_issues: dict[str, str] = {}
+        self.visited_paths: set[str] = set()
+        self._capture_enqueued = self._capture_bytes = 0
         self.capture_unterminated_tail = capture_unterminated_tail
         self.allowed_root_input = (
             Path(os.path.abspath(Path(allowed_root).expanduser()))
@@ -217,6 +223,9 @@ class RolloutCapturer:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return CaptureResult(locked=True)
+            self.source_issues = {}
+            self.visited_paths = set()
+            self._capture_enqueued = self._capture_bytes = 0
             states, candidate_cursor = self._load_state()
             enqueued = captured = errors = 0
             all_paths = list(
@@ -244,8 +253,10 @@ class RolloutCapturer:
                 if raw_path not in priority_paths:
                     visited_backlog += 1
                 path = Path(raw_path)
+                self.visited_paths.add(raw_path)
+                before_enqueued, before_captured = self._capture_enqueued, self._capture_bytes
                 try:
-                    path_enqueued, path_captured = self._capture_path(
+                    self._capture_path(
                         path,
                         states,
                         native_session_ids or {},
@@ -259,13 +270,15 @@ class RolloutCapturer:
                         ),
                         snapshots.get(raw_path),
                     )
-                except (ContractError, OSError, ValueError):
+                except (ContractError, OSError, ValueError) as error:
+                    self.source_issues[raw_path] = f"{type(error).__name__}: {error}"
                     if not best_effort:
                         raise
                     errors += 1
-                    continue
-                enqueued += path_enqueued
-                captured += path_captured
+                finally:
+                    # Include durable chunks written before a later record failed.
+                    enqueued += self._capture_enqueued - before_enqueued
+                    captured += self._capture_bytes - before_captured
             next_cursor = (
                 (candidate_cursor + visited_backlog) % len(backlog_paths)
                 if backlog_paths
@@ -343,7 +356,11 @@ class RolloutCapturer:
             replaced = state is None or not self._same_generation(
                 state, path, details, prefix_length, prefix_sha
             )
-            if replaced:
+            legacy_tail = False
+            if state is not None and not replaced and state.offset and not self.capture_unterminated_tail:
+                handle.seek(state.offset - 1)
+                legacy_tail = handle.read(1) != b"\n"
+            if replaced or legacy_tail:
                 sequence = 0 if state is None else state.generation_seq + 1
                 state = StreamState(
                     path=str(path),
@@ -360,6 +377,7 @@ class RolloutCapturer:
                         sequence,
                     ),
                     offset=0,
+                    recovery_reason="legacy_unterminated_cursor_recaptured" if legacy_tail else None,
                 )
             enqueued = captured = 0
             while state.offset < stable_end and captured < byte_budget:
@@ -382,6 +400,10 @@ class RolloutCapturer:
                         stable_end,
                     )
                     if not plan.terminated and not self.capture_unterminated_tail:
+                        self.source_issues[str(path)] = "incomplete_trailing_record"
+                        break
+                    if self.enforce_sync_budget and plan.end_offset - plan.start_offset > remaining_budget:
+                        self.source_issues[str(path)] = "record_exceeds_remaining_run_budget"
                         break
                     if plan.end_offset - plan.start_offset <= MAX_SOURCE_BYTES:
                         raise ContractError(
@@ -410,6 +432,11 @@ class RolloutCapturer:
                     captured += fragment_captured
                     continue
                 if not source:
+                    handle.seek(max(state.offset, stable_end - 1))
+                    self.source_issues[str(path)] = (
+                        "incomplete_trailing_record" if handle.read(1) != b"\n"
+                        else "record_exceeds_remaining_run_budget"
+                    )
                     break
                 manifest, stored = build_source_batch(
                     source,
@@ -436,6 +463,8 @@ class RolloutCapturer:
                     stored,
                     workload_class=workload_class,
                 )
+                self._capture_enqueued += 1
+                self._capture_bytes += len(source)
                 state.offset = manifest.end_offset
                 states[key] = state
                 self._save_state(states, candidate_cursor)
@@ -542,6 +571,8 @@ class RolloutCapturer:
                     stored,
                     workload_class=workload_class,
                 )
+                self._capture_enqueued += 1
+                self._capture_bytes += len(source)
                 captured += len(source)
         return plan.fragment_count, captured
 
@@ -636,8 +667,25 @@ class RolloutCapturer:
             return b""
         return self._limit_records(selected)
 
-    @staticmethod
+    def snapshot_offset(self, path: Path, snapshot: SourceSnapshot, state: StreamState) -> int:
+        """Only match a frontier to the generation inspected at discovery."""
+        if (state.path, state.device, state.inode) != (str(path), snapshot.device, snapshot.inode):
+            return 0
+        if state.prefix_length == snapshot.prefix_length:
+            matches = state.prefix_sha256 == snapshot.prefix_sha256
+        elif state.prefix_length < snapshot.prefix_length:
+            try:
+                with self._open_source(path) as handle:
+                    details = os.fstat(handle.fileno())
+                    matches = (details.st_dev, details.st_ino) == (snapshot.device, snapshot.inode) and source_prefix(handle, state.prefix_length) == (state.prefix_length, state.prefix_sha256)
+            except (OSError, ValueError):
+                matches = False
+        else:
+            matches = False
+        return min(state.offset, snapshot.end_offset) if matches else 0
+
     def _deferred_snapshots(
+        self,
         all_paths: Iterable[str],
         snapshots: Mapping[str, SourceSnapshot],
         states: Mapping[str, StreamState],
@@ -649,13 +697,8 @@ class RolloutCapturer:
                 continue
             state = states.get(_stream_key(Path(raw_path)))
             offset = 0
-            if (
-                state is not None
-                and state.path == raw_path
-                and state.device == snapshot.device
-                and state.inode == snapshot.inode
-            ):
-                offset = min(state.offset, snapshot.end_offset)
+            if state is not None:
+                offset = self.snapshot_offset(Path(raw_path), snapshot, state)
             remaining = snapshot.end_offset - offset
             if remaining > 0:
                 deferred_files += 1

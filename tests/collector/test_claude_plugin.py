@@ -1976,6 +1976,8 @@ class ClaudePluginTests(unittest.TestCase):
                 json.dumps({"enabledPlugins": {"sherlock-claude-code@sherlock": True}}),
                 encoding="utf-8",
             )
+            (claude_home / "sherlock").mkdir()
+            (claude_home / "sherlock" / "scheduler.json").write_text('{"status":"disabled"}')
             enabled = subprocess.run(
                 [sys.executable, str(verifier)],
                 check=False,

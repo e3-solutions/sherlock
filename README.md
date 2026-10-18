@@ -27,6 +27,56 @@ skipped. Use `--claude-backfill-hours HOURS` to configure the initial Claude
 window from 1 hour through 31 days.
 Start a new session in every installed agent so its hooks load.
 
+Each provider installer also registers a low-priority periodic reconciler: a
+macOS LaunchAgent or Linux `systemd --user` timer, with a crontab fallback when
+the user service manager is unavailable. It runs about every 15 minutes from
+the installed runtime and pins the selected `CODEX_HOME` or `CLAUDE_CONFIG_DIR`.
+It discovers **all retained native history**, including files older than the
+initial backfill windows, and resumes bounded capture and upload without any
+agent hook or running agent CLI. Use `--no-scheduler` on any installer (or
+`SHERLOCK_NO_SCHEDULER=1`) to opt out and remove that home's prior entry.
+Reinstalling replaces the same scheduler entry.
+
+To run or audit either provider manually:
+
+```sh
+PYTHONPATH="$CODEX_HOME/sherlock/runtime" python3 -m sherlock_collector.cli --codex-home "$CODEX_HOME" reconcile
+PYTHONPATH="$CLAUDE_CONFIG_DIR/sherlock/runtime" python3 -m sherlock_collector.cli --provider claude_code --claude-home "$CLAUDE_CONFIG_DIR" reconcile
+PYTHONPATH="$CLAUDE_CONFIG_DIR/sherlock/runtime" python3 -m sherlock_collector.cli --provider claude_code --claude-home "$CLAUDE_CONFIG_DIR" inventory --session-id UUID
+```
+
+Set those home variables explicitly or substitute `~/.codex` and `~/.claude`.
+Each reconciliation captures at most 64 files and 128 MiB, rotates unfinished
+sources, and attempts at most 128 uploads. `reconcile --max-files`, `--max-bytes`,
+and `--max-uploads` change these limits. Complete native records are atomic;
+a record above a run's byte budget stays deferred until a larger budget is used.
+Records above the 100-MiB contract cap remain blocked with their source path and
+reason in `sherlock/telemetry/<provider>-reconcile.json`. Incomplete trailing
+records remain there until the provider writes the newline. Missing sources
+remain auditable in the ledger. Discovery scans native file metadata and bounded
+prefixes across retained history, so its cost grows with the number of files.
+
+Transient upload failures retry with persisted exponential backoff (one minute
+through one day). Permanent rejections retain the original manifest and payload
+under `sherlock/telemetry/queue/dead-letter`, with an error and timestamp, while
+other byte ranges continue. Dead letters require operator review and requeue
+after the underlying rejection is corrected; they never count as committed
+receipts. Existing evidence captured at an old partial-line cursor remains
+immutable; repair recaptures complete lines in an explicit new generation.
+
+Inspect or uninstall a home's scheduler without removing telemetry:
+
+```sh
+PYTHONPATH="$CODEX_HOME/sherlock/runtime" python3 -m sherlock_collector.scheduler status --home "$CODEX_HOME"
+PYTHONPATH="$CODEX_HOME/sherlock/runtime" python3 -m sherlock_collector.scheduler uninstall --home "$CODEX_HOME"
+```
+
+For Claude, use its runtime/home and add `--provider claude_code`. Verification
+checks generated files and scheduler registration; an explicit opt-out reports
+`disabled`. User schedulers run while the user account's scheduler is available;
+they do not collect files deleted before discovery or operate while the machine
+is off. A later scan recovers retained history without an age cutoff.
+
 Use the same work email on every machine that should be linked to you. If an
 agent is installing Sherlock for someone else, it must ask for all three values
 instead of inferring them.
@@ -99,7 +149,8 @@ that Sherlock did not observe.
 
 ## Verify
 
-For missing Codex sessions, see [collector inventory and receipt recovery](docs/collector-receipts.md).
+Run `python3 plugins/sherlock/scripts/verify_install.py` to check the Codex
+collector configuration and periodic scheduler. For missing Codex sessions, see [collector inventory and receipt recovery](docs/collector-receipts.md).
 It distinguishes local capture from acknowledged delivery and records raw token-payload presence.
 
 ```sh
