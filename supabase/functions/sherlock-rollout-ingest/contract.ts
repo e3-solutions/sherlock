@@ -5,7 +5,9 @@ export const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 export const MAX_RECORDS = 20_000;
 export const MAX_REQUEST_BYTES = 24 * 1024 * 1024;
 export const FRAGMENT_SOURCE_BYTES = 4 * 1024 * 1024;
-export const MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024;
+// PostgreSQL fragment_count is int4; offsets must also remain JS safe integers.
+// This is a representation bound, not an allocation or projection limit.
+export const MAX_LOGICAL_RECORD_BYTES = (2 ** 31 - 1) * FRAGMENT_SOURCE_BYTES;
 export const NATIVE_LABEL_BYTES = 256;
 export const IDENTITY_HINT_BYTES = 512;
 export const VERSION_HINT_BYTES = 128;
@@ -692,7 +694,7 @@ export function validateManifest(manifest: BatchManifest): void {
     if (logicalBytes > MAX_LOGICAL_RECORD_BYTES) {
       throw new IngestError(
         "payload_too_large",
-        "fragmented native record exceeds the 100 MiB logical limit",
+        "fragmented native record exceeds the int4 fragment-count limit",
         413,
       );
     }
