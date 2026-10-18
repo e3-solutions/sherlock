@@ -12,7 +12,7 @@ from .drain import Drain, UploadTransport
 from .rollout import CaptureResult, DEFAULT_MAX_FILES, RolloutCapturer, _stream_key
 from .spool import DurableSpool, _atomic_json, secure_lock, utc_now
 
-# A complete native record (up to 100 MiB) can be committed atomically in one run.
+# Fragment publication resumes across runs within this source-byte budget.
 DEFAULT_RECONCILE_BYTES = 128 * 1024 * 1024
 
 
@@ -178,6 +178,7 @@ def reconcile(
                 entry["generation_seq"] = state.generation_seq
                 entry["generation_key"] = state.generation_key
                 entry["recovery_reason"] = state.recovery_reason
+                entry["fragment_progress"] = state.pending_fragment
         _atomic_json(ledger_path, ledger)
         # Drain even when capture is busy or discovery is empty. Queue recovery
         # must never depend on another source event or successful capture.

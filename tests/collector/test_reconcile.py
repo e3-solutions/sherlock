@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -27,7 +28,7 @@ from sherlock_collector.inventory import collection_inventory
 from sherlock_collector.reconcile import reconcile
 from sherlock_collector.rollout import RolloutCapturer
 from sherlock_collector.spool import DurableSpool, secure_lock
-from test_collector import SuccessTransport, batch
+from test_collector import SuccessTransport, batch, receipt
 
 
 def native_file(home, provider, *, tail=b"", archived=False, native_id=None):
@@ -240,6 +241,148 @@ class ReconcileTests(unittest.TestCase):
             self.assertEqual(ledger[str(good)]["status"], "captured")
             self.assertEqual(result["unfinished_sources"], 1)
             self.assertTrue(bad.exists())
+
+    def test_above_100_mib_record_resumes_and_preserves_later_records_for_both_providers(self):
+        for provider in ("codex", "claude_code"):
+            with self.subTest(provider=provider), TemporaryDirectory() as directory:
+                home, state = Path(directory) / "home", Path(directory) / "state"
+                path = native_file(home, provider)
+                first_record = path.read_bytes()
+                # Generated valid JSON, bounded fixture construction memory.
+                with path.open("ab") as handle:
+                    handle.write(b'{"type":"compacted","payload":"')
+                    for _ in range(101):
+                        handle.write(b"x" * (1024 * 1024))
+                transport = SuccessTransport()
+                ledger_path = state / f"{provider}-reconcile.json"
+                for _ in range(2):
+                    result = reconcile(home, state, provider, transport)
+                    entry = json.loads(ledger_path.read_text())["sources"][str(path)]
+                    self.assertEqual(entry["capture_offset"], len(first_record))
+                    self.assertEqual(entry["reason"], "incomplete_trailing_record")
+                    self.assertEqual(len(transport.items), 1)
+                    self.assertEqual(result["status"], "partial")
+                    # Even a growing oversized tail must wait for its newline.
+                    with path.open("ab") as handle:
+                        handle.write(b"x")
+                later = b'{"type":"later","payload":{"type":"task_complete"}}\n'
+                with path.open("ab") as handle:
+                    handle.write(b'"}\n' + later)
+                budget = 32 * 1024 * 1024
+                first = reconcile(home, state, provider, transport, max_bytes=budget)
+                self.assertLessEqual(first["capture"]["captured_bytes"], budget)
+                entry = json.loads(ledger_path.read_text())["sources"][str(path)]
+                self.assertEqual(entry["status"], "unfinished")
+                self.assertEqual(entry["reason"], "native_record_fragmentation_in_progress")
+                self.assertEqual(entry["capture_offset"], len(first_record))
+                self.assertEqual(entry["fragment_progress"]["next_fragment"], 8)
+                for _ in range(4):
+                    result = reconcile(home, state, provider, transport, max_bytes=budget)
+                    self.assertLessEqual(result["capture"]["captured_bytes"], budget)
+                    if result["status"] == "complete":
+                        break
+                self.assertEqual(result["status"], "complete")
+                entry = json.loads(ledger_path.read_text())["sources"][str(path)]
+                self.assertEqual(entry["capture_offset"], path.stat().st_size)
+                self.assertIsNone(entry["fragment_progress"])
+                items = sorted(transport.items, key=lambda i: i.manifest.start_offset)
+                self.assertEqual(validate_stored_payload(items[-1].manifest, items[-1].stored_payload), later)
+                actual, original, native = hashlib.sha256(), hashlib.sha256(), hashlib.sha256()
+                frontier = 0
+                fragments = items[1:-1]
+                for index, item in enumerate(items):
+                    self.assertEqual(item.manifest.start_offset, frontier)
+                    frontier = item.manifest.end_offset
+                    source = validate_stored_payload(item.manifest, item.stored_payload)
+                    actual.update(source)
+                    if 0 < index < len(items) - 1:
+                        native.update(source)
+                with path.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        original.update(chunk)
+                self.assertEqual(frontier, path.stat().st_size)
+                self.assertEqual(actual.hexdigest(), original.hexdigest())
+                for index, item in enumerate(fragments):
+                    locator = item.manifest.records[0]
+                    self.assertEqual(locator.parse_status, "fragment")
+                    self.assertEqual(locator.fragment_index, index)
+                    self.assertEqual(locator.fragment_count, len(fragments))
+                    self.assertEqual(locator.native_record_sha256, native.hexdigest())
+                    self.assertGreater(locator.native_record_end_offset - locator.native_record_start_offset, 100 * 1024 * 1024)
+                count = len(transport.items)
+                repeat = reconcile(home, state, provider, transport, max_bytes=budget)
+                self.assertEqual(repeat["status"], "complete")
+                self.assertEqual(repeat["capture"]["enqueued"], 0)
+                self.assertEqual(len(transport.items), count)
+                # Inventory has its own conservative inspection budget; receipt
+                # delivery does not widen semantic inspection or imply usage.
+                report = collection_inventory(home, state, provider=provider)
+                self.assertEqual(report["status"], "partial")
+                self.assertEqual(report["sources"][0]["reason"], "inspection_budget_exceeded")
+
+    def test_fragment_resume_crash_replays_only_deterministic_pending_ranges(self):
+        with TemporaryDirectory() as directory:
+            home, state = Path(directory) / "home", Path(directory) / "state"
+            native_file(home, "codex", tail=b"x" * (MAX_SOURCE_BYTES + 1) + b"\n" + b"{}\n")
+
+            class IdempotentTransport(SuccessTransport):
+                def __init__(self):
+                    super().__init__()
+                    self.receipts = {}
+
+                def upload(self, item):
+                    self.items.append(item)
+                    return self.receipts.setdefault(
+                        item.manifest.spool_key, receipt(item.manifest)
+                    )
+
+            transport = IdempotentTransport()
+            budget = 4 * 1024 * 1024 + 1024
+            reconcile(home, state, "codex", transport, max_bytes=budget)
+            cursor_path = state / "rollout-state.json"
+            pending_before = json.loads(cursor_path.read_text())["streams"]
+            original = DurableSpool.enqueue
+
+            def crash_after_enqueue(spool, *args, **kwargs):
+                original(spool, *args, **kwargs)
+                raise OSError("crashed after fragment enqueue")
+
+            with patch.object(DurableSpool, "enqueue", crash_after_enqueue):
+                failed = reconcile(home, state, "codex", transport, max_bytes=budget)
+            self.assertEqual(failed["status"], "partial")
+            self.assertEqual(json.loads(cursor_path.read_text())["streams"], pending_before)
+            # The durable fragment can already have a receipt. Re-enqueue must
+            # retain exactly its original identity; server retries are idempotent.
+            saved = transport.items[-1]
+            self.assertEqual(saved.manifest.records[0].fragment_index, 1)
+            resumed = reconcile(home, state, "codex", transport, max_bytes=budget)
+            self.assertEqual(resumed["capture"]["enqueued"], 1)
+            self.assertEqual(transport.items[-1].manifest, saved.manifest)
+            self.assertEqual(transport.items[-1].stored_payload, saved.stored_payload)
+            for _ in range(5):
+                result = reconcile(home, state, "codex", transport, max_bytes=budget)
+                if result["status"] == "complete":
+                    break
+            self.assertEqual(result["status"], "complete")
+            completed = json.loads(cursor_path.read_text())["streams"]
+            self.assertNotIn("pending_fragment", next(iter(completed.values())))
+
+    def test_pending_fragment_mutation_is_rejected_before_resume(self):
+        with TemporaryDirectory() as directory:
+            home, state = Path(directory) / "home", Path(directory) / "state"
+            path = native_file(home, "codex", tail=b"x" * (MAX_SOURCE_BYTES + 1) + b"\n")
+            transport = SuccessTransport()
+            reconcile(home, state, "codex", transport, max_bytes=4 * 1024 * 1024 + 1024)
+            count = len(transport.items)
+            with path.open("r+b") as handle:
+                handle.seek(5 * 1024 * 1024)
+                handle.write(b"y")
+            result = reconcile(home, state, "codex", transport)
+            self.assertEqual(len(transport.items), count)
+            self.assertEqual(result["status"], "partial")
+            entry = json.loads((state / "codex-reconcile.json").read_text())["sources"][str(path)]
+            self.assertIn("changed before resume", entry["reason"])
+            self.assertEqual(entry["status"], "unfinished")
 
     def test_incomplete_tail_is_retained_until_completed(self):
         with TemporaryDirectory() as directory:

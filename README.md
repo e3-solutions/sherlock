@@ -57,6 +57,14 @@ records remain there until the provider writes the newline. Missing sources
 remain auditable in the ledger. Discovery scans native file metadata and bounded
 prefixes across retained history, so its cost grows with the number of files.
 
+Complete native records above 100 MiB are captured losslessly as canonical
+4 MiB fragments. Capture resumes across reconcile byte budgets, with the logical
+range/hash and next index retained as `fragment_progress` in the ledger until
+all fragments are durable. Growing tails remain deferred. Fragments normalize
+as `unknown/native_fragment`; product text limits stay unchanged. Deploy the
+updated ingest validator before updating collector runtimes; no schema migration
+or worker update is needed. See [receipt recovery](docs/collector-receipts.md).
+
 Both providers capture only complete newline-terminated records. Claude's terminal
 hooks retain their existing bounded wait for the asynchronous transcript writer.
 If a final Codex Stop record (or a late Claude write) is still missing its newline,

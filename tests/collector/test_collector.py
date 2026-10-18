@@ -1063,7 +1063,7 @@ class RolloutCaptureTests(unittest.TestCase):
             chunk_bytes=128,
         )
 
-        result = capturer.capture([self.rollout], max_sync_bytes=1024 * 1024)
+        result = capturer.capture([self.rollout], max_sync_bytes=len(source))
 
         expected_count = (len(source) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
         self.assertEqual(result.enqueued, expected_count)

@@ -52,6 +52,7 @@ class StreamState:
     generation_key: str
     offset: int
     recovery_reason: str | None = None
+    pending_fragment: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -386,6 +387,8 @@ class RolloutCapturer:
             while state.offset < stable_end and captured < byte_budget:
                 remaining_budget = byte_budget - captured
                 try:
+                    if state.pending_fragment is not None:
+                        raise _OversizedNativeRecord("resume pending native record")
                     source = self._read_chunk(
                         handle,
                         state.offset,
@@ -394,9 +397,8 @@ class RolloutCapturer:
                         remaining_budget,
                     )
                 except _OversizedNativeRecord:
-                    # max_sync_bytes selects ordinary batches. One logical native
-                    # record may exceed it because every deterministic fragment
-                    # must be durable before the logical cursor can advance.
+                    # Hash the whole native range without loading its JSON envelope.
+                    # Fragment publication can span runs; the logical cursor waits.
                     plan = self._native_record_fragment_plan(
                         handle,
                         state.offset,
@@ -405,9 +407,15 @@ class RolloutCapturer:
                     if not plan.terminated and not self.capture_unterminated_tail:
                         self.source_issues[str(path)] = "incomplete_trailing_record"
                         break
-                    if self.enforce_sync_budget and plan.end_offset - plan.start_offset > remaining_budget:
-                        self.source_issues[str(path)] = "record_exceeds_remaining_run_budget"
-                        break
+                    pending = state.pending_fragment
+                    if pending is not None and pending["plan"] != asdict(plan):
+                        raise OSError("pending native source record changed before resume")
+                    first_fragment = pending["next_fragment"] if pending else 0
+                    # A soft hook budget permits one canonical fragment. Reconcile
+                    # honors the strict budget and reports too-small budgets explicitly.
+                    fragment_budget = remaining_budget if self.enforce_sync_budget else max(
+                        remaining_budget, FRAGMENT_BYTES
+                    )
                     if plan.end_offset - plan.start_offset <= MAX_SOURCE_BYTES:
                         raise ContractError(
                             f"native source record exceeds {self.max_object_bytes} bytes"
@@ -420,6 +428,8 @@ class RolloutCapturer:
                         native_session_ids.get(str(path)),
                         parent_native_session_ids.get(str(path)),
                         workload_class,
+                        first_fragment=first_fragment,
+                        byte_budget=fragment_budget,
                     )
                     after = os.fstat(handle.fileno())
                     if (
@@ -428,11 +438,25 @@ class RolloutCapturer:
                         or after.st_size < stable_end
                     ):
                         raise OSError("native source file changed while fragmenting")
-                    state.offset = plan.end_offset
+                    next_fragment = first_fragment + fragment_enqueued
+                    if next_fragment == plan.fragment_count:
+                        state.offset = plan.end_offset
+                        state.pending_fragment = None
+                    elif fragment_enqueued:
+                        state.pending_fragment = {
+                            "plan": asdict(plan),
+                            "next_fragment": next_fragment,
+                        }
                     states[key] = state
                     self._save_state(states, candidate_cursor)
                     enqueued += fragment_enqueued
                     captured += fragment_captured
+                    if state.offset != plan.end_offset:
+                        self.source_issues[str(path)] = (
+                            "native_record_fragmentation_in_progress" if fragment_enqueued
+                            else "record_exceeds_remaining_run_budget"
+                        )
+                        break
                     continue
                 if not source:
                     handle.seek(max(state.offset, stable_end - 1))
@@ -521,8 +545,22 @@ class RolloutCapturer:
         observed_native_session_id: str | None,
         observed_parent_native_session_id: str | None,
         workload_class: str | None,
+        *,
+        first_fragment: int = 0,
+        byte_budget: int,
     ) -> tuple[int, int]:
         record_bytes = plan.end_offset - plan.start_offset
+        selected_start = first_fragment * FRAGMENT_BYTES
+        selected_end = selected_start
+        last_fragment = first_fragment
+        while last_fragment < plan.fragment_count:
+            end = min((last_fragment + 1) * FRAGMENT_BYTES, record_bytes)
+            if end - selected_start > byte_budget:
+                break
+            selected_end = end
+            last_fragment += 1
+        if last_fragment == first_fragment:
+            return 0, 0
         with tempfile.TemporaryFile(mode="w+b", dir=self.state_root) as staged:
             handle.seek(plan.start_offset)
             digest = hashlib.sha256()
@@ -532,17 +570,23 @@ class RolloutCapturer:
                 if not source:
                     raise OSError("native source record changed while staging")
                 digest.update(source)
-                staged.write(source)
+                relative_start = record_bytes - remaining
+                # Stage only this run's fragments while rehashing the entire
+                # original range. Scratch usage is bounded by the run budget.
+                begin = max(selected_start - relative_start, 0)
+                end = min(selected_end - relative_start, len(source))
+                if begin < end:
+                    staged.write(source[begin:end])
                 remaining -= len(source)
             if digest.hexdigest() != plan.sha256:
                 raise OSError("native source record changed while staging")
 
             captured = 0
-            for fragment_index in range(plan.fragment_count):
+            for fragment_index in range(first_fragment, last_fragment):
                 relative_start = fragment_index * FRAGMENT_BYTES
                 start = plan.start_offset + relative_start
                 end = min(start + FRAGMENT_BYTES, plan.end_offset)
-                staged.seek(relative_start)
+                staged.seek(relative_start - selected_start)
                 source = staged.read(end - start)
                 if len(source) != end - start:
                     raise OSError("staged native source record is incomplete")
@@ -577,7 +621,7 @@ class RolloutCapturer:
                 self._capture_enqueued += 1
                 self._capture_bytes += len(source)
                 captured += len(source)
-        return plan.fragment_count, captured
+        return last_fragment - first_fragment, captured
 
     def _canonical_path(self, value: Path | str) -> Path:
         path = Path(value).expanduser()
@@ -765,10 +809,17 @@ class RolloutCapturer:
         candidate_cursor: int,
         update_backup: bool = False,
     ) -> None:
+        streams = {}
+        for key, state in states.items():
+            entry = asdict(state)
+            if state.pending_fragment is None:
+                # Completed cursors retain the shape readable by older runtimes.
+                entry.pop("pending_fragment")
+            streams[key] = entry
         value = {
             "state_version": 1,
             "candidate_cursor": candidate_cursor,
-            "streams": {key: asdict(value) for key, value in states.items()},
+            "streams": streams,
         }
         _atomic_json(
             self.state_path,
