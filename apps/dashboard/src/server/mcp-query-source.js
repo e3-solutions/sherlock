@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { FlameSourceError } from "./flame-source.js";
 
 export const MCP_QUERY_SCHEMA_VERSION = "sherlock.query.v1";
-export const USAGE_DERIVATION_VERSION = "sherlock.usage-reconciliation.v1";
+export const USAGE_DERIVATION_VERSION = "sherlock.usage-reconciliation.v2";
 export const MCP_QUERY_DEFAULT_LIMIT = 20;
 export const MCP_QUERY_MAX_LIMIT = 100;
 export const MCP_QUERY_MAX_GROUPS = 200;
@@ -20,6 +20,7 @@ const PROVIDER_VERSIONS = Object.freeze([
   "sherlock.codex-rollout.v1",
   "sherlock.codex-rollout.v2",
   "sherlock.codex-rollout.v3",
+  "sherlock.codex-rollout.v4",
   "sherlock.claude-code-transcript.v1",
 ]);
 
@@ -35,6 +36,14 @@ export function activeNormalizerPredicate(event, session, batch, cutover) {
     and ${event}.normalizer_version = '${FRAME_CLAUDE_VERSION}'
     or ${batch}.source_provider = 'codex'
     and (
+      ${event}.normalizer_version = 'sherlock.codex-rollout.v4'
+      or not exists (
+        select 1 from telemetry.events upgraded
+         where upgraded.workspace_id = ${event}.workspace_id
+           and upgraded.source_record_id = ${event}.source_record_id
+           and upgraded.normalizer_version = 'sherlock.codex-rollout.v4'
+           and not upgraded.is_replay
+      ) and (
       ${event}.normalizer_version = 'sherlock.codex-rollout.v3'
       or not exists (
         select 1 from telemetry.events corrected
@@ -59,6 +68,7 @@ export function activeNormalizerPredicate(event, session, batch, cutover) {
         )
       )
       )
+      )
     )
   )`;
 }
@@ -71,6 +81,28 @@ function activeUsageNormalizerPredicate(event, session, batch, cutover) {
     when ${batch}.source_provider = 'codex'
     then ${activeNormalizerPredicate(event, session, batch, cutover)}
     else false end`;
+}
+
+// Any valid token_count stream wins for the whole session, even if its
+// observations fall outside this window. Never mix overlapping native streams.
+// Missing baselines/regressions stay explicit rather than being hidden by a
+// fallback. Late token_count arrivals may intentionally revise prior answers.
+function tokenCountExistsPredicate(workspaceId, sessionId) {
+  return `exists (
+    select 1 from telemetry.events preferred
+     where preferred.workspace_id = ${workspaceId}
+       and preferred.session_id = ${sessionId}
+       and preferred.event_kind = 'usage' and not preferred.is_replay
+       and preferred.event_subtype = 'token_count'
+       and preferred.normalizer_version in (
+         'sherlock.codex-rollout.v1', 'sherlock.codex-rollout.v2',
+         'sherlock.codex-rollout.v3', 'sherlock.codex-rollout.v4'
+       )
+  )`;
+}
+
+function preferredUsageStreamPredicate(event, session) {
+  return `(${event}.event_subtype is distinct from 'token_usage_record' or not ${session}.has_token_count)`;
 }
 
 function canonicalNormalizer(event) {
@@ -238,7 +270,8 @@ function providerFromVersion(version) {
   if (version === "sherlock.claude-code-transcript.v1") return "claude";
   if (version === "sherlock.codex-rollout.v1" ||
       version === "sherlock.codex-rollout.v2" ||
-      version === "sherlock.codex-rollout.v3") return "codex";
+      version === "sherlock.codex-rollout.v3" ||
+      version === "sherlock.codex-rollout.v4") return "codex";
   return "unknown";
 }
 
@@ -474,7 +507,8 @@ with p as not materialized (
      and split_part(pe.email, '@', 2) = $4
      and split_part(pe.email, '@', 3) = ''
 ), eligible_sessions as materialized (
-  select s.id session_id, s.person_id, r.display_name, s.started_at
+  select s.id session_id, s.person_id, r.display_name, s.started_at,
+         ${tokenCountExistsPredicate("s.workspace_id", "s.id")} has_token_count
     from window_sessions w
     join telemetry.sessions s on s.workspace_id = $1 and s.id = w.session_id
     join roster r on r.person_id = s.person_id
@@ -507,6 +541,7 @@ export const QUERY_USAGE_SQL = `${USAGE_SESSIONS_SQL}, candidates as not materia
      and (e.event_kind = 'usage' or
           e.event_kind = 'lifecycle' and e.event_subtype = 'turn_context')
      and ${activeUsageNormalizerPredicate("e", "s", "ib", "c")}
+     and ${preferredUsageStreamPredicate("e", "s")}
 ), canonical_ranked as not materialized (
   select *, row_number() over (
     partition by session_id, normalizer_version, canonical_scope_key, logical_event_key, event_kind
@@ -562,15 +597,24 @@ export const QUERY_USAGE_SQL = `${USAGE_SESSIONS_SQL}, candidates as not materia
 ), usage_attributed as materialized (
   -- Incremental facts need source/model assessment, but no cumulative windows.
   -- Retain only fields needed by arithmetic before sharing the two branches.
-  select id, session_id, person_id, display_name, started_at, provider, model,
+  select id, session_id, person_id, display_name, started_at, provider, model, normalizer_version,
          usage_stream_key, usage_is_cumulative, input_tokens, cached_input_tokens,
          output_tokens, reasoning_tokens, total_tokens, usage_at, native_start,
          native_end, in_window, source_uncertain
     from attributed where event_kind = 'usage'
 ), ordered as not materialized (
   select *,
-         lag(input_tokens) over stream_order previous_input,
-         lag(cached_input_tokens) over stream_order previous_cached,
+         -- Cache writes were included in uncached input before v4. Across that
+         -- boundary the component baseline is unknowable without reprocessing;
+         -- inclusive totals/output remain comparable in the same stream.
+         case when provider = 'codex' and
+           (normalizer_version = 'sherlock.codex-rollout.v4') is distinct from
+           (lag(normalizer_version) over stream_order = 'sherlock.codex-rollout.v4')
+           then null else lag(input_tokens) over stream_order end previous_input,
+         case when provider = 'codex' and
+           (normalizer_version = 'sherlock.codex-rollout.v4') is distinct from
+           (lag(normalizer_version) over stream_order = 'sherlock.codex-rollout.v4')
+           then null else lag(cached_input_tokens) over stream_order end previous_cached,
          lag(output_tokens) over stream_order previous_output,
          lag(reasoning_tokens) over stream_order previous_reasoning,
          lag(total_tokens) over stream_order previous_total,
@@ -724,6 +768,7 @@ select page.id::text session_id, page.person_id::text, page.display_name,
 export const GET_SESSION_SQL = `
 with selected as materialized (
   select s.id, s.person_id, s.actor_role, s.model, s.started_at, s.ended_at,
+         ${tokenCountExistsPredicate("s.workspace_id", "s.id")} has_token_count,
          s.parent_session_id,
          coalesce(nullif(btrim(pe.display_name), ''), 'Unknown') display_name
     from telemetry.sessions s
@@ -755,6 +800,7 @@ with selected as materialized (
    where e.normalizer_version = any($4::text[])
      and ${activeNormalizerPredicate("e", "s", "ib", "c")}
      and ${canonicalWinnerPredicate("e", "s")}
+     and ${preferredUsageStreamPredicate("e", "s")}
 ), facts as (
   select count(*) filter (
            where event_kind = 'message' and canonical_rank = 1
@@ -782,7 +828,7 @@ select selected.id::text session_id, selected.person_id::text,
 // so discovery is driven by events_usage_window_idx.
 const COVERAGE_PROJECTION_COLUMNS = `e.id, e.workspace_id, e.session_id,
   e.source_record_id, e.normalizer_version, e.canonical_scope_key,
-  e.logical_event_key, e.event_kind, e.projection_index, e.source_priority, e.occurred_at`;
+  e.logical_event_key, e.event_kind, e.event_subtype, e.projection_index, e.source_priority, e.occurred_at`;
 
 export const COVERAGE_SQL = `
 with window_usage as materialized (
@@ -796,11 +842,18 @@ with window_usage as materialized (
     from telemetry.people pe
    where pe.workspace_id = $1 and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = $4 and split_part(pe.email, '@', 3) = ''
-), window_candidates as materialized (
-  select w.*, s.started_at
-    from window_usage w
+), session_preferences as materialized (
+  -- Assess stream preference once per touched session, never once per native
+  -- response (a native-only long session would otherwise rescan its history).
+  select s.id session_id, s.started_at,
+         ${tokenCountExistsPredicate("s.workspace_id", "s.id")} has_token_count
+    from (select distinct session_id from window_usage) w
     join telemetry.sessions s on s.workspace_id = $1 and s.id = w.session_id
     join roster r on r.person_id = s.person_id
+), window_candidates as materialized (
+  select w.*, s.started_at
+    from window_usage w join session_preferences s using (session_id)
+   where ${preferredUsageStreamPredicate("w", "s")}
 ), window_keys as materialized (
   select distinct session_id, started_at, normalizer_version, canonical_scope_key, logical_event_key
     from window_candidates

@@ -939,7 +939,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         snapshot: legacyDay.snapshot,
         now: partialRead,
       });
-      expect(legacyDay.snapshot).toMatch(/^v5\./);
+      expect(legacyDay.snapshot).toMatch(/^v7\./);
       expect(legacyDay.latest).toBe(partialActivityAt.toISOString());
       expect(legacyDay.people[0].lastActivity).toBe(
         partialActivityAt.toISOString(),

@@ -6,6 +6,7 @@ import {
   BUCKET_MS,
   CLAUDE_NORMALIZER_VERSION,
   COMPATIBLE_WORK_FRAME_VERSION,
+  CODEX_V3_NORMALIZER_VERSIONS,
   DEFAULT_WORK_DETAIL_LIMIT,
   FRAME_VERSION,
   PREVIOUS_FRAME_VERSION,
@@ -431,6 +432,7 @@ describe("Sherlock Flame payload", () => {
       NORMALIZER_VERSION,
       CLAUDE_NORMALIZER_VERSION,
       CORRECTED_CODEX_NORMALIZER_VERSION,
+      "sherlock.codex-rollout.v4",
     ]);
     for (const sql of [FLAME_SQL, INTERVAL_WORK_SQL, WORK_DETAIL_SQL]) {
       expect(sql).toContain("$4::text[] normalizer_versions");
@@ -575,7 +577,7 @@ describe("Sherlock Flame payload", () => {
   it("round-trips a bounded immutable aggregate snapshot receipt", () => {
     const token = encodeSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ });
 
-    expect(token).toMatch(/^v5\.[A-Za-z0-9_-]+$/);
+    expect(token).toMatch(/^v7\.[A-Za-z0-9_-]+$/);
     expect(decodeSnapshotToken(token)).toEqual({
       snapshot: PG_SNAPSHOT,
       read: READ,
@@ -587,6 +589,12 @@ describe("Sherlock Flame payload", () => {
       PG_SNAPSHOT,
       READ.toISOString(),
     ])).toString("base64url");
+    expect(decodeSnapshotToken(`v5.${legacyBody}`)).toEqual({
+      snapshot: PG_SNAPSHOT, read: READ, normalizerVersions: CODEX_V3_NORMALIZER_VERSIONS,
+      originClassificationVersion: "bonaparte-origin-v1",
+    });
+    expect(CODEX_V3_NORMALIZER_VERSIONS).not.toContain("sherlock.codex-rollout.v4");
+    expect(NORMALIZER_VERSIONS).toContain("sherlock.codex-rollout.v4");
     expect(decodeSnapshotToken(`v3.${legacyBody}`)).toEqual({
       snapshot: PG_SNAPSHOT, read: READ, normalizerVersions: PREVIOUS_NORMALIZER_VERSIONS,
     });
@@ -681,8 +689,8 @@ describe("Sherlock Flame payload", () => {
   it.each([
     [true, false, PROJECTION_FLAME_SQL, "v6", FRAME_VERSION],
     [false, true, PROJECTION_FLAME_SQL, "v6", COMPATIBLE_WORK_FRAME_VERSION],
-    [false, false, FLAME_SQL, "v5", null],
-    [null, null, FLAME_SQL, "v5", null],
+    [false, false, FLAME_SQL, "v7", null],
+    [null, null, FLAME_SQL, "v7", null],
   ])("routes current activation %s and compatible work activation %s", async (
     frameProjectionActive,
     compatibleWorkProjectionActive,
@@ -766,7 +774,7 @@ describe("Sherlock Flame payload", () => {
     expect(unsafe.mock.calls[0][0]).not.toContain("analytics.frame_projection_activations");
     expect(unsafe.mock.calls[0][1]).toBeUndefined();
     expect(unsafe.mock.calls[2][0]).toBe(FLAME_SQL);
-    expect(payload.snapshot).toMatch(/^v5\./);
+    expect(payload.snapshot).toMatch(/^v7\./);
   });
 
   it("selects the 60-second transaction timeout only for the cached timeline", async () => {
@@ -1633,5 +1641,5 @@ it("keeps pre-classification snapshots unannotated even after metadata exists", 
   const current = decodeSnapshotToken(encodeProjectionSnapshotToken({ snapshot: PG_SNAPSHOT, read: READ, frameVersion: FRAME_VERSION }));
   expect(classificationSnapshotQuery(PROJECTION_INTERVAL_PROMPTS_SQL, current)).toBe(PROJECTION_INTERVAL_PROMPTS_SQL);
   const rawBody = Buffer.from(JSON.stringify([PG_SNAPSHOT, READ.toISOString()])).toString("base64url");
-  expect(decodeSnapshotToken(`v4.${rawBody}`)).toEqual({ snapshot: PG_SNAPSHOT, read: READ, normalizerVersions: NORMALIZER_VERSIONS });
+  expect(decodeSnapshotToken(`v4.${rawBody}`)).toEqual({ snapshot: PG_SNAPSHOT, read: READ, normalizerVersions: CODEX_V3_NORMALIZER_VERSIONS });
 });

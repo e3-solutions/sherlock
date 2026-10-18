@@ -35,7 +35,7 @@ async function cleanup(sql, workspaceId) {
   await sql.unsafe("delete from telemetry.workspaces where id = $1", [workspaceId]);
 }
 
-async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt = null } = {}) {
+async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt = null, parity = true } = {}) {
   const workspaceId = crypto.randomUUID();
   const personId = crypto.randomUUID();
   const sessionId = crypto.randomUUID();
@@ -133,6 +133,7 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt
     scope = null,
     logicalKey = null,
     sourceRecordId = null,
+    usageScope = "session",
   }) => {
     const [record] = sourceRecordId ? [{ id: sourceRecordId }] : await sql.unsafe(
       `insert into telemetry.native_records (
@@ -175,7 +176,7 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt
         occurredAt,
         model,
         kind === "usage" ? stream : null,
-        kind === "usage" ? "session" : null,
+        kind === "usage" ? usageScope : null,
         kind === "usage" ? cumulative : null,
         kind === "usage" ? input : null,
         kind === "usage" ? cachedInput : null,
@@ -212,7 +213,7 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt
   const querySource = {
     ...directQuerySource,
     async fetchUsage(args) {
-      await expectUsageQueryParity(sql, workspaceId, args);
+      if (parity) await expectUsageQueryParity(sql, workspaceId, args);
       return await directQuerySource.fetchUsage(args);
     },
   };
@@ -273,6 +274,105 @@ describePostgres("usage reconciliation PostgreSQL regressions", () => {
     } finally {
       await sql.end({ timeout: 5 });
     }
+  });
+
+  it.each([
+    { mode: "token_count only", native: false, counter: true, expectedEvents: 2 },
+    { mode: "native response only", native: true, counter: false, expectedEvents: 2 },
+    { mode: "both streams", native: true, counter: true, expectedEvents: 2 },
+  ])("reconciles $mode without double counting response replays", async ({ native, counter, expectedEvents }) => {
+    let fixture;
+    try {
+      fixture = await createFixture({ startedAt: WINDOW_START, parity: false });
+      const batchId = await fixture.createBatch();
+      await fixture.context({ batchId, recordIndex: 0, offset: 0, model: "model-A", normalizer: "sherlock.codex-rollout.v4", scope: "session" });
+      if (counter) {
+        await fixture.usage({ batchId, recordIndex: 1, offset: 10, subtype: "token_count", total: 100, normalizer: "sherlock.codex-rollout.v4", scope: "session" });
+        await fixture.usage({ batchId, recordIndex: 2, offset: 20, subtype: "token_count", total: 150, normalizer: "sherlock.codex-rollout.v4", scope: "session" });
+      }
+      if (native) {
+        for (const [recordIndex, offset, response, total, isReplay] of [
+          [3, 30, "response-A", 100, false], [4, 40, "response-B", 50, false],
+          [5, 50, "response-A", 100, false], [6, 60, "response-B", 50, true],
+        ]) await fixture.usage({ batchId, recordIndex, offset, subtype: "token_usage_record", total,
+          normalizer: "sherlock.codex-rollout.v4", cumulative: false, usageScope: "response",
+          scope: "session", logicalKey: `usage:response:${response}`, stream: `session:response:${response}`, isReplay });
+        // A transport generation replay with a different source_record_id is
+        // also the same logical response, including outside the query window.
+        const replayBatch = await fixture.createBatch();
+        await fixture.usage({ batchId: replayBatch, recordIndex: 0, offset: 30,
+          subtype: "token_usage_record", total: 100, normalizer: "sherlock.codex-rollout.v4",
+          cumulative: false, usageScope: "response", scope: "session", logicalKey: "usage:response:response-A", stream: "session:response:response-A" });
+      }
+      const result = await fetchUsage(fixture.querySource);
+      expect(result.groups).toHaveLength(1);
+      expect(result.groups[0]).toMatchObject({ model: "model-A", knownTokens: { total: 150 }, usageEventCount: expectedEvents });
+      expect(result.coverage.observedUsageEvents).toBe(expectedEvents);
+      expect(await fixture.querySource.fetchCoverage({ start: WINDOW_START, end: WINDOW_END }))
+        .toMatchObject({ observedSessions: 1, observedUsageEvents: expectedEvents });
+    } finally { await disposeFixture(fixture); }
+  });
+
+  it("prefers token_count even outside the window, but replay-only counters do not suppress fallback", async () => {
+    let fixture;
+    try {
+      fixture = await createFixture({ parity: false });
+      const batchId = await fixture.createBatch();
+      await fixture.usage({ batchId, recordIndex: 0, offset: 0, subtype: "token_count", total: 10,
+        occurredAt: "2026-09-10T11:30:00Z", isReplay: true });
+      await fixture.usage({ batchId, recordIndex: 1, offset: 10, subtype: "token_usage_record", total: 20,
+        normalizer: "sherlock.codex-rollout.v4", cumulative: false, scope: "session", logicalKey: "usage:response:one" });
+      expect((await fetchUsage(fixture.querySource)).groups[0].knownTokens.total).toBe(20);
+      await fixture.usage({ batchId, recordIndex: 2, offset: 20, subtype: "token_count", total: 30,
+        occurredAt: "2026-09-10T13:30:00Z" });
+      expect((await fetchUsage(fixture.querySource)).groups).toEqual([]);
+      expect(await fixture.querySource.fetchCoverage({ start: WINDOW_START, end: WINDOW_END }))
+        .toMatchObject({ observedSessions: 0, observedUsageEvents: 0 });
+    } finally { await disposeFixture(fixture); }
+  });
+
+  it("keeps an out-of-window original response from becoming new usage when replayed in-window", async () => {
+    let fixture;
+    try {
+      fixture = await createFixture({ parity: false });
+      const batchId = await fixture.createBatch();
+      for (const [recordIndex, offset, occurredAt, response, total] of [
+        [0, 0, "2026-09-10T11:59:00Z", "original", 100],
+        [1, 10, SAME_TIME, "original", 100],
+        [2, 20, SAME_TIME, "new", 50],
+      ]) await fixture.usage({ batchId, recordIndex, offset, occurredAt, total,
+        subtype: "token_usage_record", normalizer: "sherlock.codex-rollout.v4", cumulative: false,
+        usageScope: "response", scope: "session", logicalKey: `usage:response:${response}`, stream: `session:response:${response}` });
+      const result = await fetchUsage(fixture.querySource);
+      expect(result.groups[0].knownTokens.total).toBe(50);
+      expect(result.coverage.observedUsageEvents).toBe(1);
+      expect(await fixture.querySource.fetchCoverage({ start: WINDOW_START, end: WINDOW_END }))
+        .toMatchObject({ observedSessions: 1, observedUsageEvents: 1 });
+    } finally { await disposeFixture(fixture); }
+  });
+
+  it("v4 supersedes old projections without adding cumulative totals at the version boundary", async () => {
+    let fixture;
+    try {
+      fixture = await createFixture({ startedAt: WINDOW_START, parity: false });
+      const batchId = await fixture.createBatch();
+      const record = await fixture.usage({ batchId, recordIndex: 0, offset: 0, subtype: "token_count", total: 100, normalizer: "sherlock.codex-rollout.v3" });
+      await fixture.usage({ batchId, recordIndex: 1, offset: 10, subtype: "token_count", total: 140,
+        input: 70, cachedInput: 70, normalizer: "sherlock.codex-rollout.v4" });
+      const result = await fetchUsage(fixture.querySource);
+      expect(result.groups[0].knownTokens.total).toBe(140);
+      expect(result.groups[0].knownTokens.input).toBe(100);
+      expect(result.groups[0].coverage.missingTokenComponents).toEqual(["cachedInput", "input"]);
+      // Operator reprocessing replaces the interpretation, preserving the old
+      // fact/source link and restoring comparable component baselines.
+      await fixture.usage({ batchId, recordIndex: 0, offset: 0, sourceRecordId: record, subtype: "token_count",
+        total: 100, input: 50, cachedInput: 50, normalizer: "sherlock.codex-rollout.v4" });
+      const backfilled = await fetchUsage(fixture.querySource);
+      expect(backfilled.groups[0].knownTokens).toMatchObject({ total: 140, input: 70, cachedInput: 70 });
+      expect(backfilled.coverage.observedUsageEvents).toBe(2);
+      expect(await fixture.querySource.fetchCoverage({ start: WINDOW_START, end: WINDOW_END }))
+        .toMatchObject({ observedSessions: 1, observedUsageEvents: 2 });
+    } finally { await disposeFixture(fixture); }
   });
 
   it("has valid partial usage indexes and bounds timestamp discovery in both plans", async () => {

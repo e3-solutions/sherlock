@@ -45,7 +45,7 @@ Keeping one exact definition prevents the architecture notes from drifting.
 - The ingest request durably enqueues work and returns its existing receipt
   without waiting for normalization.
 - Railway dispatches every native record to the immutable provider-specific
-  `sherlock.codex-rollout.v2` or `sherlock.claude-code-transcript.v1`
+  `sherlock.codex-rollout.v4` or `sherlock.claude-code-transcript.v1`
   normalizer, then reduces only affected sessions into append-only
   `sherlock.activity.v1` span revisions.
 - Railway also projects payload-free activity and prompt selections with one
@@ -177,6 +177,49 @@ Codex v3 classifies `codex_internal_context` and the existing reserved runtime
 envelopes in both user-message representations. The queue migration routes each
 new Codex upload to v3, including uploads in existing sessions. Previously queued
 jobs and v1/v2 facts keep their original versions; no normalization replay occurs.
+
+Codex v4 retains v3 runtime classification and additionally projects native
+`token_usage_record.payload.usage` as a non-cumulative `usage` event with
+`usage_scope = response`. Its logical key is `usage:response:<response_id>`
+and its stream key includes the canonical session scope and response ID. Missing
+response IDs or invalid counters yield an auditable `unknown` event with an error
+code. `turn_token_usage` and `thread_token_usage` overlap the response increment;
+they stay in immutable raw Storage, rather than becoming additional usage facts.
+Every projection retains its exact `source_record_id`. Duplicate response
+occurrences remain source facts and collapse to the earliest canonical response
+in readers, including copies in later transport generations.
+
+For both v4 `token_count` and native response usage, inclusive Codex input is
+split into uncached input and cached input. Cached input includes cache reads
+plus `cache_write_input_tokens`, matching Claude
+`cache_read_input_tokens + cache_creation_input_tokens`. Writes are a subset of
+Codex input, so they are subtracted from uncached input, never added to native
+total tokens; the write count is also retained in bounded attributes. Missing
+writes mean zero; invalid/negative writes or read+write exceeding inclusive
+input reject usage. Inclusive output is split into output and reasoning as
+before. The source mapping is the official [Codex Responses parser](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/sse/responses.rs).
+
+MCP usage reconciliation v2 prefers valid, non-replay `token_count` facts for
+the **entire session** whenever any supported token-count stream exists, even
+outside the requested window. Native response increments contribute only in
+sessions with no token-count facts. This conservative rule cannot silently
+combine overlapping streams; it intentionally does not fill gaps in a partial
+token-count session. A later counter arrival may revise a prior fallback answer.
+Coverage applies the same choice and response deduplication. Across an old/v4
+cumulative boundary, inclusive total/output remain comparable, while input/cache
+component baselines are unknown for that transition. Readers retain measured
+prefixes and mark those components partial instead of reporting a false counter
+regression or adding the cumulative total again. Reprocessing the complete
+session with v4 restores comparable component baselines.
+
+The v4 routing migration changes only new jobs. Old jobs and v1–v3 outputs remain
+reproducible and untouched. Readers/projectors prefer v4 per source record, then
+v3, then the existing v1/v2 cutover rule. Frame v5 keeps the same message/activity
+interpretation: v4 changes usage only, which is not frame evidence. Its live
+source receipts accept v4; issued raw snapshot tokens retain their frozen
+normalizer universes; new raw tokens v7 include v4 without expanding issued
+v4/v5 tokens. Historical raw normalization is optional and explicit; see
+[the v4 operator procedure](telemetry-processing.md#codex-v4-usage-rollout-and-optional-backfill).
 
 ### Activity spans are rebuildable
 

@@ -84,7 +84,7 @@ Claude message-scoped usage is incremental and is summed. Codex session-scoped
 usage is cumulative and is differenced within each independent usage stream.
 Normalizer version is projection provenance, not a separate native counter, so
 an active pre-cutover v2 fallback continues the same v1 cumulative stream.
-Usage derivation `sherlock.usage-reconciliation.v1` reads the history of sessions
+Usage derivation `sherlock.usage-reconciliation.v2` reads the history of sessions
 with in-window usage so uncertainty cannot disappear when a window moves. It
 collapses repeated native occurrences by session scope, native byte range, full
 record hash, event kind, and projection index. Upload batch/transport identifiers
@@ -96,6 +96,24 @@ is reconciled before applying both timestamp bounds, including observations
 whose timestamps run backward relative to their native positions. Each delta
 belongs to the timestamp window of its current observation; that does not prove
 when the underlying work occurred.
+
+Codex v4 additionally reads `token_usage_record.payload.usage` as a response
+increment keyed by response ID. Duplicate/replayed responses count once. Turn
+and thread cumulative totals in the same record are not additive. If any valid,
+non-replay token-count fact exists anywhere in a session, **only token-count
+usage** contributes for that session. This preference is assessed once per
+touched session; native response increments are a fallback for sessions without
+that stream. Both `coverage` and `query_usage` use the same rule, including
+out-of-window winners. Counter gaps/regressions remain partial; response data
+does not hide them. A late counter arrival may revise earlier fallback results.
+
+V4 classifies Codex cache reads plus writes as cached input, consistent with
+Claude cache reads plus creation. Both are subsets of Codex inclusive input;
+total tokens do not increase. At an old/v4 cumulative boundary, only the
+input/cache component baselines are unknown for that transition; inclusive
+total/output still difference continuously. Reprocessing the complete session
+with v4 removes that uncertainty without rewriting older facts. See
+[operator steps](telemetry-processing.md#codex-v4-usage-rollout-and-optional-backfill).
 
 Codex models come from the preceding `turn_context` in native source order,
 including context from earlier uploads and before the window. Batch-final and

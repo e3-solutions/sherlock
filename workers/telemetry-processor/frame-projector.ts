@@ -12,6 +12,7 @@ import {
   FRAME_CORRECTED_CODEX_NORMALIZER_VERSION,
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
+  FRAME_USAGE_CODEX_NORMALIZER_VERSION,
   FRAME_VERSION,
   FRAME_WINDOW_HOURS,
 } from "../../packages/frame-evidence/constants.js";
@@ -178,6 +179,14 @@ export function frameSourceNormalizerPredicateSql(
     and ${eventAlias}.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
     or ${batchAlias}.source_provider = 'codex'
     and (
+      ${eventAlias}.normalizer_version = '${FRAME_USAGE_CODEX_NORMALIZER_VERSION}'
+      or not exists (
+        select 1 from telemetry.events native_usage
+         where native_usage.workspace_id = ${eventAlias}.workspace_id
+           and native_usage.source_record_id = ${eventAlias}.source_record_id
+           and native_usage.normalizer_version = '${FRAME_USAGE_CODEX_NORMALIZER_VERSION}'
+           and not native_usage.is_replay
+      ) and (
       ${eventAlias}.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
       or not exists (
         select 1 from telemetry.events corrected
@@ -200,6 +209,7 @@ export function frameSourceNormalizerPredicateSql(
              and legacy.normalizer_version = '${FRAME_LEGACY_CODEX_NORMALIZER_VERSION}'
              and not legacy.is_replay
         )
+      )
       )
       )
     )
