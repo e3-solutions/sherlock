@@ -23,6 +23,7 @@ def main() -> int:
     try:
         from sherlock_collector.config import ConfigurationError, load_config
         from sherlock_collector.scheduler import scheduler_status
+        from sherlock_collector.spool import DurableSpool
     except ImportError:
         print(json.dumps({"status": "degraded", "reason": "runtime_missing"}))
         return 1
@@ -32,12 +33,21 @@ def main() -> int:
     except ConfigurationError as error:
         configuration = str(error)
     scheduler = scheduler_status(home, check_loaded=True)
-    ok = configuration == "ok" and scheduler.get("status") in {"installed", "disabled"}
+    try:
+        upload = DurableSpool(home / "sherlock" / "telemetry" / "queue").upload_status()
+    except (OSError, ValueError) as error:
+        upload = {"status": "unreadable", "reason": str(error)}
+    ok = (
+        upload["status"] == "ready"
+        and configuration == "ok"
+        and scheduler.get("status") in {"installed", "disabled"}
+    )
     print(
         json.dumps(
             {
                 "status": "ok" if ok else "degraded",
                 "configuration": configuration,
+                "upload": upload,
                 "scheduler": scheduler,
             },
             sort_keys=True,

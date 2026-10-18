@@ -48,7 +48,8 @@ PYTHONPATH="$CLAUDE_CONFIG_DIR/sherlock/runtime" python3 -m sherlock_collector.c
 Set those home variables explicitly or substitute `~/.codex` and `~/.claude`.
 Each reconciliation captures at most 64 files and 128 MiB, rotates unfinished
 sources, and attempts at most 128 uploads. `reconcile --max-files`, `--max-bytes`,
-and `--max-uploads` change these limits. Complete native records are atomic;
+and `--max-uploads` change these limits; upload scheduling stops after 120
+seconds (already running requests may finish). Complete native records are atomic;
 a record above a run's byte budget stays deferred until a larger budget is used.
 Records above the 100-MiB contract cap remain blocked with their source path and
 reason in `sherlock/telemetry/<provider>-reconcile.json`. Incomplete trailing
@@ -56,13 +57,44 @@ records remain there until the provider writes the newline. Missing sources
 remain auditable in the ledger. Discovery scans native file metadata and bounded
 prefixes across retained history, so its cost grows with the number of files.
 
-Transient upload failures retry with persisted exponential backoff (one minute
-through one day). Permanent rejections retain the original manifest and payload
-under `sherlock/telemetry/queue/dead-letter`, with an error and timestamp, while
-other byte ranges continue. Dead letters require operator review and requeue
-after the underlying rejection is corrected; they never count as committed
-receipts. Existing evidence captured at an old partial-line cursor remains
-immutable; repair recaptures complete lines in an explicit new generation.
+Both providers capture only complete newline-terminated records. Claude's terminal
+hooks retain their existing bounded wait for the asynchronous transcript writer.
+If a final Codex Stop record (or a late Claude write) is still missing its newline,
+its cursor stays put; the next eligible hook or periodic reconciliation captures
+it once complete. With no further hooks this adds roughly one scheduler interval
+(15 minutes after the newline is written), subject to run budgets and backoff.
+Legacy cursors inside a line continue from the existing offset in the same
+generation: the remainder through the next newline stays a split record, while
+all subsequent capture uses complete lines. Existing raw artifacts stay immutable,
+and the ledger records `legacy_unterminated_cursor_continued` for audit.
+
+Upload failures retry with persisted exponential backoff (one minute through one
+day). Shared endpoint, auth and identity failures stop new upload scheduling;
+already running requests finish, and all rejected items stay queued. A shared
+cooldown in `sherlock/telemetry/queue/upload-status.json` also applies to subsequent
+hook drains and newly captured streams. `reconcile` reports `collector_failure`
+and exits 75; both install verifiers report degraded status with the server code,
+HTTP status and next retry time until an upload succeeds. HTTP 401/403/404/405/407
+and 410 are shared failures because they describe identity, routing or a retired
+endpoint. Unknown codes, unqualified 413s, identity conflicts and unsupported
+contract/encoding responses also stay queued for configuration or deploy repair.
+
+Only explicit batch-specific server codes can dead-letter: HTTP 400 manifest,
+payload, gzip or integrity failures; HTTP 409 storage/range/record/generation
+conflicts or range overlaps; and HTTP 413 `payload_too_large`. The current server
+has no batch-specific 422 code, so 422 remains queued. These rejections retain the
+original manifest and payload under `sherlock/telemetry/queue/dead-letter`, with
+the server code, HTTP status and timestamp, while other byte ranges continue.
+Dead letters require operator review and requeue after the rejection is corrected;
+they never count as committed receipts.
+
+Scheduled runs have no interactive input and write to
+`sherlock/telemetry/<provider>-reconcile.log` under the state root. Logs rotate at
+1 MiB with three backups (at most 4 MiB per provider), with owner-only permissions.
+A scheduler-run lock covers logging, discovery, capture and drain, and independent
+capture/drain locks coordinate manual commands and hooks. LaunchAgents use
+`ProcessType=Background`, `Nice=10` and low-priority I/O; systemd uses a oneshot
+service with `Nice=10` and `IOSchedulingClass=idle`; cron uses `nice -n 10`.
 
 Inspect or uninstall a home's scheduler without removing telemetry:
 

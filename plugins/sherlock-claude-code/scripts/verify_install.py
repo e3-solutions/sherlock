@@ -11,9 +11,11 @@ PLUGIN_ID = "sherlock-claude-code@sherlock"
 
 
 def main() -> int:
-    claude_home = Path(
-        os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")
-    ).expanduser().resolve()
+    claude_home = (
+        Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+        .expanduser()
+        .resolve()
+    )
     settings_path = claude_home / "settings.json"
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -25,19 +27,34 @@ def main() -> int:
         print(f"Claude plugin is not enabled: {PLUGIN_ID}", file=sys.stderr)
         return 1
     runtime = claude_home / "sherlock" / "runtime"
-    source = Path(__file__).resolve().parents[3] / "packages" / "telemetry-collector" / "src"
+    source = (
+        Path(__file__).resolve().parents[3] / "packages" / "telemetry-collector" / "src"
+    )
     sys.path.insert(0, str(runtime if runtime.is_dir() else source))
     try:
         from sherlock_collector.scheduler import scheduler_status
+        from sherlock_collector.spool import DurableSpool
+
         scheduler = scheduler_status(claude_home, check_loaded=True)
+        try:
+            upload = DurableSpool(
+                claude_home / "sherlock" / "telemetry" / "queue"
+            ).upload_status()
+        except (OSError, ValueError) as error:
+            upload = {"status": "unreadable", "reason": str(error)}
     except ImportError:
         scheduler = {"status": "runtime_missing"}
-    scheduler_ok = scheduler.get("status") in {"installed", "disabled"}
+        upload = {"status": "runtime_missing"}
+    scheduler_ok = upload["status"] == "ready" and scheduler.get("status") in {
+        "installed",
+        "disabled",
+    }
     print(
         json.dumps(
             {
                 "status": "ok" if scheduler_ok else "degraded",
                 "scheduler": scheduler,
+                "upload": upload,
                 "check": "local_plugin_enabled",
                 "plugin": PLUGIN_ID,
             },

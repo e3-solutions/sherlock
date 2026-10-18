@@ -360,7 +360,11 @@ class RolloutCapturer:
             if state is not None and not replaced and state.offset and not self.capture_unterminated_tail:
                 handle.seek(state.offset - 1)
                 legacy_tail = handle.read(1) != b"\n"
-            if replaced or legacy_tail:
+            if legacy_tail:
+                # Earlier collectors split this record already. Keep its generation
+                # and continue from the durable cursor without replaying history.
+                state.recovery_reason = "legacy_unterminated_cursor_continued"
+            if replaced:
                 sequence = 0 if state is None else state.generation_seq + 1
                 state = StreamState(
                     path=str(path),
@@ -377,7 +381,6 @@ class RolloutCapturer:
                         sequence,
                     ),
                     offset=0,
-                    recovery_reason="legacy_unterminated_cursor_recaptured" if legacy_tail else None,
                 )
             enqueued = captured = 0
             while state.offset < stable_end and captured < byte_budget:

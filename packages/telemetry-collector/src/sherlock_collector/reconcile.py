@@ -199,6 +199,7 @@ def reconcile(
             or capture.errors
             or drain is None
             or drain.locked
+            or drain.collector_failure
         )
         return {
             "status": "partial" if partial else "complete",

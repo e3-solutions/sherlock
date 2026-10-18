@@ -17,8 +17,22 @@ class TransientUploadError(RuntimeError):
     pass
 
 
+class CollectorUploadError(TransientUploadError):
+    """A shared endpoint/identity failure; stop all streams until a later probe."""
+
+    def __init__(self, message: str, *, error_code: str | None, http_status: int):
+        super().__init__(message)
+        self.error_code = error_code
+        self.http_status = http_status
+
+
 class PermanentUploadError(RuntimeError):
-    pass
+    """An explicit server rejection of this artifact, with its audit identity."""
+
+    def __init__(self, message: str, *, error_code: str, http_status: int):
+        super().__init__(message)
+        self.error_code = error_code
+        self.http_status = http_status
 
 
 class UploadTransport(Protocol):
@@ -32,6 +46,7 @@ class DrainResult:
     dead_lettered: int = 0
     recovered: int = 0
     locked: bool = False
+    collector_failure: dict | None = None
 
 
 class Drain:
@@ -58,10 +73,20 @@ class Drain:
             except BlockingIOError:
                 return DrainResult(locked=True)
             recovered = self.spool.recover_processing()
+            status = self.spool.upload_status()
+            if (
+                status.get("status") == "blocked"
+                and status["next_upload_at"] > time.time()
+            ):
+                return DrainResult(recovered=recovered, collector_failure=status)
             uploaded = requeued = dead_lettered = 0
             blocked_streams: set[tuple[str, str]] = set()
             frontiers, invalid = self._pending_frontiers(blocked_streams)
-            while (frontiers or invalid) and uploaded + requeued + dead_lettered < max_items and time.monotonic() < deadline:
+            while (
+                (frontiers or invalid)
+                and uploaded + requeued + dead_lettered < max_items
+                and time.monotonic() < deadline
+            ):
                 outcomes = self._drain_frontiers(
                     frontiers,
                     invalid,
@@ -73,11 +98,31 @@ class Drain:
                 requeued += outcomes[1]
                 dead_lettered += outcomes[2]
 
+                if outcomes[3] is not None:
+                    status = self.spool.defer_uploads(outcomes[3])
+                    return DrainResult(
+                        uploaded,
+                        requeued,
+                        dead_lettered,
+                        recovered,
+                        collector_failure=status,
+                    )
+
                 # Producers do not take the drain lock. Inventory the queue again
                 # only after the current frontier is quiet so artifacts enqueued
                 # during uploads are observed without returning to quadratic scans.
                 frontiers, invalid = self._pending_frontiers(blocked_streams)
-            return DrainResult(uploaded, requeued, dead_lettered, recovered, False)
+            if uploaded:
+                self.spool.clear_upload_failure()
+            elif status.get("status") == "blocked":
+                return DrainResult(
+                    uploaded,
+                    requeued,
+                    dead_lettered,
+                    recovered,
+                    collector_failure=status,
+                )
+            return DrainResult(uploaded, requeued, dead_lettered, recovered)
 
     def _pending_frontiers(
         self,
@@ -110,7 +155,8 @@ class Drain:
             ordered.setdefault(stream, []).append((order, path))
         frontiers = {
             stream: deque(path for _, path in sorted(items))
-            for stream, items in sorted(ordered.items()) if stream not in blocked_streams
+            for stream, items in sorted(ordered.items())
+            if stream not in blocked_streams
         }
         return frontiers, invalid
 
@@ -121,16 +167,29 @@ class Drain:
         blocked_streams: set[tuple[str, str]],
         max_items: int,
         deadline: float,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, CollectorUploadError | None]:
         uploaded = requeued = dead_lettered = 0
+        collector_error = None
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            in_flight: dict[Future[str], tuple[str, str] | None] = {}
+            in_flight: dict[
+                Future[str | CollectorUploadError], tuple[str, str] | None
+            ] = {}
 
-            ready = deque((stream, paths.popleft()) for stream, paths in frontiers.items() if paths)
+            ready = deque(
+                (stream, paths.popleft())
+                for stream, paths in frontiers.items()
+                if paths
+            )
             ready.extend((None, path) for path in invalid)
             submitted = 0
             while ready or in_flight:
-                while ready and len(in_flight) < self.max_workers and submitted < max_items and time.monotonic() < deadline:
+                while (
+                    collector_error is None
+                    and ready
+                    and len(in_flight) < self.max_workers
+                    and submitted < max_items
+                    and time.monotonic() < deadline
+                ):
                     stream, path = ready.popleft()
                     if stream in blocked_streams:
                         continue
@@ -142,7 +201,10 @@ class Drain:
                 for future in completed:
                     stream = in_flight.pop(future)
                     outcome = future.result()
-                    if outcome == "uploaded":
+                    if isinstance(outcome, CollectorUploadError):
+                        requeued += 1
+                        collector_error = outcome
+                    elif outcome == "uploaded":
                         uploaded += 1
                     elif outcome == "requeued":
                         requeued += 1
@@ -150,12 +212,16 @@ class Drain:
                             blocked_streams.add(stream)
                     elif outcome == "dead-lettered":
                         dead_lettered += 1
-                    if stream is not None and stream not in blocked_streams and frontiers.get(stream):
+                    if (
+                        stream is not None
+                        and stream not in blocked_streams
+                        and frontiers.get(stream)
+                    ):
                         ready.append((stream, frontiers[stream].popleft()))
 
-        return uploaded, requeued, dead_lettered
+        return uploaded, requeued, dead_lettered, collector_error
 
-    def _upload_claimed(self, pending_path: Path) -> str:
+    def _upload_claimed(self, pending_path: Path) -> str | CollectorUploadError:
         claimed = self.spool.claim(pending_path)
         if claimed is None:
             return "missing"
@@ -174,6 +240,10 @@ class Drain:
                 validated_receipt,
                 token_payload,
             )
+        except CollectorUploadError as error:
+            # upload() is called only after a readable item has been loaded.
+            self.spool.requeue(claimed, item, error)
+            return error
         except (TransientUploadError, ReceiptMismatch) as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
