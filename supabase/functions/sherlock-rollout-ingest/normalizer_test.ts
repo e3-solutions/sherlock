@@ -481,7 +481,7 @@ Deno.test("normalizer emits observable unknown events for malformed records", as
   assert(projection.events[0].error_code === "native_malformed");
 });
 
-Deno.test("normalizer never parses a native record fragment", async () => {
+Deno.test("normalizer never parses a native record fragment above 100 MiB", async () => {
   const { manifest, source } = await fixture([{
     timestamp: "2026-08-15T00:00:00Z",
     type: "event_msg",
@@ -497,10 +497,10 @@ Deno.test("normalizer never parses a native record fragment", async () => {
     occurred_at: null,
     parse_status: "fragment",
     native_record_start_offset: 0,
-    native_record_end_offset: source.byteLength * 2,
+    native_record_end_offset: 104 * 1024 * 1024 + 7,
     native_record_sha256: "f".repeat(64),
     fragment_index: 0,
-    fragment_count: 2,
+    fragment_count: 27,
   };
 
   const projection = await projectBatch(manifest, source);
@@ -538,10 +538,10 @@ Deno.test("Claude fragments cannot poison provider-specific session facts", asyn
     occurred_at: null,
     parse_status: "fragment",
     native_record_start_offset: 0,
-    native_record_end_offset: source.byteLength * 2,
+    native_record_end_offset: 104 * 1024 * 1024 + 7,
     native_record_sha256: "f".repeat(64),
     fragment_index: 0,
-    fragment_count: 2,
+    fragment_count: 27,
   };
 
   const projection = await projectBatch(manifest, source);
