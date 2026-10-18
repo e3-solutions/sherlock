@@ -121,6 +121,12 @@ const queryWindowInput = {
     .describe("Exclusive end. Defaults to the server read time and cannot be in the future."),
 };
 
+const usageWindowInput = {
+  ...queryWindowInput,
+  start: ISO_TIMESTAMP.optional()
+    .describe("Inclusive start. Defaults to 7 days before end. Maximum window: 30 days."),
+};
+
 const queryWindowOutputSchema = z.object({
   startInclusive: ISO_TIMESTAMP,
   endExclusive: ISO_TIMESTAMP,
@@ -151,7 +157,7 @@ const diagnosticsOutputSchema = z.object({
   pendingNormalizationJobs: z.number().int().nonnegative().nullable(),
 }).strict();
 
-const coverageInputSchema = z.object(queryWindowInput).strict();
+const coverageInputSchema = z.object(usageWindowInput).strict();
 const coverageState = z.enum(["partial", "missing"]);
 const coverageOutputSchema = z.object({
   schemaVersion: z.literal(MCP_QUERY_SCHEMA_VERSION),
@@ -222,7 +228,7 @@ const getSessionOutputSchema = z.object({
 }).strict();
 
 const queryUsageInputSchema = z.object({
-  ...queryWindowInput,
+  ...usageWindowInput,
   groupBy: z.enum(["person", "model", "person_model"]).optional()
     .describe("Provider remains a dimension in every grouping."),
 }).strict();
@@ -296,6 +302,8 @@ const queryUsageOutputSchema = z.object({
   }).strict(),
 }).strict();
 
+const USAGE_WINDOW_DOCUMENTATION = "Usage and coverage default to the trailing 7 days, accept historical windows up to 30 days, and return window_too_large or query_timeout with narrowing guidance. Paginated session queries search all stored history by default. Row, group, transaction-time, workspace, and roster safety bounds still apply.";
+
 const QUERY_DOCUMENTATION = Object.freeze({
   schemaVersion: MCP_QUERY_SCHEMA_VERSION,
   service: "sherlock",
@@ -304,12 +312,12 @@ const QUERY_DOCUMENTATION = Object.freeze({
     "Read-only private-schema queries through the constrained sherlock_reader role.",
     "No raw Storage or SQL execution is exposed; the new query tools also omit transcript search, message and prompt content, filesystem paths, and repository remotes.",
     "The pre-existing list_prompt_evidence tool still returns bounded, explicitly untrusted prompt excerpts.",
-    "Time-window queries search all stored history by default and accept any valid historical duration; row, group, transaction-time, workspace, and roster safety bounds still apply.",
+    USAGE_WINDOW_DOCUMENTATION,
     "The shared bearer is a transport gate, not principal-scoped authorization; Cosmos provides authenticated org-wide access and call auditing.",
   ],
   tools: [
     { name: "diagnostics", purpose: "Check the read-only backend and normalization freshness without running an activity query." },
-    { name: "coverage", purpose: "Check observed session/usage coverage and pending normalization for any historical window." },
+    { name: "coverage", purpose: "Check observed session/usage coverage and pending normalization for windows up to 30 days (default 7 days)." },
     { name: "list_sessions", purpose: "Page through safe session metadata; no titles, content, paths, branches, or repository remotes." },
     { name: "get_session", purpose: "Read one workspace-scoped session metadata record and aggregate event counts." },
     { name: "query_usage", purpose: "Aggregate Codex and Claude token observations by person/model with cumulative streams differenced correctly." },
@@ -359,6 +367,16 @@ const ERRORS = {
     retryable: false,
     recovery: "Ask the Sherlock operator to review the configured roster bound before retrying.",
   },
+  window_too_large: {
+    message: "Usage and coverage windows cannot exceed 30 days.",
+    retryable: false,
+    recovery: "Provide an explicit window with start and end at most 30 days apart. Omitted start defaults to 7 days before end.",
+  },
+  query_timeout: {
+    message: "The usage query exceeded its database work budget.",
+    retryable: false,
+    recovery: "Retry with a narrower explicit time window. Full touched-session history is retained for reconciliation; if even a 1-day window fails, ask the operator to review query plans and usage indexes.",
+  },
   unavailable: {
     message: "Usage evidence is temporarily unavailable.",
     retryable: true,
@@ -386,6 +404,8 @@ function errorCode(error, { search = false } = {}) {
     return error.code === "invalid_argument" ? "invalid_argument" : "unavailable";
   }
   if (error instanceof FlameSourceError) {
+    if (error.code === "flame_mcp_query_window_too_large") return "window_too_large";
+    if (error.code === "flame_mcp_query_timeout") return "query_timeout";
     if (error.code.endsWith("_roster_too_large")) return "roster_too_large";
     if (error.code.endsWith("_result_too_large")) return "result_too_large";
     if (error.code.endsWith("_snapshot_expired") ||
@@ -423,7 +443,9 @@ function documentation(source) {
   if (!search && !providerUsage) return QUERY_DOCUMENTATION;
   return {
     ...QUERY_DOCUMENTATION,
-    boundaries: search ? SEARCH_DOCUMENTATION.boundaries : QUERY_DOCUMENTATION.boundaries,
+    boundaries: search
+      ? [...SEARCH_DOCUMENTATION.boundaries, USAGE_WINDOW_DOCUMENTATION]
+      : QUERY_DOCUMENTATION.boundaries,
     tools: [
       ...QUERY_DOCUMENTATION.tools,
       ...(providerUsage ? [{ name: "list_provider_usage", purpose: "Read recovered provider plan percentages with cutoff and coverage; separate from tokens." }] : []),
@@ -512,7 +534,7 @@ export function registerBonaparteTools(server, source) {
     "coverage",
     {
       title: "Sherlock coverage",
-      description: "Report observed session and usage coverage for any historical window. Omitting start searches all stored history. Missing and partial states remain explicit and are never converted to zero-confidence claims.",
+      description: "Report observed session and usage coverage for historical windows up to 30 days. Omitting start uses the trailing 7 days before end. Overlarge windows return window_too_large; excessive work returns query_timeout. Missing and partial states remain explicit and are never converted to zero-confidence claims.",
       inputSchema: coverageInputSchema,
       outputSchema: coverageOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -566,7 +588,7 @@ export function registerBonaparteTools(server, source) {
     "query_usage",
     {
       title: "Query Sherlock token usage",
-      description: "Aggregate observed Codex and Claude token facts by person, model, or both for any historical window. Omitting start searches all stored history. Codex cumulative streams are differenced; Claude incremental facts are summed. Coverage exposes missing baselines, regressions, and pending normalization.",
+      description: "Aggregate observed Codex and Claude token facts by person, model, or both for historical windows up to 30 days. Omitting start uses the trailing 7 days before end. Overlarge windows return window_too_large; excessive work returns query_timeout. Codex cumulative streams are differenced; Claude incremental facts are summed. Coverage exposes missing baselines, regressions, and pending normalization.",
       inputSchema: queryUsageInputSchema,
       outputSchema: queryUsageOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,

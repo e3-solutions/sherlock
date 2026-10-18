@@ -21,6 +21,7 @@ import {
   PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
 } from "./flame-source.js";
+import { expectUsageQueryParity } from "./test-fixtures/usage-query-oracle.js";
 import { createSherlockQuerySource } from "./mcp-query-source.js";
 
 const DATABASE_URL = process.env.SHERLOCK_TEST_DATABASE_URL;
@@ -2406,6 +2407,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
       const ranges = fixture.collisionKey
         ? [[boundary, end]] : [[start, boundary], [boundary, end], [start, end]];
       for (const [from, to] of ranges) {
+        await expectUsageQueryParity(sql, workspaceId, { start: from, end: to });
         windows.push(await querySource.fetchUsage({ start: from, end: to, now: new Date(end) }));
         coverageEvents.push((await querySource.fetchCoverage({
           start: from, end: to, now: new Date(end),

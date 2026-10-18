@@ -7,6 +7,9 @@ export const USAGE_DERIVATION_VERSION = "sherlock.usage-reconciliation.v1";
 export const MCP_QUERY_DEFAULT_LIMIT = 20;
 export const MCP_QUERY_MAX_LIMIT = 100;
 export const MCP_QUERY_MAX_GROUPS = 200;
+export const MCP_USAGE_DEFAULT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+export const MCP_USAGE_MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
 export const MCP_QUERY_HISTORY_START = "1970-01-01T00:00:00.000Z";
 
 const SESSION_CURSOR_VERSION = "s1";
@@ -58,6 +61,16 @@ export function activeNormalizerPredicate(event, session, batch, cutover) {
       )
     )
   )`;
+}
+
+// CASE keeps PostgreSQL from pushing Codex projection probes below the provider
+// join and running them for every Claude assistant message.
+function activeUsageNormalizerPredicate(event, session, batch, cutover) {
+  return `case when ${batch}.source_provider = 'claude_code'
+    then ${event}.normalizer_version = '${FRAME_CLAUDE_VERSION}'
+    when ${batch}.source_provider = 'codex'
+    then ${activeNormalizerPredicate(event, session, batch, cutover)}
+    else false end`;
 }
 
 function canonicalNormalizer(event) {
@@ -123,6 +136,30 @@ export function queryWindow({ start, end } = {}, now = new Date()) {
     throw new FlameSourceError("flame_mcp_query_request_invalid");
   }
   return { startAt, endAt, readAt: read };
+}
+
+// Usage is intentionally bounded independently of paginated session metadata.
+export function usageWindow({ start, end } = {}, now = new Date()) {
+  const endAt = end === undefined ? asDate(now) : asDate(end);
+  const window = queryWindow({
+    start: start === undefined ? new Date(endAt.getTime() - MCP_USAGE_DEFAULT_WINDOW_MS) : start,
+    end: endAt,
+  }, now);
+  if (window.endAt - window.startAt > MCP_USAGE_MAX_WINDOW_MS) {
+    throw new FlameSourceError("flame_mcp_query_window_too_large");
+  }
+  return window;
+}
+
+async function usageTransaction(source, callback, signal) {
+  try {
+    return await source.transaction(callback, { signal, statementTimeoutMs: 20_000 });
+  } catch (error) {
+    if (error?.code === "flame_database_timeout" || error?.code === "57014") {
+      throw new FlameSourceError("flame_mcp_query_timeout", { cause: error });
+    }
+    throw error;
+  }
 }
 
 function parseLimit(value) {
@@ -415,34 +452,35 @@ async function ensureRosterBound(tx, source, signal) {
   }
 }
 
-// Reconcile the usage view from immutable native occurrences. History is scoped
-// to sessions touched by the window: a pre-window discontinuity must not become
-// an apparently valid baseline when the caller changes the reporting window.
-// Inline parameter bounds so PostgreSQL can use events_session_occurred_idx
-// when finding window-touched sessions instead of scanning their entire history.
-export const QUERY_USAGE_SQL = `
+// Fence the window lookup before joining the small roster. Otherwise the planner
+// walks every historical session per person. Reconciliation must still read ALL
+// usage/context history of touched sessions (including after end_at): canonical
+// corrections, source conflicts and pre-window regressions can change the result.
+const USAGE_SESSIONS_SQL = `
 with p as not materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text expected_email_domain
+), window_sessions as materialized (
+  select distinct e.session_id
+    from telemetry.events e
+   where e.workspace_id = $1 and e.event_kind = 'usage' and not e.is_replay
+     and e.occurred_at >= $2 and e.occurred_at < $3
 ), roster as materialized (
   select pe.id person_id,
          coalesce(nullif(btrim(pe.display_name), ''), 'Unknown') display_name
-    from telemetry.people pe cross join p
-   where pe.workspace_id = p.workspace_id
+    from telemetry.people pe
+   where pe.workspace_id = $1
      and pe.github_id is distinct from 'sherlock-smoke'
-     and split_part(pe.email, '@', 2) = p.expected_email_domain
+     and split_part(pe.email, '@', 2) = $4
      and split_part(pe.email, '@', 3) = ''
 ), eligible_sessions as materialized (
   select s.id session_id, s.person_id, r.display_name, s.started_at
-    from telemetry.sessions s join roster r on r.person_id = s.person_id cross join p
-   where s.workspace_id = p.workspace_id and s.started_at < p.end_at
-     and exists (
-       select 1 from telemetry.events w
-        where w.workspace_id = p.workspace_id and w.session_id = s.id
-          and w.event_kind = 'usage' and not w.is_replay
-          and w.occurred_at >= p.start_at and w.occurred_at < p.end_at
-     )
-), candidates as materialized (
+    from window_sessions w
+    join telemetry.sessions s on s.workspace_id = $1 and s.id = w.session_id
+    join roster r on r.person_id = s.person_id
+)`;
+
+export const QUERY_USAGE_SQL = `${USAGE_SESSIONS_SQL}, candidates as not materialized (
   select e.id, e.session_id, s.person_id, s.display_name, s.started_at,
          e.normalizer_version, e.event_kind, e.event_subtype, e.projection_index,
          e.canonical_scope_key, e.logical_event_key, e.usage_stream_key, e.usage_is_cumulative,
@@ -465,48 +503,45 @@ with p as not materialized (
      and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
     cross join p
    where e.workspace_id = p.workspace_id and not e.is_replay
+     and s.started_at < p.end_at
      and (e.event_kind = 'usage' or
           e.event_kind = 'lifecycle' and e.event_subtype = 'turn_context')
-     and ${activeNormalizerPredicate("e", "s", "ib", "c")}
-), canonical_ranked as materialized (
+     and ${activeUsageNormalizerPredicate("e", "s", "ib", "c")}
+), canonical_ranked as not materialized (
   select *, row_number() over (
     partition by session_id, normalizer_version, canonical_scope_key, logical_event_key, event_kind
     order by source_priority desc, usage_at, id
   ) canonical_rank
   from candidates
-), canonical_events as materialized (
+), canonical_events as not materialized (
   select * from canonical_ranked
    where canonical_rank = 1 or canonical_scope_key is null or logical_event_key is null
-), native_positions as materialized (
-  select session_id, provider, canonical_scope_key, native_start, native_end,
-         min(native_hash) <> max(native_hash) hash_conflict
-    from canonical_events
-   group by session_id, provider, canonical_scope_key, native_start, native_end
-), position_conflicts as materialized (
-  select *, hash_conflict
+), position_assessed as not materialized (
+  -- Peer groups are distinct native byte ranges. GROUPS frames assess adjacent
+  -- ranges without joining a wide event history back to its grouped positions.
+  select *, min(native_hash) over position_peers <> max(native_hash) over position_peers
     or coalesce(max(native_end) over (
-      partition by session_id, provider, canonical_scope_key
-      order by native_start, native_end rows between unbounded preceding and 1 preceding
+      position_order groups between unbounded preceding and 1 preceding
     ) > native_start, false)
-    or coalesce(lead(native_start) over (
-      partition by session_id, provider, canonical_scope_key
-      order by native_start, native_end
+    or coalesce(min(native_start) over (
+      position_order groups between 1 following and 1 following
     ) < native_end, false) source_conflict
-  from native_positions
-), ranked as materialized (
-  select ce.*, pc.source_conflict,
-         row_number() over (
-           partition by ce.session_id, ce.provider, ce.canonical_scope_key,
-             ce.native_start, ce.native_end, native_hash, event_kind, projection_index
-           order by source_priority desc, id
-         ) source_rank
-    from canonical_events ce
-    join position_conflicts pc on pc.session_id = ce.session_id and pc.provider = ce.provider
-      and pc.canonical_scope_key is not distinct from ce.canonical_scope_key
-      and pc.native_start = ce.native_start and pc.native_end = ce.native_end
-), native_events as materialized (
+    from canonical_events
+  window position_peers as (
+    partition by session_id, provider, canonical_scope_key, native_start, native_end
+  ), position_order as (
+    partition by session_id, provider, canonical_scope_key order by native_start, native_end
+  )
+), ranked as not materialized (
+  select *, row_number() over (
+    partition by session_id, provider, canonical_scope_key,
+      native_start, native_end, native_hash, event_kind, projection_index
+    order by source_priority desc, id
+  ) source_rank
+  from position_assessed
+), native_events as not materialized (
   select * from ranked where source_rank = 1
-), contextualized as materialized (
+), contextualized as not materialized (
   select *,
          count(*) filter (where event_subtype = 'turn_context') over source_order context_number,
          bool_or(source_conflict) over source_order source_uncertain
@@ -515,7 +550,7 @@ with p as not materialized (
     partition by session_id, provider, canonical_scope_key
     order by native_start, native_end, id rows unbounded preceding
   )
-), attributed as materialized (
+), attributed as not materialized (
   select *, case when provider = 'claude'
                 then coalesce(nullif(btrim(recorded_model), ''), 'unknown')
                 when source_uncertain then 'unknown'
@@ -524,7 +559,15 @@ with p as not materialized (
                 ) over (partition by session_id, provider, canonical_scope_key, context_number), 'unknown')
            end model
     from contextualized
-), ordered as materialized (
+), usage_attributed as materialized (
+  -- Incremental facts need source/model assessment, but no cumulative windows.
+  -- Retain only fields needed by arithmetic before sharing the two branches.
+  select id, session_id, person_id, display_name, started_at, provider, model,
+         usage_stream_key, usage_is_cumulative, input_tokens, cached_input_tokens,
+         output_tokens, reasoning_tokens, total_tokens, usage_at, native_start,
+         native_end, in_window, source_uncertain
+    from attributed where event_kind = 'usage'
+), ordered as not materialized (
   select *,
          lag(input_tokens) over stream_order previous_input,
          lag(cached_input_tokens) over stream_order previous_cached,
@@ -532,12 +575,12 @@ with p as not materialized (
          lag(reasoning_tokens) over stream_order previous_reasoning,
          lag(total_tokens) over stream_order previous_total,
          lag(id) over stream_order previous_id
-    from attributed where event_kind = 'usage'
+    from usage_attributed where usage_is_cumulative
   window stream_order as (
     partition by session_id, provider, usage_stream_key, usage_is_cumulative
     order by native_start, native_end, id
   )
-), assessed as materialized (
+), assessed_cumulative as not materialized (
   select *, bool_or(
     usage_is_cumulative and previous_id is not null and (
       input_tokens < previous_input or cached_input_tokens < previous_cached
@@ -551,7 +594,15 @@ with p as not materialized (
     (usage_is_cumulative and previous_id is null
       and started_at < (select start_at from p)) missing_baseline
   from ordered
-), contributions as materialized (
+), assessed as not materialized (
+  select * from assessed_cumulative
+  union all
+  select *, null::bigint previous_input, null::bigint previous_cached,
+         null::bigint previous_output, null::bigint previous_reasoning,
+         null::bigint previous_total, null::bigint previous_id,
+         false stream_regressed, false missing_baseline
+    from usage_attributed where not usage_is_cumulative
+), contributions as not materialized (
   select *,
     case when stream_regressed or source_uncertain then 0
          when not usage_is_cumulative then coalesce(input_tokens, 0)
@@ -725,38 +776,80 @@ select selected.id::text session_id, selected.person_id::text,
   from selected cross join facts
 `;
 
+// Coverage needs only window observations and their possible out-of-window
+// canonical competitors. Unlike cumulative arithmetic it does not need every
+// usage observation from a long-lived session. Materialize before roster joins
+// so discovery is driven by events_usage_window_idx.
+const COVERAGE_PROJECTION_COLUMNS = `e.id, e.workspace_id, e.session_id,
+  e.source_record_id, e.normalizer_version, e.canonical_scope_key,
+  e.logical_event_key, e.event_kind, e.projection_index, e.source_priority, e.occurred_at`;
+
 export const COVERAGE_SQL = `
-with roster as materialized (
+with window_usage as materialized (
+  select ${COVERAGE_PROJECTION_COLUMNS}
+    from telemetry.events e
+   where e.workspace_id = $1 and e.event_kind = 'usage' and not e.is_replay
+     and e.occurred_at >= $2 and e.occurred_at < $3
+     and e.normalizer_version = any($5::text[])
+), roster as materialized (
   select pe.id person_id
     from telemetry.people pe
    where pe.workspace_id = $1 and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = $4 and split_part(pe.email, '@', 3) = ''
-), candidates as materialized (
-  select e.id, e.session_id,
-         row_number() over (
-           partition by e.session_id, ib.source_provider, e.canonical_scope_key,
-             coalesce(nr.native_record_start_offset, nr.source_start_offset),
-             coalesce(nr.native_record_end_offset, nr.source_end_offset),
-             coalesce(nr.native_record_sha256, nr.record_sha256), e.event_kind, e.projection_index
-           order by e.source_priority desc, e.occurred_at, e.id
-         ) canonical_rank
-    from telemetry.sessions s
+), window_candidates as materialized (
+  select w.*, s.started_at
+    from window_usage w
+    join telemetry.sessions s on s.workspace_id = $1 and s.id = w.session_id
     join roster r on r.person_id = s.person_id
+), window_keys as materialized (
+  select distinct session_id, started_at, normalizer_version, canonical_scope_key, logical_event_key
+    from window_candidates
+   where canonical_scope_key is not null and logical_event_key is not null
+), projections as materialized (
+  select * from window_candidates
+  union all
+  select ${COVERAGE_PROJECTION_COLUMNS}, k.started_at
+    from window_keys k
     join telemetry.events e
-      on e.workspace_id = s.workspace_id and e.session_id = s.id
+      on e.workspace_id = $1 and e.session_id = k.session_id
+     and e.normalizer_version = k.normalizer_version
+     and e.canonical_scope_key = k.canonical_scope_key
+     and e.logical_event_key = k.logical_event_key
+     and e.event_kind = 'usage' and not e.is_replay
+   where (e.occurred_at >= $2 and e.occurred_at < $3) is not true
+), active_usage as materialized (
+  select e.id, e.session_id, e.normalizer_version, e.canonical_scope_key,
+         e.logical_event_key, e.event_kind, e.projection_index, e.source_priority,
+         e.occurred_at, ib.source_provider,
+         coalesce(nr.native_record_start_offset, nr.source_start_offset) native_start,
+         coalesce(nr.native_record_end_offset, nr.source_end_offset) native_end,
+         coalesce(nr.native_record_sha256, nr.record_sha256) native_hash
+    from projections e
     join telemetry.native_records nr
       on nr.workspace_id = e.workspace_id and nr.id = e.source_record_id
     join telemetry.ingest_batches ib
       on ib.workspace_id = nr.workspace_id and ib.id = nr.batch_id
     left join analytics.normalizer_cutovers c
-      on c.workspace_id = s.workspace_id
-     and c.source_provider = ib.source_provider
+      on c.workspace_id = e.workspace_id and c.source_provider = ib.source_provider
      and c.to_normalizer_version = '${FRAME_CODEX_VERSION}'
-   where s.workspace_id = $1 and e.event_kind = 'usage' and not e.is_replay
-     and e.occurred_at >= $2 and e.occurred_at < $3
-     and e.normalizer_version = any($5::text[])
-     and ${activeNormalizerPredicate("e", "s", "ib", "c")}
-     and ${canonicalWinnerPredicate("e", "s")}
+   where ${activeUsageNormalizerPredicate("e", "e", "ib", "c")}
+), canonical_ranked as materialized (
+  select *, row_number() over (
+    partition by session_id, normalizer_version, canonical_scope_key, logical_event_key, event_kind
+    order by source_priority desc, occurred_at, id
+  ) winner_rank
+  from active_usage
+), window_winners as materialized (
+  select * from canonical_ranked
+   where (winner_rank = 1 or canonical_scope_key is null or logical_event_key is null)
+     and occurred_at >= $2 and occurred_at < $3
+), candidates as (
+  select session_id, row_number() over (
+    partition by session_id, source_provider, canonical_scope_key,
+      native_start, native_end, native_hash, event_kind, projection_index
+    order by source_priority desc, occurred_at, id
+  ) canonical_rank
+  from window_winners
 )
 select count(distinct session_id)::bigint observed_sessions,
        count(*)::bigint observed_usage_events
@@ -790,12 +883,16 @@ export function createSherlockQuerySource(source) {
     },
 
     async fetchUsage({ start, end, groupBy = "person_model", signal, now } = {}) {
-      const window = queryWindow({ start, end }, now);
-      return await source.transaction(async (tx) => {
+      const window = usageWindow({ start, end }, now);
+      return await usageTransaction(source, async (tx) => {
         await ensureRosterBound(tx, source, signal);
         const receiptRows = await runQuery(
           tx, FRESHNESS_RECEIPT_SQL, receiptParams(), signal,
         );
+        // Bound per-operation memory on this pinned transaction. Reconciliation
+        // sorts full touched-session histories; the 4MB default spills heavily
+        // at month-scale volume. SET LOCAL resets when the transaction ends.
+        await runQuery(tx, "set local work_mem = '16MB'", undefined, signal);
         const rows = await runQuery(tx, QUERY_USAGE_SQL, [
           source.workspaceId,
           window.startAt.toISOString(),
@@ -803,7 +900,7 @@ export function createSherlockQuerySource(source) {
           source.expectedEmailDomain,
         ], signal);
         return buildUsageResult(rows, receiptRows[0], { groupBy, ...window });
-      }, { signal, statementTimeoutMs: 20_000 });
+      }, signal);
     },
 
     async fetchSessions({
@@ -908,8 +1005,8 @@ export function createSherlockQuerySource(source) {
     },
 
     async fetchCoverage({ start, end, signal, now } = {}) {
-      const window = queryWindow({ start, end }, now);
-      return await source.transaction(async (tx) => {
+      const window = usageWindow({ start, end }, now);
+      return await usageTransaction(source, async (tx) => {
         await ensureRosterBound(tx, source, signal);
         const receiptRows = await runQuery(
           tx, FRESHNESS_RECEIPT_SQL, receiptParams(), signal,
@@ -947,7 +1044,7 @@ export function createSherlockQuerySource(source) {
           rawWatermark: coverage.rawWatermark,
           canonicalWatermark: coverage.canonicalWatermark,
         };
-      }, { signal });
+      }, signal);
     },
   });
 }

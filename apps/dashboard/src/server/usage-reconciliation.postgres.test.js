@@ -5,7 +5,8 @@ import {
   DirectFlameSource,
   NORMALIZER_VERSION,
 } from "./flame-source.js";
-import { createSherlockQuerySource } from "./mcp-query-source.js";
+import { expectUsageQueryParity } from "./test-fixtures/usage-query-oracle.js";
+import { COVERAGE_SQL, QUERY_USAGE_SQL, createSherlockQuerySource } from "./mcp-query-source.js";
 
 const DATABASE_URL = process.env.SHERLOCK_TEST_DATABASE_URL;
 const describePostgres = DATABASE_URL ? describe : describe.skip;
@@ -34,7 +35,7 @@ async function cleanup(sql, workspaceId) {
   await sql.unsafe("delete from telemetry.workspaces where id = $1", [workspaceId]);
 }
 
-async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
+async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt = null } = {}) {
   const workspaceId = crypto.randomUUID();
   const personId = crypto.randomUUID();
   const sessionId = crypto.randomUUID();
@@ -43,9 +44,9 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
   let batchSequence = 0;
 
   await sql.unsafe(
-    `insert into telemetry.workspaces (id, slug, name)
-     values ($1, $2, 'Usage reconciliation fixture')`,
-    [workspaceId, `usage-reconciliation-${workspaceId}`],
+    `insert into telemetry.workspaces (id, slug, name, created_at)
+     values ($1, $2, 'Usage reconciliation fixture', coalesce($3::timestamptz, now()))`,
+    [workspaceId, `usage-reconciliation-${workspaceId}`, cutoverAt],
   );
   await sql.unsafe(
     `insert into telemetry.people (
@@ -69,6 +70,7 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
     generationKey = `generation-${batchSequence}`,
     generationSeq = 0,
     batchHash = hash(10_000 + batchSequence),
+    provider = "codex",
   } = {}) => {
     const batchId = crypto.randomUUID();
     batchSequence += 1;
@@ -82,7 +84,7 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
          first_occurred_at, last_occurred_at
        ) values (
          $1, $2, $3, 'usage-reconciliation', $4,
-         'codex', 'rollout', $5, $6,
+         $12, $13, $5, $6,
          $7, 0, 1000, 1000,
          $8, $9, 'identity', 1000,
          $8, 32, 'sherlock.rollout-batch.v1', $10, $11
@@ -99,6 +101,8 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
         `usage-reconciliation/${workspaceId}/${batchId}.jsonl`,
         "2026-09-10T10:00:00.000Z",
         "2026-09-10T13:00:00.000Z",
+        provider,
+        provider === "codex" ? "rollout" : "transcript",
       ],
     );
     return batchId;
@@ -123,8 +127,14 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
     reasoning = total === null ? null : 0,
     stream = "main",
     cumulative = true,
+    normalizer = NORMALIZER_VERSION,
+    isReplay = false,
+    priority = 100,
+    scope = null,
+    logicalKey = null,
+    sourceRecordId = null,
   }) => {
-    const [record] = await sql.unsafe(
+    const [record] = sourceRecordId ? [{ id: sourceRecordId }] : await sql.unsafe(
       `insert into telemetry.native_records (
          workspace_id, batch_id, record_index, source_start_offset,
          source_end_offset, record_sha256, native_type,
@@ -149,17 +159,17 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
          actor_role, occurred_at, observed_at, server_received_at, model,
          usage_stream_key, usage_scope, usage_is_cumulative,
          input_tokens, cached_input_tokens, output_tokens,
-         reasoning_tokens, total_tokens
+         reasoning_tokens, total_tokens, is_replay, canonical_scope_key, logical_event_key
        ) values (
-         $1, $2, $3, $4, 0, 100, $5, $6,
+         $1, $2, $3, $4, 0, $19, $5, $6,
          'primary', $7, $7, $17, $8,
-         $9, $10, $11, $12, $13, $14, $15, $16
+         $9, $10, $11, $12, $13, $14, $15, $16, $18, $20, $21
        )`,
       [
         workspaceId,
         sessionId,
         record.id,
-        NORMALIZER_VERSION,
+        normalizer,
         kind,
         subtype,
         occurredAt,
@@ -173,8 +183,13 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
         kind === "usage" ? reasoning : null,
         kind === "usage" ? total : null,
         serverReceivedAt,
+        isReplay,
+        priority,
+        scope,
+        logicalKey,
       ],
     );
+    return record.id;
   };
 
   const context = (options) => insertEvent({
@@ -193,7 +208,14 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z" } = {}) {
     workspaceId,
     expectedEmailDomain: "e3group.ai",
   });
-  const querySource = createSherlockQuerySource(source);
+  const directQuerySource = createSherlockQuerySource(source);
+  const querySource = {
+    ...directQuerySource,
+    async fetchUsage(args) {
+      await expectUsageQueryParity(sql, workspaceId, args);
+      return await directQuerySource.fetchUsage(args);
+    },
+  };
   return {
     workspaceId,
     personId,
@@ -250,6 +272,119 @@ describePostgres("usage reconciliation PostgreSQL regressions", () => {
       await sql.unsafe("grant sherlock_reader to postgres");
     } finally {
       await sql.end({ timeout: 5 });
+    }
+  });
+
+  it("has valid partial usage indexes and bounds timestamp discovery in both plans", async () => {
+    let fixture;
+    try {
+      fixture = await createFixture();
+      const indexes = await fixture.sql.unsafe(`
+        select c.relname, i.indisvalid, i.indisready, pg_get_indexdef(c.oid) definition
+          from pg_index i join pg_class c on c.oid = i.indexrelid
+         where c.oid in ('telemetry.events_usage_window_idx'::regclass,
+                         'telemetry.events_usage_history_idx'::regclass)
+      `);
+      expect(indexes).toHaveLength(2);
+      for (const index of indexes) {
+        expect(index).toMatchObject({ indisvalid: true, indisready: true });
+        expect(index.definition).toContain("NOT is_replay");
+      }
+      expect(indexes.find((i) => i.relname === "events_usage_window_idx").definition)
+        .toContain("(workspace_id, occurred_at, session_id, id)");
+      const inspect = (value) => {
+        if (!value || typeof value !== "object") return [];
+        return [value, ...Object.values(value).flatMap(inspect)];
+      };
+      await fixture.sql.begin(async (tx) => {
+        await tx.unsafe("set local role sherlock_reader; set local enable_seqscan = off");
+        for (const [sql, params] of [
+          [QUERY_USAGE_SQL, [fixture.workspaceId, WINDOW_START, WINDOW_END, "e3group.ai"]],
+          [COVERAGE_SQL, [fixture.workspaceId, WINDOW_START, WINDOW_END, "e3group.ai",
+            ["sherlock.codex-rollout.v1", "sherlock.codex-rollout.v2", "sherlock.codex-rollout.v3", "sherlock.claude-code-transcript.v1"]]],
+        ]) {
+          const [plan] = await tx.unsafe(`explain (format json) ${sql}`, params);
+          const nodes = inspect(plan["QUERY PLAN"]);
+          // Empty/tiny workspaces can legitimately favor the smaller history
+          // index. Assert the timestamp bounds stay inside discovery, before
+          // roster joins; the volume benchmark exercises the time index.
+          const window = nodes.find((n) => ["CTE window_sessions", "CTE window_usage"].includes(n["Subplan Name"]));
+          const predicates = inspect(window).filter((n) => n["Relation Name"] === "events")
+            .map((n) => `${n["Index Cond"] ?? ""} ${n.Filter ?? ""}`).join(" ");
+          expect(predicates).toContain("workspace_id =");
+          expect(predicates).toContain("occurred_at >=");
+          expect(predicates).toContain("occurred_at <");
+        }
+      });
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it.each([
+    { name: "pre-cutover v1", cutoverAt: WINDOW_END, versions: [1, 2], total: 10 },
+    { name: "pre-cutover v2 fallback", cutoverAt: WINDOW_END, versions: [2], total: 20 },
+    { name: "replay v1 does not suppress v2 fallback", cutoverAt: WINDOW_END, versions: [2], total: 20, replayV1: true },
+    { name: "pre-cutover v3 correction", cutoverAt: WINDOW_END, versions: [1, 2, 3], total: 30 },
+    { name: "post-cutover v2", cutoverAt: "2026-09-10T10:00:00Z", versions: [1, 2], total: 20 },
+    { name: "post-cutover v3 correction", cutoverAt: "2026-09-10T10:00:00Z", versions: [1, 2, 3], total: 30 },
+    { name: "replay v3 does not suppress v1", cutoverAt: WINDOW_END, versions: [1, 2], total: 10, replayV3: true },
+  ])("preserves old SQL results for $name without a v2-to-v3 cutover", async ({ cutoverAt, versions, total, replayV3, replayV1 }) => {
+    let fixture;
+    try {
+      fixture = await createFixture({ startedAt: WINDOW_START, cutoverAt });
+      const batchId = await fixture.createBatch();
+      let sourceRecordId;
+      for (const version of versions) {
+        sourceRecordId = await fixture.usage({
+          batchId, recordIndex: 0, offset: 0, sourceRecordId,
+          normalizer: `sherlock.codex-rollout.v${version}`, total: version * 10,
+          scope: "session", logicalKey: "same-usage",
+        });
+      }
+      if (replayV1) await fixture.usage({
+        batchId, recordIndex: 0, offset: 0, sourceRecordId,
+        normalizer: "sherlock.codex-rollout.v1", total: 999, isReplay: true,
+        scope: "session", logicalKey: "same-usage",
+      });
+      if (replayV3) await fixture.usage({
+        batchId, recordIndex: 0, offset: 0, sourceRecordId,
+        normalizer: "sherlock.codex-rollout.v3", total: 999, isReplay: true,
+        scope: "session", logicalKey: "same-usage",
+      });
+      const result = await fetchUsage(fixture.querySource);
+      expect(result.coverage.observedUsageEvents).toBe(1);
+      expect(result.groups[0].knownTokens.total).toBe(total);
+      expect(await fixture.querySource.fetchCoverage({ start: WINDOW_START, end: WINDOW_END }))
+        .toMatchObject({ observedSessions: 1, observedUsageEvents: 1 });
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("preserves Claude message.id deduplication, out-of-window winners and replay exclusion", async () => {
+    let fixture;
+    try {
+      fixture = await createFixture();
+      const batchId = await fixture.createBatch({ provider: "claude_code" });
+      const usage = (options) => fixture.usage({
+        batchId, normalizer: "sherlock.claude-code-transcript.v1", cumulative: false,
+        scope: "claude-session", model: "claude-opus", ...options,
+      });
+      await usage({ recordIndex: 0, offset: 0, logicalKey: "message:id-A:usage", total: 10, priority: 10 });
+      await usage({ recordIndex: 1, offset: 10, logicalKey: "message:id-A:usage", total: 20 });
+      await usage({ recordIndex: 2, offset: 20, logicalKey: "message:id-A:usage", total: 999, priority: 1000, isReplay: true });
+      await usage({ recordIndex: 3, offset: 30, logicalKey: "message:id-B:usage", total: 40, priority: 10 });
+      await usage({ recordIndex: 4, offset: 40, logicalKey: "message:id-B:usage", total: 50,
+        occurredAt: "2026-09-10T13:01:00Z" });
+      await usage({ recordIndex: 5, offset: 50, logicalKey: "message:id-C:usage", total: 30 });
+      const result = await fetchUsage(fixture.querySource);
+      expect(result.coverage.observedUsageEvents).toBe(2);
+      expect(result.groups[0]).toMatchObject({ provider: "claude", knownTokens: { total: 50 } });
+      expect(await fixture.querySource.fetchCoverage({ start: WINDOW_START, end: WINDOW_END }))
+        .toMatchObject({ observedSessions: 1, observedUsageEvents: 2 });
+    } finally {
+      await disposeFixture(fixture);
     }
   });
 

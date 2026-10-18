@@ -3,6 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import { FlameSourceError } from "./flame-source.js";
 import {
   MCP_QUERY_HISTORY_START,
+  MCP_USAGE_DEFAULT_WINDOW_MS,
+  MCP_USAGE_MAX_WINDOW_MS,
+  usageWindow,
   buildUsageResult,
   createSherlockQuerySource,
   decodeSessionCursor,
@@ -48,6 +51,33 @@ describe("Sherlock MCP query source", () => {
       start: NOW.toISOString(),
       end: START.toISOString(),
     }, NOW)).toThrow(FlameSourceError);
+  });
+
+  it("defaults relative to the requested end and accepts exactly 30 days", () => {
+    const end = new Date(NOW.getTime() - 86400000);
+    expect(usageWindow({ end }, NOW).startAt)
+      .toEqual(new Date(end - MCP_USAGE_DEFAULT_WINDOW_MS));
+    expect(usageWindow({ start: new Date(end - MCP_USAGE_MAX_WINDOW_MS), end }, NOW).endAt)
+      .toEqual(end);
+    expect(() => usageWindow({ start: new Date(end - MCP_USAGE_MAX_WINDOW_MS - 1), end }, NOW))
+      .toThrowError(new FlameSourceError("flame_mcp_query_window_too_large"));
+  });
+
+  it.each(["fetchUsage", "fetchCoverage"])("%s rejects overlarge windows before database work", async (method) => {
+    const source = { transaction: vi.fn(), readiness: vi.fn() };
+    await expect(createSherlockQuerySource(source)[method]({ start: START, now: NOW }))
+      .rejects.toThrowError(new FlameSourceError("flame_mcp_query_window_too_large"));
+    expect(source.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each(["fetchUsage", "fetchCoverage"])("%s exposes database budget exhaustion explicitly", async (method) => {
+    const source = {
+      transaction: vi.fn().mockRejectedValue(new FlameSourceError("flame_database_timeout")),
+      readiness: vi.fn(),
+    };
+    await expect(createSherlockQuerySource(source)[method]({ now: NOW }))
+      .rejects.toThrowError(new FlameSourceError("flame_mcp_query_timeout"));
+    expect(source.transaction.mock.calls[0][1]).toMatchObject({ statementTimeoutMs: 20_000 });
   });
 
   it("binds session cursors to the original filters and window", () => {
@@ -359,11 +389,11 @@ describe("Sherlock MCP query source", () => {
       observedSessions: 2,
       observedUsageEvents: 4,
     });
-    expect(unsafe.mock.calls.at(-1)[1][1]).toBe(MCP_QUERY_HISTORY_START);
+    expect(unsafe.mock.calls.at(-1)[1][1]).toBe(new Date(NOW - MCP_USAGE_DEFAULT_WINDOW_MS).toISOString());
   });
 
-  it("passes the all-history default through to usage SQL", async () => {
-    const unsafe = vi.fn()
+  it("passes the bounded 7-day default through to usage SQL", async () => {
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ person_count: 0 }])
       .mockResolvedValueOnce([{
         pending_normalize_count: 0,
@@ -381,12 +411,13 @@ describe("Sherlock MCP query source", () => {
 
     const result = await createSherlockQuerySource(source).fetchUsage({ now: NOW });
 
+    expect(unsafe.mock.calls.some(([sql]) => sql === "set local work_mem = '16MB'")).toBe(true);
     expect(result.window).toMatchObject({
-      startInclusive: MCP_QUERY_HISTORY_START,
+      startInclusive: new Date(NOW - MCP_USAGE_DEFAULT_WINDOW_MS).toISOString(),
       endExclusive: NOW.toISOString(),
     });
-    expect(unsafe.mock.calls[2][1].slice(1, 3)).toEqual([
-      MCP_QUERY_HISTORY_START,
+    expect(unsafe.mock.calls.at(-1)[1].slice(1, 3)).toEqual([
+      new Date(NOW - MCP_USAGE_DEFAULT_WINDOW_MS).toISOString(),
       NOW.toISOString(),
     ]);
   });

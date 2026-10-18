@@ -15,11 +15,22 @@ is a separate surface, described in
 3. Call `query_usage`, normally with `groupBy: "person_model"`.
 4. Use `list_sessions` and `get_session` only for metadata drill-down.
 
-Every time-window query defaults to all stored Sherlock history, from
-`1970-01-01T00:00:00.000Z` through the server read time. Callers may still provide
-an explicit historical start and end, with no duration cap. Future and
-non-positive windows remain invalid. Row, group, transaction-time, workspace,
-and roster safety bounds still apply.
+`query_usage` and `coverage` default to the trailing 7 days before `end`
+(server read time if omitted). Explicit historical windows up to 30 days are
+supported. Larger windows fail before querying with `window_too_large`; callers
+must request smaller windows. The response always states the actual interval;
+explicit windows are never silently clamped. Future and non-positive windows
+remain invalid.
+
+Both tools use a 20-second per-statement database budget. Dense windows or
+unusually long touched sessions can exceed it and return `query_timeout`, with
+instructions to narrow the window or have the operator inspect the usage indexes.
+This is an explicit refusal, never a truncated success or a generic `unavailable`.
+Connection or other database failures still return `unavailable`.
+
+`list_sessions` continues to default to all stored Sherlock history, from
+`1970-01-01T00:00:00.000Z` through the server read time, with no duration cap.
+Row, group, transaction-time, workspace, and roster safety bounds still apply.
 `list_sessions` uses a query-bound keyset cursor; callers must reuse the exact
 window and filters from the preceding page.
 
@@ -57,7 +68,9 @@ tools above are unchanged and remain metadata-only.
 The query uses the same immutable active-projection rule as Sherlock's frame
 projector: Claude transcript v1; Codex v2 at or after the recorded workspace
 cutover; and Codex v1 before cutover, with v2 used only for an individual source
-record that has no non-replay v1 projection. Replay rows and lower-priority
+record that has no non-replay v1 projection. A non-replay Codex v3 projection
+supersedes v1/v2 for that source record regardless of the v1-to-v2 cutover;
+no v2-to-v3 cutover row is required. Replay rows and lower-priority
 canonical duplicates are excluded, including from the pre-window baseline.
 Canonical winners are selected against all visible active projections before
 window attribution, using the winner's timestamp. For example, an incremental
@@ -160,3 +173,55 @@ health probing.
   source files, reproject history, or deploy collector upgrades. Bounded
   excerpt search for the shared organization-wide MCP bearer is a separate
   surface; see [`sherlock-investigation-mcp.md`](sherlock-investigation-mcp.md).
+
+## Query execution and rollout
+
+Usage discovery starts with non-replay usage timestamps, using
+`telemetry.events_usage_window_idx`, before joining sessions to the authorized
+roster. `events_usage_history_idx` limits touched-session reads to usage and turn
+context, without dropping any history needed for canonical winners, source
+conflicts, model attribution, or cumulative baselines. Coverage ranks active
+usage once across window observations and possible out-of-window canonical
+competitors, then applies the requested window. It does not repeat active-normalizer
+checks for every possible winner. Claude rows bypass Codex projection probes. The roster bound and the existing
+`analytics.read_dashboard_freshness` receipt (including per-person activity and
+pending normalization) retain their existing semantics and access boundary.
+
+Apply the usage-index migration through the normal Supabase migration runner
+before rollout. Like the existing recent-session index migration, it uses
+`CREATE INDEX CONCURRENTLY` outside a transaction, validates existing definitions,
+and repairs only an inactive invalid build under a short lock timeout. Do not
+wrap the migration in a transaction. Index payloads exclude token/content fields
+to bound write/storage overhead; the history index also retains B-tree deduplication
+by omitting INCLUDE payloads. Single-use reconciliation stages are inlined to
+avoid repeatedly spilling wide histories while window functions retain their
+ordering boundaries. Source-conflict windows use byte-range peer groups to
+retain the same hash/overlap assessment without joining wide histories to
+grouped positions. Incremental observations retain source/model assessment but
+skip cumulative-only lag/regression work. Usage reconciliation sets
+transaction-local `work_mem` to 16MB per sort/hash operation (the direct-source pool allows two concurrent
+transactions), then PostgreSQL resets it at transaction end. Raw records and
+projected events are unchanged.
+
+### Local validation snapshot (2026-10-18 UTC)
+
+PostgreSQL 17 / Node 24.15.0, with 12 people, 72,000 sessions across 90 days,
+2.256 million projected events and 1.128 million usage events (80% Claude,
+20% Codex). The 1 / 7 / 30-day windows contained 36,000 / 252,000 / 1,080,000
+usage observations. Both SQL versions had the new indexes installed for this
+comparison; these are local synthetic timings, not production latency claims.
+
+- Original SQL coverage: 0.49 / 3.59 / 13.07 seconds; usage: 0.86 / 7.19 /
+  statement timeout at 20 seconds.
+- Final full tool calls, including roster checks, freshness receipts, and result
+  construction: coverage 0.38 / 2.53 / 8.20 seconds; usage 0.49 / 3.17 / 15.55
+  seconds. All expected observations were counted; the 30-day accepted token
+  total was 108 million.
+
+The PostgreSQL suite compares both queries directly with frozen originals from
+commit `04491385f921e692982c188ba1027c5e6bbf4e1a`, using the constrained reader.
+It covers normalizer cutovers/corrections, replay exclusion, Claude message
+identity, boundary/undated winners, null canonical keys, native-range conflicts,
+backward timestamps, missing baselines/components, and counter regressions.
+Read-only production timing attempts without the new indexes still timed out;
+apply the migration before evaluating production performance.
