@@ -12,8 +12,7 @@ export const MCP_USAGE_MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const MCP_QUERY_HISTORY_START = "1970-01-01T00:00:00.000Z";
 
-const SESSION_CURSOR_VERSION = "s1";
-const LEGACY_QUERY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const SESSION_CURSOR_VERSION = "s2";
 const MAX_CURSOR_LENGTH = 512;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROVIDER_VERSIONS = Object.freeze([
@@ -204,6 +203,7 @@ function parseLimit(value) {
 
 function sessionFingerprint({ workspaceId, startAt, endAt, personId, model }) {
   return createHash("sha256").update(JSON.stringify([
+    "sessions-occurred-activity-v2",
     workspaceId,
     startAt.toISOString(),
     endAt.toISOString(),
@@ -213,9 +213,10 @@ function sessionFingerprint({ workspaceId, startAt, endAt, personId, model }) {
 }
 
 export function encodeSessionCursor({ readAt, createdAt, sessionId, fingerprint }) {
+  asDate(createdAt, "flame_mcp_query_cursor_invalid");
   const body = Buffer.from(JSON.stringify([
     asDate(readAt).toISOString(),
-    asDate(createdAt).toISOString(),
+    typeof createdAt === "string" ? createdAt : asDate(createdAt).toISOString(),
     sessionId,
     fingerprint,
   ]), "utf8").toString("base64url");
@@ -244,9 +245,12 @@ function parseSessionCursor(cursor) {
         !UUID_PATTERN.test(value[2]) || typeof value[3] !== "string") {
       throw new Error("invalid_cursor");
     }
+    asDate(value[1], "flame_mcp_query_cursor_invalid");
     return {
       readAt: asDate(value[0], "flame_mcp_query_cursor_invalid"),
-      createdAt: asDate(value[1], "flame_mcp_query_cursor_invalid"),
+      // Keep PostgreSQL microseconds: converting the key to a JS Date can skip
+      // sessions sharing a millisecond across page boundaries.
+      createdAt: String(value[1]),
       sessionId: value[2],
       fingerprint: value[3],
     };
@@ -285,6 +289,7 @@ function sessionFromRow(row) {
     model: row.model === null || row.model === undefined ? "unknown" : String(row.model),
     startedAt: asDate(row.started_at).toISOString(),
     endedAt: optionalIso(row.ended_at),
+    lastActivityAt: optionalIso(row.last_activity_at),
     parentSessionId: row.parent_session_id === null || row.parent_session_id === undefined
       ? null
       : String(row.parent_session_id),
@@ -739,27 +744,43 @@ with page as materialized (
     from telemetry.sessions s
     join telemetry.people pe
       on pe.workspace_id = s.workspace_id and pe.id = s.person_id
-   where s.workspace_id = $1 and s.started_at >= $2 and s.started_at < $3
+   where s.workspace_id = $1
+     and (s.started_at >= $2 and s.started_at < $3 or exists (
+       select 1 from telemetry.events activity
+        where activity.workspace_id = $1 and activity.session_id = s.id
+          and not activity.is_replay
+          and activity.occurred_at >= $2 and activity.occurred_at < $3
+          and activity.server_received_at <= $4
+     ))
      and s.created_at <= $4
      and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = $5 and split_part(pe.email, '@', 3) = ''
      and ($6::uuid is null or s.person_id = $6)
      and ($7::text is null or coalesce(nullif(btrim(s.model), ''), 'unknown') = $7)
-     and ($8::timestamptz is null or (s.created_at, s.id) < ($8, $9::uuid))
+     and ($8::text::timestamptz is null or (s.created_at, s.id) < ($8::text::timestamptz, $9::uuid))
    order by s.created_at desc, s.id desc
    limit $10
 )
 select page.id::text session_id, page.person_id::text, page.display_name,
        page.actor_role, coalesce(nullif(btrim(page.model), ''), 'unknown') model,
        page.started_at, page.ended_at, page.parent_session_id::text,
-       page.created_at,
-       provider.normalizer_version
+       page.created_at, page.created_at::text cursor_created_at,
+       activity.last_activity_at, provider.normalizer_version
   from page
+  left join lateral (
+    select e.occurred_at last_activity_at
+      from telemetry.events e
+     where e.workspace_id = $1 and e.session_id = page.id and not e.is_replay
+       and e.occurred_at >= $2 and e.occurred_at < $3
+       and e.server_received_at <= $4
+     order by e.occurred_at desc, e.id desc limit 1
+  ) activity on true
   left join lateral (
     select e.normalizer_version
       from telemetry.events e
      where e.workspace_id = $1 and e.session_id = page.id and not e.is_replay
        and e.normalizer_version = any($11::text[])
+       and e.server_received_at <= $4
      order by e.server_received_at desc, e.id desc limit 1
   ) provider on true
  order by page.created_at desc, page.id desc
@@ -818,8 +839,15 @@ select selected.id::text session_id, selected.person_id::text,
        selected.display_name, selected.actor_role,
        coalesce(nullif(btrim(selected.model), ''), 'unknown') model,
        selected.started_at, selected.ended_at, selected.parent_session_id::text,
+       activity.last_activity_at,
        facts.normalizer_version, facts.messages, facts.tool_calls, facts.usage_events
   from selected cross join facts
+  left join lateral (
+    select e.occurred_at last_activity_at from telemetry.events e
+     where e.workspace_id = $1 and e.session_id = selected.id and not e.is_replay
+       and e.occurred_at is not null
+     order by e.occurred_at desc, e.id desc limit 1
+  ) activity on true
 `;
 
 // Coverage needs only window observations and their possible out-of-window
@@ -964,38 +992,17 @@ export function createSherlockQuerySource(source) {
       if (cursorPayload?.readAt > requestNow) {
         throw new FlameSourceError("flame_mcp_query_cursor_invalid");
       }
-      let window = queryWindow({ start, end }, cursorPayload?.readAt ?? requestNow);
+      const window = queryWindow({ start, end }, cursorPayload?.readAt ?? requestNow);
       if (personId !== undefined && !UUID_PATTERN.test(personId)) {
         throw new FlameSourceError("flame_mcp_query_request_invalid");
       }
       const pageSize = parseLimit(limit);
-      let fingerprint = sessionFingerprint({
+      const fingerprint = sessionFingerprint({
         workspaceId: source.workspaceId,
         ...window,
         personId,
         model,
       });
-      // Cursors created before the all-history default used a trailing 24-hour
-      // window. Let those in-flight pages finish without restoring that legacy
-      // limit for new requests.
-      if (cursorPayload && cursorPayload.fingerprint !== fingerprint && start === undefined) {
-        const legacyEndAt = end === undefined ? cursorPayload.readAt : asDate(end);
-        const legacyStartAt = new Date(legacyEndAt.getTime() - LEGACY_QUERY_WINDOW_MS);
-        const legacyWindow = queryWindow({
-          start: legacyStartAt,
-          end: legacyEndAt,
-        }, cursorPayload.readAt);
-        const legacyFingerprint = sessionFingerprint({
-          workspaceId: source.workspaceId,
-          ...legacyWindow,
-          personId,
-          model,
-        });
-        if (cursorPayload.fingerprint === legacyFingerprint) {
-          window = legacyWindow;
-          fingerprint = legacyFingerprint;
-        }
-      }
       const decoded = decodeSessionCursor(cursor, fingerprint);
       const readAt = decoded?.readAt ?? window.readAt;
       const rows = await source.transaction(async (tx) => await runQuery(tx, LIST_SESSIONS_SQL, [
@@ -1006,7 +1013,7 @@ export function createSherlockQuerySource(source) {
         source.expectedEmailDomain,
         personId ?? null,
         model ?? null,
-        decoded?.createdAt.toISOString() ?? null,
+        decoded?.createdAt ?? null,
         decoded?.sessionId ?? null,
         pageSize + 1,
         PROVIDER_VERSIONS,
@@ -1023,7 +1030,7 @@ export function createSherlockQuerySource(source) {
         sessions: page.map(sessionFromRow),
         nextCursor: hasMore ? encodeSessionCursor({
           readAt,
-          createdAt: page.at(-1).created_at,
+          createdAt: page.at(-1).cursor_created_at ?? page.at(-1).created_at,
           sessionId: String(page.at(-1).session_id),
           fingerprint,
         }) : null,

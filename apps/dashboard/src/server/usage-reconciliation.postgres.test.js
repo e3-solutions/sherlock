@@ -134,6 +134,7 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt
     logicalKey = null,
     sourceRecordId = null,
     usageScope = "session",
+    eventSessionId = sessionId,
   }) => {
     const [record] = sourceRecordId ? [{ id: sourceRecordId }] : await sql.unsafe(
       `insert into telemetry.native_records (
@@ -168,7 +169,7 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt
        )`,
       [
         workspaceId,
-        sessionId,
+        eventSessionId,
         record.id,
         normalizer,
         kind,
@@ -225,6 +226,15 @@ async function createFixture({ startedAt = "2026-09-10T11:00:00.000Z", cutoverAt
     source,
     querySource,
     createBatch,
+    async createSession({ startedAt, createdAt = startedAt }) {
+      const id = crypto.randomUUID();
+      await sql.unsafe(`insert into telemetry.sessions (
+        id, workspace_id, person_id, collector_key, native_session_id,
+        actor_role, role_version, model, started_at, created_at
+      ) values ($1,$2,$3,'usage-reconciliation',$1::uuid::text,'primary','test.v1','model-A',$4,$5::text::timestamptz)`,
+      [id, workspaceId, personId, startedAt, createdAt]);
+      return id;
+    },
     context,
     usage,
   };
@@ -372,6 +382,46 @@ describePostgres("usage reconciliation PostgreSQL regressions", () => {
       expect(backfilled.coverage.observedUsageEvents).toBe(2);
       expect(await fixture.querySource.fetchCoverage({ start: WINDOW_START, end: WINDOW_END }))
         .toMatchObject({ observedSessions: 1, observedUsageEvents: 2 });
+    } finally { await disposeFixture(fixture); }
+  });
+
+  it("lists resumed old sessions with stable microsecond pagination across mixed starts and activity", async () => {
+    let fixture;
+    try {
+      fixture = await createFixture({ parity: false });
+      const batchId = await fixture.createBatch();
+      const fresh = await fixture.createSession({ startedAt: "2026-09-10T12:05:00Z", createdAt: "2026-09-10T12:05:00.123456Z" });
+      const freshPeer = await fixture.createSession({ startedAt: "2026-09-10T12:05:00Z", createdAt: "2026-09-10T12:05:00.123455Z" });
+      const tiedPeer = await fixture.createSession({ startedAt: "2026-09-10T12:05:00Z", createdAt: "2026-09-10T12:05:00.123455Z" });
+      const lateReceipt = await fixture.createSession({ startedAt: "2026-09-09T12:00:00Z" });
+      const replayOnly = await fixture.createSession({ startedAt: "2026-09-09T12:00:00Z" });
+      const receivedOnly = await fixture.createSession({ startedAt: "2026-09-09T12:00:00Z" });
+      const undated = await fixture.createSession({ startedAt: "2026-09-09T12:00:00Z" });
+      for (const [recordIndex, eventSessionId, occurredAt, serverReceivedAt, isReplay] of [
+        [0, fixture.sessionId, SAME_TIME, SAME_TIME, false],
+        [1, fixture.sessionId, "2026-09-10T12:45:00Z", "2026-09-10T12:45:00Z", false],
+        [2, replayOnly, SAME_TIME, SAME_TIME, true],
+        [3, receivedOnly, "2026-09-09T12:00:00Z", SAME_TIME, false],
+        [4, undated, null, SAME_TIME, false],
+        [5, fresh, SAME_TIME, SAME_TIME, false],
+        // Replay and end-exclusive boundary events cannot affect lastActivityAt.
+        [6, fixture.sessionId, "2026-09-10T12:59:00Z", SAME_TIME, true],
+        [7, fixture.sessionId, WINDOW_END, WINDOW_END, false],
+        [8, lateReceipt, SAME_TIME, "2026-09-10T13:00:00.001Z", false],
+      ]) await fixture.context({ batchId, recordIndex, offset: recordIndex * 10, eventSessionId, occurredAt, serverReceivedAt, isReplay });
+      const args = { start: WINDOW_START, end: WINDOW_END, now: new Date(WINDOW_END), limit: 1 };
+      const sessions = []; let cursor;
+      do {
+        const page = await fixture.querySource.fetchSessions({ ...args, cursor });
+        sessions.push(...page.sessions); cursor = page.nextCursor;
+      } while (cursor);
+      expect(sessions.map((s) => s.sessionId)).toEqual([fresh, ...[freshPeer, tiedPeer].sort().reverse(), fixture.sessionId]);
+      expect(new Set(sessions.map((s) => s.sessionId)).size).toBe(4);
+      expect(sessions[0].lastActivityAt).toBe(SAME_TIME);
+      expect(sessions[1].lastActivityAt).toBeNull();
+      expect(sessions[2].lastActivityAt).toBeNull();
+      expect(sessions[3].lastActivityAt).toBe("2026-09-10T12:45:00.000Z");
+      expect((await fixture.querySource.fetchSession({ sessionId: fixture.sessionId })).session.lastActivityAt).toBe(WINDOW_END);
     } finally { await disposeFixture(fixture); }
   });
 

@@ -189,6 +189,7 @@ const sessionSchema = z.object({
   model: SHORT_TEXT,
   startedAt: ISO_TIMESTAMP,
   endedAt: ISO_TIMESTAMP.nullable(),
+  lastActivityAt: ISO_TIMESTAMP.nullable(),
   parentSessionId: UUID.nullable(),
 }).strict();
 
@@ -552,7 +553,7 @@ export function registerBonaparteTools(server, source) {
     "list_sessions",
     {
       title: "List Sherlock sessions",
-      description: "Keyset-page safe session metadata for any historical window. Omitting start searches all stored history. Titles, transcripts, prompts, paths, branches, and repository remotes are omitted.",
+      description: "Keyset-page safe session metadata for sessions starting or having non-replay source activity (occurred_at) in the window, including resumed older sessions. lastActivityAt is the latest source activity in that window. Omitting start searches all stored history. Titles, transcripts, prompts, paths, branches, and repository remotes are omitted.",
       inputSchema: listSessionsInputSchema,
       outputSchema: listSessionsOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,

@@ -32,7 +32,38 @@ Connection or other database failures still return `unavailable`.
 `1970-01-01T00:00:00.000Z` through the server read time, with no duration cap.
 Row, group, transaction-time, workspace, and roster safety bounds still apply.
 `list_sessions` uses a query-bound keyset cursor; callers must reuse the exact
-window and filters from the preceding page.
+window and filters from the preceding page. Eligibility is session start in
+`[start, end)` **or** any non-replay event with source `occurred_at` in that
+window. This includes resumed older sessions. Source time keeps delayed imports
+in their historical window; receipt time alone and undated events do not imply
+activity in a recent window. Activity/provider lookups also exclude receipts
+newer than the first-page `readAt`.
+
+Ordering stays descending `(created_at, session_id)`, independent of mutable
+activity times. The `s2` cursor preserves PostgreSQL microseconds through text
+binding, fingerprints the new activity semantics, and rejects old `s1` cursors
+with `cursor_invalid`; restart pagination after upgrading. Fixed filters and
+window bounds remain required. This is keyset pagination over observed facts,
+not a retained cross-request MVCC snapshot: late normalization of older receipts
+and mutable session metadata may change eligibility between requests. Immutable
+sort keys prevent duplicate sessions when activity is appended. `lastActivityAt`
+is the latest non-replay source timestamp **inside the list window**, or null;
+`get_session` returns the latest non-replay source timestamp across all history.
+`get_session` has no start-time window filter. Dashboard Flame listings already
+select event activity in their window rather than session start dates.
+
+List eligibility uses per-session bounded probes of
+`events_session_occurred_idx(workspace_id, session_id, occurred_at, id)` instead
+of materializing every event in a multi-million-event window. The latest activity
+probe runs only for the limited page. No new index is needed.
+
+A disposable local PostgreSQL 17 benchmark of this exact list query, under the
+reader role and 20-second timeout, used 50,000 sessions (25,000 active, including
+5,000 resumed old sessions), 14 million events over 14 days, and the existing
+index shapes. A 101-row first page took 164 ms; a deep page of resumed sessions
+took 230 ms. EXPLAIN ANALYZE confirmed session/time index probes. This synthetic
+benchmark uses narrow event rows and no production privacy overlays; it verifies
+the access pattern and event-volume bound, not a production latency guarantee.
 
 ## Tools
 
@@ -45,7 +76,7 @@ window and filters from the preceding page.
   does not run cumulative-token arithmetic; `query_usage` supplies the
   query-specific partial/missing assessment and detailed reasons.
 - `list_sessions`: up to 100 safe metadata records per page. The allowlist is
-  session ID, person ID/display name, provider, actor role, model, start/end,
+  session ID, person ID/display name, provider, actor role, model, start/end, last activity,
   and parent session ID.
 - `get_session`: the same safe metadata for one configured-workspace session,
   plus aggregate message/tool-call/usage event counts. A foreign-workspace ID
