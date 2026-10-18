@@ -24,7 +24,9 @@ MAX_RECORDS = 20_000
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_STORED_BYTES = 17 * 1024 * 1024
 FRAGMENT_BYTES = 4 * 1024 * 1024
-MAX_LOGICAL_RECORD_BYTES = 100 * 1024 * 1024
+# Representation bound shared with ingest: PostgreSQL int4 fragment_count.
+# Each request/allocation stays bounded independently of the logical record.
+MAX_LOGICAL_RECORD_BYTES = (2**31 - 1) * FRAGMENT_BYTES
 SOURCE_KINDS = {
     "codex": frozenset({"rollout"}),
     "claude_code": frozenset({"transcript", "hook"}),
