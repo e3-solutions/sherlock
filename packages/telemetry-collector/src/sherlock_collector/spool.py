@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -222,8 +223,11 @@ class DurableSpool:
 
     def requeue(self, path: Path, item: SpoolItem, error: Exception) -> None:
         metadata = dict(item.metadata)
+        attempts = int(metadata.get("upload_attempts", 0)) + 1
         metadata.update(
             {
+                "upload_attempts": attempts,
+                "next_upload_at": time.time() + min(24 * 60 * 60, 60 * 2 ** min(attempts - 1, 11)),
                 "last_upload_error": str(error),
                 "last_upload_failed_at": utc_now(),
             }
@@ -234,8 +238,9 @@ class DurableSpool:
 
     def quarantine(self, path: Path, item: SpoolItem | None, error: Exception) -> None:
         if item is None:
+            original_bytes = path.read_bytes()
             try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
+                raw = json.loads(original_bytes)
                 if not isinstance(raw, dict):
                     raw = {"unreadable_value": raw}
             except Exception:
@@ -244,16 +249,20 @@ class DurableSpool:
                         "ascii"
                     )
                 }
+            raw["original_spool_base64"] = base64.b64encode(original_bytes).decode("ascii")
             raw["dead_letter"] = {"reason": str(error), "failed_at": utc_now()}
             _atomic_json(path, raw)
         else:
             metadata = dict(item.metadata)
-            metadata["dead_letter"] = {"reason": str(error), "failed_at": utc_now()}
+            metadata["dead_letter"] = {"reason": str(error), "error_type": type(error).__name__, "failed_at": utc_now()}
             _atomic_json(
                 path,
                 SpoolItem(item.manifest, item.stored_payload, metadata).to_dict(),
             )
-        _durable_replace(path, self.dead_letter / path.name)
+        destination = self.dead_letter / path.name
+        if destination.exists():
+            destination = self.dead_letter / f"{path.stem}.{uuid.uuid4().hex}.json"
+        _durable_replace(path, destination)
 
     def acknowledge(self, path: Path) -> None:
         _durable_unlink(path)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -47,7 +48,10 @@ class Drain:
         self.max_workers = max_workers
         self.expected_attribution = expected_attribution
 
-    def run(self) -> DrainResult:
+    def run(self, *, max_items: int = 1024, max_seconds: float = 300) -> DrainResult:
+        if max_items < 1 or max_seconds <= 0:
+            raise ValueError("drain budgets must be positive")
+        deadline = time.monotonic() + max_seconds
         with secure_lock(self.spool.lock_path) as lock:
             try:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -57,11 +61,13 @@ class Drain:
             uploaded = requeued = dead_lettered = 0
             blocked_streams: set[tuple[str, str]] = set()
             frontiers, invalid = self._pending_frontiers(blocked_streams)
-            while frontiers or invalid:
+            while (frontiers or invalid) and uploaded + requeued + dead_lettered < max_items and time.monotonic() < deadline:
                 outcomes = self._drain_frontiers(
                     frontiers,
                     invalid,
                     blocked_streams,
+                    max_items - uploaded - requeued - dead_lettered,
+                    deadline,
                 )
                 uploaded += outcomes[0]
                 requeued += outcomes[1]
@@ -84,13 +90,17 @@ class Drain:
         invalid: deque[Path] = deque()
         for path in self.spool.list_pending():
             try:
-                manifest = self.spool.load(path).manifest
+                item = self.spool.load(path)
+                manifest = item.manifest
             except ContractError:
                 invalid.append(path)
                 continue
             stream = manifest.stream_identity
             if stream in blocked_streams:
                 continue
+            # A delayed frontier blocks its own later byte ranges only.
+            if item.metadata.get("next_upload_at", 0) > time.time():
+                blocked_streams.add(stream)
             order = (
                 manifest.generation_seq,
                 manifest.start_offset,
@@ -100,7 +110,7 @@ class Drain:
             ordered.setdefault(stream, []).append((order, path))
         frontiers = {
             stream: deque(path for _, path in sorted(items))
-            for stream, items in sorted(ordered.items())
+            for stream, items in sorted(ordered.items()) if stream not in blocked_streams
         }
         return frontiers, invalid
 
@@ -109,26 +119,25 @@ class Drain:
         frontiers: dict[tuple[str, str], deque[Path]],
         invalid: deque[Path],
         blocked_streams: set[tuple[str, str]],
+        max_items: int,
+        deadline: float,
     ) -> tuple[int, int, int]:
         uploaded = requeued = dead_lettered = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             in_flight: dict[Future[str], tuple[str, str] | None] = {}
 
-            def submit_next(stream: tuple[str, str]) -> None:
-                frontier = frontiers.get(stream)
-                if frontier:
-                    in_flight[
-                        executor.submit(self._upload_claimed, frontier.popleft())
-                    ] = stream
-
-            # At most one future is submitted for each valid stream. A successful
-            # completion advances only that stream's ordered frontier.
-            for stream in frontiers:
-                submit_next(stream)
-            for path in invalid:
-                in_flight[executor.submit(self._upload_claimed, path)] = None
-
-            while in_flight:
+            ready = deque((stream, paths.popleft()) for stream, paths in frontiers.items() if paths)
+            ready.extend((None, path) for path in invalid)
+            submitted = 0
+            while ready or in_flight:
+                while ready and len(in_flight) < self.max_workers and submitted < max_items and time.monotonic() < deadline:
+                    stream, path = ready.popleft()
+                    if stream in blocked_streams:
+                        continue
+                    in_flight[executor.submit(self._upload_claimed, path)] = stream
+                    submitted += 1
+                if not in_flight:
+                    break
                 completed, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                 for future in completed:
                     stream = in_flight.pop(future)
@@ -141,13 +150,8 @@ class Drain:
                             blocked_streams.add(stream)
                     elif outcome == "dead-lettered":
                         dead_lettered += 1
-
-                    if (
-                        stream is not None
-                        and stream not in blocked_streams
-                        and frontiers.get(stream)
-                    ):
-                        submit_next(stream)
+                    if stream is not None and stream not in blocked_streams and frontiers.get(stream):
+                        ready.append((stream, frontiers[stream].popleft()))
 
         return uploaded, requeued, dead_lettered
 
@@ -176,13 +180,19 @@ class Drain:
                 return "dead-lettered"
             self.spool.requeue(claimed, item, error)
             return "requeued"
-        except (PermanentUploadError, ContractError) as error:
+        except PermanentUploadError as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
                 return "dead-lettered"
-            # A readable local artifact remains the source of truth even when the
-            # server rejects it. Retain it and block later ranges in this stream so
-            # a rollout/version mismatch cannot silently create a source gap.
+            # Keep immutable manifest/payload evidence with an auditable reason,
+            # and let later ranges proceed. Inventory still exposes the gap.
+            self.spool.quarantine(claimed, item, error)
+            return "dead-lettered"
+        except ContractError as error:
+            if item is None:
+                self.spool.quarantine(claimed, None, error)
+                return "dead-lettered"
+            # A local receipt conflict is an audit problem, not a server rejection.
             self.spool.requeue(claimed, item, error)
             return "requeued"
         except Exception as error:

@@ -458,6 +458,36 @@ def discover_claude_transcripts(
     )
 
 
+def discover_all_sources(home: Path | str, provider: str) -> DiscoveryResult:
+    """Enumerate native files without a lookback or hook dependency.
+
+    Reuse descriptor-safe provider validation, including archived Codex sessions
+    and Claude subagents. No database row cap is applied to this recovery scan.
+    """
+    root = Path(home).expanduser().resolve()
+    if not root.is_dir():
+        return DiscoveryResult(paths=(), native_session_ids={}, errors=("source_home_missing",))
+    try:
+        if provider == "claude_code":
+            candidates, invalid, _ = _recent_claude_candidates(root, 0)
+            if (root / "projects").is_symlink():
+                invalid += 1
+        elif provider == "codex":
+            candidates, invalid = _recent_codex_candidates(root, 0)
+        else:
+            raise ValueError("unsupported provider")
+    except OSError as error:
+        return DiscoveryResult(paths=(), native_session_ids={}, errors=(str(error),))
+    return DiscoveryResult(
+        paths=tuple(candidate.path for candidate in candidates),
+        native_session_ids={str(c.path): c.native_id for c in candidates if c.native_id},
+        parent_native_session_ids={str(c.path): c.parent_id for c in candidates if c.parent_id},
+        source_snapshots={str(c.path): c.snapshot for c in candidates},
+        selected_bytes=sum(c.snapshot.end_offset for c in candidates),
+        invalid_count=invalid,
+    )
+
+
 def _recent_codex_candidates(
     codex_home: Path,
     cutoff_ns: int,

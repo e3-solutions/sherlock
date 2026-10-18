@@ -184,7 +184,7 @@ class TeamInstallerTests(unittest.TestCase):
                      "--github-id", "test-user", "--email", "test@e3group.ai",
                      "--claude-backfill-hours", hours],
                     cwd=ROOT, check=False, capture_output=True, text=True,
-                    env={**os.environ, "CODEX_HOME": str(root / "codex"),
+                    env={**os.environ, "SHERLOCK_NO_SCHEDULER": "1", "CODEX_HOME": str(root / "codex"),
                          "CLAUDE_CONFIG_DIR": str(root / "claude"),
                          "PYTHON_BIN": sys.executable},
                 )
@@ -206,6 +206,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
@@ -299,6 +300,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(codex_bin),
@@ -358,6 +360,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
@@ -441,6 +444,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
@@ -504,6 +508,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
@@ -555,6 +560,7 @@ class TeamInstallerTests(unittest.TestCase):
                 with self.subTest(installer=installer.name):
                     provider_home = root / installer.stem
                     environment = os.environ.copy()
+                    environment["SHERLOCK_NO_SCHEDULER"] = "1"
                     environment.update(
                         {
                             home_variable: str(provider_home),
@@ -594,6 +600,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
             fake_codex.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
@@ -648,6 +655,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
@@ -700,6 +708,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(root / "missing-codex"),
@@ -753,6 +762,7 @@ class TeamInstallerTests(unittest.TestCase):
             claude_home = root / "claude"
             sherlock_home = root / "sherlock-home"
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(root / "missing-codex"),
@@ -826,6 +836,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_codex.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
             fake_codex.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CODEX_BIN": str(fake_codex),
@@ -938,6 +949,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = os.environ.copy()
+            environment["SHERLOCK_NO_SCHEDULER"] = "1"
             environment.update(
                 {
                     "CLAUDE_BIN": str(fake_claude),
@@ -1127,7 +1139,7 @@ class TeamInstallerTests(unittest.TestCase):
                     ],
                     cwd=ROOT,
                     env={
-                        **os.environ,
+                        **os.environ, "SHERLOCK_NO_SCHEDULER": "1",
                         "CLAUDE_CONFIG_DIR": str(claude_home),
                         "PYTHON_BIN": sys.executable,
                     },
@@ -1166,7 +1178,7 @@ class TeamInstallerTests(unittest.TestCase):
             fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
             fake_claude.chmod(0o755)
             environment = {
-                **os.environ,
+                **os.environ, "SHERLOCK_NO_SCHEDULER": "1",
                 "CLAUDE_BIN": str(fake_claude),
                 "CLAUDE_CONFIG_DIR": str(claude_home),
                 "PYTHON_BIN": sys.executable,

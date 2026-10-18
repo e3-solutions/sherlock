@@ -296,7 +296,7 @@ def _capture_hook(
             state_name=(
                 "claude-transcript" if provider == "claude_code" else "rollout"
             ),
-            capture_unterminated_tail=provider != "claude_code",
+            capture_unterminated_tail=False,
             allowed_root=(
                 home / "projects"
                 if provider == "claude_code"

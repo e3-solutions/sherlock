@@ -306,7 +306,7 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(queued.metadata["last_upload_error"], "try later")
         self.assertEqual(queued.metadata["workload_class"], "backfill")
 
-    def test_permanent_failure_is_retained_and_blocks_only_its_stream(self):
+    def test_permanent_failure_is_dead_lettered_and_advances_its_stream(self):
         first, _ = self.enqueue("stream-a")
         self.enqueue("stream-a", first.end_offset)
         self.enqueue("stream-b")
@@ -326,14 +326,14 @@ class CollectorDrainTests(unittest.TestCase):
         transport = Permanent()
         result = Drain(self.spool, transport).run()
 
-        self.assertEqual(result.requeued, 1)
+        self.assertEqual(result.requeued, 0)
         self.assertEqual(result.uploaded, 1)
-        self.assertEqual(result.dead_lettered, 0)
-        self.assertEqual(len(self.spool.list_pending()), 2)
-        self.assertEqual(list(self.spool.dead_letter.glob("*.json")), [])
+        self.assertEqual(result.dead_lettered, 2)
+        self.assertEqual(len(self.spool.list_pending()), 0)
+        self.assertEqual(len(list(self.spool.dead_letter.glob("*.json"))), 2)
         self.assertEqual(
             sorted(transport.calls),
-            [("stream-a", 0), ("stream-b", 0)],
+            [("stream-a", 0), ("stream-a", first.end_offset), ("stream-b", 0)],
         )
 
     def test_success_preserves_matching_dead_letter_evidence(self):
@@ -672,18 +672,17 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(second.generation_seq, 1)
         self.assertNotEqual(first.generation_key, second.generation_key)
 
-    def test_unterminated_tail_is_preserved_exactly(self):
+    def test_unterminated_tail_waits_until_a_complete_record(self):
         source = b'{"type":"tail","value":"exact"}'
         self.rollout.write_bytes(source)
-
-        self.capturer.capture([self.rollout])
-
+        self.assertEqual(self.capturer.capture([self.rollout]).enqueued, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+        with self.rollout.open("ab") as handle:
+            handle.write(b"\n")
+        self.assertEqual(self.capturer.capture([self.rollout]).enqueued, 1)
         item = self.spool.load(self.spool.list_pending()[0])
-        self.assertEqual(
-            item.manifest.source_sha256,
-            __import__("hashlib").sha256(source).hexdigest(),
-        )
-        self.assertEqual(item.manifest.end_offset, len(source))
+        self.assertEqual(item.manifest.end_offset, len(source) + 1)
+        self.assertEqual(validate_stored_payload(item.manifest, item.stored_payload), source + b"\n")
 
     def test_corrupt_primary_state_recovers_from_durable_backup(self):
         first = b'{"type":"first"}\n'
@@ -898,7 +897,7 @@ class RolloutCaptureTests(unittest.TestCase):
     def test_best_effort_capture_does_not_let_bad_file_starve_good_file(self):
         bad = self.root / "bad.jsonl"
         good = self.root / "good.jsonl"
-        bad.write_bytes(b"x" * 1025)
+        bad.write_bytes(b"x" * 1025 + b"\n")
         good.write_bytes(b'{"type":"good"}\n')
         capturer = RolloutCapturer(
             self.root / "best-effort-state",
@@ -936,7 +935,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(sorted(item.record_count for item in manifests), [1, 20_000])
 
     def test_only_lf_delimits_jsonl_records(self):
-        self.rollout.write_bytes(b"{}\r" * 20_001)
+        self.rollout.write_bytes(b"{}\r" * 20_001 + b"\n")
 
         result = self.capturer.capture([self.rollout])
 
@@ -988,7 +987,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
 
     def test_fragment_spooling_replays_safely_before_logical_checkpoint(self):
-        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        source = b"x" * (MAX_SOURCE_BYTES + 1) + b"\n"
         self.rollout.write_bytes(source)
         state_root = self.root / "fragment-replay-state"
         capturer = RolloutCapturer(state_root, self.spool, chunk_bytes=128)
@@ -1025,7 +1024,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
 
     def test_fragment_staging_rejects_mutation_before_any_spool_visibility(self):
-        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        source = b"x" * (MAX_SOURCE_BYTES + 1) + b"\n"
         self.rollout.write_bytes(source)
         state_root = self.root / "fragment-mutation-state"
         rollout = self.rollout
@@ -1072,7 +1071,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(reconstructed, self.rollout.read_bytes())
 
     def test_fragment_manifest_rejects_noncanonical_count(self):
-        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        source = b"x" * (MAX_SOURCE_BYTES + 1) + b"\n"
         self.rollout.write_bytes(source)
         RolloutCapturer(
             self.root / "fragment-contract-state",
