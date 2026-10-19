@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "source_commit": "<40-character-git-sha>",
+  "operator": "<human-name>",
+  "applied_at": "<ISO-8601-UTC>",
+  "change_ticket": "<issue-or-change-url>",
+  "desired_state_fingerprints": {
+    "bundle": "sha256:<hex>",
+    "rules": "sha256:<hex>",
+    "synthetics": "sha256:<hex>",
+    "routing": "sha256:<hex>",
+    "template": "sha256:<hex>",
+    "railway": "sha256:<hex>"
+  },
+  "grafana": {
+    "stack": "e3capital.grafana.net",
+    "version": "<read-back-version>",
+    "synthetic_monitoring_version": "<read-back-version>",
+    "prometheus_datasource_uid": "<read-back-uid>",
+    "folder_uid": "bonaparte",
+    "rule_group": "bonaparte-production",
+    "default_receiver_before": "<read-back-name>",
+    "default_receiver_after": "<same-name>",
+    "rule_uids": [
+      "bonaparte-dashboard-unavailable",
+      "bonaparte-pipeline-freshness",
+      "bonaparte-synthetic-telemetry-missing",
+      "bonaparte-supabase-telemetry-missing",
+      "bonaparte-supabase-pool-waiting"
+    ],
+    "contact_point": "Bonaparte Production Slack",
+    "unrelated_policy_export_before": "<private-backup-reference>",
+    "unrelated_policy_export_after": "<private-read-back-reference>",
+    "unrelated_policy_routes_unchanged": "<passed|failed>"
+  },
+  "synthetics": {
+    "production_origin": "https://<host>",
+    "probes": [
+      "Oregon",
+      "Ohio",
+      "Virginia"
+    ],
+    "healthz_check_uid": "<live-uid>",
+    "freshness_check_uid": "<live-uid>"
+  },
+  "supabase": {
+    "project_ref": "<read-back-project-ref>",
+    "metric_label": "supabase_project_ref"
+  },
+  "railway": {
+    "project_id": "<read-back-id>",
+    "project_name": "<exact-payload-name>",
+    "environment_id": "<read-back-production-id>",
+    "environment_name": "<exact-payload-name>",
+    "dashboard_service_id": "<read-back-id>",
+    "dashboard_service_name": "<exact-payload-name>",
+    "worker_service_id": "<read-back-id>",
+    "worker_service_name": "<exact-payload-name>",
+    "direct_slack_enabled": false
+  },
+  "verification": {
+    "offline_bundle": "<passed>",
+    "template_cases": [
+      "firing",
+      "resolved",
+      "mixed",
+      "empty",
+      "missing-severity",
+      "missing-description"
+    ],
+    "constant_rule_firing_and_recovery": "<passed|not-applied>",
+    "synthetic_firing_and_recovery": "<passed|not-applied>",
+    "supabase_query_preview": "<passed|not-applied>",
+    "grafana_rule_fields_match_contract": "<passed|not-applied>",
+    "synthetic_check_fields_match_contract": "<passed|not-applied>",
+    "notification_route_fields_match_contract": "<passed|not-applied>",
+    "template_fields_match_contract": "<passed|not-applied>",
+    "railway_delivery_contract": "<passed|not_applied_gate_closed>"
+  }
+}

@@ -53,6 +53,11 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/dashboard/pnpm-lock.yaml
 
+      - name: Validate Bonaparte alerting bundle
+        run: |
+          python3 observability/grafana/validate_bundle.py simulate
+          python3 -m unittest discover -s observability/grafana/tests -v
+
       - name: Check Deno formatting and lint
         run: |
           deno fmt --check supabase/functions workers scripts
