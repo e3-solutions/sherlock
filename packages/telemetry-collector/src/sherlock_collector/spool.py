@@ -217,6 +217,30 @@ class DurableSpool:
         """Return an unreadable claim without rewriting its source bytes."""
         _durable_replace(path, self.pending / path.name)
 
+    def record_read_failure(self, path: Path) -> int:
+        # The drain lock serializes inventory and a path has at most one worker.
+        # Separate sidecars work even when the artifact itself cannot be read.
+        counter = self.root / "read-failures" / path.name
+        try:
+            failures = int(json.loads(counter.read_text())["failures"])
+        except FileNotFoundError:
+            failures = 0
+        failures += 1
+        if not counter.parent.exists():
+            counter.parent.mkdir(mode=0o700, exist_ok=True)
+            _fsync_directory(self.root)
+        _atomic_json(counter, {"failures": failures})
+        return failures
+
+    def clear_read_failures(self, path: Path) -> None:
+        _durable_unlink(self.root / "read-failures" / path.name)
+
+    def quarantine_unreadable(self, path: Path) -> None:
+        # A persistent read error may also prevent reading bytes for the usual
+        # quarantine wrapper. Preserve the original artifact with a durable rename.
+        _durable_replace(path, self.dead_letter / path.name)
+        self.clear_read_failures(path)
+
     def recover_processing(self) -> int:
         recovered = 0
         for path in sorted(self.processing.glob("*.json")):
@@ -258,6 +282,7 @@ class DurableSpool:
                 SpoolItem(item.manifest, item.stored_payload, metadata).to_dict(),
             )
         _durable_replace(path, self.dead_letter / path.name)
+        self.clear_read_failures(path)
 
     def acknowledge(self, path: Path) -> None:
         _durable_unlink(path)

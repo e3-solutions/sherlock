@@ -33,6 +33,10 @@ class DrainResult:
     locked: bool = False
 
 
+# Persist across process restarts; one failed read per artifact per drain.
+MAX_READ_FAILURES = 3
+
+
 class Drain:
     def __init__(
         self,
@@ -54,6 +58,7 @@ class Drain:
             except BlockingIOError:
                 return DrainResult(locked=True)
             self._unreadable_paths: set[Path] = set()
+            self._exhausted_paths: set[Path] = set()
             recovered = self.spool.recover_processing()
             uploaded = requeued = dead_lettered = 0
             blocked_streams: set[tuple[str, str]] = set()
@@ -95,6 +100,10 @@ class Drain:
                 invalid.append(path)
                 continue
             except OSError:
+                if self.spool.record_read_failure(path) >= MAX_READ_FAILURES:
+                    self._exhausted_paths.add(path)
+                    invalid.append(path)
+                    continue
                 return {}, deque()
             stream = manifest.stream_identity
             if stream in blocked_streams:
@@ -163,9 +172,13 @@ class Drain:
         claimed = self.spool.claim(pending_path)
         if claimed is None:
             return "missing"
+        if pending_path in self._exhausted_paths:
+            self.spool.quarantine_unreadable(claimed)
+            return "dead-lettered"
         item: SpoolItem | None = None
         try:
             item = self.spool.load(claimed)
+            self.spool.clear_read_failures(claimed)
             token_payload = scan_token_payload(item.manifest, item.stored_payload)
             receipt = self.transport.upload(item)
             validated_receipt = validate_committed_receipt(
@@ -195,6 +208,9 @@ class Drain:
             return "requeued"
         except Exception as error:
             if item is None and isinstance(error, OSError):
+                if self.spool.record_read_failure(claimed) >= MAX_READ_FAILURES:
+                    self.spool.quarantine_unreadable(claimed)
+                    return "dead-lettered"
                 self.spool.release(claimed)
                 self._unreadable_paths.add(pending_path)
                 return "requeued"
