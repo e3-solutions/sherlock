@@ -58,8 +58,26 @@ class HookObservationCleanupTests(unittest.TestCase):
         path = self.observation()
         with patch('sherlock_collector.rollout._durable_unlink', create=True,
                    side_effect=OSError('unlink failed')):
-            # The pre-fix implementation also leaves a durable cursor here.
+            # Leave a durable cursor while simulating failed file cleanup.
             self.capturer.capture([path], best_effort=True)
         path.unlink()
         self.capturer.capture([])
         self.assertEqual(json.loads(self.capturer.state_path.read_text())['streams'], {})
+
+    def test_queue_directory_sync_failure_keeps_observation_until_retry(self):
+        path = self.observation()
+        with patch('sherlock_collector.rollout._fsync_directory',
+                   side_effect=OSError('directory sync failed')):
+            with self.assertRaises(OSError):
+                self.capturer.capture([path])
+        self.assertTrue(path.exists())
+        self.assertEqual(len(self.spool.list_pending()), 1)
+        self.capturer.capture([path])
+        self.assertFalse(path.exists())
+        self.assertEqual(len(self.spool.list_pending()), 1)
+
+    def test_capture_budget_does_not_delete_unqueued_bytes(self):
+        path = self.observation()
+        self.capturer.capture([path], max_sync_bytes=1)
+        self.assertTrue(path.exists())
+        self.assertEqual(self.spool.list_pending(), [])

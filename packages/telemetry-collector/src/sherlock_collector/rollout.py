@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping
 
+from .spool import _durable_unlink, _fsync_directory
+
 from .contract import (
     FRAGMENT_BYTES,
     MAX_LOGICAL_RECORD_BYTES,
@@ -18,9 +20,7 @@ from .contract import (
     ContractError,
     build_source_batch,
 )
-from .spool import (
-    DurableSpool, _atomic_json, _durable_unlink, _fsync_directory, secure_lock,
-)
+from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
 DEFAULT_MAX_FILES = 64
