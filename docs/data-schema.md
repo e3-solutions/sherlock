@@ -258,8 +258,8 @@ rollback without v2 support must reject them rather than change their source.
 
 | Role | Access |
 | --- | --- |
-| `sherlock_ingest` | Read workspace, person, batch, and native-record metadata; insert batches, native records, and thread timing recovery manifests |
-| `sherlock_normalizer` | Read telemetry; insert/update session caches; insert events |
+| `sherlock_ingest` | Read workspace, person, batch, and native-record metadata; insert batches, native records, and thread timing recovery manifests; insert people and update their display name, email, and GitHub ID |
+| `sherlock_normalizer` | Read telemetry and activity spans; insert/update session caches; insert events and session SCM facts (read only `source_record_id` and `source_version` on `telemetry.session_scm`) |
 | `sherlock_processor` | Select/insert/update queue jobs; read bounded SCM lookup inputs; select/insert GitHub lookup outcomes |
 | `sherlock_reducer` | Read sessions and normalized events; select/insert activity spans |
 | `sherlock_frame_projector` | Read sessions/events and only the native/batch columns needed for canonical representation pairing; select/insert frame receipts and revisions |
@@ -274,6 +274,9 @@ record adjacency, native type, collector, stream, and generation metadata; it
 cannot read source fingerprints or object locations, update/delete projection
 history, or activate itself. The reader cannot write any fact. These grants
 separate collection, interpretation, reduction, projection, and product reads.
+Schema usage and sequence usage/select grants support these operations. The
+reader may also execute bounded freshness, automated-run classification, and
+excerpt-search functions; the frame projector can read normalizer cutovers.
 The `sherlock_worker_login` role has `NOINHERIT` and may explicitly assume the
 reader for the bearer-gated Bonaparte MCP pilot. MCP transactions are
 additionally declared read-only, and any downstream prompt feedback remains an
