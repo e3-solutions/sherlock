@@ -127,6 +127,51 @@ describe("credential redaction", () => {
     }
   });
 
+  it.each([
+    ["PKCS8 PEM", "-----BEGIN PRIVATE KEY-----\nMIIEvSyntheticKeyBody123\n-----END PRIVATE KEY-----"],
+    ["OpenSSH PEM", "-----BEGIN OPENSSH PRIVATE KEY-----\nsyntheticPrivateBody123\n-----END OPENSSH PRIVATE KEY-----"],
+    ["RSA PEM", "-----BEGIN RSA PRIVATE KEY-----\r\nMIIEvSyntheticKeyBody123\r\n-----END RSA PRIVATE KEY-----"],
+    ["EC PEM", "-----BEGIN EC PRIVATE KEY-----\nMHcSyntheticKeyBody123\n-----END EC PRIVATE KEY-----"],
+    ["encrypted PEM", "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIISyntheticKeyBody123\n-----END ENCRYPTED PRIVATE KEY-----"],
+    ...["a", "b", "p", "o", "s", "r"].map((kind) => ["Slack xox" + kind, "xox" + kind + "-1234567890-abcdefghijklmnop"]),
+    ["Google API key", "AIza" + "a".repeat(35)],
+    ["Stripe secret", "sk_live_" + "a".repeat(24)],
+    ["Stripe restricted", "rk_live_" + "b".repeat(24)],
+    ["GitLab token", "glpat-" + "a".repeat(20)],
+  ])("redacts %s", (_shape, secret) => {
+    expect(redactCredentials(`before ${secret} after`))
+      .toEqual({ text: "before [REDACTED] after", redacted: true });
+  });
+
+  it.each([
+    ["password=hunter2", "password=[REDACTED]"],
+    ["api_key=synthetic-secret", "api_key=[REDACTED]"],
+    ['PASSWORD = "two words"', 'PASSWORD = "[REDACTED]"'],
+    ["api_key='two words'", "api_key='[REDACTED]'"],
+  ])("redacts assignment %s", (input, expected) => {
+    expect(redactCredentials(input)).toEqual({ text: expected, redacted: true });
+  });
+
+  it("redacts a URL password containing multiple at signs", () => {
+    expect(redactCredentials("postgres://reader:pa@ss@word@db.internal:5432/app"))
+      .toEqual({ text: "postgres://reader:[REDACTED]@db.internal:5432/app", redacted: true });
+  });
+
+  it.each([
+    "password=", "api_key=", "password policy", "my_password=example",
+    "-----BEGIN PUBLIC KEY-----\npublic\n-----END PUBLIC KEY-----",
+    "sk_live_short", "AIza-short", "glpat-short", "xoxb-short",
+  ])("preserves ordinary or incomplete shapes: %s", (text) => {
+    expect(redactCredentials(text)).toEqual({ text, redacted: false });
+  });
+
+  it("redacts PEM material when excerpt byte limits cut off the closing marker", () => {
+    const pem = "-----BEGIN PRIVATE KEY-----\n" + "A".repeat(2000) + "\n-----END PRIVATE KEY-----";
+    expect(excerptView(pem, Buffer.byteLength(pem))).toMatchObject({
+      contentExcerpt: "[REDACTED]", excerptRedacted: true, excerptTruncated: true,
+    });
+  });
+
   it("bounds multibyte excerpts by source bytes and reports truncation from original bytes", () => {
     const full = "é".repeat(600);
     const view = excerptView(full, 1200);

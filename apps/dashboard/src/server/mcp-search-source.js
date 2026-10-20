@@ -50,12 +50,21 @@ const ORIGINS = new Set([
 const REDACTED = "[REDACTED]";
 // Best-effort shapes only: a pattern miss is not proof that an excerpt is clean.
 const CREDENTIAL_PATTERNS = Object.freeze([
+  // Excerpts may end inside a PEM block, so redact an unfinished block to EOF.
+  [/-----BEGIN ((?:[A-Z0-9]+ )?PRIVATE KEY)-----[\s\S]*?(?:-----END \1-----|$)/g, REDACTED],
+  [/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, REDACTED],
+  [/\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g, REDACTED],
+  [/\b(?:sk_live_|rk_live_)[A-Za-z0-9]{16,}\b/g, REDACTED],
+  [/\bglpat-[A-Za-z0-9_-]{20,}/g, REDACTED],
+  [/(\b(?:password|api_key)\s*=\s*")[^"\r\n]+"/gi, `$1${REDACTED}"`],
+  [/(\b(?:password|api_key)\s*=\s*')[^'\r\n]+'/gi, `$1${REDACTED}'`],
+  [/(\b(?:password|api_key)\s*=\s*)[^\s"'&,;]+/gi, `$1${REDACTED}`],
   [/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}/g, REDACTED],
   [/\bsk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{16,}/g, REDACTED],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, REDACTED],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, REDACTED],
   [/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, REDACTED],
-  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s@/]+@/gi, `$1${REDACTED}@`],
+  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s/\?#]+@/gi, `$1${REDACTED}@`],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/-]{16,}=*/gi, `$1${REDACTED}`],
 ]);
 
