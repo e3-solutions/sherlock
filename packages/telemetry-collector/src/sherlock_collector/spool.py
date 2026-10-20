@@ -228,6 +228,13 @@ class DurableSpool:
                 "last_upload_failed_at": utc_now(),
             }
         )
+        # Import at call time to avoid the drain/spool module dependency cycle.
+        from .drain import PermanentUploadError
+
+        if isinstance(error, (PermanentUploadError, ContractError)):
+            metadata.setdefault("permanent_rejection_since", utc_now())
+        else:
+            metadata.pop("permanent_rejection_since", None)
         rewritten = SpoolItem(item.manifest, item.stored_payload, metadata)
         _atomic_json(path, rewritten.to_dict())
         _durable_replace(path, self.pending / path.name)

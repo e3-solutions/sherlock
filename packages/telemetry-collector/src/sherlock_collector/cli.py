@@ -392,12 +392,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sherlock collector is not configured: {error}", file=sys.stderr)
         return 78
     if args.command == "health":
-        pending_batches = len(spool.list_pending())
+        from .health import pending_health
+
+        pending = pending_health(spool)
+        pending_degraded = bool(
+            pending["stale_blocked_streams"] or pending["unreadable_pending_batches"]
+        )
         processing_batches = len(list(spool.processing.glob("*.json")))
         dead_letter_batches = len(list(spool.dead_letter.glob("*.json")))
         status = (
             "degraded"
-            if dead_letter_batches
+            if dead_letter_batches or pending_degraded
             else "recovering"
             if processing_batches
             else "ok"
@@ -409,14 +414,14 @@ def main(argv: list[str] | None = None) -> int:
                     "provider": args.provider,
                     "source_home": str(source_home),
                     "state_root": str(state_root),
-                    "pending_batches": pending_batches,
+                    **pending,
                     "processing_batches": processing_batches,
                     "dead_letter_batches": dead_letter_batches,
                 },
                 sort_keys=True,
             )
         )
-        return 1 if dead_letter_batches else 0
+        return 1 if dead_letter_batches or pending_degraded else 0
     outcome = Drain(
         spool,
         HttpTransport(
