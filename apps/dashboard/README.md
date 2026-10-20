@@ -260,8 +260,8 @@ discarded so it cannot override the dashboard's client label.
 ## Sherlock / Bonaparte MCP
 
 `/mcp` is a stateless Streamable HTTP MCP endpoint for bounded, agent-assisted
-telemetry queries and prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of at
-least 32 characters and configure the MCP client to send it as
+telemetry queries and prompt-evidence retrieval. Set `SHERLOCK_MCP_TOKEN` to a random secret of
+32–512 characters and configure the MCP client to send it as
 `Authorization: Bearer <token>`. Browser-origin requests are rejected; the
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
