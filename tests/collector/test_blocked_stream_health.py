@@ -79,3 +79,16 @@ class BlockedStreamHealthTests(unittest.TestCase):
     def test_local_contract_block_is_visible(self):
         self.reject(ContractError('conflicting receipt'))
         self.assertEqual(self.health()[1]['status'], 'degraded')
+
+    def test_alternating_rejections_keep_original_block_until_ack(self):
+        past = self.reject(PermanentUploadError('rejected'))
+        for error in (TransientUploadError('offline'), PermanentUploadError('rejected again'),
+                      ReceiptMismatch('mismatch'), TransientUploadError('offline again')):
+            transport = SuccessTransport()
+            transport.upload = lambda item: (_ for _ in ()).throw(error)
+            Drain(self.spool, transport).run()
+            item = self.spool.load(self.spool.list_pending()[0])
+            self.assertEqual(item.metadata['permanent_rejection_since'], past)
+            self.assertEqual(self.health()[1]['status'], 'degraded')
+        self.assertEqual(Drain(self.spool, SuccessTransport()).run().uploaded, 1)
+        self.assertEqual(self.health()[1]['status'], 'ok')

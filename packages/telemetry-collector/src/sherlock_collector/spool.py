@@ -236,8 +236,8 @@ class DurableSpool:
             error, ReceiptMismatch
         ):
             metadata.setdefault("permanent_rejection_since", utc_now())
-        else:
-            metadata.pop("permanent_rejection_since", None)
+        # A later transient result does not resolve an earlier permanent block.
+        # Successful delivery clears it by acknowledging (deleting) this item.
         rewritten = SpoolItem(item.manifest, item.stored_payload, metadata)
         _atomic_json(path, rewritten.to_dict())
         _durable_replace(path, self.pending / path.name)
