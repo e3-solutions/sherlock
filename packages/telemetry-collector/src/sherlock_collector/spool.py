@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from .contract import (
     BatchManifest,
     ContractError,
+    ReceiptMismatch,
     SPOOL_VERSION,
     validate_stored_payload,
 )
@@ -231,7 +232,9 @@ class DurableSpool:
         # Import at call time to avoid the drain/spool module dependency cycle.
         from .drain import PermanentUploadError
 
-        if isinstance(error, (PermanentUploadError, ContractError)):
+        if isinstance(error, (PermanentUploadError, ContractError)) and not isinstance(
+            error, ReceiptMismatch
+        ):
             metadata.setdefault("permanent_rejection_since", utc_now())
         else:
             metadata.pop("permanent_rejection_since", None)

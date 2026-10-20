@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sherlock_collector.cli import main
+from sherlock_collector.contract import ContractError, ReceiptMismatch
 from sherlock_collector.drain import Drain, PermanentUploadError, TransientUploadError
 from sherlock_collector.spool import DurableSpool
 from test_collector import batch, SuccessTransport
@@ -59,6 +60,7 @@ class BlockedStreamHealthTests(unittest.TestCase):
 
     def test_transient_or_recent_rejection_does_not_mark_stuck(self):
         for error, minutes in [(TransientUploadError('offline'), 10),
+                               (ReceiptMismatch('receipt mismatch'), 10),
                                (PermanentUploadError('rejected'), 0)]:
             with self.subTest(error=error):
                 self.reject(error, minutes=minutes)
@@ -72,4 +74,8 @@ class BlockedStreamHealthTests(unittest.TestCase):
         Drain(self.spool, transport).run()
         item = self.spool.load(self.spool.list_pending()[0])
         self.assertEqual(item.metadata['permanent_rejection_since'], past)
+        self.assertEqual(self.health()[1]['status'], 'degraded')
+
+    def test_local_contract_block_is_visible(self):
+        self.reject(ContractError('conflicting receipt'))
         self.assertEqual(self.health()[1]['status'], 'degraded')
