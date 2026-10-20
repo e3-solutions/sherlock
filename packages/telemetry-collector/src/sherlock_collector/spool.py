@@ -167,7 +167,7 @@ class DurableSpool:
     def load(self, path: Path) -> SpoolItem:
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ContractError(
                 f"cannot read spool item {path.name}: {error}"
             ) from error
@@ -212,6 +212,10 @@ class DurableSpool:
         except FileNotFoundError:
             return None
         return claimed
+
+    def release(self, path: Path) -> None:
+        """Return an unreadable claim without rewriting its source bytes."""
+        _durable_replace(path, self.pending / path.name)
 
     def recover_processing(self) -> int:
         recovered = 0

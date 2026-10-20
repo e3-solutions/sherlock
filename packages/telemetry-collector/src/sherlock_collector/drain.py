@@ -53,6 +53,7 @@ class Drain:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return DrainResult(locked=True)
+            self._unreadable_paths: set[Path] = set()
             recovered = self.spool.recover_processing()
             uploaded = requeued = dead_lettered = 0
             blocked_streams: set[tuple[str, str]] = set()
@@ -83,8 +84,14 @@ class Drain:
         ] = {}
         invalid: deque[Path] = deque()
         for path in self.spool.list_pending():
+            # An unreadable range may precede any known frontier. Defer the
+            # remaining inventory until a later drain can establish its order.
+            if path in self._unreadable_paths:
+                return {}, deque()
             try:
                 manifest = self.spool.load(path).manifest
+            except OSError:
+                return {}, deque()
             except ContractError:
                 invalid.append(path)
                 continue
@@ -170,6 +177,13 @@ class Drain:
                 validated_receipt,
                 token_payload,
             )
+        except OSError as error:
+            if item is None:
+                self.spool.release(claimed)
+                self._unreadable_paths.add(pending_path)
+                return "requeued"
+            self.spool.requeue(claimed, item, error)
+            return "requeued"
         except (TransientUploadError, ReceiptMismatch) as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
