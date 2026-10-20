@@ -92,7 +92,8 @@ Apply the migrations to a disposable Postgres/Supabase stack, then run:
 SUPABASE_DB_URL=... \
 SUPABASE_URL=https://PROJECT.supabase.co \
 SUPABASE_SERVICE_ROLE_KEY=... \
-deno run --allow-env --allow-net workers/telemetry-processor/main.ts
+deno run --config workers/telemetry-processor/deno.json --allow-env --allow-net \
+  workers/telemetry-processor/main.ts
 ```
 
 Optional settings include `SHERLOCK_WORKER_CONCURRENCY` (default `4`),
@@ -110,9 +111,11 @@ belong in the collector.
 Run focused tests with:
 
 ```sh
-deno check workers/telemetry-processor/main.ts
-deno test workers/telemetry-processor
-SHERLOCK_TEST_DATABASE_URL=... deno test --allow-env --allow-net \
+deno check --config workers/telemetry-processor/deno.json workers/telemetry-processor/main.ts
+deno test --config workers/telemetry-processor/deno.json --allow-read=railway.toml \
+  workers/telemetry-processor
+SHERLOCK_TEST_DATABASE_URL=... \
+deno test --config workers/telemetry-processor/deno.json --allow-env --allow-net \
   workers/telemetry-processor/queue_integration_test.ts
 ```
 
@@ -202,9 +205,15 @@ historical normalization replay is required.
 1. Deploy the v3-capable worker and dashboard together. The worker produces only
    frame v5, selecting existing legacy facts alongside new v3 facts. The dashboard
    retains old snapshot readers and serves v4 until v5 is activated.
-2. Run `scripts/backfill-frame-evidence.ts --workspace <uuid> --activate` with
-   `SUPABASE_DB_URL` to project the current 26-hour window from **already normalized
-   facts**. This is the existing projection handoff, not a raw-data replay or
+2. With `SUPABASE_DB_URL` set, run:
+
+   ```sh
+   deno run --config workers/telemetry-processor/deno.json --allow-env --allow-net \
+     scripts/backfill-frame-evidence.ts --workspace <uuid> --activate
+   ```
+
+   This projects the current 26-hour window from **already normalized facts**.
+   This is the existing projection handoff, not a raw-data replay or
    historical classification repair. Activation requires complete normalization
    and matching receipts covering 25 hours (the dashboard serves 24 hours).
    The 26-hour projection leaves room for live receipts to advance during handoff.

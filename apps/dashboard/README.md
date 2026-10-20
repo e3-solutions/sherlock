@@ -232,6 +232,11 @@ server connection; every dashboard transaction explicitly assumes the restricted
 exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
 the additive frame-projection migration or when stopping new v2 token minting.
 
+Set SHERLOCK_MCP_TOKEN to a server-only random secret of 32–512 characters to
+enable `/mcp`. MCP clients send that value as `Authorization: Bearer <token>`;
+never give them SUPABASE_DB_URL. An absent or invalid-length token makes MCP
+requests return HTTP 503 (`mcp_not_configured`).
+
 For shared Supavisor connections, the dashboard routes session endpoints (port
 `5432` or an omitted port) to transaction mode on port `6543`. This also works
 when `SUPABASE_DB_URL` inherits a shared Railway variable: the reference and
