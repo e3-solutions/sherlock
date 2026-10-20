@@ -53,6 +53,12 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/dashboard/pnpm-lock.yaml
 
+      - name: Check shell syntax
+        run: |
+          for script in install.sh install-claude.sh verify-claude.sh sherlock; do
+            sh -n "$script"
+          done
+
       - name: Check Deno formatting and lint
         run: |
           deno fmt --check supabase/functions workers scripts
