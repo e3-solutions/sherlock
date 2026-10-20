@@ -152,6 +152,11 @@ describe("credential redaction", () => {
     expect(redactCredentials(input)).toEqual({ text: expected, redacted: true });
   });
 
+  it("redacts assignments independently on separate lines", () => {
+    expect(redactCredentials("password = first\napi_key = second\nordinary text"))
+      .toEqual({ text: "password = [REDACTED]\napi_key = [REDACTED]\nordinary text", redacted: true });
+  });
+
   it("redacts a URL password containing multiple at signs", () => {
     expect(redactCredentials("postgres://reader:pa@ss@word@db.internal:5432/app"))
       .toEqual({ text: "postgres://reader:[REDACTED]@db.internal:5432/app", redacted: true });
@@ -159,6 +164,9 @@ describe("credential redaction", () => {
 
   it.each([
     "password=", "api_key=", "password policy", "my_password=example",
+    "if (password === expected)", "if (password == expected)", "if (password != expected)",
+    'if (password == "expected")', "if (api_key === expected)",
+    "password\n=example", "password=\nnextLine", "api_key =\r\nnextLine",
     "-----BEGIN PUBLIC KEY-----\npublic\n-----END PUBLIC KEY-----",
     "sk_live_short", "AIza-short", "glpat-short", "xoxb-short",
   ])("preserves ordinary or incomplete shapes: %s", (text) => {
