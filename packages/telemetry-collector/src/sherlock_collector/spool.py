@@ -261,6 +261,7 @@ class DurableSpool:
         _durable_replace(path, self.pending / path.name)
 
     def quarantine(self, path: Path, item: SpoolItem | None, error: Exception) -> None:
+        self.clear_read_failures(path)
         if item is None:
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
@@ -282,7 +283,6 @@ class DurableSpool:
                 SpoolItem(item.manifest, item.stored_payload, metadata).to_dict(),
             )
         _durable_replace(path, self.dead_letter / path.name)
-        self.clear_read_failures(path)
 
     def acknowledge(self, path: Path) -> None:
         _durable_unlink(path)
