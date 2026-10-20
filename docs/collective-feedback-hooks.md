@@ -19,9 +19,14 @@ that all devices subscribe, have downloaded a version, or have trusted changed h
 source inspection. Sherlock collector runtime and plugin cache are separate artifacts; updating
 the dashboard or copied collector runtime alone does not update the plugin guidance.
 
-The portable `scripts/collective_feedback.py` is intentionally mirrored inside each independently
-packaged plugin. The cross-repository test enforces byte parity. No imports from another installed
-plugin and no runtime downloads are needed.
+The portable `scripts/collective_feedback.py` is relative to each independently packaged plugin:
+[`plugins/sherlock/scripts/collective_feedback.py`](../plugins/sherlock/scripts/collective_feedback.py)
+and
+[`plugins/sherlock-claude-code/scripts/collective_feedback.py`](../plugins/sherlock-claude-code/scripts/collective_feedback.py).
+The in-repository
+[`tests/collector/test_collective_feedback.py`](../tests/collector/test_collective_feedback.py)
+enforces byte parity between these two copies. No imports from another installed plugin and no
+runtime downloads are needed.
 
 ## Local behavior
 
@@ -66,15 +71,28 @@ quality defect.
 
 ## Reproduce local verification
 
-From the codex-plugins worktree, with the companion Sherlock worktree available:
+From the Sherlock repository root, run the in-repository feedback tests:
 
 ```sh
-SHERLOCK_FEEDBACK_TEST_ROOT=/absolute/path/to/sherlock-feedback-hooks \
+PYTHONPATH=packages/telemetry-collector/src \
+python3 -m unittest discover -s tests/collector -p 'test_collective_feedback.py' -v
+```
+
+These tests check parity between the two Sherlock plugin copies, guidance and opt-out gates,
+and Codex SessionStart compaction routing with disposable state and a synthetic E3 repository.
+
+For the separate cross-repository checks, run the following from a companion `codex-plugins`
+worktree containing `tests/test_collective_hooks.py` and `tests/test_collective_feedback_hooks.py`,
+with `SHERLOCK_FEEDBACK_TEST_ROOT` pointing to this Sherlock checkout. These pytest files are not
+part of this repository:
+
+```sh
+SHERLOCK_FEEDBACK_TEST_ROOT=/absolute/path/to/sherlock \
 python3 -m pytest -q tests/test_collective_hooks.py tests/test_collective_feedback_hooks.py
 ```
 
-Tests create disposable profiles/cache/state and synthetic E3 repos. They run declared hook
-commands against packaged copies, block outbound Python connections, disable upload/update/
+The cross-repository tests create disposable profiles/cache/state and synthetic E3 repos. They run
+declared hook commands against packaged copies, block outbound Python connections, disable upload/update/
 presence side effects, verify both provider orders/concurrency and check original telemetry
 stdin. They do not install to the active user's profile or write to live Forum.
 
