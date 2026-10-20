@@ -89,12 +89,13 @@ class Drain:
             if path in self._unreadable_paths:
                 return {}, deque()
             try:
-                manifest = self.spool.load(path).manifest
-            except OSError:
-                return {}, deque()
+                item = self.spool.load(path)
+                manifest = item.manifest
             except ContractError:
                 invalid.append(path)
                 continue
+            except OSError:
+                return {}, deque()
             stream = manifest.stream_identity
             if stream in blocked_streams:
                 continue
@@ -177,13 +178,6 @@ class Drain:
                 validated_receipt,
                 token_payload,
             )
-        except OSError as error:
-            if item is None:
-                self.spool.release(claimed)
-                self._unreadable_paths.add(pending_path)
-                return "requeued"
-            self.spool.requeue(claimed, item, error)
-            return "requeued"
         except (TransientUploadError, ReceiptMismatch) as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
@@ -200,6 +194,10 @@ class Drain:
             self.spool.requeue(claimed, item, error)
             return "requeued"
         except Exception as error:
+            if item is None and isinstance(error, OSError):
+                self.spool.release(claimed)
+                self._unreadable_paths.add(pending_path)
+                return "requeued"
             if item is None:
                 self.spool.quarantine(claimed, None, error)
                 return "dead-lettered"
