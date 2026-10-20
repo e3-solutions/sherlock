@@ -7,9 +7,10 @@ dashboard Flame read API are implemented. Durable cross-version snapshot
 resolution remains future work; frame projection activation is explicit.
 
 Sherlock keeps raw telemetry immutable, database facts auditable, and product
-views separate from source data. Ten source/product tables remain across two
-private schemas, with one private operational queue table in `processing` and
-one private Storage bucket.
+views separate from source data. Sixteen source/product tables span the three
+private schemas `telemetry`, `analytics`, and `github`. A seventeenth table, the
+private operational queue, lives in `processing`; raw objects use one private
+Storage bucket.
 
 ## Sources of truth
 
@@ -31,13 +32,16 @@ Keeping one exact definition prevents the architecture notes from drifting.
 - `telemetry` stores source receipts, native record locators, and normalized
   facts.
 - `analytics` stores rebuildable activity projections.
-- Both schemas are private and excluded from the configured Data API schemas.
-- `public`, `anon`, and `authenticated` have no access to either schema or its
+- `github` stores append-only exact commit-to-pull-request lookup outcomes.
+- `processing` stores the mutable worker queue.
+- All four application schemas are private and excluded from the configured
+  Data API schemas.
+- `public`, `anon`, and `authenticated` have no access to those schemas or their
   tables and sequences.
 - The private `telemetry-raw` bucket accepts gzip and binary objects up to
   50 MiB.
-- Five no-login database roles separate ingest, normalization, reduction,
-  frame projection, and reads.
+- Six no-login database roles separate ingest, normalization, queue processing,
+  reduction, frame projection, and reads.
 - Database assertions cover the core schema, grants, bucket, and
   representative integrity failures.
 - The collector and ingest function implement the versioned immutable
@@ -91,11 +95,16 @@ database columns.
 | `telemetry.ingest_batches` | Receipt for one committed source byte range and Storage object | Ingest may insert only |
 | `telemetry.native_records` | Exact locator and parse status for each native record | Ingest may insert only |
 | `telemetry.events` | Versioned semantic projections of native records | Normalizer may insert only |
+| `telemetry.session_scm` | Versioned exact repository and commit facts tied to native session records | Normalizer may insert only |
+| `telemetry.provider_usage_snapshots` | Immutable provider billing responses, separate from native token telemetry | Administrative import; application reader may select only |
+| `telemetry.thread_activity_recovery_batches` | Immutable manifests of recovered thread timing and archived source hashes | Ingest may insert only; reader may select |
 | `analytics.activity_spans` | Versioned, rebuildable activity intervals | Reducer may insert only |
 | `analytics.frame_projection_receipts` | Bounded, fingerprinted proof of one session source state consumed by a frame version | Frame projector may insert only |
 | `analytics.frame_evidence_revisions` | Payload-free activity and prompt selection revisions tied to source events and receipts | Frame projector may insert only |
 | `analytics.normalizer_cutovers` | Immutable workspace source-version boundary | Owner inserts once; application roles read only |
 | `analytics.frame_projection_activations` | Explicit proven projection facts by workspace and version | Owner inserts once; application roles read only |
+| `analytics.bonaparte_run_classifications` | Auditable, time-bounded automated-run annotations separate from source facts | Administrative append; reader may select only |
+| `github.commit_pr_lookups` | Append-only outcomes of exact commit-associated PR lookups | Processor may select and insert; reader may select |
 | `processing.telemetry_jobs` | Mutable leases, retries, workload class, and terminal outcomes | Ingest trigger inserts; Railway transitions with fencing |
 
 Append-only behavior is enforced for application roles through grants. A
@@ -249,13 +258,16 @@ rollback without v2 support must reject them rather than change their source.
 
 | Role | Access |
 | --- | --- |
-| `sherlock_ingest` | Read workspace, person, batch, and native-record metadata; insert batches and native records |
+| `sherlock_ingest` | Read workspace, person, batch, and native-record metadata; insert batches, native records, and thread timing recovery manifests |
 | `sherlock_normalizer` | Read telemetry; insert/update session caches; insert events |
+| `sherlock_processor` | Select/insert/update queue jobs; read bounded SCM lookup inputs; select/insert GitHub lookup outcomes |
 | `sherlock_reducer` | Read sessions and normalized events; select/insert activity spans |
 | `sherlock_frame_projector` | Read sessions/events and only the native/batch columns needed for canonical representation pairing; select/insert frame receipts and revisions |
-| `sherlock_reader` | Read telemetry and analytics; no writes |
+| `sherlock_reader` | Read permitted telemetry, analytics, and GitHub lookup facts; no writes |
 
 The ingest role cannot write events or spans. The normalizer cannot write spans.
+The processor manages mutable queue state and appends GitHub lookup outcomes;
+normalization, reduction, and frame projection use their own roles.
 The reducer cannot read raw receipts or native locators, change session caches
 or events, or update/delete spans. The frame projector can read only bounded
 record adjacency, native type, collector, stream, and generation metadata; it
