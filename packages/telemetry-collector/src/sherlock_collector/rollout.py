@@ -18,7 +18,9 @@ from .contract import (
     ContractError,
     build_source_batch,
 )
-from .spool import DurableSpool, _atomic_json, secure_lock
+from .spool import (
+    DurableSpool, _atomic_json, _durable_unlink, _fsync_directory, secure_lock,
+)
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
 DEFAULT_MAX_FILES = 64
@@ -218,6 +220,14 @@ class RolloutCapturer:
             except BlockingIOError:
                 return CaptureResult(locked=True)
             states, candidate_cursor = self._load_state()
+            if self.source_provider == "claude_code" and self.source_kind == "hook":
+                states = {
+                    key: state for key, state in states.items()
+                    if not (
+                        Path(state.path).parent == self.state_root.resolve() / "claude-hook-events"
+                        and not Path(state.path).exists()
+                    )
+                }
             enqueued = captured = errors = 0
             all_paths = list(
                 dict.fromkeys(str(self._canonical_path(item)) for item in paths)
@@ -442,7 +452,25 @@ class RolloutCapturer:
                 enqueued += 1
                 captured += len(source)
             states[key] = state
-            return enqueued, captured
+        if (
+            self.source_provider == "claude_code"
+            and self.source_kind == "hook"
+            and path.parent == self.state_root.resolve() / "claude-hook-events"
+            and state.offset == stable_end
+            and (
+                (current := path.stat()).st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+            ) == (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
+        ):
+            # Observation files are immutable UUID records. Every byte is already
+            # enqueued and the cursor is durable. Sync the queue directory again
+            # in case an earlier enqueue's directory fsync failed after replace.
+            _fsync_directory(self.spool.pending)
+            _durable_unlink(path)
+            states.pop(key, None)
+        return enqueued, captured
 
     def _native_record_fragment_plan(
         self,
