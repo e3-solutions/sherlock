@@ -1216,6 +1216,7 @@ describe("Sherlock Flame payload", () => {
       .mockResolvedValueOnce([{
         session_id: sessionId,
         semantic_role: "subagent",
+        provider: "claude",
         first_at: new Date("2026-08-16T12:00:09.000Z"),
         last_at: new Date("2026-08-16T12:04:00.000Z"),
         event_count: 4,
@@ -1257,6 +1258,7 @@ describe("Sherlock Flame payload", () => {
         id: `${sessionId}:subagent`,
         sessionId,
         role: "subagent",
+        provider: "claude",
         eventCount: 4,
         summary: "Inspect the query",
         pullRequest: {
@@ -1448,6 +1450,7 @@ describe("Sherlock Flame payload", () => {
     const header = {
       session_id: SESSION_ID,
       semantic_role: "agent",
+      provider: "codex",
       first_at: new Date("2026-08-16T12:00:00.000Z"),
       last_at: new Date("2026-08-16T12:00:03.000Z"),
       event_count: 2,
@@ -1492,6 +1495,7 @@ describe("Sherlock Flame payload", () => {
     });
     expect(detail).toMatchObject({
       workId: `${SESSION_ID}:agent`,
+      provider: "codex",
       eventCount: 2,
     });
   });

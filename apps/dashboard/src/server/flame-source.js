@@ -635,7 +635,7 @@ const DETAIL_EVENT_COLUMNS = `,
          nr.native_type source_native_type,
          nr.native_payload_type source_native_payload_type,
          ib.collector_key source_collector_key,
-         ib.source_kind, ib.source_stream_key,
+         ib.source_provider, ib.source_kind, ib.source_stream_key,
          ib.generation_key, ib.generation_seq,
          ib.start_offset source_batch_start_offset,
          ib.end_offset source_batch_end_offset,
@@ -881,6 +881,7 @@ with p as materialized (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
          count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
+         min(source_provider) source_provider,
          (array_agg(content_excerpt order by observed_at, id) filter (
            where event_kind = 'message' and message_role = 'user'
              and (
@@ -894,7 +895,9 @@ with p as materialized (
    group by session_id, semantic_role
 )
 select session_id::text session_id, semantic_role, first_at, last_at,
-       event_count, summary, is_automated_run
+       event_count, summary, is_automated_run,
+       case source_provider when 'claude_code' then 'claude'
+            when 'codex' then 'codex' else 'unknown' end provider
   from grouped
  order by first_at, session_id, semantic_role
  limit $11
@@ -994,6 +997,7 @@ with p as materialized (
   select bucket_events.session_id, bucket_events.semantic_role,
          min(bucket_events.observed_at) first_at, max(bucket_events.observed_at) last_at,
          count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
+         min(source_provider) source_provider,
          (array_agg(bucket_events.content_excerpt order by bucket_events.observed_at, bucket_events.id) filter (
            where bucket_events.event_kind = 'message'
              and bucket_events.message_role = 'user'
@@ -1028,6 +1032,8 @@ with p as materialized (
 )
 select header.session_id::text session_id, header.semantic_role,
        header.first_at, header.last_at, header.event_count, header.summary, header.is_automated_run,
+       case header.source_provider when 'claude_code' then 'claude'
+            when 'codex' then 'codex' else 'unknown' end provider,
        selected.id::text id, selected.observed_at,
        selected.observed_at_microseconds, selected.message_role,
        selected.content_byte_size, selected.content_excerpt
@@ -1371,7 +1377,8 @@ with p as materialized (
 ), grouped as materialized (
   select session_id, semantic_role,
          min(observed_at) first_at, max(observed_at) last_at,
-         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run
+         count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
+         min(source_event_id) provider_event_id
     from bucket_events
    group by session_id, semantic_role
    order by first_at, session_id, semantic_role
@@ -1399,9 +1406,16 @@ with p as materialized (
 )
 select grouped.session_id::text session_id, grouped.semantic_role,
        grouped.first_at, grouped.last_at, grouped.event_count, grouped.is_automated_run,
-       session_summaries.summary
+       session_summaries.summary,
+       case when provider_source.normalizer_version = '${CLAUDE_NORMALIZER_VERSION}' then 'claude'
+            when provider_source.normalizer_version = any(array['${LEGACY_CODEX_NORMALIZER_VERSION}', '${NORMALIZER_VERSION}', '${CORRECTED_CODEX_NORMALIZER_VERSION}']) then 'codex'
+            else 'unknown' end provider
   from grouped
-  left join session_summaries using (session_id, semantic_role)
+  left join telemetry.events provider_source
+    on provider_source.workspace_id = $1 and provider_source.id = grouped.provider_event_id
+  left join session_summaries
+    on session_summaries.session_id = grouped.session_id
+   and session_summaries.semantic_role = grouped.semantic_role
  order by grouped.first_at, grouped.session_id, grouped.semantic_role
 `;
 
@@ -1470,6 +1484,7 @@ with p as materialized (
          min(bucket_events.observed_at) first_at,
          max(bucket_events.observed_at) last_at,
          count(*)::bigint event_count, bool_or(is_automated_run) is_automated_run,
+         min(bucket_events.source_event_id) provider_event_id,
          (array_agg(bucket_events.source_event_id order by bucket_events.observed_at,
                     bucket_events.source_event_id)
            filter (where bucket_events.is_summary_candidate)
@@ -1501,10 +1516,15 @@ with p as materialized (
 select header.session_id::text session_id, header.semantic_role,
        header.first_at, header.last_at, header.event_count, header.is_automated_run,
        summary.content_excerpt summary,
+       case when provider_source.normalizer_version = '${CLAUDE_NORMALIZER_VERSION}' then 'claude'
+            when provider_source.normalizer_version = any(array['${LEGACY_CODEX_NORMALIZER_VERSION}', '${NORMALIZER_VERSION}', '${CORRECTED_CODEX_NORMALIZER_VERSION}']) then 'codex'
+            else 'unknown' end provider,
        selected.source_event_id::text id, selected.observed_at,
        selected.observed_at_microseconds, selected.message_role,
        source.content_byte_size, source.content_excerpt
   from header
+  left join telemetry.events provider_source
+    on provider_source.workspace_id = $1 and provider_source.id = header.provider_event_id
   left join telemetry.events summary
     on summary.workspace_id = $1 and summary.id = header.summary_event_id
   left join selected on true
@@ -1787,6 +1807,7 @@ function workFromRow(row, pullRequest = null) {
     lastAt: asDate(row.last_at).toISOString(),
     eventCount: count(row.event_count),
     summary,
+    ...(row.provider === undefined ? {} : { provider: String(row.provider) }),
     ...(row.is_automated_run === true ? { automatedRun: true } : {}),
     ...(pullRequest === null ? {} : { pullRequest }),
   };
@@ -2546,6 +2567,7 @@ export class DirectFlameSource {
         firstAt: header.firstAt,
         lastAt: header.lastAt,
         eventCount: header.eventCount,
+        ...(header.provider === undefined ? {} : { provider: header.provider }),
         ...(header.automatedRun ? { automatedRun: true } : {}),
         items: pageRows.map(detailItemFromRow),
         nextCursor,

@@ -366,7 +366,8 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
     }
   }, 30_000);
 
-  it("uses the next human summary without changing projected prompt evidence", async () => {
+  it.each([[NORMALIZER_VERSION, "codex"], [CLAUDE_NORMALIZER_VERSION, "claude"]])(
+    "uses the next human summary and provider %s without changing projected prompt evidence", async (normalizerVersion, provider) => {
     const workspaceId = crypto.randomUUID();
     const personId = crypto.randomUUID();
     const sessionId = crypto.randomUUID();
@@ -452,7 +453,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           sessionId,
           records[0].id,
           records[1].id,
-          NORMALIZER_VERSION,
+          normalizerVersion,
           runtimeAt.toISOString(),
           humanAt.toISOString(),
           runtimeContent,
@@ -532,6 +533,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
 
       expect(work).toHaveLength(1);
       expect(work[0].summary).toBe(humanContent);
+      expect(work[0].provider).toBe(provider);
       expect(prompts.map(({ content_excerpt }) => content_excerpt)).toEqual([
         runtimeContent,
         humanContent,
@@ -1548,12 +1550,14 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
           role: "agent",
           eventCount: 4,
           summary: "Review the ingestion path",
+          provider: "claude",
         }),
         expect.objectContaining({
           sessionId: workerSessionId,
           role: "subagent",
           eventCount: 2,
           summary: "Check the dashboard query",
+          provider: "claude",
         }),
       ]);
 
@@ -1566,6 +1570,7 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
         limit: "10",
       });
       expect(detail.eventCount).toBe(4);
+      expect(detail.provider).toBe("claude");
       expect(detail.items.map(({ role, content }) => [role, content])).toEqual([
         ["user", "Review the ingestion path"],
         ["assistant", "I will inspect it."],

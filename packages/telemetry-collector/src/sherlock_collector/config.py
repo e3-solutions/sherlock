@@ -221,7 +221,9 @@ def load_config(
     path: Path | str | None = None,
     *,
     codex_home: Path | str | None = None,
+    use_environment: bool = True,
 ) -> CollectorConfig:
+    environment = os.environ if use_environment else {}
     config_path = Path(path or default_config_path(codex_home)).expanduser().resolve()
     file_values = _read_owner_only(config_path)
     if not config_path.exists():
@@ -231,16 +233,16 @@ def load_config(
             else config_path.parent.parent
         )
         _require_clean_or_configured_collector_home(source_home)
-    endpoint = os.environ.get("SHERLOCK_INGEST_URL")
+    endpoint = environment.get("SHERLOCK_INGEST_URL")
     if endpoint is None:
         endpoint = file_values.get("endpoint")
     identity = validate_identity(
-        name=os.environ.get("SHERLOCK_NAME", file_values.get("name")),
-        github_id=os.environ.get(
+        name=environment.get("SHERLOCK_NAME", file_values.get("name")),
+        github_id=environment.get(
             "SHERLOCK_GITHUB_ID", file_values.get("github_id")
         ),
-        email=os.environ.get("SHERLOCK_EMAIL", file_values.get("email")),
-        installation_id=os.environ.get(
+        email=environment.get("SHERLOCK_EMAIL", file_values.get("email")),
+        installation_id=environment.get(
             "SHERLOCK_INSTALLATION_ID", file_values.get("installation_id")
         ),
     )

@@ -1179,3 +1179,35 @@ it("labels automated activity in the tooltip without claiming human prompts", ()
   expect(screen.getByRole("status")).toHaveTextContent("Prompts 0");
   expect(screen.getByRole("status")).toHaveTextContent("4 observed sessions");
 });
+
+
+describe("provider session labels", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it.each([["claude", "Claude Code"], ["codex", "Codex"], [undefined, "Provider unknown"]])(
+    "shows %s in worker rows and conversation detail", async (provider, label) => {
+      const data = model();
+      data.people[0].buckets[0].prompts = 0;
+      vi.stubGlobal("fetch", vi.fn(async (url) => {
+        const request = new URL(url, "http://dashboard.test");
+        const start = request.searchParams.get("start");
+        const identity = { personId: "ada", start, snapshot: data.snapshot };
+        return { ok: true, json: async () => request.pathname.endsWith("/work")
+          ? { ...identity, workId: "worker:subagent", sessionId: "worker", role: "subagent",
+              provider, firstAt: start, lastAt: start, eventCount: 1, items: [], nextCursor: null }
+          : { ...identity, work: [{ id: "worker:subagent", sessionId: "worker", role: "subagent",
+              provider, firstAt: start, lastAt: start, eventCount: 1,
+              summary: "Review background job" }], prompts: [] } };
+      }));
+      const { container } = render(<FlameGraph data={data} chartWidth={1008} />);
+      const wrapper = container.querySelector(".flame-person .recharts-wrapper");
+      vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(chartBounds);
+      fireEvent.click(wrapper, { clientX: 3, clientY: 34 });
+      const row = await screen.findByRole("button", { name: /Review background job/ });
+      expect(row).toHaveTextContent(label);
+      expect(row).toHaveTextContent("Subagent");
+      fireEvent.click(row);
+      expect(await screen.findByRole("heading", { name: "Subagent session" })).toBeInTheDocument();
+      expect(container.querySelector(".flame-detail__work-meta")).toHaveTextContent(label);
+    },
+  );
+});

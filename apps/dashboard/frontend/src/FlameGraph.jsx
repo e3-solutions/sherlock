@@ -418,6 +418,10 @@ function roleLabel(role) {
   return role === "agent" ? "Agent" : role === "subagent" ? "Subagent" : "Unclassified";
 }
 
+function providerLabel(provider) {
+  return provider === "claude" ? "Claude Code" : provider === "codex" ? "Codex" : "Provider unknown";
+}
+
 function EvidenceLimits() {
   return (
     <details className="flame-detail__disclosure">
@@ -497,6 +501,8 @@ function IntervalOverview({
         <span className="flame-detail__work-copy">
           <strong className={work.summary ? undefined : "flame-detail__work-generic"}>{label}</strong>
           <span>
+            <b>{providerLabel(work.provider)}</b>
+            <span aria-hidden="true">·</span>
             <b>{work.automatedRun ? "Automated run" : roleLabel(work.role)}</b>
             <span aria-hidden="true">·</span>
             <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
@@ -658,6 +664,8 @@ function WorkDetail({
         <h2 id={headingId}>{work.automatedRun ? "Automated run" : `${roleLabel(work.role)} session`}</h2>
         <div className="flame-detail__work-meta">
           <p>
+            <b>{providerLabel(work.provider)}</b>
+            <span aria-hidden="true"> · </span>
             <time dateTime={new Date(work.firstAtMs).toISOString()}>{formatTime(work.firstAtMs)}</time>
             <span aria-hidden="true">–</span>
             <time dateTime={new Date(work.lastAtMs).toISOString()}>{formatTime(work.lastAtMs)}</time>
@@ -1277,6 +1285,8 @@ export default function FlameGraph({
       workId: work.id,
       sessionId: work.sessionId,
       role: work.role,
+      provider: work.provider,
+      automatedRun: work.automatedRun,
       firstAtMs: work.firstAtMs,
       lastAtMs: work.lastAtMs,
       eventCount: work.eventCount,

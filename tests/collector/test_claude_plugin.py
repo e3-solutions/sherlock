@@ -116,6 +116,71 @@ class ClaudePluginTests(unittest.TestCase):
             )
             self.assertEqual(rejected.paths, ())
 
+    def test_live_hooks_capture_children_without_agent_transcript_path(self):
+        with TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve() / "claude"
+            session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            project = home / "projects" / "repo"
+            main = project / f"{session_id}.jsonl"
+            children = project / session_id / "subagents"
+            children.mkdir(parents=True)
+            main.write_text(json.dumps({"sessionId": session_id}) + "\n")
+            initial = discover_claude_transcripts(home, hook_payload={
+                "session_id": session_id, "transcript_path": str(main),
+            })
+            self.assertEqual(initial.paths, (main,))
+            child = children / "agent-worker.jsonl"
+            child.write_text(json.dumps({"sessionId": session_id, "agentId": "worker"}) + "\n")
+            mismatch = children / "agent-wrong.jsonl"
+            mismatch.write_text(json.dumps({"sessionId": str(uuid.uuid4())}) + "\n")
+            other = project / str(uuid.uuid4()) / "subagents" / "agent-other.jsonl"
+            other.parent.mkdir(parents=True)
+            other.write_text('{}\n')
+            outside = Path(temporary) / "outside.jsonl"
+            outside.write_text('{}\n')
+            (children / "agent-linked.jsonl").symlink_to(outside)
+            spool = DurableSpool(Path(temporary) / "state")
+            capturer = RolloutCapturer(
+                Path(temporary) / "state", spool, allowed_root=home / "projects",
+                source_provider="claude_code", source_kind="transcript",
+                state_name="claude-transcript", capture_unterminated_tail=False,
+            )
+            for event in ("SubagentStart", "PostToolUse", "Stop", "SessionEnd"):
+                found = discover_claude_transcripts(home, hook_payload={
+                    "session_id": session_id, "transcript_path": str(main),
+                    "hook_event_name": event,
+                })
+                self.assertEqual(found.paths, (main, child))
+                self.assertEqual(found.parent_native_session_ids[str(child)], session_id)
+                self.assertEqual(found.native_session_ids[str(child)], "worker")
+                self.assertEqual(found.invalid_count, 1)
+                self.assertEqual(found.priority_count, 2)
+            first = capturer.capture(
+                found.paths, native_session_ids=found.native_session_ids,
+                parent_native_session_ids=found.parent_native_session_ids,
+                source_snapshots=found.source_snapshots,
+            )
+            self.assertEqual(first.enqueued, 2)
+            retry = capturer.capture(
+                found.paths, native_session_ids=found.native_session_ids,
+                parent_native_session_ids=found.parent_native_session_ids,
+                source_snapshots=found.source_snapshots,
+            )
+            self.assertEqual(retry.enqueued, 0)
+            with child.open("a") as handle:
+                handle.write(json.dumps({"type": "assistant", "sessionId": session_id,
+                    "agentId": "worker", "message": {"usage": {"input_tokens": 10,
+                    "output_tokens": 5}}}) + "\n")
+            refreshed = discover_claude_transcripts(home, hook_payload={
+                "session_id": session_id, "transcript_path": str(main),
+            })
+            update = capturer.capture(
+                refreshed.paths, native_session_ids=refreshed.native_session_ids,
+                parent_native_session_ids=refreshed.parent_native_session_ids,
+                source_snapshots=refreshed.source_snapshots,
+            )
+            self.assertEqual(update.enqueued, 1)
+
     def test_discovery_backfills_recent_primary_and_subagent_transcripts(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

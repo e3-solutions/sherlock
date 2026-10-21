@@ -14,9 +14,11 @@ from .config import (
     ConfigurationError,
     default_claude_home,
     default_codex_home,
+    default_config_path,
     default_state_root,
     load_config,
 )
+from .cross_provider import schedule_claude_catchup
 from .drain import Drain
 from .discovery import (
     CLAUDE_DEFAULT_LOOKBACK_SECONDS,
@@ -358,6 +360,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if not outcome.locked else 75
     if args.command == "hook":
         payload, raw_payload = _payload_from_stdin()
+        if not is_claude:
+            schedule_claude_catchup(
+                args.event_name,
+                codex_config=args.config or default_config_path(source_home),
+                environment=environment,
+            )
         outcome = run_hook(
             args.event_name,
             payload,
