@@ -1701,7 +1701,7 @@ class ClaudePluginTests(unittest.TestCase):
                     complete_discovery.parent_native_session_ids
                 ),
                 source_snapshots=complete_discovery.source_snapshots,
-                max_sync_bytes=1024 * 1024,
+                max_sync_bytes=len(oversized_partial) + 1,
                 backlog_workload_class="backfill",
             )
             oversized = oversized_partial + b"\n"
@@ -1976,6 +1976,8 @@ class ClaudePluginTests(unittest.TestCase):
                 json.dumps({"enabledPlugins": {"sherlock-claude-code@sherlock": True}}),
                 encoding="utf-8",
             )
+            (claude_home / "sherlock").mkdir()
+            (claude_home / "sherlock" / "scheduler.json").write_text('{"status":"disabled"}')
             enabled = subprocess.run(
                 [sys.executable, str(verifier)],
                 check=False,

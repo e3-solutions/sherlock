@@ -227,9 +227,9 @@ Preserve issued snapshot support and all raw and derived history.
 
 ## Oversized native records
 
-Deploy the ingest function and Railway worker before collectors that can emit
-fragments. A Codex rollout or Claude transcript JSONL record over 16 MiB and up
-to 100 MiB is transported as deterministic 4 MiB v1 fragments using the
+The ingest function and worker use the existing v1 fragment contract. A complete
+Codex rollout or Claude transcript JSONL record over 16 MiB, including records
+above 100 MiB, is transported as deterministic 4 MiB v1 fragments using the
 fragment columns already present on `telemetry.native_records`. Each fragment
 remains an immutable, independently verifiable raw fact. The normalizer emits a
 bounded `unknown/native_fragment` coverage event instead of parsing a partial
@@ -237,10 +237,29 @@ JSON document, so the oversized record itself does not create product activity
 while later records in the same stream continue normally. The complete raw
 record remains reconstructable from its ordered fragments and full-record hash.
 
-The collector's synchronous byte budget may be exceeded by one logical record:
-all fragments of that record are published durably before its cursor advances.
-This keeps crash replay stateless and idempotent at the cost of one bounded
-100 MiB worst-case capture.
+Fragment publication resumes across capture runs. The durable cursor stays at
+the logical record start until all fragments are queued, while `pending_fragment`
+stores its exact range/hash, canonical count, and next index. Each run streams
+the original bytes again, rejects a changed pending range/hash, and stages only
+the fragments selected for that run. Scratch disk usage is bounded by the
+capture byte budget; hashing I/O still covers the whole native record. Hook
+budgets may exceed the remaining budget by one 4 MiB fragment; reconcile uses a
+strict budget (at least 4 MiB is needed to progress a non-final fragment).
+A crash replays deterministic fragment keys without changing immutable bytes.
+The reconciliation ledger reports `native_record_fragmentation_in_progress`
+and `fragment_progress`; local capture is not complete until the logical cursor
+advances. Unterminated records remain deferred without publishing fragments.
+
+Deploy the relaxed ingest validator before this collector runtime: older ingest
+rejects a logical range above 100 MiB even though each fragment fits its object
+limits. Existing collectors, receipts, fragment schema, and worker projection
+remain compatible; no migration or worker version change is required. Keep the
+updated runtime when resuming a partial record: old collector runtimes cannot
+read the new `pending_fragment` cursor field. Do not delete cursor/queue state
+to roll back. Also drain queued >100 MiB logical-record fragments before
+returning to an older runtime: its spool validator rejects those ranges.
+Product text, metadata parsing, incomplete-tail retention, and
+inventory inspection limits are independent of transport fragmentation.
 
 Official collectors upload each stream in generation and source-offset order.
 The worker additionally blocks a committed later range while an earlier

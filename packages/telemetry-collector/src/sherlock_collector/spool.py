@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -109,6 +110,20 @@ class SpoolItem:
         manifest = BatchManifest.from_dict(raw_manifest)
         validate_stored_payload(manifest, stored)
         return cls(manifest, stored, metadata)
+
+
+def upload_backoff_seconds(attempts: int) -> int:
+    return min(24 * 60 * 60, 60 * 2 ** min(attempts - 1, 11))
+
+
+def upload_error_details(error: Exception) -> dict:
+    return {
+        "reason": str(error),
+        "error_type": type(error).__name__,
+        "error_code": getattr(error, "error_code", None),
+        "http_status": getattr(error, "http_status", None),
+        "failed_at": utc_now(),
+    }
 
 
 class DurableSpool:
@@ -220,11 +235,59 @@ class DurableSpool:
             recovered += 1
         return recovered
 
+    def upload_status(self) -> dict:
+        path = self.root / "upload-status.json"
+        if not path.exists():
+            return {"status": "ready"}
+        try:
+            value = json.loads(path.read_text())
+            if value.get("status") not in {"ready", "blocked"}:
+                raise ValueError("invalid upload status")
+            if value["status"] == "blocked":
+                float(value["next_upload_at"])
+                int(value["attempts"])
+            return value
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+            raise ContractError(
+                f"cannot read collector upload status: {error}"
+            ) from error
+
+    def defer_uploads(self, error: Exception) -> dict:
+        previous = self.upload_status()
+        attempts = (
+            previous.get("attempts", 0) + 1 if previous["status"] == "blocked" else 1
+        )
+        status = {
+            **upload_error_details(error),
+            "status": "blocked",
+            "attempts": attempts,
+            "next_upload_at": time.time() + upload_backoff_seconds(attempts),
+        }
+        _atomic_json(self.root / "upload-status.json", status)
+        return status
+
+    def clear_upload_failure(self) -> None:
+        previous = self.upload_status()
+        if previous["status"] == "blocked":
+            _atomic_json(
+                self.root / "upload-status.json",
+                {
+                    **previous,
+                    "status": "ready",
+                    "recovered_at": utc_now(),
+                },
+            )
+
     def requeue(self, path: Path, item: SpoolItem, error: Exception) -> None:
         metadata = dict(item.metadata)
+        attempts = int(metadata.get("upload_attempts", 0)) + 1
         metadata.update(
             {
+                "upload_attempts": attempts,
+                "next_upload_at": time.time() + upload_backoff_seconds(attempts),
                 "last_upload_error": str(error),
+                "last_upload_error_code": getattr(error, "error_code", None),
+                "last_upload_http_status": getattr(error, "http_status", None),
                 "last_upload_failed_at": utc_now(),
             }
         )
@@ -234,8 +297,9 @@ class DurableSpool:
 
     def quarantine(self, path: Path, item: SpoolItem | None, error: Exception) -> None:
         if item is None:
+            original_bytes = path.read_bytes()
             try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
+                raw = json.loads(original_bytes)
                 if not isinstance(raw, dict):
                     raw = {"unreadable_value": raw}
             except Exception:
@@ -244,16 +308,22 @@ class DurableSpool:
                         "ascii"
                     )
                 }
+            raw["original_spool_base64"] = base64.b64encode(original_bytes).decode(
+                "ascii"
+            )
             raw["dead_letter"] = {"reason": str(error), "failed_at": utc_now()}
             _atomic_json(path, raw)
         else:
             metadata = dict(item.metadata)
-            metadata["dead_letter"] = {"reason": str(error), "failed_at": utc_now()}
+            metadata["dead_letter"] = upload_error_details(error)
             _atomic_json(
                 path,
                 SpoolItem(item.manifest, item.stored_payload, metadata).to_dict(),
             )
-        _durable_replace(path, self.dead_letter / path.name)
+        destination = self.dead_letter / path.name
+        if destination.exists():
+            destination = self.dead_letter / f"{path.stem}.{uuid.uuid4().hex}.json"
+        _durable_replace(path, destination)
 
     def acknowledge(self, path: Path) -> None:
         _durable_unlink(path)

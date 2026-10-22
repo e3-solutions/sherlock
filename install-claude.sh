@@ -10,6 +10,10 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 NAME=""
 GITHUB_ID=""
 EMAIL=""
+SCHEDULER_FLAG=--install-scheduler
+if [ "${SHERLOCK_NO_SCHEDULER:-0}" = "1" ]; then
+  SCHEDULER_FLAG=--no-scheduler
+fi
 BACKFILL_HOURS=72
 
 usage() {
@@ -19,7 +23,11 @@ Usage: ./install-claude.sh --name NAME --github-id LOGIN --email EMAIL [--backfi
 Installs Sherlock's Claude Code plugin and its owner-only collector runtime.
 Supported platforms: macOS and Linux.
 
+Options:
+  --no-scheduler        Disable periodic collection (also removes a prior entry)
+
 Environment overrides:
+  SHERLOCK_NO_SCHEDULER Set to 1 to disable periodic collection
   CLAUDE_BIN            Claude executable to use
   CLAUDE_CONFIG_DIR     Claude state directory (default: ~/.claude)
   PYTHON_BIN            Python 3 executable (default: python3)
@@ -51,6 +59,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       BACKFILL_HOURS=$2
       shift 2
+      ;;
+    --no-scheduler)
+      SCHEDULER_FLAG=--no-scheduler
+      shift
       ;;
     -h|--help)
       usage
@@ -108,6 +120,8 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
 
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install.py" \
   --endpoint "$ENDPOINT" \
+  --provider claude_code \
+  "$SCHEDULER_FLAG" \
   --collector-home "$CLAUDE_CONFIG_DIR" \
   --name "$NAME" \
   --github-id "$GITHUB_ID" \
