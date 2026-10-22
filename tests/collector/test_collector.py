@@ -336,6 +336,44 @@ class CollectorDrainTests(unittest.TestCase):
             [("stream-a", 0), ("stream-b", 0)],
         )
 
+    def test_stalled_streams_reports_failing_heads_and_their_backlog(self):
+        first, _ = self.enqueue("stream-a")
+        self.enqueue("stream-a", first.end_offset)
+        self.enqueue("stream-b")
+
+        class RejectStreamA:
+            def upload(inner_self, item):
+                if item.manifest.source_stream_key == "stream-a":
+                    raise TransientUploadError("session ancestry unavailable")
+                return receipt(item.manifest)
+
+        result = Drain(self.spool, RejectStreamA()).run()
+        self.assertEqual((result.uploaded, result.requeued), (1, 1))
+
+        # A head that only just started failing is not reported yet.
+        fresh = self.spool.stalled_streams()
+        self.assertEqual(fresh["stalled_streams"], 0)
+        self.assertEqual(fresh["stalled_batches"], 0)
+
+        later = self.spool.stalled_streams(now=time.time() + 2 * 60 * 60)
+        self.assertEqual(later["stalled_streams"], 1)
+        self.assertEqual(later["stalled_batches"], 2)
+        self.assertEqual(
+            later["stalled_errors"],
+            [{"error": "session ancestry unavailable", "streams": 1}],
+        )
+        self.assertIsNotNone(later["oldest_stalled_enqueued_at"])
+
+    def test_stalled_streams_ignores_heads_that_never_failed(self):
+        first, _ = self.enqueue("stream-a")
+        self.enqueue("stream-a", first.end_offset)
+
+        health = self.spool.stalled_streams(now=time.time() + 2 * 60 * 60)
+
+        self.assertEqual(health["stalled_streams"], 0)
+        self.assertEqual(health["stalled_errors"], [])
+        self.assertIsNone(health["oldest_stalled_enqueued_at"])
+
     def test_success_preserves_matching_dead_letter_evidence(self):
         manifest, pending = self.enqueue()
         stale = self.spool.dead_letter / pending.name
