@@ -223,6 +223,56 @@ class ClaudePluginTests(unittest.TestCase):
             if outside_link is not None:
                 self.assertNotIn(outside.resolve(), result.paths)
 
+    def test_discovery_backfills_workflow_subagent_transcripts(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            primary_id = "11111111-1111-4111-8111-111111111111"
+            subagents = claude_home / "projects" / "repo" / primary_id / "subagents"
+            workflow = subagents / "workflows" / "wf_43378f07-62e"
+            agent = workflow / "agent-a52b5e564435a8ff3.jsonl"
+            metadata = workflow / "agent-a52b5e564435a8ff3.meta.json"
+            outside = root / "outside" / "agent-outside.jsonl"
+            for path, agent_id in ((agent, "a52b5e564435a8ff3"), (outside, "outside")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": primary_id,
+                            "agentId": agent_id,
+                            "isSidechain": True,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            metadata.write_text("{}", encoding="utf-8")
+            try:
+                (subagents / "workflows" / "wf_linked").symlink_to(outside.parent)
+            except OSError:
+                pass
+
+            result = discover_claude_transcripts(
+                claude_home,
+                lookback_seconds=24 * 60 * 60,
+            )
+
+            self.assertEqual(result.paths, (agent.resolve(),))
+            self.assertEqual(
+                result.native_session_ids[str(agent.resolve())],
+                "a52b5e564435a8ff3",
+            )
+            self.assertEqual(
+                result.parent_native_session_ids[str(agent.resolve())],
+                primary_id,
+            )
+            replay = discover_claude_transcripts(
+                claude_home,
+                replay_session_id=primary_id,
+            )
+            self.assertEqual(replay.paths, (agent.resolve(),))
+
     def test_claude_backfill_cutoff_is_inclusive_and_deterministic(self):
         with TemporaryDirectory() as temporary:
             claude_home = Path(temporary) / "claude"
