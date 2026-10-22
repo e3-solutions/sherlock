@@ -5,6 +5,7 @@ import json
 import os
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,8 +23,28 @@ from .collection_receipt import (
 )
 
 
+# A stream whose oldest pending batch was enqueued this long ago and whose last
+# upload attempt failed is reported as stalled: every later range in that stream
+# waits behind it, so pending counts alone hide the backlog.
+STALL_AFTER_SECONDS = 60 * 60
+MAX_REPORTED_ERRORS = 5
+MAX_REPORTED_ERROR_CHARS = 200
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _epoch_seconds(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -189,6 +210,84 @@ class DurableSpool:
         if not isinstance(value, dict):
             raise ContractError("spool item must be a JSON object")
         return SpoolItem.from_dict(value)
+
+    def stalled_streams(
+        self,
+        *,
+        stall_after_seconds: float = STALL_AFTER_SECONDS,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Summarize streams whose ordered head keeps failing to upload.
+
+        Reads only manifests and metadata, never payload bytes. A head counts as
+        stalled when its last attempt failed and it has waited at least
+        ``stall_after_seconds`` since it was enqueued.
+        """
+        current = time.time() if now is None else now
+        heads: dict[
+            tuple[str, str],
+            tuple[tuple[int, int, int, str], Mapping[str, Any]],
+        ] = {}
+        batches: Counter[tuple[str, str]] = Counter()
+        for path in self.list_pending():
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                manifest = BatchManifest.from_dict(value["manifest"])
+                metadata = value.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    continue
+            except (
+                OSError,
+                UnicodeDecodeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                ContractError,
+            ):
+                # Unreadable items are dead-lettered by the drain, which health
+                # already reports.
+                continue
+            stream = manifest.stream_identity
+            batches[stream] += 1
+            order = (
+                manifest.generation_seq,
+                manifest.start_offset,
+                manifest.end_offset,
+                path.name,
+            )
+            if stream not in heads or order < heads[stream][0]:
+                heads[stream] = (order, metadata)
+
+        stalled: list[tuple[tuple[str, str], str, float]] = []
+        for stream, (_, metadata) in heads.items():
+            error = metadata.get("last_upload_error")
+            if not isinstance(error, str) or not error:
+                continue
+            enqueued_at = _epoch_seconds(metadata.get("enqueued_at"))
+            if enqueued_at is not None and current - enqueued_at < stall_after_seconds:
+                continue
+            waiting_since = current if enqueued_at is None else enqueued_at
+            stalled.append((stream, error, waiting_since))
+
+        errors: Counter[str] = Counter(
+            error[:MAX_REPORTED_ERROR_CHARS] for _, error, _ in stalled
+        )
+        oldest = min((enqueued for _, _, enqueued in stalled), default=None)
+        return {
+            "stalled_streams": len(stalled),
+            "stalled_batches": sum(batches[stream] for stream, _, _ in stalled),
+            "oldest_stalled_enqueued_at": (
+                datetime.fromtimestamp(oldest, timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+                if oldest is not None
+                else None
+            ),
+            "stalled_errors": [
+                {"error": error, "streams": count}
+                for error, count in errors.most_common(MAX_REPORTED_ERRORS)
+            ],
+        }
 
     def list_collection_receipts(self) -> list[Path]:
         return sorted(self.receipts.glob("*.json"))

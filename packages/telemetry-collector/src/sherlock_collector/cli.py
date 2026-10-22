@@ -419,9 +419,12 @@ def main(argv: list[str] | None = None) -> int:
         pending_batches = len(spool.list_pending())
         processing_batches = len(list(spool.processing.glob("*.json")))
         dead_letter_batches = len(list(spool.dead_letter.glob("*.json")))
+        stalled = spool.stalled_streams()
         status = (
             "degraded"
             if dead_letter_batches
+            else "stalled"
+            if stalled["stalled_streams"]
             else "recovering"
             if processing_batches
             else "ok"
@@ -436,11 +439,12 @@ def main(argv: list[str] | None = None) -> int:
                     "pending_batches": pending_batches,
                     "processing_batches": processing_batches,
                     "dead_letter_batches": dead_letter_batches,
+                    **stalled,
                 },
                 sort_keys=True,
             )
         )
-        return 1 if dead_letter_batches else 0
+        return 1 if dead_letter_batches or stalled["stalled_streams"] else 0
     outcome = Drain(
         spool,
         HttpTransport(
