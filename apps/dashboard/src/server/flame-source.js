@@ -22,15 +22,20 @@ export const PREVIOUS_NORMALIZER_VERSIONS = Object.freeze([
   NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
-export const NORMALIZER_VERSIONS = Object.freeze([
+export const CODEX_V3_NORMALIZER_VERSIONS = Object.freeze([
   ...PREVIOUS_NORMALIZER_VERSIONS,
   CORRECTED_CODEX_NORMALIZER_VERSION,
+]);
+export const NORMALIZER_VERSIONS = Object.freeze([
+  ...CODEX_V3_NORMALIZER_VERSIONS,
+  "sherlock.codex-rollout.v4",
 ]);
 export const LEGACY_NORMALIZER_VERSIONS = Object.freeze([
   LEGACY_CODEX_NORMALIZER_VERSION,
   CLAUDE_NORMALIZER_VERSION,
 ]);
 export const FRESHNESS_NORMALIZER_VERSIONS = Object.freeze([
+  "sherlock.codex-rollout.v4",
   CORRECTED_CODEX_NORMALIZER_VERSION,
   LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
@@ -47,7 +52,8 @@ const PROJECTION_SNAPSHOT_TOKEN_VERSION = "v6";
 export const ORIGIN_CLASSIFICATION_VERSION = "bonaparte-origin-v1";
 const PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION = "v3";
 const UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION = "v4";
-const RAW_SNAPSHOT_TOKEN_VERSION = "v5";
+const CLASSIFIED_PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION = "v5";
+const RAW_SNAPSHOT_TOKEN_VERSION = "v7";
 const WORK_CURSOR_VERSION = "v1";
 const MAX_SNAPSHOT_TOKEN_LENGTH = 8_192;
 const MAX_WORK_CURSOR_LENGTH = 512;
@@ -1592,6 +1598,7 @@ export function decodeSnapshotToken(token) {
   const [version, body, extra] = token.split(".");
   if (![LEGACY_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION,
     PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, RAW_SNAPSHOT_TOKEN_VERSION,
+    CLASSIFIED_PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION,
     UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION, LEGACY_PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version) ||
       !body || extra !== undefined ||
       !/^[A-Za-z0-9_-]+$/.test(body)) {
@@ -1623,14 +1630,16 @@ export function decodeSnapshotToken(token) {
         throw new Error("unsupported_frame_version");
       }
       receipt.frameVersion = pinnedFrameVersion;
-    } else if ([RAW_SNAPSHOT_TOKEN_VERSION, UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION].includes(version)) {
+    } else if (version === RAW_SNAPSHOT_TOKEN_VERSION) {
       receipt.normalizerVersions = NORMALIZER_VERSIONS;
+    } else if ([CLASSIFIED_PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, UNCLASSIFIED_RAW_SNAPSHOT_TOKEN_VERSION].includes(version)) {
+      receipt.normalizerVersions = CODEX_V3_NORMALIZER_VERSIONS;
     } else if (version === PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION) {
       receipt.normalizerVersions = PREVIOUS_NORMALIZER_VERSIONS;
     } else {
       receipt.normalizerVersions = LEGACY_NORMALIZER_VERSIONS;
     }
-    if ([RAW_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version)) {
+    if ([RAW_SNAPSHOT_TOKEN_VERSION, CLASSIFIED_PREVIOUS_RAW_SNAPSHOT_TOKEN_VERSION, PROJECTION_SNAPSHOT_TOKEN_VERSION].includes(version)) {
       receipt.originClassificationVersion = ORIGIN_CLASSIFICATION_VERSION;
     }
     return receipt;
