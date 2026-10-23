@@ -75,6 +75,46 @@ def install_runtime(source: Path, destination: Path) -> None:
         shutil.rmtree(backup)
 
 
+def configure_scheduler(collector_home: Path, provider: str, *, disable: bool) -> dict:
+    """Apply the scheduler choice without letting it undo the collector install.
+
+    An earlier explicit opt-out is kept: re-running the installer (by hand or
+    by an automated refresh such as Jolly Roger, which cannot pass
+    SHERLOCK_NO_SCHEDULER) never re-enables periodic collection. Re-enable it
+    with `python3 -m sherlock_collector.scheduler install`. A scheduler that
+    cannot be registered (no GUI launchd session over SSH, no user systemd and
+    no crontab) is reported as failed; hooks keep working and the install
+    verifiers report degraded status.
+    """
+    from sherlock_collector.scheduler import (
+        install_scheduler,
+        scheduler_status,
+        uninstall_scheduler,
+    )
+    from sherlock_collector.spool import _atomic_json
+
+    errors = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired)
+    if disable:
+        try:
+            return uninstall_scheduler(collector_home, provider)
+        except errors as error:
+            raise SystemExit(f"collector installed but scheduler removal failed: {error}") from error
+    if scheduler_status(collector_home).get("status") == "disabled":
+        return {"status": "disabled", "provider": provider, "kept_opt_out": True}
+    try:
+        return install_scheduler(collector_home, provider)
+    except errors as error:
+        value = {"status": "failed", "provider": provider, "error": str(error)}
+        _atomic_json(collector_home / "sherlock" / "scheduler.json", value)
+        print(
+            f"Warning: periodic reconciler was not registered: {error}. "
+            "Hooks still collect; re-run "
+            "`python3 -m sherlock_collector.scheduler install` from the runtime.",
+            file=sys.stderr,
+        )
+        return value
+
+
 def main() -> int:
     args = arguments()
     collector_home = Path(
@@ -117,12 +157,9 @@ def main() -> int:
         {"endpoint": endpoint, **identity.to_dict()},
     )
     if args.install_scheduler or args.no_scheduler:
-        from sherlock_collector.scheduler import install_scheduler, uninstall_scheduler
-        try:
-            scheduler = (uninstall_scheduler(collector_home, args.provider) if args.no_scheduler
-                         else install_scheduler(collector_home, args.provider))
-        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
-            raise SystemExit(f"collector installed but scheduler setup failed: {error}") from error
+        scheduler = configure_scheduler(
+            collector_home, args.provider, disable=args.no_scheduler
+        )
         print("Periodic reconciler: " + json.dumps(scheduler, sort_keys=True))
     print(f"Installed collector runtime under {root}")
     print("Stored the endpoint and identity in owner-only collector.json")

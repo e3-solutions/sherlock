@@ -18,6 +18,7 @@ from .contract import (
     ContractError,
     build_source_batch,
 )
+from .exclusions import ExclusionPolicy, load_policy
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
@@ -53,6 +54,10 @@ class StreamState:
     offset: int
     recovery_reason: str | None = None
     pending_fragment: dict | None = None
+
+
+# Optional cursor fields stored outside the legacy stream entry shape.
+STATE_EXTENSION_FIELDS = ("recovery_reason", "pending_fragment")
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,7 @@ class RolloutCapturer:
         capture_unterminated_tail: bool = False,
         allowed_root: Path | str | None = None,
         enforce_sync_budget: bool = False,
+        exclusion_policy: ExclusionPolicy | None = None,
     ):
         if not (
             0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES
@@ -183,6 +189,7 @@ class RolloutCapturer:
         self.source_kind = source_kind
         self.source_version = source_version
         self.enforce_sync_budget = enforce_sync_budget
+        self.exclusion_policy = exclusion_policy
         self.source_issues: dict[str, str] = {}
         self.visited_paths: set[str] = set()
         self._capture_enqueued = self._capture_bytes = 0
@@ -228,6 +235,7 @@ class RolloutCapturer:
             self.visited_paths = set()
             self._capture_enqueued = self._capture_bytes = 0
             states, candidate_cursor = self._load_state()
+            policy = self.exclusion_policy or load_policy()
             enqueued = captured = errors = 0
             all_paths = list(
                 dict.fromkeys(str(self._canonical_path(item)) for item in paths)
@@ -255,6 +263,19 @@ class RolloutCapturer:
                     visited_backlog += 1
                 path = Path(raw_path)
                 self.visited_paths.add(raw_path)
+                blocked = policy.blocked_reason(
+                    self.source_provider,
+                    (native_session_ids or {}).get(raw_path),
+                    (parent_native_session_ids or {}).get(raw_path),
+                    codex_home=(
+                        self.allowed_root if self.source_provider == "codex" else None
+                    ),
+                    source_path=path if self.source_kind == "rollout" else None,
+                )
+                if blocked:
+                    # Local owner policy: keep the cursor, capture nothing.
+                    self.source_issues[raw_path] = blocked
+                    continue
                 before_enqueued, before_captured = self._capture_enqueued, self._capture_bytes
                 try:
                     self._capture_path(
@@ -798,8 +819,17 @@ class RolloutCapturer:
         cursor = raw.get("candidate_cursor", 0)
         if not isinstance(cursor, int) or cursor < 0:
             raise ValueError("invalid rollout candidate cursor")
+        extensions = raw.get("stream_extensions", {})
+        if not isinstance(extensions, dict) or not all(
+            isinstance(value, dict) and set(value) <= set(STATE_EXTENSION_FIELDS)
+            for value in extensions.values()
+        ):
+            raise ValueError("invalid rollout stream extensions")
         return (
-            {key: StreamState(**value) for key, value in raw["streams"].items()},
+            {
+                key: StreamState(**{**value, **extensions.get(key, {})})
+                for key, value in raw["streams"].items()
+            },
             cursor,
         )
 
@@ -809,18 +839,30 @@ class RolloutCapturer:
         candidate_cursor: int,
         update_backup: bool = False,
     ) -> None:
+        # Stream entries keep the exact shape older runtimes construct with
+        # StreamState(**entry); newer optional fields live beside them. A rollback
+        # then ignores (and drops) the extensions instead of failing every capture.
         streams = {}
+        extensions = {}
         for key, state in states.items():
             entry = asdict(state)
-            if state.pending_fragment is None:
-                # Completed cursors retain the shape readable by older runtimes.
-                entry.pop("pending_fragment")
+            extra = {
+                field: entry.pop(field)
+                for field in STATE_EXTENSION_FIELDS
+                if entry.get(field) is not None
+            }
+            for field in STATE_EXTENSION_FIELDS:
+                entry.pop(field, None)
             streams[key] = entry
+            if extra:
+                extensions[key] = extra
         value = {
             "state_version": 1,
             "candidate_cursor": candidate_cursor,
             "streams": streams,
         }
+        if extensions:
+            value["stream_extensions"] = extensions
         _atomic_json(
             self.state_path,
             value,

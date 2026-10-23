@@ -71,8 +71,10 @@ budgets; large files report `inspection_budget_exceeded`, never a false complete
 
 Deploy the relaxed ingest validator before updating collector runtimes to emit
 fragments above the former 100 MiB cap. Existing collectors remain supported;
-no database migration or worker projection update is needed. Preserve the new
-runtime while a cursor has `pending_fragment`; older runtimes cannot read that
-extended cursor state. Drain all queued fragments of >100 MiB logical records
+no database migration or worker projection update is needed. Cursor entries
+keep the shape older runtimes read; `pending_fragment` and `recovery_reason`
+are stored beside them in `stream_extensions`, which an older runtime ignores
+and drops (a partially published record then restarts from its first fragment
+with identical, idempotent keys). Drain all queued fragments of >100 MiB logical records
 before returning to an older runtime, whose spool validator rejects those ranges.
 No projected text limit is increased by this change.

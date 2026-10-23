@@ -253,10 +253,11 @@ advances. Unterminated records remain deferred without publishing fragments.
 Deploy the relaxed ingest validator before this collector runtime: older ingest
 rejects a logical range above 100 MiB even though each fragment fits its object
 limits. Existing collectors, receipts, fragment schema, and worker projection
-remain compatible; no migration or worker version change is required. Keep the
-updated runtime when resuming a partial record: old collector runtimes cannot
-read the new `pending_fragment` cursor field. Do not delete cursor/queue state
-to roll back. Also drain queued >100 MiB logical-record fragments before
+remain compatible; no migration or worker version change is required. Cursor
+entries keep the legacy shape; `pending_fragment` and `recovery_reason` live in
+a separate `stream_extensions` map that older runtimes ignore, so a collector
+rollback keeps reading its cursors (a partial record restarts from fragment 0
+with the same deterministic keys). Do not delete cursor/queue state to roll back. Also drain queued >100 MiB logical-record fragments before
 returning to an older runtime: its spool validator rejects those ranges.
 Product text, metadata parsing, incomplete-tail retention, and
 inventory inspection limits are independent of transport fragmentation.

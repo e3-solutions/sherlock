@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -14,6 +16,11 @@ from .spool import DurableSpool, _atomic_json, secure_lock, utc_now
 
 # Fragment publication resumes across runs within this source-byte budget.
 DEFAULT_RECONCILE_BYTES = 128 * 1024 * 1024
+# Files last written before this window are not discovered by the periodic scan.
+# It matches the installer's longest permitted Claude backfill (744 hours), so a
+# scheduled run never reaches further back than an install could be asked to.
+# 0 disables the bound for an explicit, operator-run history recovery.
+DEFAULT_RECONCILE_MAX_AGE_DAYS = 31
 
 
 def reconcile(
@@ -25,9 +32,15 @@ def reconcile(
     max_files: int = DEFAULT_MAX_FILES,
     max_bytes: int = DEFAULT_RECONCILE_BYTES,
     max_uploads: int = 128,
+    max_age_days: int = DEFAULT_RECONCILE_MAX_AGE_DAYS,
 ) -> dict:
     if min(max_files, max_bytes, max_uploads) < 1:
         raise ValueError("reconcile budgets must be positive")
+    if max_age_days < 0:
+        raise ValueError("reconcile max_age_days must not be negative")
+    modified_after_ns = (
+        time.time_ns() - max_age_days * 86_400 * 1_000_000_000 if max_age_days else 0
+    )
     home, root = Path(home).resolve(), Path(state_root).resolve()
     spool = DurableSpool(root / "queue")
     with secure_lock(root / f"{provider}-reconcile.lock") as lock:
@@ -52,7 +65,9 @@ def reconcile(
             except (OSError, ValueError) as error:
                 # Keep the corrupt ledger for audit; queue recovery is independent.
                 drain = (
-                    Drain(spool, transport).run(max_items=max_uploads, max_seconds=120)
+                    Drain(spool, transport, source_home=home).run(
+                    max_items=max_uploads, max_seconds=120
+                )
                     if transport
                     else None
                 )
@@ -65,7 +80,9 @@ def reconcile(
                 }
         else:
             ledger = {"version": 1, "provider": provider, "sources": {}}
-        discovery = discover_all_sources(home, provider)
+        discovery = discover_all_sources(
+            home, provider, modified_after_ns=modified_after_ns
+        )
         now = utc_now()
         sources = ledger["sources"]
         previous_issues = {
@@ -77,8 +94,23 @@ def reconcile(
             for path, entry in sources.items()
             if entry.get("status") == "captured"
         }
-        for entry in sources.values():
-            entry["status"] = "source_missing_or_invalid"
+        for raw, entry in sources.items():
+            entry["status"] = (
+                "outside_reconcile_window"
+                if _older_than(raw, modified_after_ns)
+                else "source_missing_or_invalid"
+            )
+        for status in discovery.source_statuses:
+            raw = str(status.get("rollout_path") or "")
+            if raw and status.get("reason"):
+                entry = sources.setdefault(raw, {"first_seen_at": now})
+                entry.update(
+                    {
+                        "last_seen_at": now,
+                        "status": "unfinished",
+                        "reason": status["reason"],
+                    }
+                )
         for path in discovery.paths:
             raw = str(path)
             snapshot = discovery.source_snapshots[raw]
@@ -97,6 +129,7 @@ def reconcile(
         ledger.update(
             {
                 "last_scan_at": now,
+                "max_age_days": max_age_days,
                 "discovery_errors": list(discovery.errors),
                 "invalid_sources": discovery.invalid_count,
             }
@@ -183,11 +216,16 @@ def reconcile(
         # Drain even when capture is busy or discovery is empty. Queue recovery
         # must never depend on another source event or successful capture.
         drain = (
-            Drain(spool, transport).run(max_items=max_uploads, max_seconds=120)
+            Drain(spool, transport, source_home=home).run(
+                    max_items=max_uploads, max_seconds=120
+                )
             if transport
             else None
         )
-        unfinished = sum(entry["status"] != "captured" for entry in sources.values())
+        unfinished = sum(
+            entry["status"] not in {"captured", "outside_reconcile_window"}
+            for entry in sources.values()
+        )
         dead_letters = len(list(spool.dead_letter.glob("*.json")))
         pending = len(spool.list_pending())
         partial = bool(
@@ -207,6 +245,8 @@ def reconcile(
             "provider": provider,
             "locked": capture.locked,
             "discovered": len(discovery.paths),
+            "max_age_days": max_age_days,
+            "excluded_by_cutoff": discovery.excluded_by_cutoff,
             "unfinished_sources": unfinished,
             "pending_uploads": pending,
             "dead_letters": dead_letters,
@@ -218,3 +258,12 @@ def reconcile(
             "completion_basis": "local_capture_and_queue_state",
             "delivery_audit": "inventory_uses_committed_receipts",
         }
+
+
+def _older_than(raw: str, modified_after_ns: int) -> bool:
+    if not modified_after_ns:
+        return False
+    try:
+        return os.stat(raw, follow_symlinks=False).st_mtime_ns < modified_after_ns
+    except OSError:
+        return False

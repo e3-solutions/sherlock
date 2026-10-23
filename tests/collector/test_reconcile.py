@@ -1,4 +1,5 @@
 from __future__ import annotations
+import _isolation  # noqa: F401  (must precede collector imports)
 
 import fcntl
 import io
@@ -60,12 +61,17 @@ class ReconcileTests(unittest.TestCase):
                 for path in paths:
                     os.utime(path, (1, 1))
                 transport = SuccessTransport()
-                first = reconcile(home, state, provider, transport, max_files=1)
+                # Explicit full-history recovery (the scheduled default is bounded).
+                first = reconcile(
+                    home, state, provider, transport, max_files=1, max_age_days=0
+                )
                 self.assertEqual(first["unfinished_sources"], 2)
                 ledger_path = state / f"{provider}-reconcile.json"
                 self.assertEqual(len(json.loads(ledger_path.read_text())["sources"]), 3)
                 for _ in range(3):
-                    result = reconcile(home, state, provider, transport, max_files=1)
+                    result = reconcile(
+                        home, state, provider, transport, max_files=1, max_age_days=0
+                    )
                 self.assertEqual(result["status"], "complete")
                 self.assertEqual(len(transport.items), 3)
                 self.assertTrue(
@@ -761,7 +767,7 @@ class ClaudeInventoryTests(unittest.TestCase):
             )
             for source in (path, subagent):
                 os.utime(source, (1, 1))
-            reconcile(home, state, "claude_code", SuccessTransport())
+            reconcile(home, state, "claude_code", SuccessTransport(), max_age_days=0)
             report = collection_inventory(
                 home, state, provider="claude_code", session_id=native_id
             )

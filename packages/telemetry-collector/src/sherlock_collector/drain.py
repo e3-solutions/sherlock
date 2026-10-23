@@ -4,12 +4,13 @@ import fcntl
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Protocol
 
 from .collection_receipt import scan_token_payload
 from .contract import ContractError, ReceiptMismatch, validate_committed_receipt
+from .exclusions import ExclusionPolicy, load_policy
 from .spool import DurableSpool, SpoolItem, secure_lock
 
 
@@ -47,6 +48,7 @@ class DrainResult:
     recovered: int = 0
     locked: bool = False
     collector_failure: dict | None = None
+    held_by_policy: int = 0
 
 
 class Drain:
@@ -57,15 +59,30 @@ class Drain:
         *,
         max_workers: int = 4,
         expected_attribution: Mapping[str, str] | None = None,
+        exclusion_policy: ExclusionPolicy | None = None,
+        source_home: Path | None = None,
     ):
         self.spool = spool
         self.transport = transport
         self.max_workers = max_workers
         self.expected_attribution = expected_attribution
+        self.exclusion_policy = exclusion_policy
+        self.source_home = Path(source_home) if source_home is not None else None
+        self._policy = ExclusionPolicy()
+        self._held: set[Path] = set()
 
     def run(self, *, max_items: int = 1024, max_seconds: float = 300) -> DrainResult:
         if max_items < 1 or max_seconds <= 0:
             raise ValueError("drain budgets must be positive")
+        # Owner exclusions apply to already-queued batches too (for example
+        # batches queued before an entry was added, or by an older runtime).
+        # Held batches stay pending, unsent, and block only their own stream.
+        self._policy = self.exclusion_policy or load_policy()
+        self._held = set()
+        result = self._run(max_items, max_seconds)
+        return replace(result, held_by_policy=len(self._held))
+
+    def _run(self, max_items: int, max_seconds: float) -> DrainResult:
         deadline = time.monotonic() + max_seconds
         with secure_lock(self.spool.lock_path) as lock:
             try:
@@ -142,6 +159,17 @@ class Drain:
                 continue
             stream = manifest.stream_identity
             if stream in blocked_streams:
+                continue
+            if self._policy.active and self._policy.blocked_reason(
+                manifest.source_provider,
+                manifest.observed_native_session_id,
+                manifest.observed_parent_native_session_id,
+                codex_home=(
+                    self.source_home if manifest.source_provider == "codex" else None
+                ),
+            ):
+                self._held.add(path)
+                blocked_streams.add(stream)
                 continue
             # A delayed frontier blocks its own later byte ranges only.
             if item.metadata.get("next_upload_at", 0) > time.time():

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import _isolation  # noqa: F401  (must precede collector imports)
 
 import json
 import unittest

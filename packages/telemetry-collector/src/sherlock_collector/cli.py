@@ -67,6 +67,12 @@ def parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--max-files", type=int, default=64)
     reconcile.add_argument("--max-bytes", type=int, default=128 * 1024 * 1024)
     reconcile.add_argument("--max-uploads", type=int, default=128)
+    reconcile.add_argument(
+        "--max-age-days",
+        type=int,
+        default=31,
+        help="only discover files written in the last N days (0: all retained history)",
+    )
     hook = commands.add_parser("hook")
     hook.add_argument("event_name")
     commands.add_parser("drain")
@@ -161,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["status"] == "complete" else 1
     if args.command == "reconcile":
         from .reconcile import reconcile
-        if min(args.max_files, args.max_bytes, args.max_uploads) < 1:
+        if min(args.max_files, args.max_bytes, args.max_uploads) < 1 or args.max_age_days < 0:
             print("reconcile budgets must be positive", file=sys.stderr)
             return 2
         transport = None
@@ -173,7 +179,8 @@ def main(argv: list[str] | None = None) -> int:
             config_error = str(error)
         result = reconcile(source_home, state_root, args.provider, transport,
                            max_files=args.max_files, max_bytes=args.max_bytes,
-                           max_uploads=args.max_uploads)
+                           max_uploads=args.max_uploads,
+                           max_age_days=args.max_age_days)
         if config_error:
             result["configuration_error"] = config_error
         print(json.dumps(result, sort_keys=True))
@@ -451,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             configuration.endpoint,
             configuration.identity,
         ),
+        source_home=source_home,
     ).run()
     print(json.dumps(asdict(outcome), sort_keys=True))
     return 75 if outcome.locked or outcome.collector_failure else 0

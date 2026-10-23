@@ -31,11 +31,28 @@ Each provider installer also registers a low-priority periodic reconciler: a
 macOS LaunchAgent or Linux `systemd --user` timer, with a crontab fallback when
 the user service manager is unavailable. It runs about every 15 minutes from
 the installed runtime and pins the selected `CODEX_HOME` or `CLAUDE_CONFIG_DIR`.
-It discovers **all retained native history**, including files older than the
-initial backfill windows, and resumes bounded capture and upload without any
-agent hook or running agent CLI. Use `--no-scheduler` on any installer (or
-`SHERLOCK_NO_SCHEDULER=1`) to opt out and remove that home's prior entry.
-Reinstalling replaces the same scheduler entry.
+It discovers native files written in the **last 31 days** (the longest initial
+backfill the installer accepts), including files the hooks never saw, and
+resumes bounded capture and upload without any agent hook or running agent CLI.
+Run `reconcile --max-age-days 0` by hand for an explicit full-history recovery.
+Use `--no-scheduler` on any installer (or `SHERLOCK_NO_SCHEDULER=1`) to opt out
+and remove that home's prior entry. An opt-out is kept by later reinstalls,
+including automated refreshes; re-enable it with `sherlock_collector.scheduler
+install`. Reinstalling otherwise replaces the same scheduler entry. If the
+scheduler cannot be registered (for example an SSH-only macOS session without
+a GUI launchd domain), the install still completes, hooks keep collecting, and
+the verifiers report `scheduler.status = failed`.
+
+Owner exclusions: hooks, backfill, the reconciler and every upload honour
+`~/.sherlock/session-exclusions.json` (or `$SHERLOCK_HOME/session-exclusions.json`):
+`{"version": 1, "excluded_session_ids": [...], "allowed_claude_session_ids": [...]}`.
+Excluded sessions and every Codex thread descended from or forked from them are
+never captured or uploaded; when `allowed_claude_session_ids` is present only
+those Claude root sessions are collected (no Claude subagents). Blocked sources
+keep their cursor and already-queued batches stay queued unsent
+(`held_by_policy` in drain output), so removing an entry resumes without loss.
+A policy file that exists but is unreadable or invalid blocks all capture and
+upload until repaired. Without the file nothing changes.
 
 To run or audit either provider manually:
 
@@ -115,7 +132,7 @@ For Claude, use its runtime/home and add `--provider claude_code`. Verification
 checks generated files and scheduler registration; an explicit opt-out reports
 `disabled`. User schedulers run while the user account's scheduler is available;
 they do not collect files deleted before discovery or operate while the machine
-is off. A later scan recovers retained history without an age cutoff.
+is off. A later scan recovers retained history inside the reconcile window.
 
 Use the same work email on every machine that should be linked to you. If an
 agent is installing Sherlock for someone else, it must ask for all three values

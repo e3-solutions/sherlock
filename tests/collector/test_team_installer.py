@@ -1,4 +1,5 @@
 from __future__ import annotations
+import _isolation  # noqa: F401  (must precede collector imports)
 
 import json
 import os
@@ -1053,6 +1054,9 @@ class TeamInstallerTests(unittest.TestCase):
                 if key != "PYTHONPATH" and not key.startswith("SHERLOCK_")
             }
             replay_environment["SHERLOCK_CONFIG_PATH"] = str(root / "missing.json")
+            # Owner exclusion policy location only; keeps the developer's own
+            # ~/.sherlock policy out of this test.
+            replay_environment["SHERLOCK_HOME"] = os.environ["SHERLOCK_HOME"]
             replay_environment["SHERLOCK_INGEST_URL"] = "disabled"
             selected_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
             range_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

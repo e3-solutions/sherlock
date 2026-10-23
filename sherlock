@@ -222,6 +222,6 @@ fi
 if [ "$SCHEDULER_FLAG" = "--no-scheduler" ] || [ "${SHERLOCK_NO_SCHEDULER:-0}" = "1" ]; then
   echo "  Periodic collection: disabled"
 else
-  echo "  Periodic collection: every 15 minutes for each installed provider"
+  echo "  Periodic collection: every 15 minutes for each installed provider (an earlier opt-out is kept)"
 fi
 echo "Start a new session in each installed agent to load its hooks."
