@@ -934,29 +934,29 @@ Deno.test("retry backoff grows exponentially and caps", () => {
   assert(retryDelaySeconds(20, 5, 300) === 300);
 });
 
-Deno.test("worker reloads immutable native fragment metadata", () => {
+Deno.test("worker reloads immutable fragment metadata beyond 100 MiB", () => {
   const locator = recordLocatorFromRow({
     record_index: "0",
-    source_start_offset: "4194304",
-    source_end_offset: "8388608",
+    source_start_offset: "109051904",
+    source_end_offset: "109051905",
     record_sha256: "a".repeat(64),
     native_type: null,
     native_payload_type: null,
     occurred_at: null,
     parse_status: "fragment",
     native_record_start_offset: "0",
-    native_record_end_offset: "20971521",
+    native_record_end_offset: "109051905",
     native_record_sha256: "b".repeat(64),
-    fragment_index: "1",
-    fragment_count: "6",
+    fragment_index: "26",
+    fragment_count: "27",
   });
 
   assert(locator.parse_status === "fragment");
   assert(locator.native_record_start_offset === 0);
-  assert(locator.native_record_end_offset === 20 * 1024 * 1024 + 1);
+  assert(locator.native_record_end_offset === 104 * 1024 * 1024 + 1);
   assert(locator.native_record_sha256 === "b".repeat(64));
-  assert(locator.fragment_index === 1);
-  assert(locator.fragment_count === 6);
+  assert(locator.fragment_index === 26);
+  assert(locator.fragment_count === 27);
 });
 
 Deno.test("session cutoffs use one index-preserving transaction", async () => {

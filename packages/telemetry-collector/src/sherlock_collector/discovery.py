@@ -59,6 +59,7 @@ class _CodexCandidate:
     parent_id: str | None
     is_subagent: bool
     snapshot: SourceSnapshot
+    has_session_meta: bool = False
 
 
 def native_database_candidates(
@@ -473,6 +474,69 @@ def discover_claude_transcripts(
     )
 
 
+def discover_all_sources(
+    home: Path | str,
+    provider: str,
+    *,
+    modified_after_ns: int = 0,
+) -> DiscoveryResult:
+    """Enumerate native files without a hook dependency.
+
+    Reuse descriptor-safe provider validation, including archived Codex sessions
+    and Claude subagents. No database row cap is applied to this recovery scan;
+    ``modified_after_ns`` bounds it to files written inside the reconcile window.
+    Codex rollouts are labelled only by their own session_meta (as hook-supplied
+    paths are): a rollout without a readable session_meta is reported and
+    deferred instead of being uploaded under a filename-derived identity.
+    """
+    root = Path(home).expanduser().resolve()
+    if not root.is_dir():
+        return DiscoveryResult(paths=(), native_session_ids={}, errors=("source_home_missing",))
+    cutoff_ns = max(0, int(modified_after_ns))
+    statuses: list[Mapping[str, object]] = []
+    excluded_by_cutoff = 0
+    try:
+        if provider == "claude_code":
+            candidates, invalid, excluded_by_cutoff = _recent_claude_candidates(
+                root, cutoff_ns
+            )
+            if (root / "projects").is_symlink():
+                invalid += 1
+        elif provider == "codex":
+            scanned, invalid = _recent_codex_candidates(root, cutoff_ns)
+            candidates = []
+            for candidate in scanned:
+                if candidate.has_session_meta:
+                    candidates.append(candidate)
+                    continue
+                invalid += 1
+                statuses.append(
+                    {
+                        "native_session_id": None,
+                        "rollout_path": str(candidate.path),
+                        "reason": "session_meta_unavailable",
+                    }
+                )
+        else:
+            raise ValueError("unsupported provider")
+    except OSError as error:
+        return DiscoveryResult(paths=(), native_session_ids={}, errors=(str(error),))
+    return DiscoveryResult(
+        paths=tuple(candidate.path for candidate in candidates),
+        native_session_ids={str(c.path): c.native_id for c in candidates if c.native_id},
+        parent_native_session_ids={
+            str(c.path): c.parent_id
+            for c in candidates
+            if c.parent_id and c.parent_id != c.native_id
+        },
+        source_snapshots={str(c.path): c.snapshot for c in candidates},
+        selected_bytes=sum(c.snapshot.end_offset for c in candidates),
+        invalid_count=invalid,
+        excluded_by_cutoff=excluded_by_cutoff,
+        source_statuses=tuple(statuses),
+    )
+
+
 def _recent_codex_candidates(
     codex_home: Path,
     cutoff_ns: int,
@@ -540,6 +604,7 @@ def _recent_codex_candidates(
                                     prefix_length=prefix_length,
                                     prefix_sha256=prefix_sha256,
                                 ),
+                                has_session_meta=bool(identity and identity[0]),
                             )
                         )
             except OSError:

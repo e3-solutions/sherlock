@@ -62,7 +62,17 @@ def parser() -> argparse.ArgumentParser:
     backfill.add_argument("--end")
     inventory = commands.add_parser("inventory")
     inventory.add_argument("--session-id")
-    inventory.add_argument("--lookback-seconds", type=int, default=DEFAULT_LOOKBACK_SECONDS)
+    inventory.add_argument("--lookback-seconds", type=int)
+    reconcile = commands.add_parser("reconcile")
+    reconcile.add_argument("--max-files", type=int, default=64)
+    reconcile.add_argument("--max-bytes", type=int, default=128 * 1024 * 1024)
+    reconcile.add_argument("--max-uploads", type=int, default=128)
+    reconcile.add_argument(
+        "--max-age-days",
+        type=int,
+        default=31,
+        help="only discover files written in the last N days (0: all retained history)",
+    )
     hook = commands.add_parser("hook")
     hook.add_argument("event_name")
     commands.add_parser("drain")
@@ -145,17 +155,38 @@ def main(argv: list[str] | None = None) -> int:
     modified_after_ns: int | None = None
     modified_before_ns: int | None = None
     if args.command == "inventory":
-        if is_claude:
-            print("inventory currently supports Codex native sessions", file=sys.stderr)
-            return 2
+        if args.lookback_seconds is None:
+            args.lookback_seconds = CLAUDE_DEFAULT_LOOKBACK_SECONDS if is_claude else DEFAULT_LOOKBACK_SECONDS
         if args.lookback_seconds < 1 or (args.session_id is not None and _canonical_uuid(args.session_id) is None):
             print("inventory requires a positive lookback and canonical session UUID", file=sys.stderr)
             return 2
         from .inventory import collection_inventory
         result = collection_inventory(source_home, state_root, session_id=args.session_id,
-                                      lookback_seconds=args.lookback_seconds)
+                                      lookback_seconds=args.lookback_seconds, provider=args.provider)
         print(json.dumps(result, sort_keys=True))
         return 0 if result["status"] == "complete" else 1
+    if args.command == "reconcile":
+        from .reconcile import reconcile
+        if min(args.max_files, args.max_bytes, args.max_uploads) < 1 or args.max_age_days < 0:
+            print("reconcile budgets must be positive", file=sys.stderr)
+            return 2
+        transport = None
+        config_error = None
+        try:
+            configuration = load_config(args.config, codex_home=source_home)
+            transport = HttpTransport(configuration.endpoint, configuration.identity)
+        except ConfigurationError as error:
+            config_error = str(error)
+        result = reconcile(source_home, state_root, args.provider, transport,
+                           max_files=args.max_files, max_bytes=args.max_bytes,
+                           max_uploads=args.max_uploads,
+                           max_age_days=args.max_age_days)
+        if config_error:
+            result["configuration_error"] = config_error
+        print(json.dumps(result, sort_keys=True))
+        if result["locked"] or (result.get("drain") or {}).get("collector_failure"):
+            return 75
+        return 78 if config_error else 0
     if args.command == "backfill":
         has_range = args.start is not None or args.end is not None
         if not is_claude and has_range:
@@ -251,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_provider=args.provider,
                 source_kind="transcript" if is_claude else "rollout",
                 state_name="claude-transcript" if is_claude else "rollout",
-                capture_unterminated_tail=not is_claude,
+                capture_unterminated_tail=False,
                 allowed_root=(
                     source_home / "projects"
                     if is_claude
@@ -333,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                 state_name=(
                     "claude-transcript" if args.provider == "claude_code" else "rollout"
                 ),
-                capture_unterminated_tail=args.provider != "claude_code",
+                capture_unterminated_tail=False,
             ),
             args.rollout,
             [
@@ -395,9 +426,12 @@ def main(argv: list[str] | None = None) -> int:
         pending_batches = len(spool.list_pending())
         processing_batches = len(list(spool.processing.glob("*.json")))
         dead_letter_batches = len(list(spool.dead_letter.glob("*.json")))
+        stalled = spool.stalled_streams()
         status = (
             "degraded"
             if dead_letter_batches
+            else "stalled"
+            if stalled["stalled_streams"]
             else "recovering"
             if processing_batches
             else "ok"
@@ -412,20 +446,22 @@ def main(argv: list[str] | None = None) -> int:
                     "pending_batches": pending_batches,
                     "processing_batches": processing_batches,
                     "dead_letter_batches": dead_letter_batches,
+                    **stalled,
                 },
                 sort_keys=True,
             )
         )
-        return 1 if dead_letter_batches else 0
+        return 1 if dead_letter_batches or stalled["stalled_streams"] else 0
     outcome = Drain(
         spool,
         HttpTransport(
             configuration.endpoint,
             configuration.identity,
         ),
+        source_home=source_home,
     ).run()
     print(json.dumps(asdict(outcome), sort_keys=True))
-    return 0 if not outcome.locked else 75
+    return 75 if outcome.locked or outcome.collector_failure else 0
 
 
 if __name__ == "__main__":

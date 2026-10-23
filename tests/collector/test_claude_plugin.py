@@ -1,4 +1,5 @@
 from __future__ import annotations
+import _isolation  # noqa: F401  (must precede collector imports)
 
 import json
 import base64
@@ -19,7 +20,11 @@ from unittest.mock import patch
 
 from sherlock_collector import discovery as discovery_module
 from sherlock_collector.claude_hook import write_observation
-from sherlock_collector.contract import FRAGMENT_BYTES, MAX_SOURCE_BYTES
+from sherlock_collector.contract import (
+    FRAGMENT_BYTES,
+    MAX_SOURCE_BYTES,
+    build_rollout_batch,
+)
 from sherlock_collector.discovery import (
     CLAUDE_BACKFILL_MAX_BYTES,
     CLAUDE_BACKFILL_MAX_FILES,
@@ -28,7 +33,7 @@ from sherlock_collector.discovery import (
 )
 from sherlock_collector.hook import POST_TOOL_DEBOUNCE_SECONDS, run_hook
 from sherlock_collector.rollout import RolloutCapturer
-from sherlock_collector.spool import DurableSpool
+from sherlock_collector.spool import DurableSpool, SpoolItem
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1701,7 +1706,7 @@ class ClaudePluginTests(unittest.TestCase):
                     complete_discovery.parent_native_session_ids
                 ),
                 source_snapshots=complete_discovery.source_snapshots,
-                max_sync_bytes=1024 * 1024,
+                max_sync_bytes=len(oversized_partial) + 1,
                 backlog_workload_class="backfill",
             )
             oversized = oversized_partial + b"\n"
@@ -1976,6 +1981,8 @@ class ClaudePluginTests(unittest.TestCase):
                 json.dumps({"enabledPlugins": {"sherlock-claude-code@sherlock": True}}),
                 encoding="utf-8",
             )
+            (claude_home / "sherlock").mkdir()
+            (claude_home / "sherlock" / "scheduler.json").write_text('{"status":"disabled"}')
             enabled = subprocess.run(
                 [sys.executable, str(verifier)],
                 check=False,
@@ -2102,6 +2109,89 @@ class ClaudePluginTests(unittest.TestCase):
             degraded_health = json.loads(degraded.stdout)
             self.assertEqual(degraded_health["status"], "degraded")
             self.assertEqual(degraded_health["dead_letter_batches"], 1)
+
+    def test_collector_health_reports_stalled_stream_heads(self):
+        with TemporaryDirectory() as temporary:
+            claude_home = Path(temporary) / "claude"
+            config = claude_home / "sherlock" / "collector.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps(
+                    {
+                        "endpoint": "https://example.test/ingest",
+                        "name": "Test User",
+                        "github_id": "test-user",
+                        "email": "test@example.com",
+                        "installation_id": "00000000-0000-4000-8000-000000000001",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            spool = DurableSpool(claude_home / "sherlock" / "telemetry" / "queue")
+            raw = b'{"type":"event","timestamp":"2026-08-14T00:00:00Z"}\n'
+            first, first_stored = build_rollout_batch(
+                raw,
+                source_stream_key="stream-stalled",
+                generation_key="generation-test",
+                generation_seq=0,
+                start_offset=0,
+            )
+            second, second_stored = build_rollout_batch(
+                raw,
+                source_stream_key="stream-stalled",
+                generation_key="generation-test",
+                generation_seq=0,
+                start_offset=first.end_offset,
+            )
+            head = spool.enqueue(first, first_stored)
+            spool.enqueue(second, second_stored)
+            item = spool.load(head)
+            stale = SpoolItem(
+                item.manifest,
+                item.stored_payload,
+                {**item.metadata, "enqueued_at": "2026-09-07T00:00:00Z"},
+            )
+            claimed = spool.claim(head)
+            spool.requeue(
+                claimed,
+                stale,
+                RuntimeError("ingest returned HTTP 409: conflict"),
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sherlock_collector.cli",
+                    "--provider",
+                    "claude_code",
+                    "--claude-home",
+                    str(claude_home),
+                    "--config",
+                    str(config),
+                    "health",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            health = json.loads(completed.stdout)
+            self.assertEqual(health["status"], "stalled")
+            self.assertEqual(health["pending_batches"], 2)
+            self.assertEqual(health["dead_letter_batches"], 0)
+            self.assertEqual(health["stalled_streams"], 1)
+            self.assertEqual(health["stalled_batches"], 2)
+            self.assertEqual(
+                health["oldest_stalled_enqueued_at"], "2026-09-07T00:00:00Z"
+            )
+            self.assertEqual(
+                health["stalled_errors"],
+                [{"error": "ingest returned HTTP 409: conflict", "streams": 1}],
+            )
 
 
 if __name__ == "__main__":

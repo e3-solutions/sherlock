@@ -1,4 +1,5 @@
 from __future__ import annotations
+import _isolation  # noqa: F401  (must precede collector imports)
 
 import json
 import unittest
@@ -297,7 +298,8 @@ class CollectionReceiptTests(unittest.TestCase):
             def upload(inner_self, _item):
                 raise TransientUploadError("offline")
 
-        failed = Drain(self.spool, Failed()).run()
+        with patch("sherlock_collector.drain.time.time", return_value=10**12):
+            failed = Drain(self.spool, Failed()).run()
         self.assertEqual(failed.requeued, 1)
         self.assertEqual(self.spool.list_collection_receipts(), [])
 

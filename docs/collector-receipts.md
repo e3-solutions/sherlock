@@ -55,3 +55,26 @@ file. A missing database receipt still requires collector-side source and queue
 diagnostics; do not manufacture receipts or erase state to force an apparent pass.
 Local receipts are diagnostic evidence, not signed attestations; direct database
 records remain authoritative for server commitment.
+
+Records above 100 MiB are preserved as canonical 4 MiB fragments, with exact
+source offsets, per-fragment hashes, and a streaming SHA-256 of the original
+newline-terminated record. They do not create omitted ranges. Growing tails
+remain `incomplete_trailing_record` until the newline arrives. Fragment capture
+can span reconcile runs: `fragment_progress` in the local ledger gives the
+logical range/hash and next fragment index, with reason
+`native_record_fragmentation_in_progress`. The logical capture offset does not
+advance until every fragment is durable. Retries use the same fragment keys.
+Raw receipt coverage and semantic coverage remain separate: fragment token
+presence is unknown and the normalizer emits `unknown/native_fragment`.
+Inventory retains its independent 64 MiB per-file and 512 MiB total inspection
+budgets; large files report `inspection_budget_exceeded`, never a false complete.
+
+Deploy the relaxed ingest validator before updating collector runtimes to emit
+fragments above the former 100 MiB cap. Existing collectors remain supported;
+no database migration or worker projection update is needed. Cursor entries
+keep the shape older runtimes read; `pending_fragment` and `recovery_reason`
+are stored beside them in `stream_extensions`, which an older runtime ignores
+and drops (a partially published record then restarts from its first fragment
+with identical, idempotent keys). Drain all queued fragments of >100 MiB logical records
+before returning to an older runtime, whose spool validator rejects those ranges.
+No projected text limit is increased by this change.

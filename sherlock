@@ -10,6 +10,7 @@ CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 NAME=""
 GITHUB_ID=""
 EMAIL=""
+SCHEDULER_FLAG=""
 CLAUDE_BACKFILL_HOURS=72
 
 usage() {
@@ -32,6 +33,7 @@ Environment overrides:
   SHERLOCK_INGEST_URL   Collector endpoint
 
 Options:
+  --no-scheduler        Disable periodic collection for both providers
   --claude-backfill-hours  Initial Claude transcript lookback (default: 72; max: 744)
 EOF
 }
@@ -71,6 +73,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       EMAIL=$2
       shift 2
+      ;;
+    --no-scheduler)
+      SCHEDULER_FLAG=--no-scheduler
+      shift
       ;;
     --claude-backfill-hours)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
@@ -186,6 +192,7 @@ MARKETPLACE_ROOT="$SHERLOCK_HOME/marketplace"
 if [ -n "$RESOLVED_CODEX_BIN" ]; then
   SHERLOCK_MARKETPLACE_ROOT=$MARKETPLACE_ROOT \
     CODEX_BIN=$RESOLVED_CODEX_BIN "$REPO_ROOT/install.sh" \
+    ${SCHEDULER_FLAG:+"$SCHEDULER_FLAG"} \
     --name "$NAME" \
     --github-id "$GITHUB_ID" \
     --email "$EMAIL"
@@ -194,6 +201,7 @@ fi
 if [ -n "$RESOLVED_CLAUDE_BIN" ]; then
   SHERLOCK_MARKETPLACE_ROOT=$MARKETPLACE_ROOT \
     CLAUDE_BIN=$RESOLVED_CLAUDE_BIN "$REPO_ROOT/install-claude.sh" \
+    ${SCHEDULER_FLAG:+"$SCHEDULER_FLAG"} \
     --name "$NAME" \
     --github-id "$GITHUB_ID" \
     --email "$EMAIL" \
@@ -210,5 +218,10 @@ if [ -n "$RESOLVED_CLAUDE_BIN" ]; then
   echo "  Claude Code: installed"
 else
   echo "  Claude Code: skipped - $CLAUDE_SKIP_REASON"
+fi
+if [ "$SCHEDULER_FLAG" = "--no-scheduler" ] || [ "${SHERLOCK_NO_SCHEDULER:-0}" = "1" ]; then
+  echo "  Periodic collection: disabled"
+else
+  echo "  Periodic collection: every 15 minutes for each installed provider (an earlier opt-out is kept)"
 fi
 echo "Start a new session in each installed agent to load its hooks."
