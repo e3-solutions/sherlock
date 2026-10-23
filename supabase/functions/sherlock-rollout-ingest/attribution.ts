@@ -8,10 +8,12 @@ export interface CollectorGrant {
 export interface WorkspaceRoutingConfig {
   e3_workspace_id: string;
   sixtyfour_workspace_id: string;
+  bigballer_workspace_id?: string;
 }
 
 export const E3_EMAIL_DOMAIN = "e3group.ai";
 export const SIXTYFOUR_EMAIL_DOMAIN = "sixtyfour.ai";
+export const BIGBALLER_EMAIL_DOMAIN = "bigballerbrandwheels.com";
 
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -19,6 +21,7 @@ const UUID =
 export function workspaceRoutingConfig(
   e3WorkspaceId: string,
   sixtyfourWorkspaceId: string,
+  bigballerWorkspaceId?: string,
 ): WorkspaceRoutingConfig {
   if (!UUID.test(e3WorkspaceId) || !UUID.test(sixtyfourWorkspaceId)) {
     throw new IngestError(
@@ -36,7 +39,21 @@ export function workspaceRoutingConfig(
       500,
     );
   }
+  if (
+    bigballerWorkspaceId !== undefined &&
+    (!UUID.test(bigballerWorkspaceId) ||
+      [normalizedE3WorkspaceId, normalizedSixtyfourWorkspaceId].includes(
+        bigballerWorkspaceId.toLowerCase(),
+      ))
+  ) {
+    throw new IngestError(
+      "invalid_configuration",
+      "Big Baller workspace ID must be a distinct UUID",
+      500,
+    );
+  }
   return {
+    bigballer_workspace_id: bigballerWorkspaceId?.toLowerCase(),
     e3_workspace_id: normalizedE3WorkspaceId,
     sixtyfour_workspace_id: normalizedSixtyfourWorkspaceId,
   };
@@ -51,6 +68,8 @@ export function publicCollectorGrant(
     ? config.e3_workspace_id
     : domain === SIXTYFOUR_EMAIL_DOMAIN
     ? config.sixtyfour_workspace_id
+    : domain === BIGBALLER_EMAIL_DOMAIN
+    ? config.bigballer_workspace_id ?? null
     : null;
   if (workspaceId === null) {
     throw new IngestError(

@@ -37,7 +37,7 @@ class CollectorConfig:
 
 
 GITHUB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
-APPROVED_EMAIL_DOMAINS = frozenset({"e3group.ai", "sixtyfour.ai"})
+APPROVED_EMAIL_DOMAINS = frozenset({"e3group.ai", "sixtyfour.ai", "bigballerbrandwheels.com"})
 
 
 def default_codex_home() -> Path:
@@ -94,7 +94,7 @@ def validate_install_email(value: object) -> str:
     local, domain = normalized_email.split("@")
     if not local or domain not in APPROVED_EMAIL_DOMAINS:
         raise ConfigurationError(
-            "email must use the e3group.ai or sixtyfour.ai work domain"
+            "email must use the e3group.ai, sixtyfour.ai or bigballerbrandwheels.com work domain"
         )
     return normalized_email
 

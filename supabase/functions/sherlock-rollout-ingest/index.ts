@@ -66,6 +66,7 @@ export async function handleRequest(
     const routing = workspaceRoutingConfig(
       required("SHERLOCK_E3_WORKSPACE_ID", environment),
       required("SHERLOCK_SIXTYFOUR_WORKSPACE_ID", environment),
+      environment("SHERLOCK_BIGBALLER_WORKSPACE_ID"),
     );
     const grant = publicCollectorGrant(routing, envelope.collector);
     const current = backendFactory();
