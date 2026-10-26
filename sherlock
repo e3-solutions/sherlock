@@ -5,6 +5,10 @@ set -eu
 REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SHERLOCK_HOME=${SHERLOCK_HOME:-"$HOME/.sherlock"}
+case "$SHERLOCK_HOME" in
+  /*) ;;
+  *) SHERLOCK_HOME="$(pwd)/$SHERLOCK_HOME" ;;  # hooks and scheduler run elsewhere
+esac
 CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 NAME=""
@@ -85,7 +89,9 @@ case "$1" in
     ;;
   exclude-project|include-project)
     [ "$#" -ge 2 ] || { usage >&2; exit 2; }
-    project_exclusions "$@" || exit
+    command=$1
+    shift
+    project_exclusions "$command" -- "$@" || exit
     warn_outdated_runtimes
     exit 0
     ;;
@@ -251,7 +257,7 @@ if [ -n "$EXCLUDE_PROJECTS" ]; then
   set -- $EXCLUDE_PROJECTS
   set +f
   IFS=$OLD_IFS
-  project_exclusions exclude-project "$@" || exit
+  project_exclusions exclude-project -- "$@" || exit
 fi
 
 MARKETPLACE_ROOT="$SHERLOCK_HOME/marketplace"

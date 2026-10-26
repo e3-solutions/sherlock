@@ -340,7 +340,16 @@ def install_scheduler(
     python = python or sys.executable
     previous = scheduler_status(home)
     files = scheduler_files(
-        home, provider, user_home, system, python, os.environ.get("SHERLOCK_HOME")
+        home,
+        provider,
+        user_home,
+        system,
+        python,
+        (
+            os.path.abspath(os.path.expanduser(os.environ["SHERLOCK_HOME"]))
+            if os.environ.get("SHERLOCK_HOME")
+            else None
+        ),
     )
     for path, data in files.items():
         _write(path, data)

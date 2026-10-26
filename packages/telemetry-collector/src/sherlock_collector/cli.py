@@ -18,7 +18,12 @@ from .config import (
     load_config,
 )
 from .drain import Drain
-from .exclusions import excluded_project_paths, policy_path, update_project_exclusions
+from .exclusions import (
+    _path_key,
+    excluded_project_paths,
+    policy_path,
+    update_project_exclusions,
+)
 from .discovery import (
     CLAUDE_DEFAULT_LOOKBACK_SECONDS,
     CLAUDE_BACKFILL_MAX_BYTES,
@@ -98,9 +103,10 @@ def _project_exclusions(command: str, paths: list[str]) -> int:
                     print(f"warning: {value} is not an existing directory; excluding it anyway",
                           file=sys.stderr)
         elif command == "include-project":
-            listed = set(excluded_project_paths())
+            listed = excluded_project_paths()
+            listed = {_path_key(v) for v in listed} | {_path_key(os.path.realpath(v)) for v in listed}
             for value in paths:
-                if os.path.normpath(os.path.abspath(os.path.expanduser(value))) not in listed:
+                if _path_key(os.path.realpath(os.path.expanduser(value))) not in listed:
                     print(f"warning: {value} was not excluded", file=sys.stderr)
         projects = (
             excluded_project_paths()

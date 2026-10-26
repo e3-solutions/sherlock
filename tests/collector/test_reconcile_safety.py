@@ -22,6 +22,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from sherlock_collector.contract import validate_stored_payload
 from sherlock_collector.drain import Drain
 from sherlock_collector.exclusions import (
     EXCLUDED,
@@ -37,7 +38,7 @@ from sherlock_collector.exclusions import (
 from sherlock_collector.hook import run_hook
 from sherlock_collector.reconcile import reconcile
 from sherlock_collector.rollout import RolloutCapturer, StreamState
-from sherlock_collector.scheduler import scheduler_files
+from sherlock_collector.scheduler import install_scheduler, scheduler_files
 from sherlock_collector.spool import DurableSpool
 from test_collector import SuccessTransport
 
@@ -516,6 +517,20 @@ class ProjectExclusionTests(unittest.TestCase):
         self.assertEqual(result.held_by_policy, 1)
         self.assertTrue(moved)
 
+    def test_fragments_of_oversized_records_in_excluded_projects_are_held(self):
+        home, state = self.root / "codex", self.root / "state"
+        oversized = json.dumps({"type": "turn_context", "payload": {
+            "cwd": str(self.project), "secret": "PRIVATE-MARKER" * (1_300_000),
+        }}).encode() + b"\n"
+        self.assertGreater(len(oversized), 17 * 1024 * 1024)
+        codex_rollout(home, meta={"cwd": str(self.sibling)}, tail=oversized)
+        transport, _ = self.run_reconcile(home, "codex", self.policy(self.project))
+        uploaded = b"".join(
+            validate_stored_payload(item.manifest, item.stored_payload)
+            for item in transport.items
+        )
+        self.assertNotIn(b"PRIVATE-MARKER", uploaded)
+
     def test_claude_hook_observations_of_excluded_sessions_are_not_captured(self):
         home, state = self.root / "claude", self.root / "claude" / "sherlock" / "telemetry"
         root_id = str(uuid.uuid4())
@@ -563,12 +578,66 @@ class ProjectExclusionTests(unittest.TestCase):
             EXCLUDED_PROJECT,
         )
 
+    def test_cli_resolves_symlinks_before_parent_references(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "alias").symlink_to(self.project / "sub")
+        path = self.root / "session-exclusions.json"
+        self.assertEqual(
+            update_project_exclusions(add=[f"{outside}/alias/.."], path=path), [str(self.project)]
+        )
+        self.assertEqual(update_project_exclusions(remove=[f"{outside}/alias/.."], path=path), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS normalizes Unicode in paths")
+    def test_unicode_equivalent_spellings_match_on_macos(self):
+        composed = self.root / "caf\u00e9"
+        composed.mkdir()
+        policy = write_policy(self.root, excluded_project_paths=[str(composed)])
+        self.assertTrue(policy.project_excluded(str(self.root / "cafe\u0301" / "x")))
+
+    def test_codex_sessions_of_deleted_worktrees_match_the_repository_remote(self):
+        (self.project / ".git" / "config").write_text(
+            '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/Private.git\n'
+        )
+        home = self.root / "codex"
+        _, gone = codex_rollout(home, meta={
+            "cwd": str(self.root / "deleted-worktree"),
+            "git": {"repository_url": "https://github.com/acme/private"},
+        })
+        _, child = codex_rollout(home, meta={"cwd": str(self.sibling), "parent_thread_id": gone})
+        _, other = codex_rollout(home, meta={
+            "cwd": str(self.sibling), "git": {"repository_url": "https://github.com/acme/public.git"},
+        })
+        transport, _ = self.run_reconcile(home, "codex", self.policy(self.project))
+        self.assertEqual(uploaded_ids(transport), {other})
+
+    def test_single_origin_records_from_earlier_runtimes_are_read(self):
+        (self.root / "worktree-origins.json").write_text(json.dumps(
+            {"version": 1, "origins": {str(self.root / "old-wt"): str(self.project)}}
+        ))
+        policy = self.policy(self.project)
+        self.assertTrue(policy.project_excluded(str(self.root / "old-wt" / "sub")))
+        self.assertIsNone(policy._cwds_reason({str(self.sibling)}))
+
     def test_concurrent_cli_updates_keep_every_addition(self):
         path = self.root / "session-exclusions.json"
         added = [str(self.root / f"project-{index}") for index in range(16)]
         with ThreadPoolExecutor(max_workers=16) as pool:
             list(pool.map(lambda value: update_project_exclusions(add=[value], path=path), added))
         self.assertEqual(excluded_project_paths(path), sorted(added))
+
+    def test_scheduled_runs_keep_a_custom_policy_home_as_an_absolute_path(self):
+        captured = {}
+
+        def fake_files(*arguments):
+            captured["sherlock_home"] = arguments[-1]
+            raise RuntimeError("stop before writing scheduler entries")
+
+        with patch.dict(os.environ, {"SHERLOCK_HOME": "relative-home"}), \
+                patch("sherlock_collector.scheduler.scheduler_files", fake_files):
+            with self.assertRaises(RuntimeError):
+                install_scheduler(self.root / "codex", "codex", user_home=self.root, system="Darwin")
+        self.assertEqual(captured["sherlock_home"], os.path.abspath("relative-home"))
 
     def test_scheduled_runs_keep_a_custom_policy_home(self):
         files = scheduler_files(

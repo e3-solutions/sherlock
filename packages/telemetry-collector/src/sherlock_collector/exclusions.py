@@ -37,9 +37,11 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
+from urllib.parse import urlsplit
 
 from .contract import MAX_SOURCE_BYTES
 from .spool import _atomic_json, secure_lock
@@ -61,9 +63,11 @@ NOT_ALLOWED = "not_in_claude_session_allowlist"
 UNREADABLE = "session_exclusion_policy_unreadable"
 UNVERIFIED = "session_ancestry_unverified"
 ORIGINS_UNREADABLE = "worktree_origins_unreadable"
-# macOS volumes are case-insensitive by default. Folding on a case-sensitive
-# volume can only exclude more, never less.
+# macOS volumes are case- and Unicode-normalization-insensitive by default.
+# Folding on a case-sensitive volume can only exclude more, never less.
 _FOLD_CASE = sys.platform == "darwin"
+# A top-level "cwd" field, also inside a fragment of a record too large to parse.
+_CWD_FIELD = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -100,10 +104,13 @@ def normalize_project_path(value: object) -> str:
 
 
 def _absolute_project_path(value: str) -> str:
-    """Resolve a command-line path relative to the current directory."""
+    """Resolve a command-line path as the filesystem would, symlinks before "..".
+
+    Relative paths are taken from the current directory.
+    """
     if not isinstance(value, str) or not value.strip():
         raise ValueError("project paths must be non-empty strings")
-    return normalize_project_path(os.path.abspath(os.path.expanduser(value.strip())))
+    return normalize_project_path(os.path.realpath(os.path.expanduser(value.strip())))
 
 
 def _project_paths(raw: dict) -> frozenset[str]:
@@ -123,7 +130,7 @@ def _project_paths(raw: dict) -> frozenset[str]:
 
 
 def _path_key(path: str) -> str:
-    return path.casefold() if _FOLD_CASE else path
+    return unicodedata.normalize("NFC", path).casefold() if _FOLD_CASE else path
 
 
 @dataclass(frozen=True)
@@ -131,6 +138,7 @@ class ExclusionPolicy:
     excluded: frozenset[str] = frozenset()
     allowed_claude: frozenset[str] | None = None
     excluded_projects: frozenset[str] = frozenset()
+    excluded_project_paths: tuple[str, ...] = ()
     worktree_origins_path: Path | None = None
     error: str | None = None
     _ancestry: dict = field(default_factory=dict, compare=False, repr=False)
@@ -201,10 +209,10 @@ class ExclusionPolicy:
             meta = _session_meta_ids(source_path)
             if meta is None:
                 return UNVERIFIED
-            own, ancestors, cwd = meta
+            own, ancestors, cwd, repository = meta
             if ({own} | ancestors) & self.excluded:
                 return EXCLUDED
-            blocked = self._cwd_reason(cwd)
+            blocked = self._session_reason(cwd, repository)
             if blocked:
                 return blocked
             seen.add(own)
@@ -223,14 +231,30 @@ class ExclusionPolicy:
             meta = self._ancestors(current, codex_home)
             if meta is None:
                 return UNVERIFIED
-            ancestors, cwd = meta
+            ancestors, cwd, repository = meta
             if ancestors & self.excluded:
                 return EXCLUDED
-            blocked = self._cwd_reason(cwd)
+            blocked = self._session_reason(cwd, repository)
             if blocked:
                 return blocked
             pending.extend(ancestors - seen)
         return None
+
+    def _session_reason(self, cwd: str | None, repository: str | None) -> str | None:
+        """Codex sessions also record their repository, which outlives a
+        removed worktree: a remote of an excluded checkout excludes them."""
+        if repository is not None and repository in self._excluded_repositories():
+            return EXCLUDED_PROJECT
+        return self._cwd_reason(cwd)
+
+    def _excluded_repositories(self) -> frozenset[str]:
+        if "repositories" not in self._ancestry:
+            self._ancestry["repositories"] = frozenset(
+                remote
+                for project in self.excluded_project_paths
+                for remote in _project_remotes(project)
+            )
+        return self._ancestry["repositories"]
 
     def _cwd_reason(self, cwd: str | None) -> str | None:
         if not self.excluded_projects:
@@ -358,8 +382,8 @@ class ExclusionPolicy:
 
     def _ancestors(
         self, session_id: str, codex_home: Path | None
-    ) -> tuple[set[str], str | None] | None:
-        """Ancestor ids and cwd recorded by the rollout whose session_meta is session_id.
+    ) -> tuple[set[str], str | None, str | None] | None:
+        """Ancestor ids, cwd and repository recorded by the rollout whose session_meta is session_id.
 
         None means the ancestry cannot be verified (missing or unreadable file);
         callers then fail closed. One filename index per home keeps this to a
@@ -367,11 +391,11 @@ class ExclusionPolicy:
         """
         if session_id in self._ancestry:
             return self._ancestry[session_id]
-        result: tuple[set[str], str | None] | None = None
+        result: tuple[set[str], str | None, str | None] | None = None
         for path in self._index(codex_home).get(session_id, ()):
             meta = _session_meta_ids(path)
             if meta is not None and meta[0] == session_id:
-                result = meta[1], meta[2]
+                result = meta[1], meta[2], meta[3]
                 break
         self._ancestry[session_id] = result
         return result
@@ -415,6 +439,9 @@ def load_policy(path: Path | None = None) -> ExclusionPolicy:
         excluded=excluded,
         allowed_claude=allowed,
         excluded_projects=projects,
+        excluded_project_paths=tuple(
+            sorted({normalize_project_path(v) for v in raw.get("excluded_project_paths", [])})
+        ),
         worktree_origins_path=path.parent / WORKTREE_ORIGINS_NAME,
     )
 
@@ -438,6 +465,12 @@ def _read_worktree_origins(path: Path | None) -> dict[str, list[str]] | None:
     except ValueError:
         return None
     origins = raw.get("origins") if isinstance(raw, dict) else None
+    if isinstance(origins, dict):
+        # Earlier records stored one origin per directory as a string.
+        origins = {
+            key: [values] if isinstance(values, str) else values
+            for key, values in origins.items()
+        }
     if not isinstance(origins, dict) or not all(
         isinstance(key, str)
         and isinstance(values, list)
@@ -490,7 +523,11 @@ def update_project_exclusions(
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         raw = _read_policy_object(path) or {"version": 1}
         current = {normalize_project_path(v) for v in raw.get("excluded_project_paths", [])}
-        result = sorted((current | added) - removed)
+        removed_keys = {_path_key(value) for value in removed}
+        result = sorted(
+            value for value in current | added
+            if not {_path_key(value), _path_key(os.path.realpath(value))} & removed_keys
+        )
         raw["excluded_project_paths"] = result
         _atomic_json(path, raw)
     return result
@@ -507,8 +544,10 @@ def _open_regular(path: Path):
     return os.fdopen(descriptor, "rb")
 
 
-def _session_meta_ids(path: Path) -> tuple[str, set[str], str | None] | None:
-    """Return (own id, ancestor ids, cwd) from a Codex rollout's first session_meta."""
+def _session_meta_ids(
+    path: Path,
+) -> tuple[str, set[str], str | None, str | None] | None:
+    """Return (own id, ancestor ids, cwd, repository) from a Codex rollout's first session_meta."""
     try:
         handle = _open_regular(path)
         if handle is None:
@@ -546,11 +585,81 @@ def _session_meta_ids(path: Path) -> tuple[str, set[str], str | None] | None:
         if isinstance(spawn, dict):
             ancestors.add(_normalize(spawn.get("parent_thread_id")))
     cwd = payload.get("cwd")
+    git = payload.get("git")
     return (
         own,
         {value for value in ancestors if value and value != own},
         cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None,
+        _repository_key(git.get("repository_url")) if isinstance(git, dict) else None,
     )
+
+
+def _repository_key(url: object) -> str | None:
+    """Comparable host/path of a git remote (https, ssh or scp-like)."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    if "://" in url:
+        parts = urlsplit(url)
+        host, path = parts.hostname or "", parts.path
+    elif ":" in url and not url.startswith("/"):
+        host, path = url.split(":", 1)
+        host = host.rsplit("@", 1)[-1]
+    else:
+        return None  # Local paths are matched as directories instead.
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return f"{host}/{path}".lower() if host and path else None
+
+
+def _project_remotes(project: str) -> set[str]:
+    """Remotes of the repository at project, or of repositories directly inside it."""
+    remotes: set[str] = set()
+    try:
+        children = [entry.path for entry in os.scandir(project) if entry.is_dir(follow_symlinks=False)]
+    except OSError:
+        children = []
+    for checkout in (project, *children):
+        config = _git_config_path(checkout)
+        if config is None:
+            continue
+        try:
+            with open(config, "rb") as handle:
+                lines = handle.read(MAX_GIT_FILE_BYTES * 16).decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        in_remote = False
+        for line in lines:
+            line = line.strip()
+            if line.startswith("["):
+                in_remote = line.lower().startswith("[remote ")
+            elif in_remote and line.split("=", 1)[0].strip().lower() == "url" and "=" in line:
+                key = _repository_key(line.split("=", 1)[1])
+                if key:
+                    remotes.add(key)
+    return remotes
+
+
+def _git_config_path(checkout: str) -> str | None:
+    marker = os.path.join(checkout, ".git")
+    if os.path.isdir(marker):
+        common = marker
+    elif os.path.isfile(marker):
+        gitdir = _git_pointer(marker, "gitdir:")
+        if gitdir is None:
+            return None
+        gitdir = os.path.normpath(os.path.join(checkout, gitdir))
+        pointer = _git_pointer(os.path.join(gitdir, "commondir"), "")
+        common = os.path.normpath(os.path.join(gitdir, pointer)) if pointer else gitdir
+    elif os.path.isfile(os.path.join(checkout, "HEAD")) and os.path.isdir(
+        os.path.join(checkout, "objects")
+    ):
+        common = checkout  # bare repository
+    else:
+        return None
+    config = os.path.join(common, "config")
+    return config if os.path.isfile(config) else None
 
 
 def _first_cwd(path: Path) -> str | None:
@@ -591,8 +700,20 @@ def _first_cwd(path: Path) -> str | None:
 
 
 def observed_cwds(source: bytes) -> set[str]:
-    """Working directories named by the complete records of a source byte range."""
+    """Working directories named anywhere in a source byte range.
+
+    Complete records are parsed; ``"cwd"`` fields are also matched in the raw
+    bytes so fragments of an oversized record still classify their batch.
+    Escaped occurrences inside string values do not match.
+    """
     cwds: set[str] = set()
+    for match in _CWD_FIELD.finditer(source):
+        try:
+            cwd = json.loads(b'"' + match.group(1) + b'"')
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(cwd, str) and os.path.isabs(cwd):
+            cwds.add(cwd)
     for line in source.splitlines():
         if b"cwd" not in line and b"payload_base64" not in line:
             continue
