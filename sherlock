@@ -52,8 +52,15 @@ EOF
 }
 
 project_exclusions() {
-  SHERLOCK_HOME=$SHERLOCK_HOME PYTHONPATH="$REPO_ROOT/packages/telemetry-collector/src" \
-    "$PYTHON_BIN" -m sherlock_collector.cli "$@"
+  # Isolated mode: never import modules from the caller's directory.
+  SHERLOCK_HOME=$SHERLOCK_HOME "$PYTHON_BIN" -I -c \
+    'import sys; sys.path.insert(0, sys.argv[1]); from sherlock_collector.cli import main; raise SystemExit(main(sys.argv[2:]))' \
+    "$REPO_ROOT/packages/telemetry-collector/src" "$@"
+  status=$?
+  if [ "$status" -eq 0 ] && [ "$SHERLOCK_HOME" != "$HOME/.sherlock" ]; then
+    echo "Warning: agent hooks read ~/.sherlock unless SHERLOCK_HOME=$SHERLOCK_HOME is also set in the agent's environment." >&2
+  fi
+  return "$status"
 }
 
 # Older installed runtimes ignore project exclusions; say so instead of
@@ -244,7 +251,7 @@ if [ -n "$EXCLUDE_PROJECTS" ]; then
   set -- $EXCLUDE_PROJECTS
   set +f
   IFS=$OLD_IFS
-  project_exclusions exclude-project "$@"
+  project_exclusions exclude-project "$@" || exit
 fi
 
 MARKETPLACE_ROOT="$SHERLOCK_HOME/marketplace"
@@ -288,3 +295,6 @@ else
   echo "  Periodic collection: every 15 minutes for each installed provider (an earlier opt-out is kept)"
 fi
 echo "Start a new session in each installed agent to load its hooks."
+if [ -n "$EXCLUDE_PROJECTS" ]; then
+  warn_outdated_runtimes
+fi

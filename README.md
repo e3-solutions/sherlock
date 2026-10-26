@@ -68,16 +68,26 @@ before the initial backfill, or manage the list later from any checkout:
 ```
 
 A session is excluded when its working directory is that directory, is inside
-it, or is a git worktree whose main checkout is inside it. Codex threads
+it, or is inside a git worktree (or a repository nested in one) whose main
+checkout is inside it; on macOS paths match case-insensitively. Codex threads
 descended from an excluded session and the subagents of an excluded Claude
-session are excluded too, wherever they run. Sessions are matched on the
-working directory recorded in their transcript; a session whose directory is
-not recorded yet is held until it is. Each linked worktree seen while
-exclusions exist is remembered in `worktree-origins.json` beside the policy, so
-its sessions stay excluded after the worktree is removed; a worktree removed
-before its project was excluded cannot be recognized. Exclusion stops future capture and
-upload only: sessions Sherlock has already received stay in its records. Older
-runtimes ignore `excluded_project_paths`, so reinstall to apply it.
+session are excluded too, wherever they run. Capture checks the first working
+directory each transcript records (and, for Claude, its root session's);
+uploads also check every directory recorded in the queued bytes, so a session
+that later moves into an excluded project is held from the first batch that
+records it. A session whose directory is not recorded yet, or whose root
+session cannot be read, is held until it is.
+
+Each linked worktree seen while exclusions exist is remembered in
+`worktree-origins.json` beside the policy, so its sessions stay excluded after
+the worktree is removed or its path is reused; if that file becomes unreadable,
+project-checked sessions are held until it is repaired. A worktree removed
+before its project was excluded cannot be recognized. Exclusion stops future
+capture and upload only: sessions Sherlock has already received stay in its
+records. Older runtimes ignore `excluded_project_paths`, so reinstall to apply
+it. Hooks read the policy from `~/.sherlock` unless `SHERLOCK_HOME` is set in
+the agent's environment; the scheduler keeps the `SHERLOCK_HOME` used at
+install.
 
 To run or audit either provider manually:
 

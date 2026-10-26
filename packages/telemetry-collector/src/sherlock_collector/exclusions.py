@@ -36,10 +36,12 @@ import json
 import os
 import re
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from .contract import MAX_SOURCE_BYTES
 from .spool import _atomic_json, secure_lock
 
 
@@ -47,11 +49,10 @@ POLICY_NAME = "session-exclusions.json"
 # Linked worktrees are often removed once their task ends; remembering where
 # each one pointed keeps its sessions excluded after the directory is gone.
 WORKTREE_ORIGINS_NAME = "worktree-origins.json"
-MAX_WORKTREE_ORIGINS = 10_000
 MAX_POLICY_BYTES = 1024 * 1024
 MAX_SESSION_META_BYTES = 1024 * 1024
 MAX_ANCESTRY_DEPTH = 64
-MAX_CWD_SCAN_BYTES = 16 * 1024 * 1024
+MAX_CWD_SCAN_BYTES = 64 * 1024 * 1024
 MAX_GIT_FILE_BYTES = 64 * 1024
 
 EXCLUDED = "excluded_by_session_policy"
@@ -59,6 +60,10 @@ EXCLUDED_PROJECT = "excluded_by_project_policy"
 NOT_ALLOWED = "not_in_claude_session_allowlist"
 UNREADABLE = "session_exclusion_policy_unreadable"
 UNVERIFIED = "session_ancestry_unverified"
+ORIGINS_UNREADABLE = "worktree_origins_unreadable"
+# macOS volumes are case-insensitive by default. Folding on a case-sensitive
+# volume can only exclude more, never less.
+_FOLD_CASE = sys.platform == "darwin"
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -105,11 +110,20 @@ def _project_paths(raw: dict) -> frozenset[str]:
     values = raw.get("excluded_project_paths", [])
     if not isinstance(values, list):
         raise ValueError("excluded_project_paths must be a list of strings")
-    normalized = {normalize_project_path(value) for value in values}
-    if os.sep in normalized:
-        raise ValueError("excluded_project_paths must not exclude the filesystem root")
-    # Match symlinked spellings too (for example /tmp and /private/tmp).
-    return frozenset(normalized | {os.path.realpath(value) for value in normalized})
+    keys: set[str] = set()
+    for value in values:
+        normalized = normalize_project_path(value)
+        # Resolve symlinks before collapsing "..", as the filesystem does, and
+        # keep the lexical spelling too (for example /tmp and /private/tmp).
+        resolved = os.path.realpath(os.path.expanduser(value.strip()))
+        if os.sep in (normalized, resolved):
+            raise ValueError("excluded_project_paths must not exclude the filesystem root")
+        keys |= {_path_key(normalized), _path_key(resolved)}
+    return frozenset(keys)
+
+
+def _path_key(path: str) -> str:
+    return path.casefold() if _FOLD_CASE else path
 
 
 @dataclass(frozen=True)
@@ -138,12 +152,14 @@ class ExclusionPolicy:
         *,
         source_home: Path | None = None,
         source_path: Path | None = None,
+        observed_cwds: Iterable[str] = (),
     ) -> str | None:
         """Return why this source/batch must not be captured or uploaded.
 
         ``source_home`` is the provider home (Codex home, or the Claude home or
-        its ``projects`` directory) used to resolve sessions without a source
-        file, such as already-queued batches.
+        its ``projects`` directory) used to resolve sessions and their parents.
+        ``observed_cwds`` are working directories recorded in the bytes being
+        uploaded, such as those of an already-queued batch.
         """
         if not self.active:
             return None
@@ -158,7 +174,7 @@ class ExclusionPolicy:
                 return UNVERIFIED
             if self.excluded_projects:
                 blocked = self._claude_project_reason(
-                    parent or native, source_home, source_path
+                    native, parent, source_home, source_path, set(observed_cwds)
                 )
                 if blocked:
                     return blocked
@@ -171,6 +187,9 @@ class ExclusionPolicy:
             return None
         if {native, parent} & self.excluded:
             return EXCLUDED
+        blocked = self._cwds_reason(set(observed_cwds))
+        if blocked:
+            return blocked
         codex_home = source_home
         # Codex threads can be subagents of subagents or forks of an excluded
         # session; walk the recorded ancestry through each rollout's session_meta.
@@ -218,7 +237,16 @@ class ExclusionPolicy:
             return None
         if cwd is None:
             return UNVERIFIED
-        return EXCLUDED_PROJECT if self.project_excluded(cwd) else None
+        return self._cwds_reason({cwd})
+
+    def _cwds_reason(self, cwds: set[str]) -> str | None:
+        if not self.excluded_projects or not cwds:
+            return None
+        if any(map(self.project_excluded, cwds)):
+            return EXCLUDED_PROJECT
+        if self._worktree_origins() is None:
+            return ORIGINS_UNREADABLE
+        return None
 
     def project_excluded(self, cwd: str) -> bool:
         """Whether a working directory lies in an excluded project."""
@@ -232,67 +260,101 @@ class ExclusionPolicy:
         return self._ancestry[key]
 
     def _cwd_candidates(self, cwd: str) -> set[str]:
-        """The directory, its resolved form, and its main checkout if it is a linked worktree."""
-        normalized = os.path.normpath(cwd)
-        candidates = {normalized, os.path.realpath(normalized)}
-        main = _main_worktree(normalized)
-        if main is not None:
-            self._remember_worktree(normalized, main)
-        elif not os.path.lexists(normalized):
-            main = self._worktree_origins().get(normalized)
-        if main is not None:
-            candidates |= {main, os.path.realpath(main)}
-        return candidates
+        """Every spelling of cwd and the checkouts of any git worktree containing it.
 
-    def _worktree_origins(self) -> dict[str, str]:
+        Recorded worktree roots always apply to every directory inside them, so
+        a removed (or since recreated) worktree keeps classifying its sessions.
+        """
+        normalized = os.path.normpath(cwd)
+        resolved = os.path.realpath(cwd)
+        found = {**_git_origins(normalized), **_git_origins(resolved)}
+        if found:
+            self._remember_worktrees(found)
+        origins = set(found.values())
+        spellings = {_path_key(normalized), _path_key(resolved)}
+        for root, recorded in (self._worktree_origins() or {}).items():
+            prefix = _path_key(root).rstrip(os.sep)
+            if any(value == prefix or value.startswith(prefix + os.sep) for value in spellings):
+                origins.update(recorded)
+        candidates = {normalized, resolved} | origins
+        candidates |= {os.path.realpath(origin) for origin in origins}
+        return {_path_key(candidate) for candidate in candidates}
+
+    def _worktree_origins(self) -> dict[str, list[str]] | None:
+        """Recorded origins; None when the record exists but cannot be read."""
         if "worktree-origins" not in self._ancestry:
             self._ancestry["worktree-origins"] = _read_worktree_origins(
                 self.worktree_origins_path
             )
         return self._ancestry["worktree-origins"]
 
-    def _remember_worktree(self, cwd: str, main: str) -> None:
-        if self._worktree_origins().get(cwd) == main or self.worktree_origins_path is None:
-            return
+    def _remember_worktrees(self, found: Mapping[str, str]) -> None:
+        """Record each worktree root and the checkout it belongs to."""
+        known = self._worktree_origins()
         path = self.worktree_origins_path
+        if known is None or path is None or all(
+            origin in known.get(root, ()) for root, origin in found.items()
+        ):
+            return
         try:
             with secure_lock(path.with_name(f".{path.name}.lock")) as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                origins = _read_worktree_origins(path)
-                origins.pop(cwd, None)
-                origins[cwd] = main
-                while len(origins) > MAX_WORKTREE_ORIGINS:
-                    origins.pop(next(iter(origins)))
-                _atomic_json(path, {"version": 1, "origins": origins})
+                current = _read_worktree_origins(path)
+                if current is None:
+                    self._ancestry["worktree-origins"] = None
+                    return  # Never replace a record that cannot be read.
+                for root, origin in found.items():
+                    current[root] = sorted(set(current.get(root, ())) | {origin})
+                _atomic_json(path, {"version": 1, "origins": current})
         except OSError:
             return  # Best effort: a live worktree still resolves from disk.
-        self._ancestry["worktree-origins"] = origins
+        self._ancestry["worktree-origins"] = current
+
+    def _file_cwd(self, path: Path) -> str | None:
+        key = ("file-cwd", str(path))
+        if key not in self._ancestry:
+            self._ancestry[key] = _first_cwd(path)
+        return self._ancestry[key]
 
     def _claude_project_reason(
         self,
-        root_session_id: str,
+        native: str,
+        parent: str | None,
         source_home: Path | None,
         source_path: Path | None,
+        observed: set[str],
     ) -> str | None:
-        """Check the source's own directory and its root session's directory.
+        """Check the source's own directories and its root session's directory.
 
-        A subagent or hook observation is excluded when either directory is;
-        it is unverified only when neither can be read.
+        Excluded when any of them is; unverified unless both the source's own
+        directory and the root session's directory are known.
         """
-        cwds = [_first_cwd(source_path) if source_path is not None else None]
-        if source_home is not None and (
-            source_path is None or cwds[0] is None or source_path.stem != root_session_id
-        ):
-            transcript = self._claude_index(source_home).get(root_session_id)
-            if transcript is not None:
-                key = ("claude-cwd", str(transcript))
-                if key not in self._ancestry:
-                    self._ancestry[key] = _first_cwd(transcript)
-                cwds.append(self._ancestry[key])
-        known = [cwd for cwd in cwds if cwd is not None]
-        if not known:
+        root = parent or native
+        own = set(observed)
+        root_cwd = None
+        roots, agents = (
+            self._claude_index(source_home) if source_home is not None else ({}, {})
+        )
+        if source_path is not None:
+            cwd = self._file_cwd(source_path)
+            if cwd is not None:
+                own.add(cwd)
+                if parent is None and source_path.stem.lower() == root:
+                    root_cwd = cwd
+        elif parent is not None and (parent, native) in agents:
+            cwd = self._file_cwd(agents[(parent, native)])
+            if cwd is not None:
+                own.add(cwd)
+        if root_cwd is None and root in roots:
+            root_cwd = self._file_cwd(roots[root])
+        if source_path is None and parent is None and root_cwd is not None:
+            own.add(root_cwd)
+        blocked = self._cwds_reason(own | ({root_cwd} if root_cwd else set()))
+        if blocked:
+            return blocked
+        if root_cwd is None or not own:
             return UNVERIFIED
-        return EXCLUDED_PROJECT if any(map(self.project_excluded, known)) else None
+        return None
 
     def _ancestors(
         self, session_id: str, codex_home: Path | None
@@ -320,7 +382,9 @@ class ExclusionPolicy:
             self._ancestry[key] = _rollout_index(codex_home)
         return self._ancestry[key]
 
-    def _claude_index(self, claude_home: Path) -> Mapping[str, Path]:
+    def _claude_index(
+        self, claude_home: Path
+    ) -> tuple[Mapping[str, Path], Mapping[tuple[str, str], Path]]:
         key = ("claude-index", str(claude_home))
         if key not in self._ancestry:
             self._ancestry[key] = _claude_transcript_index(claude_home)
@@ -355,22 +419,33 @@ def load_policy(path: Path | None = None) -> ExclusionPolicy:
     )
 
 
-def _read_worktree_origins(path: Path | None) -> dict[str, str]:
-    """Recorded linked-worktree directories and their main checkouts (insertion ordered)."""
+def _read_worktree_origins(path: Path | None) -> dict[str, list[str]] | None:
+    """Recorded worktree roots and the checkouts they belonged to.
+
+    No record means nothing is known; a record that exists but cannot be read
+    returns None so callers fail closed instead of forgetting exclusions.
+    """
     if path is None:
         return {}
     try:
-        raw = json.loads(path.read_bytes())
-    except (OSError, ValueError):
+        data = path.read_bytes()
+    except FileNotFoundError:
         return {}
+    except OSError:
+        return None
+    try:
+        raw = json.loads(data)
+    except ValueError:
+        return None
     origins = raw.get("origins") if isinstance(raw, dict) else None
-    if not isinstance(origins, dict):
-        return {}
-    return {
-        key: value
-        for key, value in origins.items()
-        if isinstance(key, str) and isinstance(value, str) and os.path.isabs(value)
-    }
+    if not isinstance(origins, dict) or not all(
+        isinstance(key, str)
+        and isinstance(values, list)
+        and all(isinstance(value, str) and os.path.isabs(value) for value in values)
+        for key, values in origins.items()
+    ):
+        return None
+    return origins
 
 
 def _read_policy_object(path: Path) -> dict | None:
@@ -406,14 +481,18 @@ def update_project_exclusions(
     Returns the resulting excluded project paths.
     """
     path = path or policy_path()
-    raw = _read_policy_object(path) or {"version": 1}
-    current = {normalize_project_path(v) for v in raw.get("excluded_project_paths", [])}
     added = {_absolute_project_path(value) for value in add}
-    if os.sep in added:
+    removed = {_absolute_project_path(value) for value in remove}
+    if os.sep in added or os.sep in {os.path.realpath(value) for value in added}:
         raise ValueError("refusing to exclude the filesystem root")
-    result = sorted((current | added) - {_absolute_project_path(v) for v in remove})
-    raw["excluded_project_paths"] = result
-    _atomic_json(path, raw)
+    # Serialize read-modify-write so concurrent edits cannot drop each other.
+    with secure_lock(path.with_name(f".{path.name}.lock")) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        raw = _read_policy_object(path) or {"version": 1}
+        current = {normalize_project_path(v) for v in raw.get("excluded_project_paths", [])}
+        result = sorted((current | added) - removed)
+        raw["excluded_project_paths"] = result
+        _atomic_json(path, raw)
     return result
 
 
@@ -488,13 +567,13 @@ def _first_cwd(path: Path) -> str | None:
         with handle:
             remaining = MAX_CWD_SCAN_BYTES
             while remaining > 0:
-                line = handle.readline(min(remaining, MAX_SESSION_META_BYTES))
+                line = handle.readline(min(remaining, MAX_SOURCE_BYTES))
                 if not line:
                     return None
                 remaining -= len(line)
                 if not line.endswith(b"\n"):
                     while line and not line.endswith(b"\n") and remaining > 0:
-                        line = handle.readline(min(remaining, MAX_SESSION_META_BYTES))
+                        line = handle.readline(min(remaining, MAX_SOURCE_BYTES))
                         remaining -= len(line)
                     continue
                 if b"cwd" not in line and b"payload_base64" not in line:
@@ -509,6 +588,21 @@ def _first_cwd(path: Path) -> str | None:
     except OSError:
         return None
     return None
+
+
+def observed_cwds(source: bytes) -> set[str]:
+    """Working directories named by the complete records of a source byte range."""
+    cwds: set[str] = set()
+    for line in source.splitlines():
+        if b"cwd" not in line and b"payload_base64" not in line:
+            continue
+        try:
+            cwd = _record_cwd(json.loads(line))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if cwd is not None:
+            cwds.add(cwd)
+    return cwds
 
 
 def _record_cwd(record: object) -> str | None:
@@ -532,30 +626,29 @@ def _record_cwd(record: object) -> str | None:
     return None
 
 
-def _main_worktree(cwd: str) -> str | None:
-    """Main checkout of the linked git worktree containing cwd, from local files only."""
+def _git_origins(cwd: str) -> dict[str, str]:
+    """Map each git worktree or submodule root containing cwd to its owning checkout.
+
+    Reads local git pointer files only and continues past nested repositories
+    and submodules, so a repository inside a linked worktree still maps to that
+    worktree's origin. A bare repository's origin is its git directory.
+    """
+    origins: dict[str, str] = {}
     current = cwd
     while True:
         marker = os.path.join(current, ".git")
-        if os.path.isdir(marker):
-            return None
-        if os.path.isfile(marker):
-            break
+        gitdir = _git_pointer(marker, "gitdir:") if os.path.isfile(marker) else None
+        if gitdir is not None:
+            gitdir = os.path.normpath(os.path.join(current, gitdir))
+            common = _git_pointer(os.path.join(gitdir, "commondir"), "")
+            common = os.path.normpath(os.path.join(gitdir, common)) if common else gitdir
+            origins[current] = (
+                os.path.dirname(common) if os.path.basename(common) == ".git" else common
+            )
         parent = os.path.dirname(current)
         if parent == current:
-            return None
+            return origins
         current = parent
-    gitdir = _git_pointer(marker, "gitdir:")
-    if gitdir is None:
-        return None
-    gitdir = os.path.normpath(os.path.join(current, gitdir))
-    common = _git_pointer(os.path.join(gitdir, "commondir"), "")
-    if common is None:
-        return None
-    common = os.path.normpath(os.path.join(gitdir, common))
-    if os.path.basename(common) != ".git":
-        return None
-    return os.path.dirname(common)
 
 
 def _git_pointer(path: str, prefix: str) -> str | None:
@@ -569,18 +662,24 @@ def _git_pointer(path: str, prefix: str) -> str | None:
     return text[len(prefix):].strip() or None
 
 
-def _claude_transcript_index(claude_home: Path) -> dict[str, Path]:
-    """Map Claude root session ids to their ``projects/<project>/<id>.jsonl`` transcripts."""
-    index: dict[str, Path] = {}
+def _claude_transcript_index(
+    claude_home: Path,
+) -> tuple[dict[str, Path], dict[tuple[str, str], Path]]:
+    """Index Claude root transcripts by session id and subagent transcripts by
+    (root session id, agent id), from ``projects/<project>/<id>.jsonl`` and
+    ``projects/<project>/<id>/subagents/**/agent-<agent>.jsonl``.
+    """
+    roots: dict[str, Path] = {}
+    agents: dict[tuple[str, str], Path] = {}
     projects = claude_home / "projects"
     if not projects.is_dir() or projects.is_symlink():
         projects = claude_home
     if projects.is_symlink() or not projects.is_dir():
-        return index
+        return roots, agents
     try:
         project_directories = list(os.scandir(projects))
     except OSError:
-        return index
+        return roots, agents
     for project in project_directories:
         if not project.is_dir(follow_symlinks=False):
             continue
@@ -591,8 +690,24 @@ def _claude_transcript_index(claude_home: Path) -> dict[str, Path]:
         for entry in entries:
             name = entry.name.lower()
             if name.endswith(".jsonl") and _UUID.fullmatch(name[:-6]):
-                index.setdefault(name[:-6], Path(entry.path))
-    return index
+                roots.setdefault(name[:-6], Path(entry.path))
+            elif _UUID.fullmatch(name) and entry.is_dir(follow_symlinks=False):
+                subagents = os.path.join(entry.path, "subagents")
+                if os.path.islink(subagents):
+                    continue
+                for directory, directories, files in os.walk(subagents):
+                    directories[:] = [
+                        child for child in directories
+                        if not os.path.islink(os.path.join(directory, child))
+                    ]
+                    for file_name in files:
+                        lowered = file_name.lower()
+                        if lowered.startswith("agent-") and lowered.endswith(".jsonl"):
+                            agents.setdefault(
+                                (name, lowered[len("agent-"):-len(".jsonl")]),
+                                Path(directory) / file_name,
+                            )
+    return roots, agents
 
 
 def _rollout_index(codex_home: Path | None) -> dict[str, list[Path]]:

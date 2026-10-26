@@ -9,10 +9,12 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
 from io import StringIO
@@ -25,14 +27,17 @@ from sherlock_collector.exclusions import (
     EXCLUDED,
     EXCLUDED_PROJECT,
     NOT_ALLOWED,
+    ORIGINS_UNREADABLE,
     UNREADABLE,
     UNVERIFIED,
     excluded_project_paths,
     load_policy,
     update_project_exclusions,
 )
+from sherlock_collector.hook import run_hook
 from sherlock_collector.reconcile import reconcile
 from sherlock_collector.rollout import RolloutCapturer, StreamState
+from sherlock_collector.scheduler import scheduler_files
 from sherlock_collector.spool import DurableSpool
 from test_collector import SuccessTransport
 
@@ -350,7 +355,7 @@ class ProjectExclusionTests(unittest.TestCase):
         transport, _ = self.run_reconcile(home, "codex", load_policy(self.root / "absent"))
         self.assertEqual(uploaded_ids(transport), {root_id, nested, in_worktree, child})
 
-    def test_removed_worktrees_stay_excluded(self):
+    def test_removed_or_recreated_worktrees_stay_excluded(self):
         home = self.root / "codex"
         worktree = self.root / "worktrees" / "private-wt"
         linked_worktree(self.project, worktree)
@@ -361,10 +366,72 @@ class ProjectExclusionTests(unittest.TestCase):
         shutil.rmtree(self.project / ".git" / "worktrees")  # git worktree remove
         transport, _ = self.run_reconcile(home, "codex", self.policy(self.project))
         self.assertEqual(uploaded_ids(transport), set())
-        # Without the recorded origin the removed worktree is unrecognizable.
-        (self.root / "worktree-origins.json").unlink()
+        # Every directory under the remembered worktree root stays excluded.
+        self.assertTrue(self.policy(self.project).project_excluded(str(worktree / "never-seen")))
+        worktree.mkdir()  # an unrelated directory reusing the path
         transport, _ = self.run_reconcile(home, "codex", self.policy(self.project))
-        self.assertEqual(uploaded_ids(transport), {session})
+        self.assertEqual(uploaded_ids(transport), set())
+        # A record that cannot be read holds sessions instead of forgetting.
+        (self.root / "worktree-origins.json").write_text("{broken")
+        _, public = codex_rollout(home, meta={"cwd": str(self.sibling)})
+        policy = self.policy(self.project)
+        self.assertEqual(
+            policy.blocked_reason("codex", session, source_home=home), ORIGINS_UNREADABLE
+        )
+        self.assertEqual(
+            policy.blocked_reason("codex", public, source_home=home), ORIGINS_UNREADABLE
+        )
+
+    def test_git_boundaries_and_bare_repositories_resolve_to_their_origin(self):
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git is not installed")
+
+        def run(*arguments, cwd=None):
+            subprocess.run(
+                [git, "-c", "user.email=t@e3group.ai", "-c", "user.name=t",
+                 "-c", "protocol.file.allow=always", *arguments],
+                cwd=cwd, check=True, capture_output=True,
+            )
+
+        repository = self.project / "repo"
+        repository.mkdir()
+        run("init", "-q", cwd=repository)
+        run("commit", "-q", "--allow-empty", "-m", "init", cwd=repository)
+        worktree = self.root / "outside" / "wt"
+        run("worktree", "add", "-q", str(worktree), cwd=repository)
+        nested = worktree / "nested"
+        nested.mkdir()
+        run("init", "-q", cwd=nested)
+        library = self.root / "library"
+        library.mkdir()
+        run("init", "-q", cwd=library)
+        run("commit", "-q", "--allow-empty", "-m", "init", cwd=library)
+        run("submodule", "add", "-q", str(library), "lib", cwd=worktree)
+        bare = self.project / "bare.git"
+        run("init", "-q", "--bare", str(bare))
+        seed = self.root / "seed"
+        run("clone", "-q", str(bare), str(seed))
+        run("commit", "-q", "--allow-empty", "-m", "init", cwd=seed)
+        run("push", "-q", "origin", "HEAD:main", cwd=seed)
+        bare_worktree = self.root / "outside" / "bare-wt"
+        run("worktree", "add", "-q", str(bare_worktree), "main", cwd=bare)
+        policy = self.policy(self.project)
+        for cwd in (worktree, nested, worktree / "lib", bare_worktree):
+            with self.subTest(cwd=cwd):
+                self.assertTrue(policy.project_excluded(str(cwd)))
+        self.assertFalse(policy.project_excluded(str(library)))
+
+    def test_equivalent_spellings_of_an_excluded_directory_match(self):
+        link = self.root / "link"
+        link.symlink_to(self.project / "sub")
+        policy = self.policy(self.project)
+        # link/.. is physically the project, although it collapses lexically.
+        self.assertTrue(policy.project_excluded(f"{link}/../sub"))
+        self.assertTrue(policy.project_excluded(str(link)))
+        self.assertFalse(policy.project_excluded(str(self.sibling)))
+        if sys.platform == "darwin":
+            self.assertTrue(policy.project_excluded(str(self.project).upper()))
 
     def test_already_queued_codex_batches_in_excluded_projects_are_held(self):
         home, state = self.root / "codex", self.root / "state"
@@ -397,6 +464,81 @@ class ProjectExclusionTests(unittest.TestCase):
         transport, _ = self.run_reconcile(home, "claude_code", policy)
         self.assertEqual(uploaded_ids(transport), {kept})
 
+    def test_queued_claude_subagents_use_their_own_and_root_directories(self):
+        home, state = self.root / "claude", self.root / "state"
+        public_root, private_root = str(uuid.uuid4()), str(uuid.uuid4())
+        claude_records(home, public_root, {"type": "user", "cwd": str(self.sibling)})
+        claude_records(home, public_root, {"type": "user", "cwd": str(self.project), "agentId": "a"},
+                       name=f"{public_root}/subagents/agent-a.jsonl")
+        claude_records(home, private_root, {"type": "user", "cwd": str(self.project)})
+        claude_records(home, private_root, {"type": "user", "cwd": str(self.sibling), "agentId": "b"},
+                       name=f"{private_root}/subagents/workflows/w/agent-b.jsonl")
+        reconcile(home, state, "claude_code", None)
+        spool = DurableSpool(state / "queue")
+        self.assertEqual(len(spool.list_pending()), 4)
+        transport = SuccessTransport()
+        result = Drain(
+            spool, transport, exclusion_policy=self.policy(self.project), source_home=home
+        ).run()
+        self.assertEqual(uploaded_ids(transport), {public_root})
+        self.assertEqual(result.held_by_policy, 3)
+
+    def test_claude_subagents_without_a_readable_root_are_held(self):
+        home = self.root / "claude"
+        orphan = claude_records(
+            home, str(uuid.uuid4()), {"type": "user", "cwd": str(self.sibling), "agentId": "c"},
+            name=f"{uuid.uuid4()}/subagents/agent-c.jsonl",
+        )
+        root_id = orphan.parent.parent.name
+        policy = self.policy(self.project)
+        self.assertEqual(
+            policy.blocked_reason("claude_code", "c", root_id, source_home=home, source_path=orphan),
+            UNVERIFIED,
+        )
+        self.assertEqual(
+            policy.blocked_reason("claude_code", "c", root_id, source_home=home), UNVERIFIED
+        )
+
+    def test_queued_batches_are_classified_by_the_directories_they_contain(self):
+        home, state = self.root / "codex", self.root / "state"
+        moved = codex_rollout(
+            home,
+            meta={"cwd": str(self.sibling)},
+            tail=json.dumps({"type": "turn_context", "payload": {"cwd": str(self.project)}}).encode() + b"\n",
+        )[1]
+        reconcile(home, state, "codex", None)
+        transport = SuccessTransport()
+        result = Drain(
+            DurableSpool(state / "queue"), transport,
+            exclusion_policy=self.policy(self.project), source_home=home,
+        ).run()
+        self.assertEqual(uploaded_ids(transport), set())
+        self.assertEqual(result.held_by_policy, 1)
+        self.assertTrue(moved)
+
+    def test_claude_hook_observations_of_excluded_sessions_are_not_captured(self):
+        home, state = self.root / "claude", self.root / "claude" / "sherlock" / "telemetry"
+        root_id = str(uuid.uuid4())
+        claude_records(home, root_id, {"type": "user", "cwd": str(self.project)})
+        agent = claude_records(home, root_id, {"type": "user", "cwd": str(self.sibling), "agentId": "a"},
+                               name=f"{root_id}/subagents/agent-a.jsonl")
+        payload = {
+            "session_id": root_id, "agent_id": "a", "agent_transcript_path": str(agent),
+            "hook_event_name": "SubagentStop", "cwd": str(self.sibling),
+            "last_assistant_message": "done",
+        }
+        policy = self.policy(self.project)
+        with patch("sherlock_collector.rollout.load_policy", return_value=policy), \
+                patch("sherlock_collector.hook.subprocess.Popen"):
+            outcome = run_hook(
+                "SubagentStop", payload,
+                raw_payload=json.dumps(payload).encode(),
+                provider="claude_code", claude_home=home, state_root=state,
+                drain_command=[sys.executable, "-c", "pass"],
+            )
+        self.assertEqual(outcome.enqueued, 0)
+        self.assertEqual(list((state / "queue" / "pending").glob("*.json")), [])
+
     def test_already_queued_claude_batches_and_hook_observations_are_held(self):
         home, state = self.root / "claude", self.root / "state"
         excluded, kept = str(uuid.uuid4()), str(uuid.uuid4())
@@ -418,6 +560,34 @@ class ProjectExclusionTests(unittest.TestCase):
         }) + "\n")
         self.assertEqual(
             policy.blocked_reason("claude_code", excluded, source_path=observation),
+            EXCLUDED_PROJECT,
+        )
+
+    def test_concurrent_cli_updates_keep_every_addition(self):
+        path = self.root / "session-exclusions.json"
+        added = [str(self.root / f"project-{index}") for index in range(16)]
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(lambda value: update_project_exclusions(add=[value], path=path), added))
+        self.assertEqual(excluded_project_paths(path), sorted(added))
+
+    def test_scheduled_runs_keep_a_custom_policy_home(self):
+        files = scheduler_files(
+            self.root / "codex", "codex", self.root / "user", "Darwin", sys.executable,
+            str(self.root),
+        )
+        runner = next(data for path, data in files.items() if path.name == "reconcile.py")
+        self.assertIn(f"os.environ.setdefault('SHERLOCK_HOME', {str(self.root)!r})", runner.decode())
+
+    def test_long_hook_observation_records_are_read(self):
+        observation = self.root / "observation.jsonl"
+        raw = json.dumps({"cwd": str(self.project), "last_assistant_message": "x" * (2 * 1024 * 1024)})
+        observation.write_text(json.dumps({
+            "type": "claude_hook",
+            "payload_base64": base64.b64encode(raw.encode()).decode(),
+        }) + "\n")
+        policy = self.policy(self.project)
+        self.assertEqual(
+            policy.blocked_reason("claude_code", str(uuid.uuid4()), source_path=observation),
             EXCLUDED_PROJECT,
         )
 

@@ -92,6 +92,16 @@ def parser() -> argparse.ArgumentParser:
 
 def _project_exclusions(command: str, paths: list[str]) -> int:
     try:
+        if command == "exclude-project":
+            for value in paths:
+                if not os.path.isdir(os.path.expanduser(value)):
+                    print(f"warning: {value} is not an existing directory; excluding it anyway",
+                          file=sys.stderr)
+        elif command == "include-project":
+            listed = set(excluded_project_paths())
+            for value in paths:
+                if os.path.normpath(os.path.abspath(os.path.expanduser(value))) not in listed:
+                    print(f"warning: {value} was not excluded", file=sys.stderr)
         projects = (
             excluded_project_paths()
             if command == "excluded-projects"

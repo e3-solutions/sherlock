@@ -337,6 +337,30 @@ class TeamInstallerTests(unittest.TestCase):
             }
             self.assertEqual(captured, {sessions["kept"]})
 
+    def test_project_exclusion_commands_ignore_caller_modules_and_warn(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "json.py").write_text("raise SystemExit('caller module imported')\n")
+            environment = {**os.environ, "SHERLOCK_HOME": str(root / "home"),
+                           "PYTHON_BIN": sys.executable, "CODEX_HOME": str(root / "codex"),
+                           "CLAUDE_CONFIG_DIR": str(root / "claude")}
+            excluded = subprocess.run(
+                ["sh", str(UNIFIED_INSTALLER), "exclude-project", "missing"],
+                cwd=root, env=environment, check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(excluded.returncode, 0, excluded.stderr)
+            self.assertIn("not an existing directory", excluded.stderr)
+            self.assertIn("agent hooks read ~/.sherlock", excluded.stderr)
+            self.assertEqual(
+                json.loads(excluded.stdout)["excluded_project_paths"], [str(root / "missing")]
+            )
+            included = subprocess.run(
+                ["sh", str(UNIFIED_INSTALLER), "include-project", "other"],
+                cwd=root, env=environment, check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(included.returncode, 0, included.stderr)
+            self.assertIn("was not excluded", included.stderr)
+
     def test_unified_command_preserves_multicall_codex_launcher_name(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

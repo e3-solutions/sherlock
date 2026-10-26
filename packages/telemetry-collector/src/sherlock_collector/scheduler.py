@@ -119,7 +119,12 @@ def _write(path: Path, content: bytes, mode: int = 0o600) -> None:
 
 
 def scheduler_files(
-    home: Path, provider: str, user_home: Path, system: str, python: str
+    home: Path,
+    provider: str,
+    user_home: Path,
+    system: str,
+    python: str,
+    sherlock_home: str | None = None,
 ) -> dict[Path, bytes]:
     """Pure generation: safe to test without contacting launchd or systemd."""
     home = home.resolve()
@@ -141,6 +146,12 @@ def scheduler_files(
     # working directory. The persistent runtime path is explicit.
     script = (
         "import sys\n"
+        # A custom owner-policy home must reach unattended runs too.
+        + (
+            f"import os\nos.environ.setdefault('SHERLOCK_HOME', {sherlock_home!r})\n"
+            if sherlock_home
+            else ""
+        )
         + f"sys.path.insert(0, {str(runtime)!r})\n"
         + "from pathlib import Path\n"
         + "from sherlock_collector.scheduler import run_scheduled\n"
@@ -328,7 +339,9 @@ def install_scheduler(
     user_home, system = user_home or Path.home(), system or platform.system()
     python = python or sys.executable
     previous = scheduler_status(home)
-    files = scheduler_files(home, provider, user_home, system, python)
+    files = scheduler_files(
+        home, provider, user_home, system, python, os.environ.get("SHERLOCK_HOME")
+    )
     for path, data in files.items():
         _write(path, data)
     label = scheduler_id(home, provider)
