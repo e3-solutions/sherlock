@@ -575,10 +575,32 @@ class ProjectExclusionTests(unittest.TestCase):
               source_home=home).run()
         self.assertEqual(again.items, [])
 
+    def test_claude_records_naming_cwd_last_are_held_across_capture_runs(self):
+        home, state = self.root / "claude", self.root / "state"
+        session = str(uuid.uuid4())
+        claude_records(
+            home, session,
+            {"type": "user", "cwd": str(self.sibling)},
+            # Claude writes cwd after message content; the record is fragmented.
+            {"type": "assistant", "message": "PRIVATE-MARKER" * 1_500_000, "cwd": str(self.project)},
+        )
+        policy = self.policy(self.project)
+        uploaded = []
+        for budget in (8 * 1024 * 1024, 8 * 1024 * 1024, 64 * 1024 * 1024):
+            transport = SuccessTransport()
+            with patch("sherlock_collector.rollout.load_policy", return_value=policy), \
+                    patch("sherlock_collector.drain.load_policy", return_value=policy):
+                reconcile(home, state, "claude_code", transport, max_bytes=budget)
+            uploaded += [
+                validate_stored_payload(item.manifest, item.stored_payload) for item in transport.items
+            ]
+        self.assertNotIn(b"PRIVATE-MARKER", b"".join(uploaded))
+
     def test_git_config_values_and_remote_variants_are_decoded(self):
         (self.project / ".git" / "config").write_text(
+            '[remote "upstream"]\n\turl = https://github.com/public/upstream\n'
             '[remote "origin"]\n\turl = "git@github.com:Acme/Private.git" ; quoted\n'
-            '[remote "mirror"]\n\turl = https://git.acme.test:8443/Team/Private.git # comment\n'
+            '\turl = https://git.acme.test:8443/Team/Private.git # comment\n'
         )
         home = self.root / "codex"
         ids = {}
@@ -588,12 +610,15 @@ class ProjectExclusionTests(unittest.TestCase):
             ("mirror", "https://git.acme.test:8443/Team/Private"),
             ("other-port", "https://git.acme.test:9443/Team/Private"),
             ("other-case", "https://git.acme.test:8443/team/private"),
+            ("upstream", "https://github.com/public/upstream"),
         ):
             ids[name] = codex_rollout(home, meta={
                 "cwd": str(self.root / f"gone-{name}"), "git": {"repository_url": url},
             })[1]
         transport, _ = self.run_reconcile(home, "codex", self.policy(self.project))
-        self.assertEqual(uploaded_ids(transport), {ids["other-port"], ids["other-case"]})
+        self.assertEqual(
+            uploaded_ids(transport), {ids["other-port"], ids["other-case"], ids["upstream"]}
+        )
 
     def test_claude_hook_observations_of_excluded_sessions_are_not_captured(self):
         home, state = self.root / "claude", self.root / "claude" / "sherlock" / "telemetry"

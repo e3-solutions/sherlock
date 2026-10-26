@@ -67,7 +67,7 @@ ORIGINS_UNREADABLE = "worktree_origins_unreadable"
 # macOS volumes are case- and Unicode-normalization-insensitive by default.
 # Folding on a case-sensitive volume can only exclude more, never less.
 _FOLD_CASE = sys.platform == "darwin"
-# A top-level "cwd" field, also inside a fragment of a record too large to parse.
+# A "cwd" field at any depth, also inside a fragment of a record too large to parse.
 _CWD_FIELD = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -131,7 +131,10 @@ def _project_paths(raw: dict) -> frozenset[str]:
 
 
 def _path_key(path: str) -> str:
-    return unicodedata.normalize("NFC", path).casefold() if _FOLD_CASE else path
+    if not _FOLD_CASE:
+        return path
+    # Canonical caseless matching, as APFS compares names.
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
 
 
 @dataclass(frozen=True)
@@ -698,44 +701,38 @@ def _git_config_value(raw: str) -> str:
 
 
 def _project_remotes(project: str) -> set[str]:
-    """Remotes of the repository at project, or of repositories directly inside it."""
-    remotes: set[str] = set()
+    """The origin remote of an excluded main checkout or bare repository.
+
+    Only origin is used, as that is what Codex records; linked worktrees and
+    repositories nested in an excluded directory are matched by path instead,
+    so unrelated clones of their remotes are not excluded.
+    """
+    config = _git_config_path(project)
+    if config is None:
+        return set()
     try:
-        children = [entry.path for entry in os.scandir(project) if entry.is_dir(follow_symlinks=False)]
+        with open(config, "rb") as handle:
+            lines = handle.read(MAX_GIT_FILE_BYTES * 16).decode("utf-8", "replace").splitlines()
     except OSError:
-        children = []
-    for checkout in (project, *children):
-        config = _git_config_path(checkout)
-        if config is None:
-            continue
-        try:
-            with open(config, "rb") as handle:
-                lines = handle.read(MAX_GIT_FILE_BYTES * 16).decode("utf-8", "replace").splitlines()
-        except OSError:
-            continue
-        in_remote = False
-        for line in lines:
-            line = line.strip()
-            if line.startswith("["):
-                in_remote = line.lower().startswith("[remote ")
-            elif in_remote and line.split("=", 1)[0].strip().lower() == "url" and "=" in line:
-                key = _repository_key(_git_config_value(line.split("=", 1)[1]))
-                if key:
-                    remotes.add(key)
+        return set()
+    remotes: set[str] = set()
+    in_origin = False
+    for line in lines:
+        line = line.strip()
+        if line.startswith("["):
+            in_origin = line.replace(" ", "").lower() in {'[remote"origin"]', "[remote.origin]"}
+        elif in_origin and "=" in line and line.split("=", 1)[0].strip().lower() == "url":
+            key = _repository_key(_git_config_value(line.split("=", 1)[1]))
+            if key:
+                remotes.add(key)
     return remotes
 
 
 def _git_config_path(checkout: str) -> str | None:
+    """Config of a main checkout or bare repository (not of a linked worktree)."""
     marker = os.path.join(checkout, ".git")
     if os.path.isdir(marker):
         common = marker
-    elif os.path.isfile(marker):
-        gitdir = _git_pointer(marker, "gitdir:")
-        if gitdir is None:
-            return None
-        gitdir = os.path.normpath(os.path.join(checkout, gitdir))
-        pointer = _git_pointer(os.path.join(gitdir, "commondir"), "")
-        common = os.path.normpath(os.path.join(gitdir, pointer)) if pointer else gitdir
     elif os.path.isfile(os.path.join(checkout, "HEAD")) and os.path.isdir(
         os.path.join(checkout, "objects")
     ):

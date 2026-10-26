@@ -73,9 +73,9 @@ checkout is inside it; on macOS paths match case-insensitively. Codex threads
 descended from an excluded session and the subagents of an excluded Claude
 session are excluded too, wherever they run; a child is classified by where its
 parent session started and by its own directories. Codex sessions are also
-excluded when their recorded git remote matches a remote of an excluded
-checkout (or of a repository directly inside an excluded directory), which
-covers worktrees removed before the exclusion was added. Capture checks the first working
+excluded when their recorded git remote matches the `origin` remote of an
+excluded directory that is itself a repository, which covers its worktrees
+removed before the exclusion was added (and any other clone of that origin). Capture checks the first working
 directory each transcript records (and, for Claude, its root session's);
 uploads also check every directory recorded in the queued bytes, so a session
 that later moves into an excluded project is held from the first batch that
