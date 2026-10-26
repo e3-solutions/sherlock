@@ -8,6 +8,7 @@ import sys
 import textwrap
 import time
 import unittest
+import uuid
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -284,6 +285,81 @@ class TeamInstallerTests(unittest.TestCase):
             self.assertTrue(
                 any(call.get("argv", [])[:2] == ["plugin", "install"] for call in calls)
             )
+
+    def test_unified_command_applies_project_exclusions_before_backfill(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            claude_home = root / "claude"
+            sherlock_home = root / "sherlock-home"
+            private = root / "private project"
+            private.mkdir()
+            fake_claude = root / "fake-claude"
+            fake_claude.write_text(textwrap.dedent(FAKE_CLAUDE), encoding="utf-8")
+            fake_claude.chmod(0o755)
+            sessions = {}
+            for name, cwd in (("excluded", private / "sub"), ("kept", root)):
+                native_id = str(uuid.uuid4())
+                transcript = claude_home / "projects" / name / f"{native_id}.jsonl"
+                transcript.parent.mkdir(parents=True)
+                transcript.write_text(
+                    json.dumps({"type": "user", "sessionId": native_id, "cwd": str(cwd)}) + "\n"
+                )
+                sessions[name] = native_id
+            environment = {
+                **os.environ,
+                "SHERLOCK_NO_SCHEDULER": "1",
+                "CODEX_BIN": str(root / "missing-codex"),
+                "CLAUDE_BIN": str(fake_claude),
+                "CLAUDE_CONFIG_DIR": str(claude_home),
+                "SHERLOCK_HOME": str(sherlock_home),
+                "PYTHON_BIN": sys.executable,
+                "SHERLOCK_FAKE_CAPTURE": str(root / "calls.jsonl"),
+                "SHERLOCK_INGEST_URL": "https://example.test/functions/v1/ingest",
+            }
+            completed = subprocess.run(
+                ["sh", str(UNIFIED_INSTALLER), "install", "--name", "Private User",
+                 "--github", "private-user", "--email", "private@e3group.ai",
+                 "--exclude-project", str(private)],
+                cwd=ROOT, env=environment, check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            policy = json.loads((sherlock_home / "session-exclusions.json").read_text())
+            self.assertEqual(policy["excluded_project_paths"], [str(private)])
+            # A detached drain may already be uploading, so read capture cursors
+            # rather than the queue: only the kept transcript was ever read.
+            state = json.loads(
+                (claude_home / "sherlock" / "telemetry" / "claude-transcript-state.json").read_text()
+            )
+            captured = {
+                Path(stream["path"]).stem
+                for stream in state["streams"].values()
+                if stream["offset"] > 0
+            }
+            self.assertEqual(captured, {sessions["kept"]})
+
+    def test_project_exclusion_commands_ignore_caller_modules_and_warn(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "json.py").write_text("raise SystemExit('caller module imported')\n")
+            environment = {**os.environ, "SHERLOCK_HOME": str(root / "home"),
+                           "PYTHON_BIN": sys.executable, "CODEX_HOME": str(root / "codex"),
+                           "CLAUDE_CONFIG_DIR": str(root / "claude")}
+            excluded = subprocess.run(
+                ["sh", str(UNIFIED_INSTALLER), "exclude-project", "missing"],
+                cwd=root, env=environment, check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(excluded.returncode, 0, excluded.stderr)
+            self.assertIn("not an existing directory", excluded.stderr)
+            self.assertIn("agent hooks read ~/.sherlock", excluded.stderr)
+            self.assertEqual(
+                json.loads(excluded.stdout)["excluded_project_paths"], [str(root / "missing")]
+            )
+            included = subprocess.run(
+                ["sh", str(UNIFIED_INSTALLER), "include-project", "other"],
+                cwd=root, env=environment, check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(included.returncode, 0, included.stderr)
+            self.assertIn("was not excluded", included.stderr)
 
     def test_unified_command_preserves_multicall_codex_launcher_name(self):
         with TemporaryDirectory() as temporary:

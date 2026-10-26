@@ -18,6 +18,12 @@ from .config import (
     load_config,
 )
 from .drain import Drain
+from .exclusions import (
+    _path_key,
+    excluded_project_paths,
+    policy_path,
+    update_project_exclusions,
+)
 from .discovery import (
     CLAUDE_DEFAULT_LOOKBACK_SECONDS,
     CLAUDE_BACKFILL_MAX_BYTES,
@@ -77,7 +83,49 @@ def parser() -> argparse.ArgumentParser:
     hook.add_argument("event_name")
     commands.add_parser("drain")
     commands.add_parser("health")
+    exclude_project = commands.add_parser(
+        "exclude-project", help="never capture or upload sessions in these directories"
+    )
+    exclude_project.add_argument("path", nargs="+")
+    include_project = commands.add_parser(
+        "include-project", help="remove directories from the project exclusions"
+    )
+    include_project.add_argument("path", nargs="+")
+    commands.add_parser("excluded-projects", help="list excluded project directories")
     return result
+
+
+def _project_exclusions(command: str, paths: list[str]) -> int:
+    try:
+        if command == "exclude-project":
+            for value in paths:
+                if not os.path.isdir(os.path.expanduser(value)):
+                    print(f"warning: {value} is not an existing directory; excluding it anyway",
+                          file=sys.stderr)
+        elif command == "include-project":
+            listed = excluded_project_paths()
+            listed = {_path_key(v) for v in listed} | {_path_key(os.path.realpath(v)) for v in listed}
+            for value in paths:
+                if _path_key(os.path.realpath(os.path.expanduser(value))) not in listed:
+                    print(f"warning: {value} was not excluded", file=sys.stderr)
+        projects = (
+            excluded_project_paths()
+            if command == "excluded-projects"
+            else update_project_exclusions(
+                add=paths if command == "exclude-project" else (),
+                remove=paths if command == "include-project" else (),
+            )
+        )
+    except (OSError, ValueError) as error:
+        print(f"{policy_path()}: {error}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {"policy_path": str(policy_path()), "excluded_project_paths": projects},
+            indent=2,
+        )
+    )
+    return 0
 
 
 def _payload_from_stdin() -> tuple[dict[str, object], bytes]:
@@ -136,6 +184,8 @@ def _rfc3339_ns(value: str) -> int | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command in {"exclude-project", "include-project", "excluded-projects"}:
+        return _project_exclusions(args.command, getattr(args, "path", []))
     source_home = (
         Path(
             (args.claude_home or default_claude_home())

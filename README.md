@@ -54,6 +54,45 @@ keep their cursor and already-queued batches stay queued unsent
 A policy file that exists but is unreadable or invalid blocks all capture and
 upload until repaired. Without the file nothing changes.
 
+### Exclude a project
+
+To keep every Codex and Claude Code session in a directory out of Sherlock,
+add it to `excluded_project_paths` in the same policy file. Pass
+`--exclude-project DIR` (repeatable) to `./sherlock install`, which records it
+before the initial backfill, or manage the list later from any checkout:
+
+```sh
+./sherlock exclude-project ~/code/private-project
+./sherlock include-project ~/code/private-project   # resume collection
+./sherlock excluded-projects
+```
+
+A session is excluded when its working directory is that directory, is inside
+it, or is inside a git worktree (or a repository nested in one) whose main
+checkout is inside it; on macOS paths match case-insensitively. Codex threads
+descended from an excluded session and the subagents of an excluded Claude
+session are excluded too, wherever they run; a child is classified by where its
+parent session started and by its own directories. Codex sessions are also
+excluded when their recorded git remote matches the `origin` remote of an
+excluded directory that is itself a repository, which covers its worktrees
+removed before the exclusion was added (and any other clone of that origin). Capture checks the first working
+directory each transcript records (and, for Claude, its root session's);
+uploads also check every directory recorded in the queued bytes, so a session
+that later moves into an excluded project is held from the first batch that
+records it. A session whose directory is not recorded yet, or whose root
+session cannot be read, is held until it is.
+
+Each linked worktree seen while exclusions exist is remembered in
+`worktree-origins.json` beside the policy, so its sessions stay excluded after
+the worktree is removed or its path is reused; if that file becomes unreadable,
+project-checked sessions are held until it is repaired. A worktree removed
+before its project was excluded cannot be recognized. Exclusion stops future
+capture and upload only: sessions Sherlock has already received stay in its
+records. Older runtimes ignore `excluded_project_paths`, so reinstall to apply
+it. Hooks read the policy from `~/.sherlock` unless `SHERLOCK_HOME` is set in
+the agent's environment; the scheduler keeps the `SHERLOCK_HOME` used at
+install.
+
 To run or audit either provider manually:
 
 ```sh

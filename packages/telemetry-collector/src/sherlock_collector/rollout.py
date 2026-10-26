@@ -169,6 +169,7 @@ class RolloutCapturer:
         allowed_root: Path | str | None = None,
         enforce_sync_budget: bool = False,
         exclusion_policy: ExclusionPolicy | None = None,
+        source_home: Path | str | None = None,
     ):
         if not (
             0 < chunk_bytes <= max_object_bytes <= MAX_SOURCE_BYTES
@@ -190,6 +191,9 @@ class RolloutCapturer:
         self.source_version = source_version
         self.enforce_sync_budget = enforce_sync_budget
         self.exclusion_policy = exclusion_policy
+        # Provider home for resolving parent sessions under owner policy; the
+        # capture root is used when the sources live in it.
+        self.source_home = Path(source_home) if source_home is not None else None
         self.source_issues: dict[str, str] = {}
         self.visited_paths: set[str] = set()
         self._capture_enqueued = self._capture_bytes = 0
@@ -267,10 +271,8 @@ class RolloutCapturer:
                     self.source_provider,
                     (native_session_ids or {}).get(raw_path),
                     (parent_native_session_ids or {}).get(raw_path),
-                    codex_home=(
-                        self.allowed_root if self.source_provider == "codex" else None
-                    ),
-                    source_path=path if self.source_kind == "rollout" else None,
+                    source_home=self.source_home or self.allowed_root,
+                    source_path=path,
                 )
                 if blocked:
                     # Local owner policy: keep the cursor, capture nothing.

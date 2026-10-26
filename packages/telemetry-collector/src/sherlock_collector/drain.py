@@ -9,8 +9,13 @@ from pathlib import Path
 from typing import Mapping, Protocol
 
 from .collection_receipt import scan_token_payload
-from .contract import ContractError, ReceiptMismatch, validate_committed_receipt
-from .exclusions import ExclusionPolicy, load_policy
+from .contract import (
+    ContractError,
+    ReceiptMismatch,
+    validate_committed_receipt,
+    validate_stored_payload,
+)
+from .exclusions import ExclusionPolicy, load_policy, observed_cwds
 from .spool import DurableSpool, SpoolItem, secure_lock
 
 
@@ -164,9 +169,23 @@ class Drain:
                 manifest.source_provider,
                 manifest.observed_native_session_id,
                 manifest.observed_parent_native_session_id,
-                codex_home=(
-                    self.source_home if manifest.source_provider == "codex" else None
+                source_home=self.source_home,
+                # Directories recorded in the queued bytes themselves, so a
+                # batch is classified by what it would upload.
+                observed_cwds=(
+                    observed_cwds(validate_stored_payload(manifest, item.stored_payload))
+                    if self._policy.excluded_projects
+                    else ()
                 ),
+                native_fragments=[
+                    (
+                        record.native_record_start_offset,
+                        record.native_record_end_offset,
+                        record.native_record_sha256,
+                    )
+                    for record in manifest.records
+                    if record.parse_status == "fragment"
+                ],
             ):
                 self._held.add(path)
                 blocked_streams.add(stream)

@@ -278,6 +278,7 @@ def _capture_hook(
                 source_kind="hook",
                 state_name="claude-hook",
                 capture_unterminated_tail=False,
+                source_home=home,
             ).capture(
                 observation_paths,
                 native_session_ids=native_ids,
