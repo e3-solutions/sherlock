@@ -612,7 +612,7 @@ class ProjectExclusionTests(unittest.TestCase):
     def test_git_config_values_and_remote_variants_are_decoded(self):
         (self.project / ".git" / "config").write_text(
             '[remote "upstream"]\n\turl = https://github.com/public/upstream\n'
-            '[remote "origin"]\n\turl = "git@github.com:Acme/Private.git" ; quoted\n'
+            '[remote "origin"] # primary\n\turl = "git@github.com:Acme/Private.git" ; quoted\n'
             '\turl = https://git.acme.test:8443/Team/Private.git # comment\n'
             '\turl = "https://github.com/acme/\\\nContinued.git"\n'
         )

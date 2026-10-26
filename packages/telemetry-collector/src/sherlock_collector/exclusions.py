@@ -726,7 +726,8 @@ def _project_remotes(project: str) -> set[str]:
     for line in lines:
         line = line.strip()
         if line.startswith("["):
-            in_origin = line.replace(" ", "").lower() in {'[remote"origin"]', "[remote.origin]"}
+            header = line.split("]", 1)[0] + "]"  # ignore a trailing comment
+            in_origin = header.replace(" ", "").lower() in {'[remote"origin"]', "[remote.origin]"}
         elif in_origin and "=" in line and line.split("=", 1)[0].strip().lower() == "url":
             key = _repository_key(_git_config_value(line.split("=", 1)[1]))
             if key:
