@@ -54,6 +54,31 @@ keep their cursor and already-queued batches stay queued unsent
 A policy file that exists but is unreadable or invalid blocks all capture and
 upload until repaired. Without the file nothing changes.
 
+### Exclude a project
+
+To keep every Codex and Claude Code session in a directory out of Sherlock,
+add it to `excluded_project_paths` in the same policy file. Pass
+`--exclude-project DIR` (repeatable) to `./sherlock install`, which records it
+before the initial backfill, or manage the list later from any checkout:
+
+```sh
+./sherlock exclude-project ~/code/private-project
+./sherlock include-project ~/code/private-project   # resume collection
+./sherlock excluded-projects
+```
+
+A session is excluded when its working directory is that directory, is inside
+it, or is a git worktree whose main checkout is inside it. Codex threads
+descended from an excluded session and the subagents of an excluded Claude
+session are excluded too, wherever they run. Sessions are matched on the
+working directory recorded in their transcript; a session whose directory is
+not recorded yet is held until it is. Each linked worktree seen while
+exclusions exist is remembered in `worktree-origins.json` beside the policy, so
+its sessions stay excluded after the worktree is removed; a worktree removed
+before its project was excluded cannot be recognized. Exclusion stops future capture and
+upload only: sessions Sherlock has already received stay in its records. Older
+runtimes ignore `excluded_project_paths`, so reinstall to apply it.
+
 To run or audit either provider manually:
 
 ```sh

@@ -164,9 +164,7 @@ class Drain:
                 manifest.source_provider,
                 manifest.observed_native_session_id,
                 manifest.observed_parent_native_session_id,
-                codex_home=(
-                    self.source_home if manifest.source_provider == "codex" else None
-                ),
+                source_home=self.source_home,
             ):
                 self._held.add(path)
                 blocked_streams.add(stream)

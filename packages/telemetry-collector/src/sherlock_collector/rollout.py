@@ -267,10 +267,8 @@ class RolloutCapturer:
                     self.source_provider,
                     (native_session_ids or {}).get(raw_path),
                     (parent_native_session_ids or {}).get(raw_path),
-                    codex_home=(
-                        self.allowed_root if self.source_provider == "codex" else None
-                    ),
-                    source_path=path if self.source_kind == "rollout" else None,
+                    source_home=self.allowed_root,
+                    source_path=path,
                 )
                 if blocked:
                     # Local owner policy: keep the cursor, capture nothing.

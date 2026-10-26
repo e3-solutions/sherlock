@@ -6,37 +6,56 @@ tooling already honours::
 
     {"version": 1,
      "excluded_session_ids": ["<uuid>", ...],
+     "excluded_project_paths": ["/absolute/project/path", ...],
      "allowed_claude_session_ids": ["<uuid>", ...]}
 
 * ``excluded_session_ids``: these sessions and every Codex thread descended
   from them (subagents, forks) are never captured or uploaded.
+* ``excluded_project_paths``: sessions whose working directory is one of these
+  directories or inside one, including a git worktree of a repository inside
+  one, are never captured or uploaded, nor are the Codex threads descended
+  from them or the Claude subagents of a Claude session started there.
 * ``allowed_claude_session_ids`` (optional): when present, only these Claude
   root sessions are captured or uploaded; Claude subagent transcripts are not.
 
 No file means no policy. A file that exists but cannot be read or validated
-fails closed: nothing is captured or uploaded until it is repaired. Blocked
-sources keep their cursor and blocked queued batches stay queued, so removing
-an entry later resumes collection without loss. The policy never leaves the
-machine and transcript bodies are never read beyond Codex session metadata.
+fails closed: nothing is captured or uploaded until it is repaired. A session
+whose working directory cannot be read yet while project exclusions exist is
+held the same way. Blocked sources keep their cursor and blocked queued
+batches stay queued, so removing an entry later resumes collection without
+loss. The policy never leaves the machine; locally, transcripts are read only
+up to the Codex session metadata or the first record naming a working
+directory.
 """
 
 from __future__ import annotations
 
+import base64
+import fcntl
 import json
 import os
 import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
+
+from .spool import _atomic_json, secure_lock
 
 
 POLICY_NAME = "session-exclusions.json"
+# Linked worktrees are often removed once their task ends; remembering where
+# each one pointed keeps its sessions excluded after the directory is gone.
+WORKTREE_ORIGINS_NAME = "worktree-origins.json"
+MAX_WORKTREE_ORIGINS = 10_000
 MAX_POLICY_BYTES = 1024 * 1024
 MAX_SESSION_META_BYTES = 1024 * 1024
 MAX_ANCESTRY_DEPTH = 64
+MAX_CWD_SCAN_BYTES = 16 * 1024 * 1024
+MAX_GIT_FILE_BYTES = 64 * 1024
 
 EXCLUDED = "excluded_by_session_policy"
+EXCLUDED_PROJECT = "excluded_by_project_policy"
 NOT_ALLOWED = "not_in_claude_session_allowlist"
 UNREADABLE = "session_exclusion_policy_unreadable"
 UNVERIFIED = "session_ancestry_unverified"
@@ -65,16 +84,51 @@ def _id_list(raw: dict, key: str) -> frozenset[str] | None:
     return frozenset(v for v in (_normalize(item) for item in values) if v)
 
 
+def normalize_project_path(value: object) -> str:
+    """Absolute, normalized form of a configured project directory."""
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise ValueError("project paths must be non-empty strings")
+    path = os.path.expanduser(value.strip())
+    if not os.path.isabs(path):
+        raise ValueError("project paths must be absolute")
+    return os.path.normpath(path)
+
+
+def _absolute_project_path(value: str) -> str:
+    """Resolve a command-line path relative to the current directory."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("project paths must be non-empty strings")
+    return normalize_project_path(os.path.abspath(os.path.expanduser(value.strip())))
+
+
+def _project_paths(raw: dict) -> frozenset[str]:
+    values = raw.get("excluded_project_paths", [])
+    if not isinstance(values, list):
+        raise ValueError("excluded_project_paths must be a list of strings")
+    normalized = {normalize_project_path(value) for value in values}
+    if os.sep in normalized:
+        raise ValueError("excluded_project_paths must not exclude the filesystem root")
+    # Match symlinked spellings too (for example /tmp and /private/tmp).
+    return frozenset(normalized | {os.path.realpath(value) for value in normalized})
+
+
 @dataclass(frozen=True)
 class ExclusionPolicy:
     excluded: frozenset[str] = frozenset()
     allowed_claude: frozenset[str] | None = None
+    excluded_projects: frozenset[str] = frozenset()
+    worktree_origins_path: Path | None = None
     error: str | None = None
     _ancestry: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def active(self) -> bool:
-        return bool(self.error or self.excluded or self.allowed_claude is not None)
+        return bool(
+            self.error
+            or self.excluded
+            or self.excluded_projects
+            or self.allowed_claude is not None
+        )
 
     def blocked_reason(
         self,
@@ -82,10 +136,15 @@ class ExclusionPolicy:
         native_session_id: object,
         parent_native_session_id: object = None,
         *,
-        codex_home: Path | None = None,
+        source_home: Path | None = None,
         source_path: Path | None = None,
     ) -> str | None:
-        """Return why this source/batch must not be captured or uploaded."""
+        """Return why this source/batch must not be captured or uploaded.
+
+        ``source_home`` is the provider home (Codex home, or the Claude home or
+        its ``projects`` directory) used to resolve sessions without a source
+        file, such as already-queued batches.
+        """
         if not self.active:
             return None
         if self.error:
@@ -97,15 +156,22 @@ class ExclusionPolicy:
                 return EXCLUDED
             if native is None:
                 return UNVERIFIED
+            if self.excluded_projects:
+                blocked = self._claude_project_reason(
+                    parent or native, source_home, source_path
+                )
+                if blocked:
+                    return blocked
             if self.allowed_claude is not None and (
                 parent is not None or native not in self.allowed_claude
             ):
                 return NOT_ALLOWED
             return None
-        if not self.excluded:
+        if not (self.excluded or self.excluded_projects):
             return None
         if {native, parent} & self.excluded:
             return EXCLUDED
+        codex_home = source_home
         # Codex threads can be subagents of subagents or forks of an excluded
         # session; walk the recorded ancestry through each rollout's session_meta.
         # A source file supplies its own session_meta; a queued batch is resolved
@@ -116,9 +182,12 @@ class ExclusionPolicy:
             meta = _session_meta_ids(source_path)
             if meta is None:
                 return UNVERIFIED
-            own, ancestors = meta
+            own, ancestors, cwd = meta
             if ({own} | ancestors) & self.excluded:
                 return EXCLUDED
+            blocked = self._cwd_reason(cwd)
+            if blocked:
+                return blocked
             seen.add(own)
             pending.extend(ancestors)
         elif native is not None:
@@ -132,16 +201,103 @@ class ExclusionPolicy:
             seen.add(current)
             if len(seen) > MAX_ANCESTRY_DEPTH:
                 return UNVERIFIED
-            ancestors = self._ancestors(current, codex_home)
-            if ancestors is None:
+            meta = self._ancestors(current, codex_home)
+            if meta is None:
                 return UNVERIFIED
+            ancestors, cwd = meta
             if ancestors & self.excluded:
                 return EXCLUDED
+            blocked = self._cwd_reason(cwd)
+            if blocked:
+                return blocked
             pending.extend(ancestors - seen)
         return None
 
-    def _ancestors(self, session_id: str, codex_home: Path | None) -> set[str] | None:
-        """Ancestor ids recorded by the rollout whose own session_meta is session_id.
+    def _cwd_reason(self, cwd: str | None) -> str | None:
+        if not self.excluded_projects:
+            return None
+        if cwd is None:
+            return UNVERIFIED
+        return EXCLUDED_PROJECT if self.project_excluded(cwd) else None
+
+    def project_excluded(self, cwd: str) -> bool:
+        """Whether a working directory lies in an excluded project."""
+        key = ("cwd", cwd)
+        if key not in self._ancestry:
+            self._ancestry[key] = any(
+                candidate == project or candidate.startswith(project.rstrip(os.sep) + os.sep)
+                for candidate in self._cwd_candidates(cwd)
+                for project in self.excluded_projects
+            )
+        return self._ancestry[key]
+
+    def _cwd_candidates(self, cwd: str) -> set[str]:
+        """The directory, its resolved form, and its main checkout if it is a linked worktree."""
+        normalized = os.path.normpath(cwd)
+        candidates = {normalized, os.path.realpath(normalized)}
+        main = _main_worktree(normalized)
+        if main is not None:
+            self._remember_worktree(normalized, main)
+        elif not os.path.lexists(normalized):
+            main = self._worktree_origins().get(normalized)
+        if main is not None:
+            candidates |= {main, os.path.realpath(main)}
+        return candidates
+
+    def _worktree_origins(self) -> dict[str, str]:
+        if "worktree-origins" not in self._ancestry:
+            self._ancestry["worktree-origins"] = _read_worktree_origins(
+                self.worktree_origins_path
+            )
+        return self._ancestry["worktree-origins"]
+
+    def _remember_worktree(self, cwd: str, main: str) -> None:
+        if self._worktree_origins().get(cwd) == main or self.worktree_origins_path is None:
+            return
+        path = self.worktree_origins_path
+        try:
+            with secure_lock(path.with_name(f".{path.name}.lock")) as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                origins = _read_worktree_origins(path)
+                origins.pop(cwd, None)
+                origins[cwd] = main
+                while len(origins) > MAX_WORKTREE_ORIGINS:
+                    origins.pop(next(iter(origins)))
+                _atomic_json(path, {"version": 1, "origins": origins})
+        except OSError:
+            return  # Best effort: a live worktree still resolves from disk.
+        self._ancestry["worktree-origins"] = origins
+
+    def _claude_project_reason(
+        self,
+        root_session_id: str,
+        source_home: Path | None,
+        source_path: Path | None,
+    ) -> str | None:
+        """Check the source's own directory and its root session's directory.
+
+        A subagent or hook observation is excluded when either directory is;
+        it is unverified only when neither can be read.
+        """
+        cwds = [_first_cwd(source_path) if source_path is not None else None]
+        if source_home is not None and (
+            source_path is None or cwds[0] is None or source_path.stem != root_session_id
+        ):
+            transcript = self._claude_index(source_home).get(root_session_id)
+            if transcript is not None:
+                key = ("claude-cwd", str(transcript))
+                if key not in self._ancestry:
+                    self._ancestry[key] = _first_cwd(transcript)
+                cwds.append(self._ancestry[key])
+        known = [cwd for cwd in cwds if cwd is not None]
+        if not known:
+            return UNVERIFIED
+        return EXCLUDED_PROJECT if any(map(self.project_excluded, known)) else None
+
+    def _ancestors(
+        self, session_id: str, codex_home: Path | None
+    ) -> tuple[set[str], str | None] | None:
+        """Ancestor ids and cwd recorded by the rollout whose session_meta is session_id.
 
         None means the ancestry cannot be verified (missing or unreadable file);
         callers then fail closed. One filename index per home keeps this to a
@@ -149,11 +305,11 @@ class ExclusionPolicy:
         """
         if session_id in self._ancestry:
             return self._ancestry[session_id]
-        result: set[str] | None = None
+        result: tuple[set[str], str | None] | None = None
         for path in self._index(codex_home).get(session_id, ()):
             meta = _session_meta_ids(path)
             if meta is not None and meta[0] == session_id:
-                result = meta[1]
+                result = meta[1], meta[2]
                 break
         self._ancestry[session_id] = result
         return result
@@ -162,6 +318,12 @@ class ExclusionPolicy:
         key = ("index", str(codex_home))
         if key not in self._ancestry:
             self._ancestry[key] = _rollout_index(codex_home)
+        return self._ancestry[key]
+
+    def _claude_index(self, claude_home: Path) -> Mapping[str, Path]:
+        key = ("claude-index", str(claude_home))
+        if key not in self._ancestry:
+            self._ancestry[key] = _claude_transcript_index(claude_home)
         return self._ancestry[key]
 
 
@@ -182,22 +344,97 @@ def load_policy(path: Path | None = None) -> ExclusionPolicy:
             raise ValueError("policy must be an object with version 1")
         excluded = _id_list(raw, "excluded_session_ids") or frozenset()
         allowed = _id_list(raw, "allowed_claude_session_ids")
+        projects = _project_paths(raw)
     except (ValueError, UnicodeDecodeError) as error:
         return ExclusionPolicy(error=str(error))
-    return ExclusionPolicy(excluded=excluded, allowed_claude=allowed)
+    return ExclusionPolicy(
+        excluded=excluded,
+        allowed_claude=allowed,
+        excluded_projects=projects,
+        worktree_origins_path=path.parent / WORKTREE_ORIGINS_NAME,
+    )
 
 
-def _session_meta_ids(path: Path) -> tuple[str, set[str]] | None:
-    """Return (own id, ancestor ids) from a Codex rollout's first session_meta."""
+def _read_worktree_origins(path: Path | None) -> dict[str, str]:
+    """Recorded linked-worktree directories and their main checkouts (insertion ordered)."""
+    if path is None:
+        return {}
     try:
-        # Never block on a FIFO or follow a final symlink while checking policy.
-        descriptor = os.open(
-            path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-        )
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
+        raw = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return {}
+    origins = raw.get("origins") if isinstance(raw, dict) else None
+    if not isinstance(origins, dict):
+        return {}
+    return {
+        key: value
+        for key, value in origins.items()
+        if isinstance(key, str) and isinstance(value, str) and os.path.isabs(value)
+    }
+
+
+def _read_policy_object(path: Path) -> dict | None:
+    """The validated policy object, or None when there is no policy file."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    if len(data) > MAX_POLICY_BYTES:
+        raise ValueError("policy file is too large")
+    raw = json.loads(data)
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise ValueError("policy must be an object with version 1")
+    _id_list(raw, "excluded_session_ids")
+    _id_list(raw, "allowed_claude_session_ids")
+    _project_paths(raw)
+    return raw
+
+
+def excluded_project_paths(path: Path | None = None) -> list[str]:
+    raw = _read_policy_object(path or policy_path()) or {}
+    return sorted({normalize_project_path(v) for v in raw.get("excluded_project_paths", [])})
+
+
+def update_project_exclusions(
+    add: Iterable[str] = (),
+    remove: Iterable[str] = (),
+    path: Path | None = None,
+) -> list[str]:
+    """Add or remove excluded project paths, keeping every other policy field.
+
+    An existing file that is unreadable or invalid is never overwritten.
+    Returns the resulting excluded project paths.
+    """
+    path = path or policy_path()
+    raw = _read_policy_object(path) or {"version": 1}
+    current = {normalize_project_path(v) for v in raw.get("excluded_project_paths", [])}
+    added = {_absolute_project_path(value) for value in add}
+    if os.sep in added:
+        raise ValueError("refusing to exclude the filesystem root")
+    result = sorted((current | added) - {_absolute_project_path(v) for v in remove})
+    raw["excluded_project_paths"] = result
+    _atomic_json(path, raw)
+    return result
+
+
+def _open_regular(path: Path):
+    """Open without blocking on a FIFO or following a final symlink."""
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        return None
+    return os.fdopen(descriptor, "rb")
+
+
+def _session_meta_ids(path: Path) -> tuple[str, set[str], str | None] | None:
+    """Return (own id, ancestor ids, cwd) from a Codex rollout's first session_meta."""
+    try:
+        handle = _open_regular(path)
+        if handle is None:
             return None
-        with os.fdopen(descriptor, "rb") as handle:
+        with handle:
             remaining = MAX_SESSION_META_BYTES
             while remaining > 0:
                 line = handle.readline(remaining + 1)
@@ -229,7 +466,133 @@ def _session_meta_ids(path: Path) -> tuple[str, set[str]] | None:
         spawn = source["subagent"].get("thread_spawn")
         if isinstance(spawn, dict):
             ancestors.add(_normalize(spawn.get("parent_thread_id")))
-    return own, {value for value in ancestors if value and value != own}
+    cwd = payload.get("cwd")
+    return (
+        own,
+        {value for value in ancestors if value and value != own},
+        cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None,
+    )
+
+
+def _first_cwd(path: Path) -> str | None:
+    """First absolute working directory named by a transcript or hook observation.
+
+    Claude transcripts carry ``cwd`` on most records, though not on the first
+    queue records; Sherlock hook observations carry it in the encoded hook
+    payload. Overlong records are skipped without being parsed.
+    """
+    try:
+        handle = _open_regular(path)
+        if handle is None:
+            return None
+        with handle:
+            remaining = MAX_CWD_SCAN_BYTES
+            while remaining > 0:
+                line = handle.readline(min(remaining, MAX_SESSION_META_BYTES))
+                if not line:
+                    return None
+                remaining -= len(line)
+                if not line.endswith(b"\n"):
+                    while line and not line.endswith(b"\n") and remaining > 0:
+                        line = handle.readline(min(remaining, MAX_SESSION_META_BYTES))
+                        remaining -= len(line)
+                    continue
+                if b"cwd" not in line and b"payload_base64" not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                cwd = _record_cwd(record)
+                if cwd is not None:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
+def _record_cwd(record: object) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    for container in (record, record.get("payload")):
+        if isinstance(container, dict):
+            cwd = container.get("cwd")
+            if isinstance(cwd, str) and os.path.isabs(cwd):
+                return cwd
+    encoded = record.get("payload_base64")
+    if record.get("type") == "claude_hook" and isinstance(encoded, str):
+        try:
+            payload = json.loads(base64.b64decode(encoded, validate=True))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if isinstance(payload, dict):
+            cwd = payload.get("cwd")
+            if isinstance(cwd, str) and os.path.isabs(cwd):
+                return cwd
+    return None
+
+
+def _main_worktree(cwd: str) -> str | None:
+    """Main checkout of the linked git worktree containing cwd, from local files only."""
+    current = cwd
+    while True:
+        marker = os.path.join(current, ".git")
+        if os.path.isdir(marker):
+            return None
+        if os.path.isfile(marker):
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    gitdir = _git_pointer(marker, "gitdir:")
+    if gitdir is None:
+        return None
+    gitdir = os.path.normpath(os.path.join(current, gitdir))
+    common = _git_pointer(os.path.join(gitdir, "commondir"), "")
+    if common is None:
+        return None
+    common = os.path.normpath(os.path.join(gitdir, common))
+    if os.path.basename(common) != ".git":
+        return None
+    return os.path.dirname(common)
+
+
+def _git_pointer(path: str, prefix: str) -> str | None:
+    try:
+        with open(path, "rb") as handle:
+            text = handle.read(MAX_GIT_FILE_BYTES).decode("utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith(prefix):
+        return None
+    return text[len(prefix):].strip() or None
+
+
+def _claude_transcript_index(claude_home: Path) -> dict[str, Path]:
+    """Map Claude root session ids to their ``projects/<project>/<id>.jsonl`` transcripts."""
+    index: dict[str, Path] = {}
+    projects = claude_home / "projects"
+    if not projects.is_dir() or projects.is_symlink():
+        projects = claude_home
+    if projects.is_symlink() or not projects.is_dir():
+        return index
+    try:
+        project_directories = list(os.scandir(projects))
+    except OSError:
+        return index
+    for project in project_directories:
+        if not project.is_dir(follow_symlinks=False):
+            continue
+        try:
+            entries = list(os.scandir(project.path))
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name.lower()
+            if name.endswith(".jsonl") and _UUID.fullmatch(name[:-6]):
+                index.setdefault(name[:-6], Path(entry.path))
+    return index
 
 
 def _rollout_index(codex_home: Path | None) -> dict[str, list[Path]]:
