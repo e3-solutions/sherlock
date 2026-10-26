@@ -22,7 +22,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from sherlock_collector.contract import validate_stored_payload
+from sherlock_collector.contract import FRAGMENT_BYTES, validate_stored_payload
 from sherlock_collector.drain import Drain
 from sherlock_collector.exclusions import (
     EXCLUDED,
@@ -530,6 +530,70 @@ class ProjectExclusionTests(unittest.TestCase):
             for item in transport.items
         )
         self.assertNotIn(b"PRIVATE-MARKER", uploaded)
+
+    def oversized_session(self, home, cwd_at):
+        """A public Codex session whose second record is fragmented and names
+        the excluded project with its cwd value starting cwd_at bytes into it."""
+        prefix = b'{"type":"turn_context","payload":{"pad":"'
+        middle = b'","cwd":"'
+        pad = cwd_at - len(prefix) - len(middle)
+        record = (
+            prefix + b"a" * pad + middle + str(self.project).encode()
+            + b'","secret":"' + b"PRIVATE-MARKER" * 1_300_000 + b'"}}\n'
+        )
+        json.loads(record)
+        return codex_rollout(home, meta={"cwd": str(self.sibling)}, tail=record)[1]
+
+    def test_fragment_boundaries_inside_the_cwd_value_are_held(self):
+        home = self.root / "codex"
+        self.oversized_session(home, FRAGMENT_BYTES - 5)  # value straddles fragments
+        transport, _ = self.run_reconcile(home, "codex", self.policy(self.project))
+        uploaded = b"".join(
+            validate_stored_payload(item.manifest, item.stored_payload) for item in transport.items
+        )
+        self.assertNotIn(b"PRIVATE-MARKER", uploaded)
+
+    def test_remaining_fragments_are_held_after_an_exclusion_is_added(self):
+        home, state = self.root / "codex", self.root / "state"
+        self.oversized_session(home, 64)
+        reconcile(home, state, "codex", None)
+        spool = DurableSpool(state / "queue")
+        early = SuccessTransport()
+        Drain(spool, early, exclusion_policy=load_policy(self.root / "absent"),
+              source_home=home).run(max_items=2)
+        self.assertEqual(len(early.items), 2)  # metadata and the fragment naming cwd
+        later = SuccessTransport()
+        result = Drain(spool, later, exclusion_policy=self.policy(self.project),
+                       source_home=home).run()
+        self.assertEqual(later.items, [])
+        self.assertGreater(result.held_by_policy, 0)
+        # A source that no longer matches the queued record holds it too.
+        path = next((home / "sessions").rglob("*.jsonl"))
+        path.write_bytes(path.read_bytes().replace(b"PRIVATE-MARKER", b"PUBLIC-MARKERX", 1))
+        again = SuccessTransport()
+        Drain(spool, again, exclusion_policy=self.policy(self.sibling / "elsewhere"),
+              source_home=home).run()
+        self.assertEqual(again.items, [])
+
+    def test_git_config_values_and_remote_variants_are_decoded(self):
+        (self.project / ".git" / "config").write_text(
+            '[remote "origin"]\n\turl = "git@github.com:Acme/Private.git" ; quoted\n'
+            '[remote "mirror"]\n\turl = https://git.acme.test:8443/Team/Private.git # comment\n'
+        )
+        home = self.root / "codex"
+        ids = {}
+        for name, url in (
+            ("https", "https://github.com/acme/private"),
+            ("ssh", "ssh://git@github.com/ACME/private.git"),
+            ("mirror", "https://git.acme.test:8443/Team/Private"),
+            ("other-port", "https://git.acme.test:9443/Team/Private"),
+            ("other-case", "https://git.acme.test:8443/team/private"),
+        ):
+            ids[name] = codex_rollout(home, meta={
+                "cwd": str(self.root / f"gone-{name}"), "git": {"repository_url": url},
+            })[1]
+        transport, _ = self.run_reconcile(home, "codex", self.policy(self.project))
+        self.assertEqual(uploaded_ids(transport), {ids["other-port"], ids["other-case"]})
 
     def test_claude_hook_observations_of_excluded_sessions_are_not_captured(self):
         home, state = self.root / "claude", self.root / "claude" / "sherlock" / "telemetry"

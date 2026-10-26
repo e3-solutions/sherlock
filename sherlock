@@ -91,6 +91,10 @@ case "$1" in
     [ "$#" -ge 2 ] || { usage >&2; exit 2; }
     command=$1
     shift
+    if [ "$1" = "--" ]; then
+      shift
+      [ "$#" -ge 1 ] || { usage >&2; exit 2; }
+    fi
     project_exclusions "$command" -- "$@" || exit
     warn_outdated_runtimes
     exit 0

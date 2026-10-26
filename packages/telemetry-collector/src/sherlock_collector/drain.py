@@ -177,6 +177,15 @@ class Drain:
                     if self._policy.excluded_projects
                     else ()
                 ),
+                native_fragments=[
+                    (
+                        record.native_record_start_offset,
+                        record.native_record_end_offset,
+                        record.native_record_sha256,
+                    )
+                    for record in manifest.records
+                    if record.parse_status == "fragment"
+                ],
             ):
                 self._held.add(path)
                 blocked_streams.add(stream)

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -161,6 +162,7 @@ class ExclusionPolicy:
         source_home: Path | None = None,
         source_path: Path | None = None,
         observed_cwds: Iterable[str] = (),
+        native_fragments: Iterable[tuple[int, int, str]] = (),
     ) -> str | None:
         """Return why this source/batch must not be captured or uploaded.
 
@@ -168,6 +170,9 @@ class ExclusionPolicy:
         its ``projects`` directory) used to resolve sessions and their parents.
         ``observed_cwds`` are working directories recorded in the bytes being
         uploaded, such as those of an already-queued batch.
+        ``native_fragments`` are (start, end, sha256) of oversized native records
+        a batch carries only part of; each is classified by the complete record,
+        read back from its source file, and held when that cannot be verified.
         """
         if not self.active:
             return None
@@ -175,6 +180,14 @@ class ExclusionPolicy:
             return UNREADABLE
         native = _normalize(native_session_id)
         parent = _normalize(parent_native_session_id)
+        native_fragments = tuple(native_fragments)
+        if self.excluded_projects and native_fragments:
+            fragment_cwds = self._fragment_cwds(
+                provider, native, parent, source_home, native_fragments
+            )
+            if fragment_cwds is None:
+                return UNVERIFIED
+            observed_cwds = set(observed_cwds) | fragment_cwds
         if provider == "claude_code":
             if {native, parent} & self.excluded:
                 return EXCLUDED
@@ -239,6 +252,37 @@ class ExclusionPolicy:
                 return blocked
             pending.extend(ancestors - seen)
         return None
+
+    def _fragment_cwds(
+        self,
+        provider: str,
+        native: str | None,
+        parent: str | None,
+        source_home: Path | None,
+        fragments: tuple[tuple[int, int, str], ...],
+    ) -> set[str] | None:
+        """Directories in the complete native records behind fragment batches."""
+        if native is None or source_home is None:
+            return None
+        if provider == "claude_code":
+            roots, agents = self._claude_index(source_home)
+            source = agents.get((parent, native)) if parent else roots.get(native)
+            candidates = [source] if source is not None else []
+        else:
+            candidates = [
+                path for path in self._index(source_home).get(native, ())
+                if (_session_meta_ids(path) or (None,))[0] == native
+            ]
+        cwds: set[str] = set()
+        for start, end, digest in fragments:
+            for path in candidates:
+                found = _record_range_cwds(path, start, end, digest)
+                if found is not None:
+                    cwds |= found
+                    break
+            else:
+                return None
+        return cwds
 
     def _session_reason(self, cwd: str | None, repository: str | None) -> str | None:
         """Codex sessions also record their repository, which outlives a
@@ -594,23 +638,63 @@ def _session_meta_ids(
     )
 
 
+_DEFAULT_PORTS = {"https": 443, "http": 80, "ssh": 22, "git": 9418}
+# Hosts that treat repository paths case-insensitively.
+_CASE_INSENSITIVE_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
+
+
 def _repository_key(url: object) -> str | None:
-    """Comparable host/path of a git remote (https, ssh or scp-like)."""
+    """Comparable host[:port]/path of a git remote (https, ssh or scp-like)."""
     if not isinstance(url, str) or not url.strip():
         return None
     url = url.strip()
+    port = None
     if "://" in url:
         parts = urlsplit(url)
+        try:
+            port = parts.port
+        except ValueError:
+            return None
         host, path = parts.hostname or "", parts.path
+        if port == _DEFAULT_PORTS.get(parts.scheme.lower()):
+            port = None
     elif ":" in url and not url.startswith("/"):
         host, path = url.split(":", 1)
-        host = host.rsplit("@", 1)[-1]
+        host = host.rsplit("@", 1)[-1].lower()
     else:
         return None  # Local paths are matched as directories instead.
     path = path.strip("/")
     if path.endswith(".git"):
         path = path[:-4]
-    return f"{host}/{path}".lower() if host and path else None
+    if not host or not path:
+        return None
+    if host in _CASE_INSENSITIVE_HOSTS:
+        path = path.lower()
+    return f"{host}:{port}/{path}" if port else f"{host}/{path}"
+
+
+def _git_config_value(raw: str) -> str:
+    """Decode a git config value: quotes, backslash escapes, inline comments."""
+    escapes = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
+    result, quoted, pending_space, index = [], False, "", 0
+    raw = raw.strip()
+    while index < len(raw):
+        character = raw[index]
+        if character == "\\" and index + 1 < len(raw):
+            result.append(pending_space + escapes.get(raw[index + 1], raw[index + 1]))
+            pending_space, index = "", index + 2
+            continue
+        if character == '"':
+            quoted = not quoted
+        elif not quoted and character in "#;":
+            break
+        elif not quoted and character.isspace():
+            pending_space += character
+        else:
+            result.append(pending_space + character)
+            pending_space = ""
+        index += 1
+    return "".join(result)
 
 
 def _project_remotes(project: str) -> set[str]:
@@ -635,7 +719,7 @@ def _project_remotes(project: str) -> set[str]:
             if line.startswith("["):
                 in_remote = line.lower().startswith("[remote ")
             elif in_remote and line.split("=", 1)[0].strip().lower() == "url" and "=" in line:
-                key = _repository_key(line.split("=", 1)[1])
+                key = _repository_key(_git_config_value(line.split("=", 1)[1]))
                 if key:
                     remotes.add(key)
     return remotes
@@ -724,6 +808,30 @@ def observed_cwds(source: bytes) -> set[str]:
         if cwd is not None:
             cwds.add(cwd)
     return cwds
+
+
+def _record_range_cwds(path: Path, start: int, end: int, digest: str) -> set[str] | None:
+    """Directories in bytes [start, end) of path, or None unless they hash to digest."""
+    overlap = 64 * 1024
+    try:
+        handle = _open_regular(path)
+        if handle is None:
+            return None
+        with handle:
+            handle.seek(start)
+            hasher, cwds, tail, remaining = hashlib.sha256(), set(), b"", end - start
+            while remaining > 0:
+                chunk = handle.read(min(remaining, 4 * 1024 * 1024))
+                if not chunk:
+                    return None
+                remaining -= len(chunk)
+                hasher.update(chunk)
+                window = tail + chunk
+                cwds |= observed_cwds(window)
+                tail = window[-overlap:]
+    except OSError:
+        return None
+    return cwds if hasher.hexdigest() == digest else None
 
 
 def _record_cwd(record: object) -> str | None:
