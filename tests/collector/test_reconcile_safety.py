@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from sherlock_collector.contract import FRAGMENT_BYTES, validate_stored_payload
 from sherlock_collector.drain import Drain
+import sherlock_collector.exclusions as exclusions_module
 from sherlock_collector.exclusions import (
     EXCLUDED,
     EXCLUDED_PROJECT,
@@ -596,11 +597,24 @@ class ProjectExclusionTests(unittest.TestCase):
             ]
         self.assertNotIn(b"PRIVATE-MARKER", b"".join(uploaded))
 
+    def test_fragments_of_one_record_are_read_once_per_drain(self):
+        home, state = self.root / "codex", self.root / "state"
+        self.oversized_session(home, 64)
+        reconcile(home, state, "codex", None)
+        reads = []
+        original = exclusions_module._record_range_cwds
+        with patch.object(exclusions_module, "_record_range_cwds",
+                          side_effect=lambda *a: reads.append(a) or original(*a)):
+            Drain(DurableSpool(state / "queue"), SuccessTransport(),
+                  exclusion_policy=self.policy(self.sibling / "unrelated"), source_home=home).run()
+        self.assertEqual(len(reads), 1)
+
     def test_git_config_values_and_remote_variants_are_decoded(self):
         (self.project / ".git" / "config").write_text(
             '[remote "upstream"]\n\turl = https://github.com/public/upstream\n'
             '[remote "origin"]\n\turl = "git@github.com:Acme/Private.git" ; quoted\n'
             '\turl = https://git.acme.test:8443/Team/Private.git # comment\n'
+            '\turl = "https://github.com/acme/\\\nContinued.git"\n'
         )
         home = self.root / "codex"
         ids = {}
@@ -611,6 +625,7 @@ class ProjectExclusionTests(unittest.TestCase):
             ("other-port", "https://git.acme.test:9443/Team/Private"),
             ("other-case", "https://git.acme.test:8443/team/private"),
             ("upstream", "https://github.com/public/upstream"),
+            ("continued", "https://github.com/acme/continued"),
         ):
             ids[name] = codex_rollout(home, meta={
                 "cwd": str(self.root / f"gone-{name}"), "git": {"repository_url": url},

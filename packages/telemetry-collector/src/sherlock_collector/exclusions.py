@@ -279,7 +279,11 @@ class ExclusionPolicy:
         cwds: set[str] = set()
         for start, end, digest in fragments:
             for path in candidates:
-                found = _record_range_cwds(path, start, end, digest)
+                # Fragments of one record share a single verified read per run.
+                key = ("record-cwds", str(path), start, end, digest)
+                if key not in self._ancestry:
+                    self._ancestry[key] = _record_range_cwds(path, start, end, digest)
+                found = self._ancestry[key]
                 if found is not None:
                     cwds |= found
                     break
@@ -712,9 +716,11 @@ def _project_remotes(project: str) -> set[str]:
         return set()
     try:
         with open(config, "rb") as handle:
-            lines = handle.read(MAX_GIT_FILE_BYTES * 16).decode("utf-8", "replace").splitlines()
+            text = handle.read(MAX_GIT_FILE_BYTES * 16).decode("utf-8", "replace")
     except OSError:
         return set()
+    # A backslash at the end of a line continues the value on the next one.
+    lines = re.sub(r"(?<!\\)((?:\\\\)*)\\\r?\n", r"\1", text).splitlines()
     remotes: set[str] = set()
     in_origin = False
     for line in lines:
