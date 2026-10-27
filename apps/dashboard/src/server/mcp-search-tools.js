@@ -16,6 +16,7 @@ import {
   SEARCH_MAX_QUERY_TOKENS,
   SEARCH_SCHEMA_VERSION,
 } from "./mcp-search-source.js";
+import { TIMESTAMP_INPUT, TIMESTAMP_INPUT_EXAMPLE, TIMESTAMP_INPUT_HELP } from "./mcp-timestamp.js";
 
 export const SEARCH_METHODS = Object.freeze([
   "resolvePerson",
@@ -28,6 +29,7 @@ export function hasSearchSource(source) {
 }
 
 const UUID = z.string().uuid();
+// Output timestamps stay canonical; tool inputs use the lenient TIMESTAMP_INPUT.
 const ISO_TIMESTAMP = z.string().refine((value) => {
   const date = new Date(value);
   return Number.isFinite(date.getTime()) && date.toISOString() === value;
@@ -96,10 +98,10 @@ export const searchSessionsInputSchema = z.object({
     .describe(`Focused lexical query over stored excerpts, at most ${SEARCH_MAX_QUERY_TOKENS} words including OR. Split a natural-language question into short positive terms; OR splits whole query branches: repeat shared constraints in each branch or use separate calls. Quotes mark phrases; - excludes terms. No stemming.`),
   personId: UUID.optional().describe("personId from resolve_person. Strongly recommended."),
   sessionId: UUID.optional().describe("Restrict hits to one session."),
-  start: ISO_TIMESTAMP.optional()
-    .describe("Inclusive start. Defaults to 1970-01-01, covering all stored Sherlock history."),
-  end: ISO_TIMESTAMP.optional()
-    .describe("Exclusive end. Defaults to the server read time and cannot be in the future."),
+  start: TIMESTAMP_INPUT.optional()
+    .describe(`Inclusive start. Defaults to 1970-01-01, covering all stored Sherlock history. Accepts ${TIMESTAMP_INPUT_HELP}.`),
+  end: TIMESTAMP_INPUT.optional()
+    .describe(`Exclusive end. Defaults to the server read time and cannot be in the future. Accepts ${TIMESTAMP_INPUT_HELP}; a date end excludes that day, so start 2026-10-26 with end 2026-10-27 covers all of Oct 26 UTC.`),
   limit: z.number().int().min(1).max(SEARCH_MAX_LIMIT).optional(),
   perSessionLimit: z.number().int().min(1).max(SEARCH_MAX_PER_SESSION_LIMIT).optional()
     .describe("Strongest hits kept per session before the overall limit. Defaults to 2."),
@@ -301,7 +303,7 @@ export const SEARCH_TOOLS = Object.freeze([
       invalid_argument: {
         message: "The Sherlock search is invalid.",
         retryable: false,
-        recovery: `Use a 2-256 character query with 1-${SEARCH_MAX_QUERY_TOKENS} words and at least one positive term, canonical timestamps with start before end and no future end, and personId/sessionId values returned by Sherlock.`,
+        recovery: `Use a 2-256 character query with 1-${SEARCH_MAX_QUERY_TOKENS} words and at least one positive term, ISO-8601 UTC timestamps such as ${TIMESTAMP_INPUT_EXAMPLE} or dates such as 2026-10-26 with start before end and no future end, and personId/sessionId values returned by Sherlock.`,
       },
     },
   },
