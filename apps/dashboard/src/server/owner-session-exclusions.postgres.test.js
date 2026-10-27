@@ -139,6 +139,8 @@ async function installProductionShape(tx) {
   }
   const [{ exists }] = await tx`select exists(select from pg_roles where rolname = ${SESH}) as exists`;
   if (!exists) await tx.unsafe(`create role ${SESH} nologin`);
+  // Supabase's postgres is not a superuser: it needs membership to `set role`.
+  await tx.unsafe(`grant ${SESH} to current_user`);
   await tx.unsafe(`
     grant usage on schema sherlock_access, telemetry to ${SESH};
     grant execute on function sherlock_access.protected_person_ids() to ${SESH};
