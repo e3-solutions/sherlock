@@ -471,6 +471,72 @@ describe("Sherlock search MCP tools", () => {
     expect(next.structuredContent.events.map((event) => event.eventId)).toEqual(["53", "54"]);
   });
 
+  it("accepts timestamps without milliseconds, with offsets, or as dates and normalizes them", async () => {
+    const database = searchDatabase();
+    const client = await connect(database.source);
+
+    const listed = await client.listTools();
+    const byName = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
+    for (const name of ["coverage", "list_sessions", "query_usage", "search_sessions"]) {
+      for (const key of ["start", "end"]) {
+        const property = byName[name].inputSchema.properties[key];
+        expect(property).toMatchObject({ type: "string" });
+        expect(property).not.toHaveProperty("format");
+        expect(property.description).toContain("2026-10-26T00:00:00Z");
+        expect(property.description).toContain("2026-10-26 meaning 00:00:00Z");
+      }
+    }
+
+    for (const [start, end] of [
+      ["2026-09-21T00:00:00Z", "2026-09-22"],
+      ["2026-09-21", "2026-09-22T00:00:00+00:00"],
+      ["2026-09-21T05:30:00+05:30", "2026-09-22T00:00:00.000Z"],
+    ]) {
+      const search = await client.callTool({
+        name: "search_sessions",
+        arguments: { query: OCR_QUERY, personId: SHARAD, start, end },
+      });
+      expect(search.isError).not.toBe(true);
+      expect(search.structuredContent.window).toMatchObject({
+        startInclusive: "2026-09-21T00:00:00.000Z",
+        endExclusive: "2026-09-22T00:00:00.000Z",
+      });
+      expect(database.calls.at(-1).params).toEqual(expect.arrayContaining([
+        "2026-09-21T00:00:00.000Z", "2026-09-22T00:00:00.000Z",
+      ]));
+    }
+
+    for (const start of ["last tuesday", "2026-09-21T00:00:00", "2026-02-30"]) {
+      const rejected = await client.callTool({
+        name: "search_sessions",
+        arguments: { query: OCR_QUERY, start },
+      });
+      expect(rejected.isError).toBe(true);
+      expect(rejected.content[0].text).toContain("e.g. 2026-10-26T00:00:00Z");
+    }
+  });
+
+  it("normalizes lenient timestamps on every query tool input", () => {
+    const tools = registeredTools({});
+    for (const name of ["coverage", "list_sessions", "query_usage"]) {
+      const schema = tools.get(name).config.inputSchema;
+      expect(schema.parse({ start: "2026-10-26", end: "2026-10-27T05:30:00+05:30" })).toMatchObject({
+        start: "2026-10-26T00:00:00.000Z",
+        end: "2026-10-27T00:00:00.000Z",
+      });
+      expect(schema.parse({ start: "2026-10-26T00:00:00.000Z" })).toEqual({
+        start: "2026-10-26T00:00:00.000Z",
+      });
+      expect(schema.safeParse({ start: "2026-10-26T00:00:00" }).success).toBe(false);
+      expect(schema.safeParse({ end: "soon" }).success).toBe(false);
+    }
+    expect(tools.get("list_prompt_evidence").config.inputSchema.parse({
+      snapshotToken: "token",
+      personId: SHARAD,
+      bucketStart: "2026-08-18T03:50:00Z",
+    }).bucketStart).toBe("2026-08-18T03:50:00.000Z");
+  });
+
   it("rejects invalid requests without echoing input or database details", async () => {
     const canary = "zzcanaryzz";
     const database = searchDatabase({

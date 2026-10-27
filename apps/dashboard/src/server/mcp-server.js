@@ -19,8 +19,10 @@ import {
   hasSearchSource,
   searchErrorCode,
 } from "./mcp-search-tools.js";
+import { TIMESTAMP_INPUT, TIMESTAMP_INPUT_EXAMPLE, TIMESTAMP_INPUT_HELP } from "./mcp-timestamp.js";
 
 const UUID = z.string().uuid();
+// Output timestamps stay canonical; tool inputs use the lenient TIMESTAMP_INPUT.
 const ISO_TIMESTAMP = z.string().refine((value) => {
   const date = new Date(value);
   return Number.isFinite(date.getTime()) && date.toISOString() === value;
@@ -82,7 +84,7 @@ const promptInputSchema = z.object({
   snapshotToken: z.string().min(1).max(8192)
     .describe("Opaque snapshotToken from the usage page containing this person."),
   personId: UUID.describe("personId returned by list_usage_evidence."),
-  bucketStart: ISO_TIMESTAMP.describe("Prompt-bearing bucket start returned for that person."),
+  bucketStart: TIMESTAMP_INPUT.describe("Prompt-bearing bucket start returned for that person."),
 }).strict();
 
 const promptOutputSchema = z.object({
@@ -115,10 +117,10 @@ const promptOutputSchema = z.object({
 }).strict();
 
 const queryWindowInput = {
-  start: ISO_TIMESTAMP.optional()
-    .describe("Inclusive start. Defaults to 1970-01-01, covering all possible Sherlock history."),
-  end: ISO_TIMESTAMP.optional()
-    .describe("Exclusive end. Defaults to the server read time and cannot be in the future."),
+  start: TIMESTAMP_INPUT.optional()
+    .describe(`Inclusive start. Defaults to 1970-01-01, covering all possible Sherlock history. Accepts ${TIMESTAMP_INPUT_HELP}.`),
+  end: TIMESTAMP_INPUT.optional()
+    .describe(`Exclusive end. Defaults to the server read time and cannot be in the future. Accepts ${TIMESTAMP_INPUT_HELP}; a date end excludes that day, so start 2026-10-26 with end 2026-10-27 covers all of Oct 26 UTC.`),
 };
 
 const queryWindowOutputSchema = z.object({
@@ -370,7 +372,7 @@ const QUERY_ERROR_OVERRIDES = {
   invalid_argument: {
     message: "The Sherlock query is invalid.",
     retryable: false,
-    recovery: "Use canonical timestamps with start before end and no future end, allowed enum values, and the exact prior window and filters with a cursor.",
+    recovery: `Use ISO-8601 UTC timestamps such as ${TIMESTAMP_INPUT_EXAMPLE} or dates such as 2026-10-26 with start before end and no future end, allowed enum values, and the exact prior window and filters with a cursor.`,
   },
   not_found: {
     message: "The requested Sherlock session was not found in the configured workspace.",
