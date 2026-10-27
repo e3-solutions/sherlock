@@ -15,7 +15,8 @@ from .contract import (
     validate_committed_receipt,
     validate_stored_payload,
 )
-from .exclusions import ExclusionPolicy, load_policy, observed_cwds
+from . import exclusion_report
+from .exclusions import EXCLUDED_PROJECT, ExclusionPolicy, load_policy, observed_cwds
 from .spool import DurableSpool, SpoolItem, secure_lock
 
 
@@ -54,6 +55,9 @@ class DrainResult:
     locked: bool = False
     collector_failure: dict | None = None
     held_by_policy: int = 0
+    # Best-effort report of excluded session ids so Sherlock hides copies it
+    # already received: none, unchanged, reported, skipped or failed:<code>.
+    exclusions_report: str | None = None
 
 
 class Drain:
@@ -75,6 +79,7 @@ class Drain:
         self.source_home = Path(source_home) if source_home is not None else None
         self._policy = ExclusionPolicy()
         self._held: set[Path] = set()
+        self._project_held_sessions: set[str] = set()
 
     def run(self, *, max_items: int = 1024, max_seconds: float = 300) -> DrainResult:
         if max_items < 1 or max_seconds <= 0:
@@ -84,8 +89,31 @@ class Drain:
         # Held batches stay pending, unsent, and block only their own stream.
         self._policy = self.exclusion_policy or load_policy()
         self._held = set()
+        self._project_held_sessions = set()
         result = self._run(max_items, max_seconds)
-        return replace(result, held_by_policy=len(self._held))
+        return replace(
+            result,
+            held_by_policy=len(self._held),
+            exclusions_report=self._report_exclusions(result),
+        )
+
+    def _report_exclusions(self, result: DrainResult) -> str:
+        """Tell Sherlock which sessions are excluded; never affects the drain."""
+        try:
+            policy = self._policy
+            if policy.error:
+                return exclusion_report.SKIPPED
+            # Explicitly excluded sessions, plus sessions whose queued batches
+            # this drain held because they ran in an excluded project.
+            ids = set(policy.excluded) | self._project_held_sessions
+            if not exclusion_report.normalized_session_ids(ids):
+                return exclusion_report.NONE
+            send = getattr(self.transport, "report_exclusions", None)
+            if result.locked or result.collector_failure or not callable(send):
+                return exclusion_report.SKIPPED
+            return exclusion_report.report_exclusions(self.spool.root, ids, send)
+        except Exception as error:
+            return f"failed:{type(error).__name__}"
 
     def _run(self, max_items: int, max_seconds: float) -> DrainResult:
         deadline = time.monotonic() + max_seconds
@@ -165,7 +193,7 @@ class Drain:
             stream = manifest.stream_identity
             if stream in blocked_streams:
                 continue
-            if self._policy.active and self._policy.blocked_reason(
+            reason = self._policy.active and self._policy.blocked_reason(
                 manifest.source_provider,
                 manifest.observed_native_session_id,
                 manifest.observed_parent_native_session_id,
@@ -186,7 +214,10 @@ class Drain:
                     for record in manifest.records
                     if record.parse_status == "fragment"
                 ],
-            ):
+            )
+            if reason:
+                if reason == EXCLUDED_PROJECT and manifest.observed_native_session_id:
+                    self._project_held_sessions.add(manifest.observed_native_session_id)
                 self._held.add(path)
                 blocked_streams.add(stream)
                 continue

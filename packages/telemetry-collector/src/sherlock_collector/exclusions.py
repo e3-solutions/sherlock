@@ -23,9 +23,11 @@ fails closed: nothing is captured or uploaded until it is repaired. A session
 whose working directory cannot be read yet while project exclusions exist is
 held the same way. Blocked sources keep their cursor and blocked queued
 batches stay queued, so removing an entry later resumes collection without
-loss. The policy never leaves the machine; locally, transcripts are read only
-up to the Codex session metadata or the first record naming a working
-directory.
+loss. Project paths and the rest of the policy never leave the machine; only
+excluded session ids are reported to Sherlock (see exclusion_report.py) so it
+can hide copies uploaded before they were excluded. Locally, transcripts are
+read only up to the Codex session metadata or the first record naming a
+working directory.
 """
 
 from __future__ import annotations

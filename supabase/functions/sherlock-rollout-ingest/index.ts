@@ -1,5 +1,6 @@
 import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
+import { parseExclusionsRequest, requestOperation } from "./exclusions.ts";
 import { PostgresBatchRepository } from "./postgres.ts";
 import { IngestService, type WorkloadClassHint } from "./service.ts";
 import { SupabaseImmutableStorage } from "./storage.ts";
@@ -62,12 +63,32 @@ export async function handleRequest(
       });
     }
     const body = await readJsonBounded(request);
+    const routing = () =>
+      workspaceRoutingConfig(
+        required("SHERLOCK_E3_WORKSPACE_ID", environment),
+        required("SHERLOCK_SIXTYFOUR_WORKSPACE_ID", environment),
+      );
+    if (requestOperation(body) !== null) {
+      // Authenticated exactly like a batch: the same collector identity
+      // resolves the workspace and person the exclusions are scoped to.
+      const exclusions = parseExclusionsRequest(body);
+      const grant = publicCollectorGrant(routing(), exclusions.collector);
+      const current = backendFactory();
+      const attribution = await current.batches.resolveAttribution(
+        grant,
+        exclusions.collector,
+      );
+      const receipt = await current.batches.recordOwnerExclusions(
+        attribution,
+        exclusions.excluded_session_ids,
+      );
+      return Response.json(receipt, {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
     const envelope = parseEnvelope(body);
-    const routing = workspaceRoutingConfig(
-      required("SHERLOCK_E3_WORKSPACE_ID", environment),
-      required("SHERLOCK_SIXTYFOUR_WORKSPACE_ID", environment),
-    );
-    const grant = publicCollectorGrant(routing, envelope.collector);
+    const grant = publicCollectorGrant(routing(), envelope.collector);
     const current = backendFactory();
     const attribution = await current.batches.resolveAttribution(
       grant,
