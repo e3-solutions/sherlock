@@ -14,7 +14,7 @@ const migration = (name) => DATABASE_URL
   : null;
 const SEARCH_MIGRATION = migration("20261012135923_add_bounded_excerpt_search.sql");
 const PRODUCT_ROLE_MIGRATION = migration("20261012140548_filter_excerpt_search_product_roles.sql");
-const EXCLUSIONS_MIGRATION = migration("20261027220000_hide_owner_excluded_sessions.sql");
+const EXCLUSIONS_MIGRATION = migration("20261027233920_hide_owner_excluded_sessions.sql");
 const SEARCH = "analytics.search_excerpt_candidates(uuid, text, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer)";
 const GATE = "analytics._assert_excerpt_search_policy_shape()";
 const RECORD = "sherlock_access.record_owner_session_exclusions(uuid, uuid, text[])";
