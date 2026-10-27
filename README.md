@@ -87,8 +87,15 @@ Each linked worktree seen while exclusions exist is remembered in
 the worktree is removed or its path is reused; if that file becomes unreadable,
 project-checked sessions are held until it is repaired. A worktree removed
 before its project was excluded cannot be recognized. Exclusion stops future
-capture and upload only: sessions Sherlock has already received stay in its
-records. Older runtimes ignore `excluded_project_paths`, so reinstall to apply
+capture and upload; it does not delete what Sherlock already received. So that
+those copies are hidden too, each drain reports the ids in
+`excluded_session_ids`, plus sessions whose queued batches it held for an
+excluded project, to Sherlock once they change (`exclusions_report` in drain
+output); Sherlock then hides those sessions and their subagents and forks from
+every reader. Only session ids are sent, never project paths, and reports are
+additive: removing an id locally does not un-hide it. A project session
+uploaded completely before its project was excluded is not reported. Older
+runtimes ignore `excluded_project_paths`, so reinstall to apply
 it. Hooks read the policy from `~/.sherlock` unless `SHERLOCK_HOME` is set in
 the agent's environment; the scheduler keeps the `SHERLOCK_HOME` used at
 install.

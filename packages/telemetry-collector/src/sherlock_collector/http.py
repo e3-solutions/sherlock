@@ -9,6 +9,7 @@ from typing import Mapping
 
 from .config import CollectorIdentity
 from .drain import CollectorUploadError, PermanentUploadError, TransientUploadError
+from .exclusion_report import ExclusionReportError
 from .spool import SpoolItem
 
 
@@ -114,4 +115,70 @@ class HttpTransport:
             raise TransientUploadError("ingest returned invalid JSON") from error
         if not isinstance(value, dict):
             raise TransientUploadError("ingest receipt must be an object")
+        return value
+
+    def report_exclusions(self, session_ids: list[str]) -> Mapping[str, object]:
+        """Report excluded session ids so Sherlock hides copies it already has.
+
+        Only the ids are sent. Any failure raises ExclusionReportError with the
+        server's error code when there is one; callers treat it as best-effort.
+        """
+        body = json.dumps(
+            {
+                "op": "exclusions",
+                "collector": self.identity.to_dict(),
+                "excluded_session_ids": list(session_ids),
+            },
+            separators=(",", ":"),
+        ).encode()
+        request = urllib.request.Request(
+            self.endpoint,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "sherlock-telemetry-collector/0.1.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout_seconds
+            ) as response:
+                raw = response.read(65_537)
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read(4096).decode("utf-8", "replace")
+            try:
+                value = json.loads(detail)
+                server_error = value.get("error") if isinstance(value, dict) else None
+                code = (
+                    server_error.get("code") if isinstance(server_error, dict) else None
+                )
+                code = code if isinstance(code, str) else None
+            except ValueError:
+                code = None
+            raise ExclusionReportError(
+                f"exclusions report returned HTTP {error.code}",
+                error_code=code or f"http_{error.code}",
+            ) from error
+        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as error:
+            raise ExclusionReportError(
+                f"exclusions report transport failed: {error}",
+                error_code="transport",
+            ) from error
+        if len(raw) > 65_536:
+            raise ExclusionReportError(
+                "exclusions response exceeds 64 KiB", error_code="invalid_response"
+            )
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ExclusionReportError(
+                "exclusions response is not JSON", error_code="invalid_response"
+            ) from error
+        if not isinstance(value, dict):
+            raise ExclusionReportError(
+                "exclusions response must be an object", error_code="invalid_response"
+            )
         return value
