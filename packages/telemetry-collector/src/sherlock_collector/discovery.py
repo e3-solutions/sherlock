@@ -59,6 +59,7 @@ class _CodexCandidate:
     parent_id: str | None
     is_subagent: bool
     snapshot: SourceSnapshot
+    has_session_meta: bool = False
 
 
 def native_database_candidates(
@@ -207,6 +208,7 @@ def discover_rollouts(
     home = Path(codex_home or default_codex_home()).expanduser().resolve()
     cutoff_ms = 0 if replay_session_id else int(time.time() * 1000) - max(1, lookback_seconds) * 1000
     discovered: dict[Path, tuple[int, str | None]] = {}
+    parent_ids: dict[str, str] = {}
     payload_paths: list[Path] = []
     errors: list[str] = []
     payload = hook_payload or {}
@@ -225,20 +227,23 @@ def discover_rollouts(
     omitted_count = 0
     invalid_count = 0
     selected_bytes = 0
-    for key, native_id in (
-        ("rollout_path", payload_session),
-        ("transcript_path", payload_session),
-        ("agent_transcript_path", payload_agent),
-    ):
+    for key in ("rollout_path", "transcript_path", "agent_transcript_path"):
         raw_path = payload.get(key)
         if isinstance(raw_path, str) and raw_path:
             try:
                 path = _rollout_path(home, raw_path)
-                if path is not None:
+                identity = (
+                    _hook_rollout_identity(home, path, payload_session)
+                    if path is not None
+                    else None
+                )
+                if path is not None and identity is not None:
                     discovered[path] = (
                         int(path.stat().st_mtime_ns // 1_000_000),
-                        _native_session_id(native_id),
+                        identity[0],
                     )
+                    if identity[1] is not None:
+                        parent_ids[str(path)] = identity[1]
                     payload_paths.append(path)
             except OSError:
                 continue
@@ -313,6 +318,12 @@ def discover_rollouts(
                 max(candidate.mtime_ns // 1_000_000, previous[0] if previous else 0),
                 native_id,
             )
+            if (
+                native_id == candidate.native_id
+                and candidate.parent_id is not None
+                and candidate.parent_id != native_id
+            ):
+                parent_ids.setdefault(str(candidate.path), candidate.parent_id)
             source_snapshots[str(candidate.path)] = candidate.snapshot
             selected_bytes += candidate.snapshot.end_offset
             if matches_priority:
@@ -336,6 +347,11 @@ def discover_rollouts(
     return DiscoveryResult(
         paths=tuple(prioritized),
         native_session_ids=native_ids,
+        parent_native_session_ids={
+            path: parent_id
+            for path, parent_id in parent_ids.items()
+            if native_ids.get(path) not in (None, parent_id)
+        },
         priority_count=len(set(payload_paths)),
         errors=tuple(errors),
         invalid_count=invalid_count,
@@ -458,6 +474,69 @@ def discover_claude_transcripts(
     )
 
 
+def discover_all_sources(
+    home: Path | str,
+    provider: str,
+    *,
+    modified_after_ns: int = 0,
+) -> DiscoveryResult:
+    """Enumerate native files without a hook dependency.
+
+    Reuse descriptor-safe provider validation, including archived Codex sessions
+    and Claude subagents. No database row cap is applied to this recovery scan;
+    ``modified_after_ns`` bounds it to files written inside the reconcile window.
+    Codex rollouts are labelled only by their own session_meta (as hook-supplied
+    paths are): a rollout without a readable session_meta is reported and
+    deferred instead of being uploaded under a filename-derived identity.
+    """
+    root = Path(home).expanduser().resolve()
+    if not root.is_dir():
+        return DiscoveryResult(paths=(), native_session_ids={}, errors=("source_home_missing",))
+    cutoff_ns = max(0, int(modified_after_ns))
+    statuses: list[Mapping[str, object]] = []
+    excluded_by_cutoff = 0
+    try:
+        if provider == "claude_code":
+            candidates, invalid, excluded_by_cutoff = _recent_claude_candidates(
+                root, cutoff_ns
+            )
+            if (root / "projects").is_symlink():
+                invalid += 1
+        elif provider == "codex":
+            scanned, invalid = _recent_codex_candidates(root, cutoff_ns)
+            candidates = []
+            for candidate in scanned:
+                if candidate.has_session_meta:
+                    candidates.append(candidate)
+                    continue
+                invalid += 1
+                statuses.append(
+                    {
+                        "native_session_id": None,
+                        "rollout_path": str(candidate.path),
+                        "reason": "session_meta_unavailable",
+                    }
+                )
+        else:
+            raise ValueError("unsupported provider")
+    except OSError as error:
+        return DiscoveryResult(paths=(), native_session_ids={}, errors=(str(error),))
+    return DiscoveryResult(
+        paths=tuple(candidate.path for candidate in candidates),
+        native_session_ids={str(c.path): c.native_id for c in candidates if c.native_id},
+        parent_native_session_ids={
+            str(c.path): c.parent_id
+            for c in candidates
+            if c.parent_id and c.parent_id != c.native_id
+        },
+        source_snapshots={str(c.path): c.snapshot for c in candidates},
+        selected_bytes=sum(c.snapshot.end_offset for c in candidates),
+        invalid_count=invalid,
+        excluded_by_cutoff=excluded_by_cutoff,
+        source_statuses=tuple(statuses),
+    )
+
+
 def _recent_codex_candidates(
     codex_home: Path,
     cutoff_ns: int,
@@ -525,6 +604,7 @@ def _recent_codex_candidates(
                                     prefix_length=prefix_length,
                                     prefix_sha256=prefix_sha256,
                                 ),
+                                has_session_meta=bool(identity and identity[0]),
                             )
                         )
             except OSError:
@@ -645,22 +725,19 @@ def _scan_claude_project(
             try:
                 if subagents.is_symlink() or not subagents.is_dir():
                     continue
-                with os.scandir(subagents) as agent_entries:
-                    for agent_entry in agent_entries:
-                        if not agent_entry.is_file(follow_symlinks=False):
-                            continue
-                        agent_id = _agent_filename_identity(agent_entry.name)
-                        if agent_id is None:
-                            continue
-                        invalid, excluded = _append_recent_claude_candidate(
-                            candidates,
-                            allowed_root,
-                            agent_entry,
-                            cutoff_ns,
-                            (agent_id, parent_id),
-                        )
-                        invalid_count += invalid
-                        excluded_by_cutoff += excluded
+                for agent_entry in _claude_agent_entries(subagents):
+                    agent_id = _agent_filename_identity(agent_entry.name)
+                    if agent_id is None:
+                        continue
+                    invalid, excluded = _append_recent_claude_candidate(
+                        candidates,
+                        allowed_root,
+                        agent_entry,
+                        cutoff_ns,
+                        (agent_id, parent_id),
+                    )
+                    invalid_count += invalid
+                    excluded_by_cutoff += excluded
             except OSError:
                 invalid_count += 1
     return candidates, invalid_count, excluded_by_cutoff
@@ -678,6 +755,27 @@ def _agent_filename_identity(name: str) -> str | None:
     if not name.startswith("agent-") or not name.endswith(".jsonl"):
         return None
     return _text_identity(name[len("agent-") : -len(".jsonl")])
+
+
+def _claude_agent_entries(subagents: Path):
+    """Yield agent files, including workflow agents in workflows/<wf>/."""
+    workflows: Path | None = None
+    with os.scandir(subagents) as entries:
+        for entry in entries:
+            if entry.name == "workflows" and entry.is_dir(follow_symlinks=False):
+                workflows = Path(entry.path)
+            elif entry.is_file(follow_symlinks=False):
+                yield entry
+    if workflows is None:
+        return
+    with os.scandir(workflows) as workflow_entries:
+        for workflow in workflow_entries:
+            if not workflow.is_dir(follow_symlinks=False):
+                continue
+            with os.scandir(workflow.path) as entries:
+                for entry in entries:
+                    if entry.is_file(follow_symlinks=False):
+                        yield entry
 
 
 def _append_recent_claude_candidate(
@@ -808,6 +906,32 @@ def _rollout_path(codex_home: Path, value: str) -> Path | None:
             continue
         return path if path.is_file() else None
     return None
+
+
+def _hook_rollout_identity(
+    codex_home: Path,
+    path: Path,
+    hook_session_id: object,
+) -> tuple[str, str | None] | None:
+    """Label a hook-supplied rollout by its own session_meta.
+
+    Codex fires tool hooks inside a subagent with the parent's session_id and
+    the subagent's rollout path, so the payload id is only a parent hint. A
+    rollout without a readable session_meta is still being created: defer it
+    (its cursor does not move) rather than upload it under a borrowed id.
+    """
+    try:
+        with open_regular_under_root(codex_home, path) as handle:
+            identity = _codex_rollout_identity(handle)
+    except (OSError, ValueError):
+        return None
+    if identity is None or identity[0] is None:
+        return None
+    native_id, parent_id, _ = identity
+    hook_id = _native_session_id(hook_session_id)
+    if parent_id is None and hook_id not in (None, native_id):
+        parent_id = hook_id
+    return native_id, parent_id if parent_id != native_id else None
 
 
 def _claude_transcript_path(claude_home: Path, value: str) -> Path | None:

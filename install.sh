@@ -10,6 +10,10 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 NAME=""
 GITHUB_ID=""
 EMAIL=""
+SCHEDULER_FLAG=--install-scheduler
+if [ "${SHERLOCK_NO_SCHEDULER:-0}" = "1" ]; then
+  SCHEDULER_FLAG=--no-scheduler
+fi
 
 usage() {
   cat <<'EOF'
@@ -18,7 +22,11 @@ Usage: ./install.sh --name NAME --github-id LOGIN --email EMAIL
 Installs the Sherlock Codex plugin, collector runtime/config, and trusts only
 the installed Sherlock hooks.
 
+Options:
+  --no-scheduler        Disable periodic collection (also removes a prior entry)
+
 Environment overrides:
+  SHERLOCK_NO_SCHEDULER Set to 1 to disable periodic collection
   CODEX_BIN             Codex executable to use
   CODEX_HOME            Codex state directory (default: ~/.codex)
   PYTHON_BIN             Python 3 executable (default: python3)
@@ -42,6 +50,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       EMAIL=$2
       shift 2
+      ;;
+    --no-scheduler)
+      SCHEDULER_FLAG=--no-scheduler
+      shift
       ;;
     -h|--help)
       usage
@@ -94,6 +106,8 @@ ENDPOINT=${SHERLOCK_INGEST_URL:-$DEFAULT_ENDPOINT}
 
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install.py" \
   --endpoint "$ENDPOINT" \
+  --provider codex \
+  "$SCHEDULER_FLAG" \
   --codex-home "$CODEX_HOME" \
   --name "$NAME" \
   --github-id "$GITHUB_ID" \
@@ -116,11 +130,11 @@ if BACKFILL_RESULT=$(PYTHONPATH="$COLLECTOR_PYTHONPATH" "$PYTHON_BIN" \
   case "$BACKFILL_RESULT" in
     *'"status": "complete"'*) ;;
     *)
-      echo "Warning: Codex backfill was partial; later SessionStart hooks will resume it." >&2
+      echo "Warning: Codex backfill was partial; periodic reconciliation will resume it unless disabled." >&2
       ;;
   esac
 else
-  echo "Warning: Codex backfill could not start; plugin installation will continue and SessionStart will retry it." >&2
+  echo "Warning: Codex backfill could not start; plugin installation will continue and periodic reconciliation will retry it unless disabled." >&2
 fi
 
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/install_marketplace.py" \

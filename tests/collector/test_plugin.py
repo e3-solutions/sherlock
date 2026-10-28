@@ -1,4 +1,5 @@
 from __future__ import annotations
+import _isolation  # noqa: F401  (must precede collector imports)
 
 import fcntl
 import json
@@ -83,6 +84,14 @@ def create_threads_database(path: Path, rows: list[dict[str, object]]) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def codex_session_meta(session_id: str, parent_id: str | None = None) -> str:
+    payload: dict[str, object] = {"id": session_id, "source": "cli"}
+    if parent_id is not None:
+        payload["source"] = {"subagent": {"other": "worker"}}
+        payload["parent_thread_id"] = parent_id
+    return json.dumps({"type": "session_meta", "payload": payload}) + "\n"
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -184,8 +193,11 @@ class DiscoveryTests(unittest.TestCase):
                 / "rollout-live.jsonl"
             )
             rollout.parent.mkdir(parents=True)
-            rollout.write_text('{"type":"event"}\n', encoding="utf-8")
             session_id = str(uuid.uuid4())
+            rollout.write_text(
+                codex_session_meta(session_id) + '{"type":"event"}\n',
+                encoding="utf-8",
+            )
 
             result = discover_rollouts(
                 codex_home,
@@ -212,9 +224,13 @@ class DiscoveryTests(unittest.TestCase):
                 / "rollout-agent.jsonl"
             )
             rollout.parent.mkdir(parents=True)
-            rollout.write_text('{"type":"event"}\n', encoding="utf-8")
             parent_session_id = str(uuid.uuid4())
             agent_id = str(uuid.uuid4())
+            rollout.write_text(
+                codex_session_meta(agent_id, parent_session_id)
+                + '{"type":"event"}\n',
+                encoding="utf-8",
+            )
 
             result = discover_rollouts(
                 codex_home,
@@ -229,6 +245,10 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(
                 result.native_session_ids[str(rollout.resolve())], agent_id
             )
+            self.assertEqual(
+                result.parent_native_session_ids[str(rollout.resolve())],
+                parent_session_id,
+            )
 
     def test_payload_path_is_prioritized_and_outside_files_are_rejected(self):
         with TemporaryDirectory() as temporary:
@@ -241,6 +261,10 @@ class DiscoveryTests(unittest.TestCase):
             outside = root / "rollout-outside.jsonl"
             for path in (current, recent, outside):
                 path.write_text('{"type":"event"}\n', encoding="utf-8")
+            current.write_text(
+                codex_session_meta(str(uuid.uuid4())) + '{"type":"event"}\n',
+                encoding="utf-8",
+            )
             create_threads_database(
                 codex_home / "state_5.sqlite",
                 [
@@ -292,6 +316,143 @@ class DiscoveryTests(unittest.TestCase):
             result = discover_rollouts(codex_home)
 
             self.assertEqual(result.paths, (rollout.resolve(),))
+
+
+    def _subagent_rollout(self, codex_home: Path, child_id: str) -> Path:
+        rollout = (
+            codex_home
+            / "sessions"
+            / "2026"
+            / "10"
+            / "20"
+            / f"rollout-2026-10-20T00-00-00-{child_id}.jsonl"
+        )
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        return rollout
+
+    def test_tool_hook_inside_subagent_labels_rollout_by_session_meta(self):
+        # Codex fires PreToolUse/PostToolUse inside a subagent with the
+        # parent's session_id but the subagent's own rollout path (COR-4920).
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            parent_id = str(uuid.uuid4())
+            child_id = str(uuid.uuid4())
+            rollout = self._subagent_rollout(codex_home, child_id)
+            rollout.write_text(
+                codex_session_meta(child_id, parent_id) + '{"type":"event"}\n',
+                encoding="utf-8",
+            )
+
+            result = discover_rollouts(
+                codex_home,
+                hook_payload={
+                    "session_id": parent_id,
+                    "transcript_path": str(rollout),
+                },
+            )
+
+            self.assertEqual(result.paths, (rollout.resolve(),))
+            self.assertEqual(result.priority_count, 1)
+            self.assertEqual(
+                result.native_session_ids, {str(rollout.resolve()): child_id}
+            )
+            self.assertEqual(
+                result.parent_native_session_ids,
+                {str(rollout.resolve()): parent_id},
+            )
+
+    def test_tool_hook_parent_hint_links_subagent_without_parent_thread_id(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            parent_id = str(uuid.uuid4())
+            child_id = str(uuid.uuid4())
+            rollout = self._subagent_rollout(codex_home, child_id)
+            rollout.write_text(
+                codex_session_meta(child_id) + '{"type":"event"}\n',
+                encoding="utf-8",
+            )
+
+            result = discover_rollouts(
+                codex_home,
+                hook_payload={
+                    "session_id": parent_id,
+                    "transcript_path": str(rollout),
+                },
+            )
+
+            self.assertEqual(
+                result.native_session_ids[str(rollout.resolve())], child_id
+            )
+            self.assertEqual(
+                result.parent_native_session_ids[str(rollout.resolve())],
+                parent_id,
+            )
+
+    def test_hook_matching_session_meta_keeps_label_without_parent(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            session_id = str(uuid.uuid4())
+            rollout = self._subagent_rollout(codex_home, session_id)
+            rollout.write_text(
+                codex_session_meta(session_id) + '{"type":"event"}\n',
+                encoding="utf-8",
+            )
+
+            result = discover_rollouts(
+                codex_home,
+                hook_payload={
+                    "session_id": session_id,
+                    "transcript_path": str(rollout),
+                },
+            )
+
+            self.assertEqual(result.paths, (rollout.resolve(),))
+            self.assertEqual(
+                result.native_session_ids, {str(rollout.resolve()): session_id}
+            )
+            self.assertEqual(result.parent_native_session_ids, {})
+
+    def test_hook_rollout_without_session_meta_is_deferred(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            parent_id = str(uuid.uuid4())
+            child_id = str(uuid.uuid4())
+            rollout = self._subagent_rollout(codex_home, child_id)
+            meta = codex_session_meta(child_id, parent_id)
+            payload = {"session_id": parent_id, "transcript_path": str(rollout)}
+
+            for partial in ("", meta[:40], '{"type":"event"}\n'):
+                rollout.write_text(partial, encoding="utf-8")
+                result = discover_rollouts(codex_home, hook_payload=payload)
+                self.assertEqual(result.paths, ())
+                self.assertEqual(result.native_session_ids, {})
+                self.assertEqual(result.priority_count, 0)
+
+            rollout.write_text(meta, encoding="utf-8")
+            result = discover_rollouts(codex_home, hook_payload=payload)
+            self.assertEqual(
+                result.native_session_ids, {str(rollout.resolve()): child_id}
+            )
+
+    def test_recent_file_scan_reports_codex_subagent_parent(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            parent_id = str(uuid.uuid4())
+            child_id = str(uuid.uuid4())
+            rollout = self._subagent_rollout(codex_home, child_id)
+            rollout.write_text(
+                codex_session_meta(child_id, parent_id), encoding="utf-8"
+            )
+
+            result = discover_rollouts(codex_home, scan_recent_files=True)
+
+            self.assertEqual(
+                result.native_session_ids, {str(rollout.resolve()): child_id}
+            )
+            self.assertEqual(
+                result.parent_native_session_ids,
+                {str(rollout.resolve()): parent_id},
+            )
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -912,9 +1073,9 @@ class HookIntegrationTests(unittest.TestCase):
                 f"rollout-2026-08-21T00-00-00-{recent_id}.jsonl"
             )
             current.parent.mkdir(parents=True)
-            source = b'{"type":"event_msg"}\n'
+            source = codex_session_meta(current_id).encode() + b'{"type":"event_msg"}\n'
             current.write_bytes(source)
-            recent.write_bytes(source)
+            recent.write_bytes(source.replace(current_id.encode(), recent_id.encode()))
             state_root = codex_home / "sherlock" / "telemetry"
 
             with patch("sherlock_collector.hook.subprocess.Popen") as popen:
@@ -944,6 +1105,48 @@ class HookIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 items[recent_id]["metadata"]["workload_class"],
                 "backfill",
+            )
+
+    def test_post_tool_use_inside_subagent_uploads_under_subagent_id(self):
+        with TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex"
+            parent_id = "99999999-9999-4999-8999-999999999999"
+            child_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            child = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "10"
+                / "20"
+                / f"rollout-2026-10-20T00-00-00-{child_id}.jsonl"
+            )
+            child.parent.mkdir(parents=True)
+            child.write_text(
+                codex_session_meta(child_id, parent_id)
+                + '{"type":"event_msg"}\n',
+                encoding="utf-8",
+            )
+            state_root = codex_home / "sherlock" / "telemetry"
+
+            with patch("sherlock_collector.hook.subprocess.Popen"):
+                result = run_hook(
+                    "PostToolUse",
+                    {
+                        "session_id": parent_id,
+                        "transcript_path": str(child),
+                        "tool_name": "shell",
+                    },
+                    codex_home=codex_home,
+                    state_root=state_root,
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+
+            self.assertEqual(result.enqueued, 1)
+            [pending] = list((state_root / "queue" / "pending").glob("*.json"))
+            manifest = json.loads(pending.read_text(encoding="utf-8"))["manifest"]
+            self.assertEqual(manifest["observed_native_session_id"], child_id)
+            self.assertEqual(
+                manifest["observed_parent_native_session_id"], parent_id
             )
 
     def test_subagent_start_captures_recent_child_before_sqlite_registration(self):

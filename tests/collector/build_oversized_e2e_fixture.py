@@ -104,7 +104,7 @@ def build_codex_fixture(root: Path) -> dict[str, object]:
     first = capturer.capture(
         [rollout],
         native_session_ids=native_sessions,
-        max_sync_bytes=1024 * 1024,
+        max_sync_bytes=len(oversized),
     )
     expected_fragments = (len(oversized) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
     if first.enqueued != expected_fragments or first.captured_bytes != len(oversized):
@@ -311,7 +311,7 @@ def build_claude_fixture(root: Path) -> dict[str, object]:
     first = capturer.capture(
         discovery.paths,
         max_files=1,
-        max_sync_bytes=1024 * 1024,
+        max_sync_bytes=len(oversized),
         **capture_options,
     )
     expected_fragments = (len(oversized) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES

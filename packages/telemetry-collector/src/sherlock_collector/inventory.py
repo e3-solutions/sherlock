@@ -12,7 +12,9 @@ from .discovery import (
     CODEX_BACKFILL_MAX_FILES,
     DEFAULT_LOOKBACK_SECONDS,
     _codex_rollout_identity,
+    _claude_transcript_identity,
     discover_rollouts,
+    discover_claude_transcripts,
 )
 from .rollout import _stream_key, open_regular_under_root
 
@@ -21,7 +23,7 @@ MAX_INVENTORY_BYTES = 512 * 1024 * 1024
 MAX_RECEIPTS = 100_000
 
 
-def _token_scan(data: bytes) -> dict:
+def _token_scan(data: bytes, provider: str = "codex") -> dict:
     records = []
     invalid = 0
     for line in data.splitlines():
@@ -33,17 +35,21 @@ def _token_scan(data: bytes) -> dict:
                 records.append(value)
         except (ValueError, UnicodeDecodeError):
             invalid += 1
-    return scan_token_records(records, source_provider='codex', source_kind='rollout',
+    return scan_token_records(records, source_provider=provider, source_kind='transcript' if provider == 'claude_code' else 'rollout',
                               scope={'start_offset': 0, 'end_offset': len(data),
                                      'source_sha256': hashlib.sha256(data).hexdigest()},
                               uninspectable_records=invalid)
 
 
 def _inspect_source(home: Path, path: Path, native_id: str | None, receipts: list[dict],
-                    budget: int) -> tuple[dict, int]:
+                    budget: int, provider: str = "codex",
+                    parent_id: str | None = None) -> tuple[dict, int]:
     result = {'native_session_id': native_id, 'rollout_path': str(path),
               'source_stream_key': _stream_key(path), 'status': 'unresolved',
               'reason': None, 'token_payload': {'presence': 'unknown'}, 'receipts': []}
+    if provider == "claude_code":
+        result["transcript_path"] = str(path)
+        result["parent_native_session_id"] = parent_id
     if native_id is None:
         result['reason'] = 'native_session_identity_missing'
         return result, 0
@@ -54,7 +60,10 @@ def _inspect_source(home: Path, path: Path, native_id: str | None, receipts: lis
             if before.st_size > min(MAX_INSPECTION_BYTES, budget):
                 result['reason'] = 'inspection_budget_exceeded'
                 return result, 0
-            identity = _codex_rollout_identity(handle)
+            identity = _codex_rollout_identity(handle) if provider == "codex" else None
+            if provider == "claude_code" and _claude_transcript_identity(handle, path.name, (native_id, parent_id)) is None:
+                result['reason'] = 'native_identity_conflict'
+                return result, 0
             if identity and identity[0] and native_id and identity[0] != native_id:
                 result['reason'] = 'native_identity_conflict'
                 return result, 0
@@ -71,11 +80,13 @@ def _inspect_source(home: Path, path: Path, native_id: str | None, receipts: lis
     if not data:
         result['reason'] = 'empty_source_file'
         return result, 0
-    result['token_payload'] = _token_scan(data)
+    result['token_payload'] = _token_scan(data, provider)
+    if not data.endswith(b'\n'):
+        result['incomplete_trailing_record'] = True
     ranges = []
     for receipt in receipts:
         source = receipt['source']
-        if source['source_stream_key'] != result['source_stream_key'] or source['source_provider'] != 'codex' or source['source_kind'] != 'rollout':
+        if source['source_stream_key'] != result['source_stream_key'] or source['source_provider'] != provider or source['source_kind'] != ('transcript' if provider == 'claude_code' else 'rollout'):
             continue
         if source.get('observed_native_session_id') != native_id:
             continue
@@ -104,12 +115,19 @@ def _inspect_source(home: Path, path: Path, native_id: str | None, receipts: lis
 
 def collection_inventory(codex_home: Path | str, state_root: Path | str, *,
                          session_id: str | None = None,
-                         lookback_seconds: int = DEFAULT_LOOKBACK_SECONDS) -> dict:
+                         lookback_seconds: int = DEFAULT_LOOKBACK_SECONDS,
+                         provider: str = "codex") -> dict:
     """Audit the selected snapshot, never infer receipt from a capture cursor."""
     home = Path(codex_home).expanduser().resolve()
-    discovery = discover_rollouts(home, replay_session_id=session_id,
-                                 lookback_seconds=lookback_seconds, scan_recent_files=True,
-                                 rows_per_database=CODEX_BACKFILL_MAX_FILES)
+    if provider not in {"codex", "claude_code"}:
+        raise ValueError("unsupported provider")
+    discovery = (discover_claude_transcripts(
+        home, replay_session_id=session_id,
+        lookback_seconds=None if session_id else lookback_seconds,
+    ) if provider == "claude_code" else discover_rollouts(
+        home, replay_session_id=session_id, lookback_seconds=lookback_seconds,
+        scan_recent_files=True, rows_per_database=CODEX_BACKFILL_MAX_FILES,
+    ))
     errors = list(discovery.errors)
     if not home.is_dir():
         errors.append('source_home_missing_or_unreadable')
@@ -126,7 +144,6 @@ def collection_inventory(codex_home: Path | str, state_root: Path | str, *,
     sources = {}
     for entry in discovery.source_statuses:
         if entry['reason']:
-            reason = entry['reason']
             sources[(entry['native_session_id'], entry['rollout_path'])] = {
                 **entry, 'status': 'unresolved',
                 'token_payload': {'presence': 'unknown'}, 'receipts': [],
@@ -144,7 +161,8 @@ def collection_inventory(codex_home: Path | str, state_root: Path | str, *,
                 'rollout_path': str(path), 'status': 'unresolved', 'reason': 'inventory_source_limit_exceeded',
                 'token_payload': {'presence': 'unknown'}, 'receipts': []}
             continue
-        value, used = _inspect_source(home, path, native_id, receipts, remaining)
+        value, used = _inspect_source(home, path, native_id, receipts, remaining, provider,
+                                      discovery.parent_native_session_ids.get(str(path)))
         sources[(native_id, str(path))] = value
         remaining -= used
     if session_id and not sources:
@@ -163,7 +181,7 @@ def collection_inventory(codex_home: Path | str, state_root: Path | str, *,
     )
     return {'inventory_version': 'sherlock.collection-inventory.v1',
             'status': 'complete' if complete else 'partial',
-            'scope': {'provider': 'codex', 'session_id': session_id,
+            'scope': {'provider': provider, 'session_id': session_id,
                       'lookback_seconds': None if session_id else lookback_seconds,
                       'basis': 'selected_native_sources_at_inventory_time'},
             'sources': rows, 'discovery_errors': errors,

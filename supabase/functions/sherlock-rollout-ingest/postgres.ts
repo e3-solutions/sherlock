@@ -10,6 +10,7 @@ import {
   storagePath,
   timestampMicros,
 } from "./contract.ts";
+import type { ExclusionsReceipt, ExclusionsRepository } from "./exclusions.ts";
 import type { BatchRepository, WorkloadClassHint } from "./service.ts";
 
 type Sql = ReturnType<typeof postgres>;
@@ -21,10 +22,15 @@ export function edgeFunctionDatabaseUrl(databaseUrl: string): string {
   let url: URL;
   try {
     url = new URL(databaseUrl);
+    if (
+      !["postgres:", "postgresql:"].includes(url.protocol) || !url.hostname
+    ) {
+      throw new Error("invalid Postgres URL");
+    }
   } catch {
     throw new IngestError(
       "invalid_configuration",
-      "SUPABASE_DB_URL must be a valid Postgres URL",
+      "SHERLOCK_INGEST_DATABASE_URL must be a valid Postgres URL",
       500,
     );
   }
@@ -37,7 +43,7 @@ export function edgeFunctionDatabaseUrl(databaseUrl: string): string {
   if (hostname.startsWith("db.") && hostname.endsWith(".supabase.co")) {
     throw new IngestError(
       "invalid_configuration",
-      "SUPABASE_DB_URL must use the Supabase transaction pooler",
+      "SHERLOCK_INGEST_DATABASE_URL must use the Supabase transaction pooler (port 6543)",
       500,
     );
   }
@@ -210,7 +216,8 @@ async function findExactBatch(
   return row;
 }
 
-export class PostgresBatchRepository implements BatchRepository {
+export class PostgresBatchRepository
+  implements BatchRepository, ExclusionsRepository {
   constructor(private readonly sql: Sql) {}
 
   static connect(databaseUrl: string): PostgresBatchRepository {
@@ -226,6 +233,44 @@ export class PostgresBatchRepository implements BatchRepository {
 
   async close(): Promise<void> {
     await this.sql.end();
+  }
+
+  // Additive and scoped to the caller's own person; the definer function
+  // validates every id again. Absent in environments without the optional
+  // sherlock_access schema, which reports as temporarily unavailable.
+  async recordOwnerExclusions(
+    attribution: { workspace_id: string; person_id: string },
+    nativeSessionIds: readonly string[],
+  ): Promise<ExclusionsReceipt> {
+    let rows: readonly Record<string, unknown>[];
+    try {
+      rows = await this.sql.begin(async (tx) => {
+        await tx.unsafe("set local role sherlock_ingest");
+        return await tx.unsafe(
+          `select accepted, total
+             from sherlock_access.record_owner_session_exclusions(
+               $1::uuid, $2::uuid, $3::text[])`,
+          [
+            attribution.workspace_id,
+            attribution.person_id,
+            `{${nativeSessionIds.join(",")}}`,
+          ],
+        );
+      });
+    } catch (error) {
+      throw exclusionsError(error);
+    }
+    if (rows.length !== 1) {
+      throw new IngestError(
+        "exclusions_unavailable",
+        "owner exclusions could not be recorded",
+        503,
+      );
+    }
+    return {
+      accepted: Number(rows[0].accepted),
+      total: Number(rows[0].total),
+    };
   }
 
   async resolveAttribution(
@@ -490,4 +535,29 @@ export class PostgresBatchRepository implements BatchRepository {
       return receiptFromRow(inserted[0] as Record<string, unknown>);
     });
   }
+}
+
+// Undefined schema/function or missing privileges mean the optional privacy
+// schema is not deployed here; the function's own argument errors are client
+// errors. Everything else stays an internal error.
+export function exclusionsError(error: unknown): unknown {
+  const code = (error as { code?: unknown })?.code;
+  const message = (error as { message?: unknown })?.message;
+  if (code === "3F000" || code === "42883" || code === "42501") {
+    return new IngestError(
+      "exclusions_unavailable",
+      "owner exclusions are not available",
+      503,
+    );
+  }
+  if (code === "22023" && typeof message === "string") {
+    return new IngestError(
+      "invalid_exclusions",
+      message === "owner_exclusions_unknown_person"
+        ? "collector person is unknown"
+        : "excluded_session_ids are invalid",
+      400,
+    );
+  }
+  return error;
 }

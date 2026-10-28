@@ -149,6 +149,15 @@ mutable identity configuration.
 Native records locate every source record, including unknown or malformed
 ones. They remain separate from events because one native record may produce
 multiple semantic events and later normalizer versions may reinterpret it.
+A record above 16 MiB, including one above 100 MiB, uses deterministic 4 MiB
+`parse_status = fragment` rows. Each stores the original logical range/hash and
+its index/count, while the payload remains in immutable Storage objects. The
+existing int4 `fragment_count` bounds the logical range to `(2^31 - 1) * 4 MiB`;
+there is no 100 MiB schema constraint. Per-batch source/stored limits remain
+16/17 MiB (the bucket permits 50 MiB objects). No reassembly or JSON parsing is
+required by ingest or the worker; each fragment projects as an explicit
+`unknown/native_fragment` event with no conversation text. No source gap is
+silently acknowledged and no omission marker is used.
 
 The database enforces hashes, positive ranges and sizes, controlled values,
 uniqueness, and tenant-consistent foreign keys. The drain must enforce the

@@ -16,15 +16,19 @@ record source offsets are unique, ordered, non-overlapping, and contained by
 the batch; `record_count` equals the array length and is at most 20,000. Source
 batches are capped at 16 MiB and their stable gzip representation at 17 MiB.
 
-A native JSONL record larger than 16 MiB, up to the 100 MiB logical-record
-cap, is transported as canonical 4 MiB source fragments. Each independently
+A complete native JSONL record larger than 16 MiB is transported as canonical 4 MiB source fragments. Each independently
 gzipped batch contains one locator with `parse_status = fragment`, the complete
 native-record range and SHA-256, and its zero-based fragment index/count.
 Parsed type and timestamp fields are null. Fragment ranges are derived exactly
 from the native start plus `fragment_index * 4 MiB`; the final range alone may
 be shorter. Requiring every index, contiguous ranges, and the complete hash
 allows the immutable source record to be reconstructed byte-for-byte without
-misrepresenting transport fragments as independent JSONL records.
+misrepresenting transport fragments as independent JSONL records. The logical
+range is limited only by the PostgreSQL int4 fragment count (`2^31 - 1`), so
+records above 100 MiB use the same wire format. All offsets remain JavaScript
+safe integers; per-request source/stored limits are unchanged. Original bytes
+(including the terminating LF) are hashed with a streaming scan, independently
+of per-fragment integrity. Fragments never claim parsed semantic metadata.
 
 The only successful acknowledgement is a JSON object with
 `receipt_version = sherlock.committed-receipt.v1` and `status = committed`.

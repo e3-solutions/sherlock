@@ -1,12 +1,15 @@
 from __future__ import annotations
+import _isolation  # noqa: F401  (must precede collector imports)
 
 import gzip
 import hashlib
+import io
 import json
 import os
 import threading
 import time
 import unittest
+import urllib.error
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,6 +28,7 @@ from sherlock_collector.contract import (
 )
 from sherlock_collector.config import CollectorIdentity
 from sherlock_collector.drain import (
+    CollectorUploadError,
     Drain,
     PermanentUploadError,
     TransientUploadError,
@@ -141,6 +145,53 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(body["collector"]["email"], "test@example.com")
         self.assertEqual(body["collector"]["github_id"], "test-user")
         self.assertEqual(value["status"], "committed")
+
+    def upload_error(self, status, body):
+        manifest, stored = batch("http-error")
+        error = urllib.error.HTTPError(
+            "https://example.test/ingest", status, "rejected", {}, io.BytesIO(body)
+        )
+        identity = CollectorIdentity(
+            name="Test User", github_id="test-user", email="test@example.com",
+            installation_id="00000000-0000-4000-8000-000000000001",
+        )
+        with patch("sherlock_collector.http.urllib.request.urlopen", side_effect=error):
+            HttpTransport("https://example.test/ingest", identity).upload(
+                SpoolItem(manifest, stored, {})
+            )
+
+    def test_only_known_artifact_status_and_code_pairs_are_permanent(self):
+        # Independently enumerate the current ingest handlers' batch failures.
+        expected = {
+            400: ("invalid_manifest", "invalid_payload", "invalid_gzip",
+                  "stored_integrity_mismatch", "source_integrity_mismatch", "record_integrity_mismatch"),
+            409: ("storage_integrity_conflict", "range_identity_conflict",
+                  "record_identity_conflict", "generation_mapping_conflict", "range_overlap"),
+            413: ("payload_too_large",),
+        }
+        for status, codes in expected.items():
+            for code in codes:
+                with self.subTest(status=status, code=code):
+                    with self.assertRaises(PermanentUploadError) as caught:
+                        self.upload_error(status, json.dumps({"error": {"code": code}}).encode())
+                    self.assertEqual(caught.exception.error_code, code)
+                    self.assertEqual(caught.exception.http_status, status)
+
+    def test_auth_routing_and_unknown_errors_stop_the_collector(self):
+        for status in (400, 401, 403, 404, 405, 407, 408, 409, 410, 413, 422, 425, 429, 500, 503):
+            for body in (b"proxy rejection", b'{"error":{"code":"unknown_error"}}', b'{"error":[]}', b'[]'):
+                with self.subTest(status=status, body=body):
+                    with self.assertRaises(CollectorUploadError) as caught:
+                        self.upload_error(status, body)
+                    self.assertEqual(caught.exception.http_status, status)
+        for status, code in ((400, "invalid_identity"), (409, "identity_conflict"),
+                             (400, "unsupported_contract"), (400, "unsupported_encoding"),
+                             (400, "invalid_workload_class"), (403, "invalid_manifest"),
+                             (422, "invalid_manifest"), (500, "payload_too_large")):
+            with self.subTest(status=status, code=code):
+                with self.assertRaises(CollectorUploadError) as caught:
+                    self.upload_error(status, json.dumps({"error": {"code": code}}).encode())
+                self.assertEqual(caught.exception.error_code, code)
 
     def test_backfill_spool_fact_sets_workload_header(self):
         manifest, stored = batch("stream-backfill-http")
@@ -306,7 +357,68 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertEqual(queued.metadata["last_upload_error"], "try later")
         self.assertEqual(queued.metadata["workload_class"], "backfill")
 
-    def test_permanent_failure_is_retained_and_blocks_only_its_stream(self):
+    def test_collector_failure_stops_all_streams_and_persists_backoff(self):
+        for index in range(6):
+            self.enqueue(f"stream-{index}")
+        before = {p.name: self.spool.load(p) for p in self.spool.list_pending()}
+
+        class Forbidden:
+            calls = 0
+
+            def upload(self, item):
+                self.calls += 1
+                raise CollectorUploadError("HTTP 403", error_code="collector_domain_forbidden", http_status=403)
+
+        transport = Forbidden()
+        with patch("sherlock_collector.drain.time.time", return_value=1000):
+            result = Drain(self.spool, transport, max_workers=1).run()
+            self.assertEqual(result.requeued, 1)
+            self.assertEqual(result.collector_failure["next_upload_at"], 1060)
+            self.assertEqual(result.collector_failure["error_code"], "collector_domain_forbidden")
+            # A newly captured stream and a new drain instance share the cooldown.
+            self.enqueue("new-stream")
+            delayed = Drain(self.spool, transport).run()
+            self.assertEqual(delayed.requeued, 0)
+            self.assertEqual(transport.calls, 1)
+        self.assertEqual(list(self.spool.dead_letter.glob("*.json")), [])
+        for path in self.spool.list_pending():
+            item = self.spool.load(path)
+            if path.name in before:
+                self.assertEqual(item.manifest, before[path.name].manifest)
+                self.assertEqual(item.stored_payload, before[path.name].stored_payload)
+        retried = next(self.spool.load(p) for p in self.spool.list_pending()
+                       if self.spool.load(p).metadata.get("upload_attempts"))
+        self.assertEqual(retried.metadata["last_upload_error_code"], "collector_domain_forbidden")
+        self.assertEqual(retried.metadata["last_upload_http_status"], 403)
+        with patch("sherlock_collector.drain.time.time", return_value=1061):
+            failed_again = Drain(self.spool, transport, max_workers=1).run()
+        self.assertEqual(failed_again.collector_failure["attempts"], 2)
+        self.assertEqual(failed_again.collector_failure["next_upload_at"], 1181)
+        with patch("sherlock_collector.drain.time.time", return_value=1182):
+            recovered = Drain(self.spool, SuccessTransport()).run()
+        self.assertEqual(recovered.uploaded, 7)
+        self.assertIsNone(recovered.collector_failure)
+        self.assertEqual(self.spool.upload_status()["status"], "ready")
+        self.assertIn("recovered_at", self.spool.upload_status())
+
+    def test_collector_failure_only_finishes_already_in_flight_uploads(self):
+        for index in range(12):
+            self.enqueue(f"stream-{index}")
+        barrier = threading.Barrier(3)
+
+        class Unavailable:
+            def upload(self, item):
+                barrier.wait(timeout=5)
+                raise CollectorUploadError("HTTP 404", error_code=None, http_status=404)
+
+        result = Drain(self.spool, Unavailable(), max_workers=3).run()
+        self.assertEqual(result.requeued, 3)
+        self.assertEqual(result.dead_lettered, 0)
+        self.assertEqual(len(self.spool.list_pending()), 12)
+        self.assertEqual(list(self.spool.processing.glob("*.json")), [])
+        self.assertEqual(result.collector_failure["http_status"], 404)
+
+    def test_permanent_failure_is_dead_lettered_and_advances_its_stream(self):
         first, _ = self.enqueue("stream-a")
         self.enqueue("stream-a", first.end_offset)
         self.enqueue("stream-b")
@@ -320,21 +432,59 @@ class CollectorDrainTests(unittest.TestCase):
                     (item.manifest.source_stream_key, item.manifest.start_offset)
                 )
                 if item.manifest.source_stream_key == "stream-a":
-                    raise PermanentUploadError("unsupported contract")
+                    raise PermanentUploadError("invalid manifest", error_code="invalid_manifest", http_status=400)
                 return receipt(item.manifest)
 
         transport = Permanent()
         result = Drain(self.spool, transport).run()
 
-        self.assertEqual(result.requeued, 1)
+        self.assertEqual(result.requeued, 0)
         self.assertEqual(result.uploaded, 1)
-        self.assertEqual(result.dead_lettered, 0)
-        self.assertEqual(len(self.spool.list_pending()), 2)
-        self.assertEqual(list(self.spool.dead_letter.glob("*.json")), [])
+        self.assertEqual(result.dead_lettered, 2)
+        self.assertEqual(len(self.spool.list_pending()), 0)
+        self.assertEqual(len(list(self.spool.dead_letter.glob("*.json"))), 2)
         self.assertEqual(
             sorted(transport.calls),
-            [("stream-a", 0), ("stream-b", 0)],
+            [("stream-a", 0), ("stream-a", first.end_offset), ("stream-b", 0)],
         )
+
+    def test_stalled_streams_reports_failing_heads_and_their_backlog(self):
+        first, _ = self.enqueue("stream-a")
+        self.enqueue("stream-a", first.end_offset)
+        self.enqueue("stream-b")
+
+        class RejectStreamA:
+            def upload(inner_self, item):
+                if item.manifest.source_stream_key == "stream-a":
+                    raise TransientUploadError("session ancestry unavailable")
+                return receipt(item.manifest)
+
+        result = Drain(self.spool, RejectStreamA()).run()
+        self.assertEqual((result.uploaded, result.requeued), (1, 1))
+
+        # A head that only just started failing is not reported yet.
+        fresh = self.spool.stalled_streams()
+        self.assertEqual(fresh["stalled_streams"], 0)
+        self.assertEqual(fresh["stalled_batches"], 0)
+
+        later = self.spool.stalled_streams(now=time.time() + 2 * 60 * 60)
+        self.assertEqual(later["stalled_streams"], 1)
+        self.assertEqual(later["stalled_batches"], 2)
+        self.assertEqual(
+            later["stalled_errors"],
+            [{"error": "session ancestry unavailable", "streams": 1}],
+        )
+        self.assertIsNotNone(later["oldest_stalled_enqueued_at"])
+
+    def test_stalled_streams_ignores_heads_that_never_failed(self):
+        first, _ = self.enqueue("stream-a")
+        self.enqueue("stream-a", first.end_offset)
+
+        health = self.spool.stalled_streams(now=time.time() + 2 * 60 * 60)
+
+        self.assertEqual(health["stalled_streams"], 0)
+        self.assertEqual(health["stalled_errors"], [])
+        self.assertIsNone(health["oldest_stalled_enqueued_at"])
 
     def test_success_preserves_matching_dead_letter_evidence(self):
         manifest, pending = self.enqueue()
@@ -672,18 +822,17 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(second.generation_seq, 1)
         self.assertNotEqual(first.generation_key, second.generation_key)
 
-    def test_unterminated_tail_is_preserved_exactly(self):
+    def test_unterminated_tail_waits_until_a_complete_record(self):
         source = b'{"type":"tail","value":"exact"}'
         self.rollout.write_bytes(source)
-
-        self.capturer.capture([self.rollout])
-
+        self.assertEqual(self.capturer.capture([self.rollout]).enqueued, 0)
+        self.assertEqual(self.spool.list_pending(), [])
+        with self.rollout.open("ab") as handle:
+            handle.write(b"\n")
+        self.assertEqual(self.capturer.capture([self.rollout]).enqueued, 1)
         item = self.spool.load(self.spool.list_pending()[0])
-        self.assertEqual(
-            item.manifest.source_sha256,
-            __import__("hashlib").sha256(source).hexdigest(),
-        )
-        self.assertEqual(item.manifest.end_offset, len(source))
+        self.assertEqual(item.manifest.end_offset, len(source) + 1)
+        self.assertEqual(validate_stored_payload(item.manifest, item.stored_payload), source + b"\n")
 
     def test_corrupt_primary_state_recovers_from_durable_backup(self):
         first = b'{"type":"first"}\n'
@@ -898,7 +1047,7 @@ class RolloutCaptureTests(unittest.TestCase):
     def test_best_effort_capture_does_not_let_bad_file_starve_good_file(self):
         bad = self.root / "bad.jsonl"
         good = self.root / "good.jsonl"
-        bad.write_bytes(b"x" * 1025)
+        bad.write_bytes(b"x" * 1025 + b"\n")
         good.write_bytes(b'{"type":"good"}\n')
         capturer = RolloutCapturer(
             self.root / "best-effort-state",
@@ -936,7 +1085,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(sorted(item.record_count for item in manifests), [1, 20_000])
 
     def test_only_lf_delimits_jsonl_records(self):
-        self.rollout.write_bytes(b"{}\r" * 20_001)
+        self.rollout.write_bytes(b"{}\r" * 20_001 + b"\n")
 
         result = self.capturer.capture([self.rollout])
 
@@ -953,7 +1102,7 @@ class RolloutCaptureTests(unittest.TestCase):
             chunk_bytes=128,
         )
 
-        result = capturer.capture([self.rollout], max_sync_bytes=1024 * 1024)
+        result = capturer.capture([self.rollout], max_sync_bytes=len(source))
 
         expected_count = (len(source) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
         self.assertEqual(result.enqueued, expected_count)
@@ -988,7 +1137,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
 
     def test_fragment_spooling_replays_safely_before_logical_checkpoint(self):
-        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        source = b"x" * (MAX_SOURCE_BYTES + 1) + b"\n"
         self.rollout.write_bytes(source)
         state_root = self.root / "fragment-replay-state"
         capturer = RolloutCapturer(state_root, self.spool, chunk_bytes=128)
@@ -1025,7 +1174,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(next(iter(state["streams"].values()))["offset"], len(source))
 
     def test_fragment_staging_rejects_mutation_before_any_spool_visibility(self):
-        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        source = b"x" * (MAX_SOURCE_BYTES + 1) + b"\n"
         self.rollout.write_bytes(source)
         state_root = self.root / "fragment-mutation-state"
         rollout = self.rollout
@@ -1072,7 +1221,7 @@ class RolloutCaptureTests(unittest.TestCase):
         self.assertEqual(reconstructed, self.rollout.read_bytes())
 
     def test_fragment_manifest_rejects_noncanonical_count(self):
-        source = b"x" * (MAX_SOURCE_BYTES + 1)
+        source = b"x" * (MAX_SOURCE_BYTES + 1) + b"\n"
         self.rollout.write_bytes(source)
         RolloutCapturer(
             self.root / "fragment-contract-state",

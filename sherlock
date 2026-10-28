@@ -5,19 +5,35 @@ set -eu
 REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SHERLOCK_HOME=${SHERLOCK_HOME:-"$HOME/.sherlock"}
+case "$SHERLOCK_HOME" in
+  /*) ;;
+  *) SHERLOCK_HOME="$(pwd)/$SHERLOCK_HOME" ;;  # hooks and scheduler run elsewhere
+esac
 CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 NAME=""
 GITHUB_ID=""
 EMAIL=""
+SCHEDULER_FLAG=""
 CLAUDE_BACKFILL_HOURS=72
+EXCLUDE_PROJECTS=""
+NEWLINE='
+'
 
 usage() {
   cat <<'EOF'
-Usage: ./sherlock install --name NAME --github LOGIN --email EMAIL [--claude-backfill-hours HOURS]
+Usage: ./sherlock install --name NAME --github LOGIN --email EMAIL [--claude-backfill-hours HOURS] [--exclude-project DIR]...
+       ./sherlock exclude-project DIR...
+       ./sherlock include-project DIR...
+       ./sherlock excluded-projects
 
 Installs Sherlock for each available Codex or Claude Code CLI with the same
 team identity. At least one usable agent CLI must already be installed.
+
+Sessions whose working directory is inside an excluded project (or a git
+worktree of one) are never captured or uploaded. Exclusions are stored only on
+this machine in $SHERLOCK_HOME/session-exclusions.json and apply to every
+provider; sessions already uploaded are not removed.
 
 Aliases:
   --github-id LOGIN     Same as --github
@@ -32,8 +48,34 @@ Environment overrides:
   SHERLOCK_INGEST_URL   Collector endpoint
 
 Options:
+  --no-scheduler        Disable periodic collection for both providers
   --claude-backfill-hours  Initial Claude transcript lookback (default: 72; max: 744)
+  --exclude-project DIR Never collect sessions in DIR (repeatable; applied
+                        before the initial backfill)
 EOF
+}
+
+project_exclusions() {
+  # Isolated mode: never import modules from the caller's directory.
+  SHERLOCK_HOME=$SHERLOCK_HOME "$PYTHON_BIN" -I -c \
+    'import sys; sys.path.insert(0, sys.argv[1]); from sherlock_collector.cli import main; raise SystemExit(main(sys.argv[2:]))' \
+    "$REPO_ROOT/packages/telemetry-collector/src" "$@"
+  status=$?
+  if [ "$status" -eq 0 ] && [ "$SHERLOCK_HOME" != "$HOME/.sherlock" ]; then
+    echo "Warning: agent hooks read ~/.sherlock unless SHERLOCK_HOME=$SHERLOCK_HOME is also set in the agent's environment." >&2
+  fi
+  return "$status"
+}
+
+# Older installed runtimes ignore project exclusions; say so instead of
+# implying the policy already applies.
+warn_outdated_runtimes() {
+  for runtime in "$CODEX_HOME/sherlock/runtime" "$CLAUDE_CONFIG_DIR/sherlock/runtime"; do
+    policy_module="$runtime/sherlock_collector/exclusions.py"
+    if [ -f "$runtime/sherlock_collector/cli.py" ] && ! grep -q excluded_project_paths "$policy_module" 2>/dev/null; then
+      echo "Warning: the runtime under $runtime predates project exclusions and ignores them; rerun ./sherlock install to apply them." >&2
+    fi
+  done
 }
 
 if [ "$#" -eq 0 ]; then
@@ -44,6 +86,23 @@ fi
 case "$1" in
   install)
     shift
+    ;;
+  exclude-project|include-project)
+    [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+    command=$1
+    shift
+    if [ "$1" = "--" ]; then
+      shift
+      [ "$#" -ge 1 ] || { usage >&2; exit 2; }
+    fi
+    project_exclusions "$command" -- "$@" || exit
+    warn_outdated_runtimes
+    exit 0
+    ;;
+  excluded-projects)
+    [ "$#" -eq 1 ] || { usage >&2; exit 2; }
+    project_exclusions "$@"
+    exit
     ;;
   -h|--help|help)
     usage
@@ -72,9 +131,24 @@ while [ "$#" -gt 0 ]; do
       EMAIL=$2
       shift 2
       ;;
+    --no-scheduler)
+      SCHEDULER_FLAG=--no-scheduler
+      shift
+      ;;
     --claude-backfill-hours)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       CLAUDE_BACKFILL_HOURS=$2
+      shift 2
+      ;;
+    --exclude-project)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || { usage >&2; exit 2; }
+      case "$2" in
+        *"$NEWLINE"*)
+          echo "--exclude-project paths must not contain newlines." >&2
+          exit 2
+          ;;
+      esac
+      EXCLUDE_PROJECTS="$EXCLUDE_PROJECTS$2$NEWLINE"
       shift 2
       ;;
     -h|--help)
@@ -178,6 +252,18 @@ if [ -n "$RESOLVED_CLAUDE_BIN" ]; then
     --collector-home "$CLAUDE_CONFIG_DIR"
 fi
 
+# Exclusions must exist before either installer runs its initial backfill.
+if [ -n "$EXCLUDE_PROJECTS" ]; then
+  OLD_IFS=$IFS
+  IFS=$NEWLINE
+  # shellcheck disable=SC2086 # split on newlines only
+  set -f
+  set -- $EXCLUDE_PROJECTS
+  set +f
+  IFS=$OLD_IFS
+  project_exclusions exclude-project -- "$@" || exit
+fi
+
 MARKETPLACE_ROOT="$SHERLOCK_HOME/marketplace"
 "$PYTHON_BIN" "$REPO_ROOT/plugins/sherlock/scripts/stage_marketplace.py" \
   --repo-root "$REPO_ROOT" \
@@ -186,6 +272,7 @@ MARKETPLACE_ROOT="$SHERLOCK_HOME/marketplace"
 if [ -n "$RESOLVED_CODEX_BIN" ]; then
   SHERLOCK_MARKETPLACE_ROOT=$MARKETPLACE_ROOT \
     CODEX_BIN=$RESOLVED_CODEX_BIN "$REPO_ROOT/install.sh" \
+    ${SCHEDULER_FLAG:+"$SCHEDULER_FLAG"} \
     --name "$NAME" \
     --github-id "$GITHUB_ID" \
     --email "$EMAIL"
@@ -194,6 +281,7 @@ fi
 if [ -n "$RESOLVED_CLAUDE_BIN" ]; then
   SHERLOCK_MARKETPLACE_ROOT=$MARKETPLACE_ROOT \
     CLAUDE_BIN=$RESOLVED_CLAUDE_BIN "$REPO_ROOT/install-claude.sh" \
+    ${SCHEDULER_FLAG:+"$SCHEDULER_FLAG"} \
     --name "$NAME" \
     --github-id "$GITHUB_ID" \
     --email "$EMAIL" \
@@ -211,4 +299,12 @@ if [ -n "$RESOLVED_CLAUDE_BIN" ]; then
 else
   echo "  Claude Code: skipped - $CLAUDE_SKIP_REASON"
 fi
+if [ "$SCHEDULER_FLAG" = "--no-scheduler" ] || [ "${SHERLOCK_NO_SCHEDULER:-0}" = "1" ]; then
+  echo "  Periodic collection: disabled"
+else
+  echo "  Periodic collection: every 15 minutes for each installed provider (an earlier opt-out is kept)"
+fi
 echo "Start a new session in each installed agent to load its hooks."
+if [ -n "$EXCLUDE_PROJECTS" ]; then
+  warn_outdated_runtimes
+fi

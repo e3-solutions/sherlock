@@ -557,6 +557,44 @@ Deno.test("fragment manifests use the deterministic 4 MiB partition", async () =
   assert(parsed.manifest.records[0].fragment_count === 6);
 });
 
+Deno.test("fragments above 100 MiB retain per-object integrity and idempotency", async () => {
+  const { attribution, manifest } = await fixture();
+  // Last, short fragment of a >100 MiB logical record: no huge test allocation.
+  const logicalBytes = 104 * 1024 * 1024 + 7;
+  const source = new TextEncoder().encode("tail}\n ");
+  const stored = new Uint8Array(
+    await new Response(
+      new Blob([source]).stream().pipeThrough(new CompressionStream("gzip")),
+    ).arrayBuffer(),
+  );
+  const fragmented = fragmentManifest(manifest, 26, logicalBytes);
+  fragmented.source_sha256 = await sha256Hex(source);
+  fragmented.stored_byte_count = stored.byteLength;
+  fragmented.stored_sha256 = await sha256Hex(stored);
+  fragmented.records[0].record_sha256 = fragmented.source_sha256;
+  validateManifest(fragmented);
+  assert((await validateStoredBatch(fragmented, stored)).byteLength === 7);
+  const storage = new MemoryStorage();
+  const batches = new MemoryBatches();
+  const service = new IngestService(storage, batches);
+  const first = await service.ingest(attribution, fragmented, stored);
+  const second = await service.ingest(attribution, fragmented, stored);
+  assert(first.batch_id === second.batch_id);
+  assert(storage.calls === 1);
+  const changed = { ...fragmented, source_sha256: "d".repeat(64) };
+  try {
+    await validateStoredBatch(changed, stored);
+    assert(false, "fragment source integrity must still be checked");
+  } catch (error) {
+    assert(
+      error instanceof IngestError &&
+        error.code === "source_integrity_mismatch",
+    );
+  }
+  // The database count boundary is accepted without allocating the logical record.
+  validateManifest(fragmentManifest(manifest, 0, MAX_LOGICAL_RECORD_BYTES));
+});
+
 Deno.test("fragment manifests reject incomplete or non-deterministic metadata", async () => {
   const { manifest } = await fixture();
   const fragmented = fragmentManifest(manifest);

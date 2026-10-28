@@ -45,8 +45,12 @@ selecting only the newest files. JSON status reports `deferred_files` and
 `deferred_bytes` when a pass reaches a bound or observes an incomplete trailing
 record; a partial result prints a warning. Later `SessionStart` hooks resume
 transcripts still inside the default 72-hour window, while older configured
-windows should be retried with the installer or `replay-history`. Hooks resume
-the same checkpointed catch-up. Once Claude finishes the trailing record,
+windows can also be retried with the installer or `replay-history`. The default
+periodic reconciler independently scans all retained history every 15 minutes,
+including old deferred sources, and resumes the same capture checkpoints and
+upload queue. It uses a low-priority LaunchAgent or systemd user timer with a
+crontab fallback. Pass `--no-scheduler` to opt out and remove a prior entry.
+Hooks resume the same checkpointed catch-up. Once Claude finishes the trailing record,
 Sherlock queues that exact remaining byte range once.
 Historical transcripts do not fabricate `Stop` or `SubagentStop` evidence that
 Sherlock never observed, so pre-install turns can remain provisionally open.
@@ -93,7 +97,8 @@ This keeps the hook fail-open and makes the final transcript capture survive
 non-interactive `claude -p` teardown. Terminal hooks give Claude's asynchronous
 transcript writer a bounded quiet window in that detached process before
 capturing the final byte range. Verification above is local-only: it
-confirms plugin enablement, configuration, and queue health, but does not prove
+confirms plugin enablement, configuration, scheduler registration (or explicit
+opt-out), and queue health, but does not prove
 that an upload was committed, normalized, or displayed by the dashboard.
 Dead-lettered batches make this local check fail with `"status":"degraded"`.
 

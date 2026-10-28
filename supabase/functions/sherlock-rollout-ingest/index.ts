@@ -1,6 +1,10 @@
 import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
-import { PostgresBatchRepository } from "./postgres.ts";
+import { parseExclusionsRequest, requestOperation } from "./exclusions.ts";
+import {
+  edgeFunctionDatabaseUrl,
+  PostgresBatchRepository,
+} from "./postgres.ts";
 import { IngestService, type WorkloadClassHint } from "./service.ts";
 import { SupabaseImmutableStorage } from "./storage.ts";
 
@@ -17,6 +21,16 @@ function required(
   return value;
 }
 
+export function ingestDatabaseUrl(
+  environment: EnvironmentReader = (name) => Deno.env.get(name),
+): string {
+  // Supabase injects SUPABASE_DB_URL as a direct connection. Ingestion needs
+  // its own configurable pooler URL rather than that reserved variable.
+  return edgeFunctionDatabaseUrl(
+    required("SHERLOCK_INGEST_DATABASE_URL", environment),
+  );
+}
+
 let backend: {
   service: IngestService;
   batches: PostgresBatchRepository;
@@ -26,7 +40,7 @@ function ingestBackend(): {
   batches: PostgresBatchRepository;
 } {
   if (backend) return backend;
-  const databaseUrl = required("SUPABASE_DB_URL");
+  const databaseUrl = ingestDatabaseUrl();
   const batches = PostgresBatchRepository.connect(databaseUrl);
   backend = {
     batches,
@@ -62,12 +76,32 @@ export async function handleRequest(
       });
     }
     const body = await readJsonBounded(request);
+    const routing = () =>
+      workspaceRoutingConfig(
+        required("SHERLOCK_E3_WORKSPACE_ID", environment),
+        required("SHERLOCK_SIXTYFOUR_WORKSPACE_ID", environment),
+      );
+    if (requestOperation(body) !== null) {
+      // Authenticated exactly like a batch: the same collector identity
+      // resolves the workspace and person the exclusions are scoped to.
+      const exclusions = parseExclusionsRequest(body);
+      const grant = publicCollectorGrant(routing(), exclusions.collector);
+      const current = backendFactory();
+      const attribution = await current.batches.resolveAttribution(
+        grant,
+        exclusions.collector,
+      );
+      const receipt = await current.batches.recordOwnerExclusions(
+        attribution,
+        exclusions.excluded_session_ids,
+      );
+      return Response.json(receipt, {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
     const envelope = parseEnvelope(body);
-    const routing = workspaceRoutingConfig(
-      required("SHERLOCK_E3_WORKSPACE_ID", environment),
-      required("SHERLOCK_SIXTYFOUR_WORKSPACE_ID", environment),
-    );
-    const grant = publicCollectorGrant(routing, envelope.collector);
+    const grant = publicCollectorGrant(routing(), envelope.collector);
     const current = backendFactory();
     const attribution = await current.batches.resolveAttribution(
       grant,
