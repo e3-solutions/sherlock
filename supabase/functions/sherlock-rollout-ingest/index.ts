@@ -1,7 +1,10 @@
 import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
 import { parseExclusionsRequest, requestOperation } from "./exclusions.ts";
-import { PostgresBatchRepository } from "./postgres.ts";
+import {
+  edgeFunctionDatabaseUrl,
+  PostgresBatchRepository,
+} from "./postgres.ts";
 import { IngestService, type WorkloadClassHint } from "./service.ts";
 import { SupabaseImmutableStorage } from "./storage.ts";
 
@@ -18,6 +21,16 @@ function required(
   return value;
 }
 
+export function ingestDatabaseUrl(
+  environment: EnvironmentReader = (name) => Deno.env.get(name),
+): string {
+  // Supabase injects SUPABASE_DB_URL as a direct connection. Ingestion needs
+  // its own configurable pooler URL rather than that reserved variable.
+  return edgeFunctionDatabaseUrl(
+    required("SHERLOCK_INGEST_DATABASE_URL", environment),
+  );
+}
+
 let backend: {
   service: IngestService;
   batches: PostgresBatchRepository;
@@ -27,7 +40,7 @@ function ingestBackend(): {
   batches: PostgresBatchRepository;
 } {
   if (backend) return backend;
-  const databaseUrl = required("SUPABASE_DB_URL");
+  const databaseUrl = ingestDatabaseUrl();
   const batches = PostgresBatchRepository.connect(databaseUrl);
   backend = {
     batches,
