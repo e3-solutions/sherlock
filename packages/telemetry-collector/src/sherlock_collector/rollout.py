@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import bisect
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import stat as stat_module
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping
 
@@ -27,6 +29,14 @@ DEFAULT_MAX_SYNC_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_OBJECT_BYTES = MAX_SOURCE_BYTES
 PREFIX_BYTES = 4096
 SCAN_BYTES = 1024 * 1024
+# Each caller keeps its own backlog cursor in the shared state file. A hook's
+# backlog is usually empty, so a single shared cursor let every hook event
+# reset the periodic reconciler back to the first sorted file (COR-5023).
+HOOK_CURSOR = "hook"
+RECONCILE_CURSOR = "reconcile"
+# Policy-blocked backlog files do not use the per-run file budget; this bounds
+# how many of them one run may step over before it yields.
+BLOCKED_SCAN_FACTOR = 16
 
 
 class _OversizedNativeRecord(ContractError):
@@ -196,6 +206,9 @@ class RolloutCapturer:
         self.source_home = Path(source_home) if source_home is not None else None
         self.source_issues: dict[str, str] = {}
         self.visited_paths: set[str] = set()
+        # Paths whose durable cursor reached the end observed during this run.
+        self.completed_paths: set[str] = set()
+        self._cursors: dict[str, str] = {}
         self._capture_enqueued = self._capture_bytes = 0
         self.capture_unterminated_tail = capture_unterminated_tail
         self.allowed_root_input = (
@@ -215,6 +228,10 @@ class RolloutCapturer:
         self.state_path = self.state_root / f"{state_name}-state.json"
         self.state_backup_path = self.state_root / f"{state_name}-state.previous.json"
         self.lock_path = self.state_root / f"{state_name}-sync.lock"
+        # Write-ahead record of each cursor advance, so a process killed between
+        # enqueueing a batch and saving the full state cannot re-capture the same
+        # start offset later (the source of server range_overlap rejections).
+        self.journal_path = self.state_root / f"{state_name}-journal.jsonl"
 
     def capture(
         self,
@@ -229,6 +246,7 @@ class RolloutCapturer:
         priority_workload_class: str | None = None,
         backlog_workload_class: str | None = None,
         source_snapshots: Mapping[str, SourceSnapshot] | None = None,
+        cursor_name: str = HOOK_CURSOR,
     ) -> CaptureResult:
         with secure_lock(self.lock_path) as lock:
             try:
@@ -237,6 +255,7 @@ class RolloutCapturer:
                 return CaptureResult(locked=True)
             self.source_issues = {}
             self.visited_paths = set()
+            self.completed_paths = set()
             self._capture_enqueued = self._capture_bytes = 0
             states, candidate_cursor = self._load_state()
             policy = self.exclusion_policy or load_policy()
@@ -250,21 +269,23 @@ class RolloutCapturer:
             }
             priority_count = min(max(0, priority_count), len(all_paths), max_files)
             priority_paths = all_paths[:priority_count]
+            priority_set = set(priority_paths)
             backlog_paths = sorted(all_paths[priority_count:])
-            if backlog_paths:
-                candidate_cursor %= len(backlog_paths)
-                rotated = (
-                    backlog_paths[candidate_cursor:] + backlog_paths[:candidate_cursor]
-                )
-                selected_paths = priority_paths + rotated[: max_files - priority_count]
-            else:
-                selected_paths = priority_paths
-            visited_backlog = 0
-            for raw_path in selected_paths:
-                if captured >= max_sync_bytes:
+            start = self._cursor_start(backlog_paths, cursor_name, candidate_cursor)
+            rotated = backlog_paths[start:] + backlog_paths[:start]
+            selected_files = blocked_backlog = 0
+            last_backlog: str | None = None
+            for raw_path in itertools.chain(priority_paths, rotated):
+                if captured >= max_sync_bytes or selected_files >= max_files:
                     break
-                if raw_path not in priority_paths:
-                    visited_backlog += 1
+                is_priority = raw_path in priority_set
+                if (
+                    not is_priority
+                    and blocked_backlog >= max_files * BLOCKED_SCAN_FACTOR
+                ):
+                    break
+                if not is_priority:
+                    last_backlog = raw_path
                 path = Path(raw_path)
                 self.visited_paths.add(raw_path)
                 blocked = policy.blocked_reason(
@@ -275,9 +296,14 @@ class RolloutCapturer:
                     source_path=path,
                 )
                 if blocked:
-                    # Local owner policy: keep the cursor, capture nothing.
+                    # Local owner policy: capture nothing and step over the file
+                    # without spending this run's file budget on it, so a backlog
+                    # that starts with excluded files still reaches the rest.
                     self.source_issues[raw_path] = blocked
+                    if not is_priority:
+                        blocked_backlog += 1
                     continue
+                selected_files += 1
                 before_enqueued, before_captured = self._capture_enqueued, self._capture_bytes
                 try:
                     self._capture_path(
@@ -303,12 +329,19 @@ class RolloutCapturer:
                     # Include durable chunks written before a later record failed.
                     enqueued += self._capture_enqueued - before_enqueued
                     captured += self._capture_bytes - before_captured
-            next_cursor = (
-                (candidate_cursor + visited_backlog) % len(backlog_paths)
-                if backlog_paths
-                else 0
-            )
+            next_cursor = candidate_cursor
+            if last_backlog is not None:
+                # Resume after the last backlog file examined. A run with no
+                # backlog (a hook naming only its own transcript) leaves every
+                # cursor where it was.
+                self._cursors[cursor_name] = last_backlog
+                if cursor_name == HOOK_CURSOR:
+                    # Older runtimes read only this index; keep it meaningful.
+                    next_cursor = bisect.bisect_right(backlog_paths, last_backlog) % len(
+                        backlog_paths
+                    )
             self._save_state(states, next_cursor, update_backup=True)
+            self._clear_journal()
             deferred_files, deferred_bytes = self._deferred_snapshots(
                 all_paths,
                 snapshots,
@@ -508,6 +541,14 @@ class RolloutCapturer:
                     ),
                     collector_version=self.collector_version,
                 )
+                # Record the advance before the batch becomes durable. Replay
+                # applies it only when the batch reached the spool, so a kill at
+                # any point never re-captures this start offset (range_overlap).
+                self._journal_advance(
+                    key,
+                    replace(state, offset=manifest.end_offset),
+                    manifest.spool_key,
+                )
                 self.spool.enqueue(
                     manifest,
                     stored,
@@ -517,10 +558,11 @@ class RolloutCapturer:
                 self._capture_bytes += len(source)
                 state.offset = manifest.end_offset
                 states[key] = state
-                self._save_state(states, candidate_cursor)
                 enqueued += 1
                 captured += len(source)
             states[key] = state
+            if state.offset >= stable_end and state.pending_fragment is None:
+                self.completed_paths.add(str(path))
             return enqueued, captured
 
     def _native_record_fragment_plan(
@@ -788,13 +830,102 @@ class RolloutCapturer:
             return source[:search_from]
         return source
 
+    def _cursor_start(
+        self,
+        backlog_paths: list[str],
+        cursor_name: str,
+        legacy_cursor: int,
+    ) -> int:
+        if not backlog_paths:
+            return 0
+        after = self._cursors.get(cursor_name)
+        if after is None:
+            # Only the hook ever used the legacy index; the reconciler starts
+            # its own cursor at the first file.
+            return legacy_cursor % len(backlog_paths) if cursor_name == HOOK_CURSOR else 0
+        return bisect.bisect_right(backlog_paths, after) % len(backlog_paths)
+
+    def _journal_advance(self, key: str, state: StreamState, spool_key: str) -> None:
+        line = (
+            json.dumps(
+                {"key": key, "spool_key": spool_key, "state": asdict(state)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        descriptor = os.open(
+            self.journal_path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.write(descriptor, line)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _clear_journal(self) -> None:
+        try:
+            self.journal_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _spooled(self, spool_key: str) -> bool:
+        name = f"{spool_key}.json"
+        return (
+            any(
+                (directory / name).exists()
+                for directory in (
+                    self.spool.pending,
+                    self.spool.processing,
+                    self.spool.receipts,
+                    self.spool.dead_letter,
+                )
+            )
+            or any(self.spool.dead_letter.glob(f"{spool_key}.*.json"))
+        )
+
+    def _replay_journal(self, states: dict[str, StreamState]) -> int:
+        """Apply journaled advances whose batch is durably in the spool."""
+        try:
+            raw = self.journal_path.read_bytes()
+        except FileNotFoundError:
+            return 0
+        applied = 0
+        for line in raw.splitlines():
+            try:
+                entry = json.loads(line)
+                key = entry["key"]
+                spool_key = entry["spool_key"]
+                advanced = StreamState(**entry["state"])
+            except (ValueError, TypeError, KeyError):
+                # A torn final line: its batch was never acknowledged as spooled.
+                continue
+            if not isinstance(key, str) or not isinstance(spool_key, str):
+                continue
+            if not self._spooled(spool_key):
+                continue
+            current = states.get(key)
+            if (
+                current is None
+                or current.generation_seq < advanced.generation_seq
+                or (
+                    current.generation_key == advanced.generation_key
+                    and current.offset < advanced.offset
+                )
+            ):
+                states[key] = advanced
+                applied += 1
+        return applied
+
     def _load_state(self) -> tuple[dict[str, StreamState], int]:
         errors: list[Exception] = []
         for path in (self.state_path, self.state_backup_path):
             if not path.exists():
                 continue
             try:
-                result = self._read_state(path)
+                states, cursor, cursors = self._read_state_full(path)
             except (
                 OSError,
                 UnicodeDecodeError,
@@ -804,15 +935,30 @@ class RolloutCapturer:
             ) as error:
                 errors.append(error)
                 continue
-            if path == self.state_backup_path:
-                self._save_state(*result)
-            return result
+            self._cursors = cursors
+            replayed = self._replay_journal(states)
+            if path == self.state_backup_path or replayed:
+                self._save_state(states, cursor)
+            self._clear_journal()
+            return states, cursor
         if errors:
             raise ValueError("rollout state and backup are unreadable") from errors[0]
-        return {}, 0
+        self._cursors = {}
+        states: dict[str, StreamState] = {}
+        if self._replay_journal(states):
+            self._save_state(states, 0)
+        self._clear_journal()
+        return states, 0
+
+    @classmethod
+    def _read_state(cls, path: Path) -> tuple[dict[str, StreamState], int]:
+        states, cursor, _ = cls._read_state_full(path)
+        return states, cursor
 
     @staticmethod
-    def _read_state(path: Path) -> tuple[dict[str, StreamState], int]:
+    def _read_state_full(
+        path: Path,
+    ) -> tuple[dict[str, StreamState], int, dict[str, str]]:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("rollout state must be an object")
@@ -827,12 +973,24 @@ class RolloutCapturer:
             for value in extensions.values()
         ):
             raise ValueError("invalid rollout stream extensions")
+        named = raw.get("cursors", {})
+        # Named cursors are advisory: an unreadable entry restarts that scan.
+        cursors = (
+            {
+                name: value
+                for name, value in named.items()
+                if isinstance(name, str) and isinstance(value, str)
+            }
+            if isinstance(named, dict)
+            else {}
+        )
         return (
             {
                 key: StreamState(**{**value, **extensions.get(key, {})})
                 for key, value in raw["streams"].items()
             },
             cursor,
+            cursors,
         )
 
     def _save_state(
@@ -865,6 +1023,10 @@ class RolloutCapturer:
         }
         if extensions:
             value["stream_extensions"] = extensions
+        if self._cursors:
+            # Older runtimes ignore (and drop) this key; they fall back to
+            # candidate_cursor, exactly as before named cursors existed.
+            value["cursors"] = dict(sorted(self._cursors.items()))
         _atomic_json(
             self.state_path,
             value,

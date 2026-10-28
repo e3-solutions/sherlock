@@ -475,8 +475,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "health":
         pending_batches = len(spool.list_pending())
         processing_batches = len(list(spool.processing.glob("*.json")))
-        dead_letter_batches = len(list(spool.dead_letter.glob("*.json")))
+        dead_letters = spool.dead_letter_summary()
+        dead_letter_batches = dead_letters["dead_letter_batches"]
         stalled = spool.stalled_streams()
+        try:
+            reconcile_status = json.loads((state_root / "collector-status.json").read_text())
+            if not isinstance(reconcile_status, dict):
+                reconcile_status = {}
+        except (OSError, ValueError):
+            reconcile_status = {}
         status = (
             "degraded"
             if dead_letter_batches
@@ -495,8 +502,20 @@ def main(argv: list[str] | None = None) -> int:
                     "state_root": str(state_root),
                     "pending_batches": pending_batches,
                     "processing_batches": processing_batches,
-                    "dead_letter_batches": dead_letter_batches,
+                    **dead_letters,
                     **stalled,
+                    "reconcile_runs_without_progress": reconcile_status.get(
+                        "runs_without_progress"
+                    ),
+                    "reconcile_last_progress_at": reconcile_status.get(
+                        "last_progress_at"
+                    ),
+                    "reconcile_eligible_unfinished_sources": reconcile_status.get(
+                        "eligible_unfinished_sources"
+                    ),
+                    "pending_source_markers": reconcile_status.get(
+                        "pending_source_markers"
+                    ),
                 },
                 sort_keys=True,
             )

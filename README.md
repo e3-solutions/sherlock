@@ -159,6 +159,25 @@ the server code, HTTP status and timestamp, while other byte ranges continue.
 Dead letters require operator review and requeue after the rejection is corrected;
 they never count as committed receipts.
 
+Hooks and the reconciler keep separate backlog cursors (`cursors` in
+`<state>-state.json`), so hook events no longer restart the reconciler at the first
+file, and owner-excluded files are stepped over without using the per-run file
+budget. Each cursor advance is journaled (`<state>-journal.jsonl`) before its batch
+is enqueued, so a process killed between enqueue and the state save cannot
+re-capture the same start offset (the cause of HTTP 409 `range_overlap`). For a
+`range_overlap` dead letter, the reconciler re-enqueues only the part no local
+committed receipt covers, from the dead letter's own bytes, and marks it
+`overlap_repair`. When a hook cannot capture a transcript or rollout it named (the
+capture lock is busy, or a terminal event left it unfinished), it leaves a marker in
+`<state>-pending/`; later hooks and the reconciler capture marked sources first.
+
+Every reconcile writes counters only (no content) to
+`sherlock/telemetry/collector-status.json`: `dead_letters`, `dead_letter_codes`
+(for example `{"409_range_overlap": 3}`), `dead_letters_total`,
+`runs_without_progress`, `eligible_unfinished_sources` (owner-excluded files are
+not counted) and `pending_source_markers`. `health` reports the same counters, and
+`queue/dead-letter-stats.json` keeps a cumulative count by reason code.
+
 Scheduled runs have no interactive input and write to
 `sherlock/telemetry/<provider>-reconcile.log` under the state root. Logs rotate at
 1 MiB with three backups (at most 4 MiB per provider), with owner-only permissions.
