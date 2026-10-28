@@ -279,3 +279,27 @@ identity, boundary/undated winners, null canonical keys, native-range conflicts,
 backward timestamps, missing baselines/components, and counter regressions.
 Read-only production timing attempts without the new indexes still timed out;
 apply the migration before evaluating production performance.
+
+### Production measurement (2026-10-28 UTC, before the indexes)
+
+Read-only, as `postgres` (no reader row security), on a 1-hour live window
+of the e3group.ai workspace, with window discovery approximated through
+`events_recent_sessions_idx`:
+
+- Coverage: 2,659 usage observations in 66 sessions, 1.13 s. Most of it is
+  the per-observation `native_records`/`ingest_batches` lookups and
+  normalizer probes (~0.3 ms per observation, largely disk reads; the
+  instance has 2 GB of shared buffers against a 19 GB events heap and a
+  15 GB native-records heap). A day holds roughly 50-65k observations, so
+  a 1-day coverage call is expected near 10-20 s and 7 days cannot finish
+  inside 20 s. That is why the default is 24 hours and the cap 7 days.
+- Usage: the same 66 sessions have 41,596 usage/turn-context rows of
+  history. Joining only that history to `native_records` and
+  `ingest_batches` took 15.0 s (31,901 buffer reads). Reading complete
+  touched-session history therefore cannot fit a 1-day window in 20 s on
+  this instance, with or without the new indexes. `query_usage` returns
+  `query_timeout` for such windows; making it routinely answer needs
+  precomputed per-session usage (or a bounded baseline), not more indexes.
+
+Re-measure after applying the index migration before relying on these
+estimates.
