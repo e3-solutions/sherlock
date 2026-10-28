@@ -1,5 +1,9 @@
-import { CONTRACT_VERSION, sha256Hex } from "./contract.ts";
-import { handleRequest, parseWorkloadClassHint } from "./index.ts";
+import { CONTRACT_VERSION, IngestError, sha256Hex } from "./contract.ts";
+import {
+  handleRequest,
+  ingestDatabaseUrl,
+  parseWorkloadClassHint,
+} from "./index.ts";
 import { exclusionsError, PostgresBatchRepository } from "./postgres.ts";
 
 function assert(
@@ -8,6 +12,61 @@ function assert(
 ): asserts condition {
   if (!condition) throw new Error(message);
 }
+
+Deno.test("ingest uses its custom pooler URL despite injected direct database URL", () => {
+  const variables: Record<string, string> = {
+    SHERLOCK_INGEST_DATABASE_URL:
+      "postgresql://postgres.project:secret@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require",
+    SUPABASE_DB_URL:
+      "postgresql://postgres:injected-secret@db.project.supabase.co:5432/postgres",
+  };
+  const url = new URL(ingestDatabaseUrl((name) => variables[name]));
+  assert(url.hostname === "aws-0-us-east-1.pooler.supabase.com");
+  assert(url.port === "6543");
+  assert(url.username === "postgres.project" && url.password === "secret");
+  assert(url.searchParams.get("sslmode") === "require");
+});
+
+Deno.test("ingest configuration fails actionably without exposing credentials", () => {
+  for (
+    const [value, message] of [
+      [undefined, "SHERLOCK_INGEST_DATABASE_URL is required"],
+      ["", "SHERLOCK_INGEST_DATABASE_URL is required"],
+      [
+        "not-a-url:secret",
+        "SHERLOCK_INGEST_DATABASE_URL must be a valid Postgres URL",
+      ],
+      [
+        "https://user:secret@example.com/db",
+        "SHERLOCK_INGEST_DATABASE_URL must be a valid Postgres URL",
+      ],
+      [
+        "postgresql://postgres:secret@db.project.supabase.co:5432/postgres",
+        "SHERLOCK_INGEST_DATABASE_URL must use the Supabase transaction pooler (port 6543)",
+      ],
+    ] as const
+  ) {
+    let thrown: unknown;
+    try {
+      ingestDatabaseUrl((name) =>
+        name === "SHERLOCK_INGEST_DATABASE_URL"
+          ? value
+          : "postgresql://postgres:injected-secret@db.project.supabase.co/postgres"
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    assert(thrown instanceof IngestError);
+    assert(thrown.status === 500 && thrown.code === "invalid_configuration");
+    assert(thrown.message === message);
+    assert(!thrown.message.includes("secret"));
+  }
+});
+
+Deno.test("ingest supports explicit local Postgres configuration", () => {
+  const local = "postgresql://postgres:local@127.0.0.1:54322/postgres";
+  assert(ingestDatabaseUrl(() => local) === local);
+});
 
 Deno.test("workload class header is optional and strictly bounded", () => {
   assert(parseWorkloadClassHint(null) === null);

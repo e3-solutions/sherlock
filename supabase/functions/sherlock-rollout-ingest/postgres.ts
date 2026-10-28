@@ -22,10 +22,15 @@ export function edgeFunctionDatabaseUrl(databaseUrl: string): string {
   let url: URL;
   try {
     url = new URL(databaseUrl);
+    if (
+      !["postgres:", "postgresql:"].includes(url.protocol) || !url.hostname
+    ) {
+      throw new Error("invalid Postgres URL");
+    }
   } catch {
     throw new IngestError(
       "invalid_configuration",
-      "SUPABASE_DB_URL must be a valid Postgres URL",
+      "SHERLOCK_INGEST_DATABASE_URL must be a valid Postgres URL",
       500,
     );
   }
@@ -38,7 +43,7 @@ export function edgeFunctionDatabaseUrl(databaseUrl: string): string {
   if (hostname.startsWith("db.") && hostname.endsWith(".supabase.co")) {
     throw new IngestError(
       "invalid_configuration",
-      "SUPABASE_DB_URL must use the Supabase transaction pooler",
+      "SHERLOCK_INGEST_DATABASE_URL must use the Supabase transaction pooler (port 6543)",
       500,
     );
   }
