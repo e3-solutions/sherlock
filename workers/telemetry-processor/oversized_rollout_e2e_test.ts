@@ -281,6 +281,7 @@ async function runOversizedE2E(
   const previousEnvironment = new Map<string, string | undefined>();
   for (
     const [name, value] of Object.entries({
+      SHERLOCK_INGEST_DATABASE_URL: databaseUrl!,
       SUPABASE_DB_URL: databaseUrl!,
       SUPABASE_URL: supabaseUrl!,
       SUPABASE_SERVICE_ROLE_KEY: serviceRoleKey!,
