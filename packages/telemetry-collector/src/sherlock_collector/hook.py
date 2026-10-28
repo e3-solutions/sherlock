@@ -218,6 +218,7 @@ def _remember_uncaptured(
         pending_sources.remember(root, state_name, unfinished, native_ids, parent_ids)
     pending_sources.settle(
         reminders,
+        visited=capturer.visited_paths,
         completed=capturer.completed_paths,
         source_issues=capturer.source_issues,
         blocked_reasons=FINAL_POLICY_REASONS,
@@ -295,10 +296,10 @@ def _capture_hook(
     # come right after this hook's own sources.
     reminders = [
         entry
-        for entry in pending_sources.load(root, source_state_name)
+        for entry in pending_sources.load(
+            root, source_state_name, allowed_root=allowed_root
+        )
         if entry.path not in hook_paths
-        and allowed_root is not None
-        and entry.path.startswith(str(allowed_root) + os.sep)
     ]
     capture_paths = [
         *hook_paths,

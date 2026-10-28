@@ -269,6 +269,52 @@ class HookNamedSourceTests(unittest.TestCase):
             self.assertEqual(result["pending_source_markers"], 0)
 
 
+    def test_unfinishable_markers_age_out_and_never_starve_the_backlog(self):
+        with TemporaryDirectory() as directory:
+            home, state = Path(directory) / "claude", Path(directory) / "state"
+            stuck = []
+            for index in range(pending_sources.MAX_MARKERS_PER_CAPTURE + 2):
+                path, native_id = transcript(home, 100 + index)
+                with path.open("ab") as handle:
+                    handle.write(b'{"partial":')  # never terminated
+                stuck.append((str(path), native_id))
+            eligible = [transcript(home, index)[1] for index in range(3)]
+            for path, native_id in stuck:
+                pending_sources.remember(
+                    state, "claude-transcript", [path], {path: native_id}, {}
+                )
+            transport = SuccessTransport()
+            # Markers take at most a quarter of the file budget, so the first
+            # run already reaches the backlog.
+            reconcile(home, state, "claude_code", transport, max_files=8)
+            self.assertTrue(set(eligible) <= uploaded_ids(transport))
+            # Each stuck marker is retried MAX_MARKER_ATTEMPTS times, round robin.
+            for _ in range(pending_sources.MAX_MARKER_ATTEMPTS * 3):
+                reconcile(home, state, "claude_code", transport, max_files=32)
+            self.assertEqual(pending_sources.count(state, "claude-transcript"), 0)
+
+    def test_marker_rewritten_during_a_capture_is_not_settled(self):
+        with TemporaryDirectory() as directory:
+            home, state = Path(directory) / "claude", Path(directory) / "state"
+            path, native_id = transcript(home, 1)
+            pending_sources.remember(state, "claude-transcript", [str(path)], {}, {})
+            (loaded,) = pending_sources.load(
+                state, "claude-transcript", allowed_root=(home / "projects").resolve()
+            )
+            # A newer hook names the same source while the capture runs.
+            later = loaded.modified_ns + 5_000_000_000
+            os.utime(loaded.marker, ns=(later, later))
+            removed = pending_sources.settle(
+                [loaded],
+                visited={str(path)},
+                completed={str(path)},
+                source_issues={},
+                blocked_reasons=frozenset(),
+            )
+            self.assertEqual(removed, 0)
+            self.assertTrue(loaded.marker.exists())
+
+
 class DeadLetterVisibilityTests(unittest.TestCase):
     def overlap_fixture(self, state: Path):
         spool = DurableSpool(state / "queue")

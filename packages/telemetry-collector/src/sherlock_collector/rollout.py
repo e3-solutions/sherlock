@@ -21,7 +21,7 @@ from .contract import (
     build_source_batch,
 )
 from .exclusions import ExclusionPolicy, load_policy
-from .spool import DurableSpool, _atomic_json, secure_lock
+from .spool import DurableSpool, _atomic_json, _fsync_directory, secure_lock
 
 DEFAULT_CHUNK_BYTES = 512 * 1024
 DEFAULT_MAX_FILES = 64
@@ -854,6 +854,7 @@ class RolloutCapturer:
             )
             + "\n"
         ).encode()
+        created = not self.journal_path.exists()
         descriptor = os.open(
             self.journal_path,
             os.O_WRONLY | os.O_CREAT | os.O_APPEND,
@@ -864,6 +865,9 @@ class RolloutCapturer:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        if created:
+            # The new name must survive a power loss as well as the batch does.
+            _fsync_directory(self.state_root)
 
     def _clear_journal(self) -> None:
         try:

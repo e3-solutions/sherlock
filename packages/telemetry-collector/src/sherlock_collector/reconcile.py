@@ -160,14 +160,13 @@ def reconcile(
             enforce_sync_budget=True,
         )
         capture_error = None
-        discovered = {str(path) for path in discovery.paths}
         # Sources a hook named but could not capture go first (COR-5023).
-        reminders = [
-            entry
-            for entry in pending_sources.load(root, state_name, limit=max_files)
-            if entry.path in discovered
-            or entry.path.startswith(str(home) + os.sep)
-        ]
+        reminders = pending_sources.load(
+            root,
+            state_name,
+            allowed_root=home,
+            limit=min(pending_sources.MAX_MARKERS_PER_CAPTURE, max(1, max_files // 4)),
+        )
         native_ids = dict(discovery.native_session_ids)
         parent_ids = dict(discovery.parent_native_session_ids)
         for entry in reminders:
@@ -203,6 +202,7 @@ def reconcile(
             if not capture.locked:
                 pending_sources.settle(
                     reminders,
+                    visited=capturer.visited_paths,
                     completed=capturer.completed_paths,
                     source_issues=capturer.source_issues,
                     blocked_reasons=POLICY_REASONS,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 import uuid
 from collections import Counter
@@ -172,6 +173,9 @@ class DurableSpool:
         self.processing = self.root / "processing"
         self.dead_letter = self.root / "dead-letter"
         self.receipts = self.root / "receipts"
+        # Drain workers quarantine concurrently; the drain lock already keeps
+        # other processes out, so this guards the stats file within one drain.
+        self._stats_lock = threading.Lock()
         for directory in (
             self.pending,
             self.processing,
@@ -452,34 +456,37 @@ class DurableSpool:
             getattr(error, "error_code", None),
             type(error).__name__,
         )
-        try:
-            previous = json.loads(self.dead_letter_stats_path.read_text())
-            if not isinstance(previous, dict) or not isinstance(
-                previous.get("by_code"), dict
-            ):
-                raise ValueError("invalid dead-letter stats")
-        except (OSError, ValueError):
-            previous = {"total": 0, "by_code": {}}
-        by_code = {
-            str(key): int(value)
-            for key, value in previous["by_code"].items()
-            if isinstance(value, int)
-        }
-        by_code[code] = by_code.get(code, 0) + 1
-        try:
-            _atomic_json(
-                self.dead_letter_stats_path,
-                {
-                    "stats_version": 1,
-                    "total": int(previous.get("total", 0)) + 1,
-                    "by_code": by_code,
-                    "last_code": code,
-                    "last_dead_lettered_at": utc_now(),
-                },
-            )
-        except OSError:
-            # Counting never blocks quarantine; the folder itself is the record.
-            pass
+        with self._stats_lock:
+            try:
+                previous = json.loads(self.dead_letter_stats_path.read_text())
+                if not isinstance(previous, dict) or not isinstance(
+                    previous.get("by_code"), dict
+                ):
+                    raise ValueError("invalid dead-letter stats")
+            except (OSError, ValueError):
+                previous = {"total": 0, "by_code": {}}
+            by_code = {
+                str(key): value
+                for key, value in previous["by_code"].items()
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+            by_code[code] = by_code.get(code, 0) + 1
+            total = previous.get("total")
+            total = total if isinstance(total, int) and not isinstance(total, bool) else 0
+            try:
+                _atomic_json(
+                    self.dead_letter_stats_path,
+                    {
+                        "stats_version": 1,
+                        "total": total + 1,
+                        "by_code": by_code,
+                        "last_code": code,
+                        "last_dead_lettered_at": utc_now(),
+                    },
+                )
+            except OSError:
+                # Counting never blocks quarantine; the folder itself is the record.
+                pass
 
     @property
     def dead_letter_index_path(self) -> Path:
@@ -559,7 +566,9 @@ class DurableSpool:
             "dead_letter_batches": sum(codes.values()),
             "dead_letter_codes": dict(sorted(codes.items())),
             "oldest_dead_letter_at": oldest,
-            "dead_letters_total": int(cumulative.get("total", 0) or 0),
+            "dead_letters_total": cumulative.get("total")
+            if isinstance(cumulative.get("total"), int)
+            else 0,
             "dead_letters_total_by_code": cumulative.get("by_code") or {},
             "last_dead_lettered_at": cumulative.get("last_dead_lettered_at"),
         }
