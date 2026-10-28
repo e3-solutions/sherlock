@@ -7,8 +7,11 @@ export const USAGE_DERIVATION_VERSION = "sherlock.usage-reconciliation.v2";
 export const MCP_QUERY_DEFAULT_LIMIT = 20;
 export const MCP_QUERY_MAX_LIMIT = 100;
 export const MCP_QUERY_MAX_GROUPS = 200;
-export const MCP_USAGE_DEFAULT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-export const MCP_USAGE_MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+// Production (Oct 28 2026) touches ~50-65k usage observations per day, each
+// joined to native_records/ingest_batches under the 20 s budget: one day is the
+// default that can finish, and a week is the largest window worth attempting.
+export const MCP_USAGE_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const MCP_USAGE_MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const MCP_QUERY_HISTORY_START = "1970-01-01T00:00:00.000Z";
 
@@ -745,10 +748,15 @@ with page as materialized (
     join telemetry.people pe
       on pe.workspace_id = s.workspace_id and pe.id = s.person_id
    where s.workspace_id = $1
+     -- Resumed sessions qualify through model activity (usage or turn context)
+     -- in the window. That predicate matches events_usage_history_idx, so the
+     -- per-session probe stays on a small index instead of every event.
      and (s.started_at >= $2 and s.started_at < $3 or exists (
        select 1 from telemetry.events activity
         where activity.workspace_id = $1 and activity.session_id = s.id
           and not activity.is_replay
+          and (activity.event_kind = 'usage' or
+               activity.event_kind = 'lifecycle' and activity.event_subtype = 'turn_context')
           and activity.occurred_at >= $2 and activity.occurred_at < $3
           and activity.server_received_at <= $4
      ))

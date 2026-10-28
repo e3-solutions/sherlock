@@ -53,7 +53,7 @@ describe("Sherlock MCP query source", () => {
     }, NOW)).toThrow(FlameSourceError);
   });
 
-  it("defaults relative to the requested end and accepts exactly 30 days", () => {
+  it("defaults relative to the requested end and accepts exactly 7 days", () => {
     const end = new Date(NOW.getTime() - 86400000);
     expect(usageWindow({ end }, NOW).startAt)
       .toEqual(new Date(end - MCP_USAGE_DEFAULT_WINDOW_MS));
@@ -365,7 +365,7 @@ describe("Sherlock MCP query source", () => {
     expect(unsafe.mock.calls.at(-1)[1][1]).toBe(new Date(NOW - MCP_USAGE_DEFAULT_WINDOW_MS).toISOString());
   });
 
-  it("passes the bounded 7-day default through to usage SQL", async () => {
+  it("passes the bounded 24-hour default through to usage SQL", async () => {
     const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ person_count: 0 }])
       .mockResolvedValueOnce([{

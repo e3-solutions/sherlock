@@ -433,15 +433,20 @@ describePostgres("usage reconciliation PostgreSQL regressions", () => {
         select c.relname, i.indisvalid, i.indisready, pg_get_indexdef(c.oid) definition
           from pg_index i join pg_class c on c.oid = i.indexrelid
          where c.oid in ('telemetry.events_usage_window_idx'::regclass,
-                         'telemetry.events_usage_history_idx'::regclass)
+                         'telemetry.events_usage_history_idx'::regclass,
+                         'telemetry.events_usage_token_count_idx'::regclass)
       `);
-      expect(indexes).toHaveLength(2);
+      expect(indexes).toHaveLength(3);
       for (const index of indexes) {
         expect(index).toMatchObject({ indisvalid: true, indisready: true });
         expect(index.definition).toContain("NOT is_replay");
       }
       expect(indexes.find((i) => i.relname === "events_usage_window_idx").definition)
         .toContain("(workspace_id, occurred_at, session_id, id)");
+      expect(indexes.find((i) => i.relname === "events_usage_history_idx").definition)
+        .toContain("(workspace_id, session_id, occurred_at)");
+      expect(indexes.find((i) => i.relname === "events_usage_token_count_idx").definition)
+        .toContain("event_subtype = 'token_count'");
       const inspect = (value) => {
         if (!value || typeof value !== "object") return [];
         return [value, ...Object.values(value).flatMap(inspect)];

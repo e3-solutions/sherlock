@@ -15,8 +15,8 @@ is a separate surface, described in
 3. Call `query_usage`, normally with `groupBy: "person_model"`.
 4. Use `list_sessions` and `get_session` only for metadata drill-down.
 
-`query_usage` and `coverage` default to the trailing 7 days before `end`
-(server read time if omitted). Explicit historical windows up to 30 days are
+`query_usage` and `coverage` default to the trailing 24 hours before `end`
+(server read time if omitted). Explicit historical windows up to 7 days are
 supported. Larger windows fail before querying with `window_too_large`; callers
 must request smaller windows. The response always states the actual interval;
 explicit windows are never silently clamped. Future and non-positive windows
@@ -33,8 +33,10 @@ Connection or other database failures still return `unavailable`.
 Row, group, transaction-time, workspace, and roster safety bounds still apply.
 `list_sessions` uses a query-bound keyset cursor; callers must reuse the exact
 window and filters from the preceding page. Eligibility is session start in
-`[start, end)` **or** any non-replay event with source `occurred_at` in that
-window. This includes resumed older sessions. Source time keeps delayed imports
+`[start, end)` **or** a non-replay model-activity event (usage, or a
+`turn_context` lifecycle event) with source `occurred_at` in that window. This
+includes resumed older sessions. Hook-only sessions with no transcript have no
+model activity and still qualify only by start time. Source time keeps delayed imports
 in their historical window; receipt time alone and undated events do not imply
 activity in a recent window. Activity/provider lookups also exclude receipts
 newer than the first-page `readAt`.
@@ -52,10 +54,13 @@ is the latest non-replay source timestamp **inside the list window**, or null;
 `get_session` has no start-time window filter. Dashboard Flame listings already
 select event activity in their window rather than session start dates.
 
-List eligibility uses per-session bounded probes of
-`events_session_occurred_idx(workspace_id, session_id, occurred_at, id)` instead
-of materializing every event in a multi-million-event window. The latest activity
-probe runs only for the limited page. No new index is needed.
+List eligibility uses per-session bounded probes of the partial
+`events_usage_history_idx(workspace_id, session_id, occurred_at)` (usage and
+turn context only) instead of materializing every event in a multi-million-event
+window. Probing every session through the full
+`events_session_occurred_idx` instead took more than 15 seconds for a 7-day
+window in production (Oct 28 2026, 52k sessions, 34M events, cold cache). The
+latest-activity probe runs only for the limited page.
 
 A disposable local PostgreSQL 17 benchmark of this exact list query, under the
 reader role and 20-second timeout, used 50,000 sessions (25,000 active, including

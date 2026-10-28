@@ -93,8 +93,8 @@ describe("Bonaparte MCP tools", () => {
     expect(JSON.stringify(result)).not.toContain("admin pilot gate");
     expect(tools.get("list_sessions").config.description).toContain("all stored history");
     for (const name of ["coverage", "query_usage"]) {
-      expect(tools.get(name).config.description).toContain("30 days");
-      expect(tools.get(name).config.description).toContain("trailing 7 days");
+      expect(tools.get(name).config.description).toContain("up to 7 days");
+      expect(tools.get(name).config.description).toContain("trailing 24 hours");
       expect(tools.get(name).config.description).toContain("query_timeout");
     }
   });
@@ -409,8 +409,8 @@ describe("Sherlock search MCP tools", () => {
     ]);
     const text = JSON.stringify(docs.structuredContent);
     expect(text).toContain("metadata-only");
-    expect(text).toContain("trailing 7 days");
-    expect(text).toContain("up to 30 days");
+    expect(text).toContain("trailing 24 hours");
+    expect(text).toContain("up to 7 days");
     expect(text).toContain("1024 source bytes");
     expect(text).toContain("private principal is refused");
     expect(text).toContain("focused positive lexical terms of at most 8 words");

@@ -125,8 +125,8 @@ const queryWindowInput = {
 
 const usageWindowInput = {
   ...queryWindowInput,
-  start: ISO_TIMESTAMP.optional()
-    .describe("Inclusive start. Defaults to 7 days before end. Maximum window: 30 days."),
+  start: TIMESTAMP_INPUT.optional()
+    .describe(`Inclusive start. Defaults to 24 hours before end. Maximum window: 7 days. Accepts ${TIMESTAMP_INPUT_HELP}.`),
 };
 
 const queryWindowOutputSchema = z.object({
@@ -305,7 +305,7 @@ const queryUsageOutputSchema = z.object({
   }).strict(),
 }).strict();
 
-const USAGE_WINDOW_DOCUMENTATION = "Usage and coverage default to the trailing 7 days, accept historical windows up to 30 days, and return window_too_large or query_timeout with narrowing guidance. Paginated session queries search all stored history by default. Row, group, transaction-time, workspace, and roster safety bounds still apply.";
+const USAGE_WINDOW_DOCUMENTATION = "Usage and coverage default to the trailing 24 hours, accept historical windows up to 7 days, and return window_too_large or query_timeout with narrowing guidance. Paginated session queries search all stored history by default. Row, group, transaction-time, workspace, and roster safety bounds still apply.";
 
 const QUERY_DOCUMENTATION = Object.freeze({
   schemaVersion: MCP_QUERY_SCHEMA_VERSION,
@@ -320,7 +320,7 @@ const QUERY_DOCUMENTATION = Object.freeze({
   ],
   tools: [
     { name: "diagnostics", purpose: "Check the read-only backend and normalization freshness without running an activity query." },
-    { name: "coverage", purpose: "Check observed session/usage coverage and pending normalization for windows up to 30 days (default 7 days)." },
+    { name: "coverage", purpose: "Check observed session/usage coverage and pending normalization for windows up to 7 days (default 24 hours)." },
     { name: "list_sessions", purpose: "Page through safe session metadata; no titles, content, paths, branches, or repository remotes." },
     { name: "get_session", purpose: "Read one workspace-scoped session metadata record and aggregate event counts." },
     { name: "query_usage", purpose: "Aggregate Codex and Claude token observations by person/model with cumulative streams differenced correctly." },
@@ -371,9 +371,9 @@ const ERRORS = {
     recovery: "Ask the Sherlock operator to review the configured roster bound before retrying.",
   },
   window_too_large: {
-    message: "Usage and coverage windows cannot exceed 30 days.",
+    message: "Usage and coverage windows cannot exceed 7 days.",
     retryable: false,
-    recovery: "Provide an explicit window with start and end at most 30 days apart. Omitted start defaults to 7 days before end.",
+    recovery: "Provide an explicit window with start and end at most 7 days apart. Omitted start defaults to 24 hours before end.",
   },
   query_timeout: {
     message: "The usage query exceeded its database work budget.",
@@ -537,7 +537,7 @@ export function registerBonaparteTools(server, source) {
     "coverage",
     {
       title: "Sherlock coverage",
-      description: "Report observed session and usage coverage for historical windows up to 30 days. Omitting start uses the trailing 7 days before end. Overlarge windows return window_too_large; excessive work returns query_timeout. Missing and partial states remain explicit and are never converted to zero-confidence claims.",
+      description: "Report observed session and usage coverage for historical windows up to 7 days. Omitting start uses the trailing 24 hours before end. Overlarge windows return window_too_large; excessive work returns query_timeout. Missing and partial states remain explicit and are never converted to zero-confidence claims.",
       inputSchema: coverageInputSchema,
       outputSchema: coverageOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -555,7 +555,7 @@ export function registerBonaparteTools(server, source) {
     "list_sessions",
     {
       title: "List Sherlock sessions",
-      description: "Keyset-page safe session metadata for sessions starting or having non-replay source activity (occurred_at) in the window, including resumed older sessions. lastActivityAt is the latest source activity in that window. Omitting start searches all stored history. Titles, transcripts, prompts, paths, branches, and repository remotes are omitted.",
+      description: "Keyset-page safe session metadata for sessions starting or having non-replay model activity (usage or turn context, by occurred_at) in the window, including resumed older sessions. lastActivityAt is the latest source activity in that window. Omitting start searches all stored history. Titles, transcripts, prompts, paths, branches, and repository remotes are omitted.",
       inputSchema: listSessionsInputSchema,
       outputSchema: listSessionsOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -591,7 +591,7 @@ export function registerBonaparteTools(server, source) {
     "query_usage",
     {
       title: "Query Sherlock token usage",
-      description: "Aggregate observed Codex and Claude token facts by person, model, or both for historical windows up to 30 days. Omitting start uses the trailing 7 days before end. Overlarge windows return window_too_large; excessive work returns query_timeout. Codex cumulative streams are differenced; Claude incremental facts are summed. Coverage exposes missing baselines, regressions, and pending normalization.",
+      description: "Aggregate observed Codex and Claude token facts by person, model, or both for historical windows up to 7 days. Omitting start uses the trailing 24 hours before end. Overlarge windows return window_too_large; excessive work returns query_timeout. Codex cumulative streams are differenced; Claude incremental facts are summed. Coverage exposes missing baselines, regressions, and pending normalization.",
       inputSchema: queryUsageInputSchema,
       outputSchema: queryUsageOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,

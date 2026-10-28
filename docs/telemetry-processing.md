@@ -276,7 +276,7 @@ collector-first rollback are required.
 ## Codex v4 usage rollout and optional backfill
 
 Deploy the v4-capable ingest normalizer, worker and dashboard readers before
-applying `20261018020925_codex_v4_native_usage.sql`. New Codex batches then get
+applying `20261028213100_codex_v4_native_usage.sql`. New Codex batches then get
 one v4 normalization job, including continued old sessions. Existing jobs drain
 at their original versions. Claude routing is unchanged. No raw-data rewrite,
 collector change, frame-version activation, or automatic historical replay is
