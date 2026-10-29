@@ -28,7 +28,8 @@ class CollectiveFeedbackTests(unittest.TestCase):
                 env = {"E3_COLLECTIVE_HOOK_STATE_DIR": temporary}
                 payload = {"source": "startup", "session_id": "fixture", "cwd": "unused"}
                 with patch.dict(os.environ, env, clear=True), patch.object(module, "_e3_repository", return_value=True):
-                    self.assertIn("E3 Collective / Forum:", module.feedback_context(payload, event_name="SessionStart", agent="codex"))
+                    # COR-5037: off by default while Forum is hidden from Cosmos.
+                    self.assertIsNone(module.feedback_context(payload, event_name="SessionStart", agent="codex"))
                     payload["session_id"] = "explicit-enabled"
                     for invalid in ("", "0", "true"):
                         os.environ["E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED"] = invalid

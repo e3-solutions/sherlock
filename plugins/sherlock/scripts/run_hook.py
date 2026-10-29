@@ -29,7 +29,7 @@ def collector_source() -> Path | None:
 def main() -> int:
     event_name = sys.argv[1] if len(sys.argv) > 1 else ""
     response = dict(CODEX_SUCCESS_RESPONSE)
-    if event_name == "SessionStart" and os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "1") == "1":
+    if event_name == "SessionStart" and os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "0") == "1":
         # Read once, then replay the identical bytes to telemetry. Emit guidance in
         # the parent; collector stdout is deliberately suppressed below.
         source_input = getattr(sys.stdin, "buffer", sys.stdin)

@@ -183,7 +183,7 @@ def main() -> int:
     if len(sys.argv) >= 3 and sys.argv[1] == "--capture":
         return capture(sys.argv[2])
     event_name = sys.argv[1] if len(sys.argv) > 1 else ""
-    if event_name == "SessionStart" and os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "1") == "1":
+    if event_name == "SessionStart" and os.environ.get("E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED", "0") == "1":
         source_input = getattr(sys.stdin, "buffer", sys.stdin)
         raw = source_input.read()
         raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
