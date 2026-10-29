@@ -1169,6 +1169,50 @@ Deno.test("legacy Claude Stop hooks stay unlinked without a verified prompt anch
   assert(projection.events[0].native_item_id === assistantUuid);
 });
 
+Deno.test("Claude hooks for unsaved runs carry transcript_state", async () => {
+  const sessionId = "0e80d9f3-de3e-498d-91b1-18beb3790278";
+  async function project(
+    transcriptState: unknown,
+    transcript: Uint8Array | null,
+  ) {
+    const hook = {
+      ...(await claudeHookEnvelope({
+        dispatchEventName: "Stop",
+        nativeSessionId: sessionId,
+        transcript,
+        payload: { session_id: sessionId, hook_event_name: "Stop" },
+      })),
+      transcript_state: transcriptState,
+    };
+    const { manifest, source } = await fixture([hook]);
+    manifest.source_provider = "claude_code";
+    manifest.source_kind = "hook";
+    manifest.codex_version = null;
+    manifest.observed_native_session_id = sessionId;
+    return (await projectBatch(manifest, source)).events[0];
+  }
+
+  const unsaved = await project("not_saved", null);
+  assert(unsaved.event_subtype === "response_complete_unlinked");
+  assert(unsaved.attributes?.transcript_state === "not_saved");
+  const capturedWithBytes = await project(
+    "captured",
+    new TextEncoder().encode("sanitized immutable Claude transcript\n"),
+  );
+  assert(capturedWithBytes.attributes?.transcript_state === "captured");
+  // Unknown or inconsistent labels are dropped, never rejected.
+  assert(
+    (await project("bogus", null)).attributes?.transcript_state === undefined,
+  );
+  assert(
+    (await project("captured", null)).attributes?.transcript_state ===
+      undefined,
+  );
+  assert(
+    (await project(undefined, null)).attributes?.transcript_state === undefined,
+  );
+});
+
 Deno.test("Claude hook projections reject tampered payloads and identity", async () => {
   const sessionId = "0e80d9f3-de3e-498d-91b1-18beb3790278";
   const promptUuid = "1d1ab296-9746-4cca-bceb-768359d37b30";
