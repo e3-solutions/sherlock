@@ -18,11 +18,28 @@ from .contract import (
 )
 from . import exclusion_report
 from .exclusions import EXCLUDED_PROJECT, ExclusionPolicy, load_policy, observed_cwds
-from .spool import DurableSpool, SpoolItem, dead_letter_code, secure_lock
+from .spool import (
+    MAX_UPLOAD_BACKOFF_SECONDS,
+    DurableSpool,
+    SpoolItem,
+    dead_letter_code,
+    secure_lock,
+)
 
 
 class TransientUploadError(RuntimeError):
     pass
+
+
+# Consecutive 5xx responses tolerated before every stream stops (COR-5058).
+MAX_SERVER_ERRORS_IN_A_ROW = 3
+
+
+def _delayed(next_upload_at: float) -> bool:
+    """True while a retry delay is running. Delays longer than the current cap
+    were written by an older collector (up to 24 hours) and are already due."""
+    now = time.time()
+    return now < float(next_upload_at) <= now + MAX_UPLOAD_BACKOFF_SECONDS
 
 
 class CollectorUploadError(TransientUploadError):
@@ -105,6 +122,8 @@ class Drain:
         self._held = set()
         self._project_held_sessions = set()
         self._dead_letter_codes = Counter()
+        self._server_errors_in_a_row = 0
+        self._last_server_error: CollectorUploadError | None = None
         result = self._run(max_items, max_seconds)
         return replace(
             result,
@@ -140,10 +159,7 @@ class Drain:
                 return DrainResult(locked=True)
             recovered = self.spool.recover_processing()
             status = self.spool.upload_status()
-            if (
-                status.get("status") == "blocked"
-                and status["next_upload_at"] > time.time()
-            ):
+            if status.get("status") == "blocked" and _delayed(status["next_upload_at"]):
                 return DrainResult(recovered=recovered, collector_failure=status)
             uploaded = requeued = dead_lettered = 0
             blocked_streams: set[tuple[str, str]] = set()
@@ -165,7 +181,9 @@ class Drain:
                 dead_lettered += outcomes[2]
 
                 if outcomes[3] is not None:
-                    status = self.spool.defer_uploads(outcomes[3])
+                    status = self.spool.defer_uploads(
+                        outcomes[3], progressed=uploaded > 0
+                    )
                     return DrainResult(
                         uploaded,
                         requeued,
@@ -180,6 +198,16 @@ class Drain:
                 frontiers, invalid = self._pending_frontiers(blocked_streams)
             if uploaded:
                 self.spool.clear_upload_failure()
+            elif self._last_server_error is not None:
+                # Only 5xx and no upload: report the outage like any other.
+                status = self.spool.defer_uploads(self._last_server_error)
+                return DrainResult(
+                    uploaded,
+                    requeued,
+                    dead_lettered,
+                    recovered,
+                    collector_failure=status,
+                )
             elif status.get("status") == "blocked":
                 return DrainResult(
                     uploaded,
@@ -238,7 +266,7 @@ class Drain:
                 blocked_streams.add(stream)
                 continue
             # A delayed frontier blocks its own later byte ranges only.
-            if item.metadata.get("next_upload_at", 0) > time.time():
+            if _delayed(item.metadata.get("next_upload_at", 0)):
                 blocked_streams.add(stream)
             order = (
                 manifest.generation_seq,
@@ -297,9 +325,22 @@ class Drain:
                     outcome = future.result()
                     if isinstance(outcome, CollectorUploadError):
                         requeued += 1
-                        collector_error = outcome
+                        if (
+                            outcome.http_status >= 500
+                            and self._server_errors_in_a_row
+                            < MAX_SERVER_ERRORS_IN_A_ROW
+                        ):
+                            # A cold-boot 5xx between successes: delay only this
+                            # stream and keep draining the others.
+                            self._server_errors_in_a_row += 1
+                            self._last_server_error = outcome
+                            if stream is not None:
+                                blocked_streams.add(stream)
+                        else:
+                            collector_error = outcome
                     elif outcome == "uploaded":
                         uploaded += 1
+                        self._server_errors_in_a_row = 0
                     elif outcome == "requeued":
                         requeued += 1
                         if stream is not None:
