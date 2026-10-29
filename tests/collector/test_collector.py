@@ -456,6 +456,39 @@ class CollectorDrainTests(unittest.TestCase):
             self.assertEqual(item.metadata["last_upload_http_status"], 503)
             self.assertLessEqual(item.metadata["next_upload_at"], time.time() + 300)
 
+    def test_a_server_error_holds_back_the_rest_of_its_stream(self):
+        first, _ = self.enqueue("stream-a")
+        second, _ = self.enqueue("stream-a", first.end_offset)
+        self.enqueue("stream-a", second.end_offset)
+        self.enqueue("stream-b")
+
+        class FirstFails(SuccessTransport):
+            def upload(self, item):
+                if item.manifest.source_stream_key == "stream-a" and item.manifest.start_offset == 0:
+                    raise CollectorUploadError("HTTP 503", error_code=None, http_status=503)
+                return super().upload(item)
+
+        transport = FirstFails()
+        result = Drain(self.spool, transport, max_workers=1).run()
+        self.assertEqual(
+            [item.manifest.source_stream_key for item in transport.items], ["stream-b"]
+        )
+        self.assertEqual(result.uploaded, 1)
+        self.assertIsNone(result.collector_failure)
+        self.assertEqual(len(self.spool.list_pending()), 3)
+
+    def test_an_outage_with_few_batches_is_still_reported(self):
+        self.enqueue("stream-a")
+
+        class Down:
+            def upload(self, item):
+                raise CollectorUploadError("HTTP 503", error_code=None, http_status=503)
+
+        result = Drain(self.spool, Down()).run()
+        self.assertEqual(result.uploaded, 0)
+        self.assertEqual(result.collector_failure["http_status"], 503)
+        self.assertEqual(self.spool.upload_status()["status"], "blocked")
+
     def test_server_errors_in_a_row_stop_every_stream(self):
         for index in range(8):
             self.enqueue(f"stream-{index}")

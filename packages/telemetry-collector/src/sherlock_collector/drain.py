@@ -122,6 +122,8 @@ class Drain:
         self._held = set()
         self._project_held_sessions = set()
         self._dead_letter_codes = Counter()
+        self._server_errors_in_a_row = 0
+        self._last_server_error: CollectorUploadError | None = None
         result = self._run(max_items, max_seconds)
         return replace(
             result,
@@ -196,6 +198,16 @@ class Drain:
                 frontiers, invalid = self._pending_frontiers(blocked_streams)
             if uploaded:
                 self.spool.clear_upload_failure()
+            elif self._last_server_error is not None:
+                # Only 5xx and no upload: report the outage like any other.
+                status = self.spool.defer_uploads(self._last_server_error)
+                return DrainResult(
+                    uploaded,
+                    requeued,
+                    dead_lettered,
+                    recovered,
+                    collector_failure=status,
+                )
             elif status.get("status") == "blocked":
                 return DrainResult(
                     uploaded,
@@ -280,7 +292,6 @@ class Drain:
     ) -> tuple[int, int, int, CollectorUploadError | None]:
         uploaded = requeued = dead_lettered = 0
         collector_error = None
-        server_errors_in_a_row = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             in_flight: dict[
                 Future[str | CollectorUploadError], tuple[str, str] | None
@@ -316,18 +327,20 @@ class Drain:
                         requeued += 1
                         if (
                             outcome.http_status >= 500
-                            and server_errors_in_a_row < MAX_SERVER_ERRORS_IN_A_ROW
+                            and self._server_errors_in_a_row
+                            < MAX_SERVER_ERRORS_IN_A_ROW
                         ):
                             # A cold-boot 5xx between successes: delay only this
                             # stream and keep draining the others.
-                            server_errors_in_a_row += 1
+                            self._server_errors_in_a_row += 1
+                            self._last_server_error = outcome
                             if stream is not None:
                                 blocked_streams.add(stream)
                         else:
                             collector_error = outcome
                     elif outcome == "uploaded":
                         uploaded += 1
-                        server_errors_in_a_row = 0
+                        self._server_errors_in_a_row = 0
                     elif outcome == "requeued":
                         requeued += 1
                         if stream is not None:
