@@ -463,6 +463,13 @@ Deno.test("connection-level failures are classified as retryable", () => {
       new TypeError("Cannot read properties of null (reading 'write')"),
       Object.assign(new Error("canceling statement"), { code: "57014" }),
       Object.assign(new Error("internal"), { code: "XX000" }),
+      Object.assign(new Error("(ENOTFOUND) Tenant or user not found"), {
+        code: "XX000",
+      }),
+      Object.assign(new TypeError("x.map is not a function"), {
+        stack:
+          "TypeError: x.map is not a function\n    at handle (file:///node_modules/postgres/3.4.7/src/connection.js:1:1)",
+      }),
       new IngestError("range_overlap", "overlap", 409),
       new Error("boom"),
       "CONNECT_TIMEOUT",
@@ -669,4 +676,25 @@ Deno.test("detached postgres.js connection errors do not crash the worker", () =
   });
   globalThis.dispatchEvent(unrelated);
   assert(!unrelated.defaultPrevented, "other crashes must stay visible");
+});
+
+Deno.test("a request that outlives its deadline answers 503 and drops the client", async () => {
+  let discarded = 0;
+  const started = performance.now();
+  const response = await handleRequest(await requestFor("user@e3group.ai"), {
+    environment: ENVIRONMENT,
+    backendFactory: (() => ({
+      batches: { resolveAttribution: () => new Promise(() => {}) },
+      service: {},
+    })) as never,
+    discardBackend: () => {
+      discarded += 1;
+    },
+    requestDeadlineMs: 50,
+  });
+  assert(response.status === 503, `status ${response.status}`);
+  assert(response.headers.get("Retry-After") === "5");
+  assert((await response.json()).error.code === "ingest_timeout");
+  assert(discarded === 1);
+  assert(performance.now() - started < 1_000);
 });

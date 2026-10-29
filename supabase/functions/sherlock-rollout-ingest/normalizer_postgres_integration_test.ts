@@ -16,6 +16,7 @@ import {
   isDatabaseConnectionError,
   PostgresBatchRepository,
 } from "./postgres.ts";
+import { handleRequest } from "./index.ts";
 
 const permission = await Deno.permissions.query({
   name: "env",
@@ -1349,17 +1350,23 @@ Deno.test({
 // auth_scram_first_wait; one that hangs up straight away; or one that starts
 // the session, drops it on the first query and stalls the reconnect.
 async function withFakePooler(
-  behaviour: "stall" | "hang_up" | "drop_then_stall",
-  run: (url: string) => Promise<void>,
+  behaviour: "stall" | "hang_up" | "drop_then_stall" | "close_cleanly",
+  run: (url: string, accepted: () => number) => Promise<void>,
 ): Promise<void> {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const held: Deno.Conn[] = [];
+  let accepted = 0;
   const accepting = (async () => {
-    let accepted = 0;
     for await (const conn of listener) {
       accepted += 1;
       if (behaviour === "hang_up") conn.close();
-      else held.push(conn);
+      if (behaviour === "close_cleanly") {
+        // Read the startup message, then FIN without an error message.
+        conn.read(new Uint8Array(65_536)).then(() => conn.close()).catch(
+          () => undefined,
+        );
+        continue;
+      } else held.push(conn);
       if (behaviour === "drop_then_stall" && accepted === 1) {
         startThenDrop(conn).catch(() => undefined);
       }
@@ -1367,7 +1374,10 @@ async function withFakePooler(
   })().catch(() => undefined);
   try {
     const { port } = listener.addr as Deno.NetAddr;
-    await run(`postgresql://ingest:secret@127.0.0.1:${port}/postgres`);
+    await run(
+      `postgresql://ingest:secret@127.0.0.1:${port}/postgres`,
+      () => accepted,
+    );
   } finally {
     listener.close();
     for (const conn of held) {
@@ -1470,6 +1480,53 @@ Deno.test({
     });
     // A detached rejection would surface here and fail the test.
     await new Promise((resolve) => setTimeout(resolve, 1_500));
+  },
+});
+
+Deno.test({
+  // postgres.js reconnects at once, without CONNECT_TIMEOUT, whenever the
+  // pooler closes cleanly during startup. The request deadline must end it.
+  name: "a pooler that closes cleanly during startup cannot hang the request",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    await withFakePooler("close_cleanly", async (url, accepted) => {
+      let current: { batches: PostgresBatchRepository } | null = null;
+      const started = performance.now();
+      const response = await handleRequest(
+        await ingestRequest("loop@e3group.ai"),
+        {
+          environment: (name) =>
+            ({
+              SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
+              SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
+                "00000000-0000-4000-8000-000000000002",
+            })[name],
+          backendFactory: (() => {
+            const batches = PostgresBatchRepository.connect(url, {
+              connectTimeoutSeconds: 1,
+            });
+            current = { batches };
+            return { batches, service: {} };
+          }) as never,
+          discardBackend: () => current?.batches.abandon(),
+          requestDeadlineMs: 1_500,
+        },
+      );
+      const elapsed = performance.now() - started;
+      assert(response.status === 503, `status ${response.status}`);
+      assert((await response.json()).error.code === "ingest_timeout");
+      assert(elapsed < 3_000, `answered after ${elapsed} ms`);
+      // abandon() settles within a few event-loop turns; then no more.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const settled = accepted();
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(
+        accepted() === settled,
+        `reconnects continued after abandon: ${accepted() - settled}`,
+      );
+    });
   },
 });
 
@@ -1577,3 +1634,58 @@ Deno.test({
     }
   },
 });
+
+async function ingestRequest(email: string): Promise<Request> {
+  const source = new TextEncoder().encode("test\n");
+  const stored = new Uint8Array(
+    await new Response(
+      new Blob([source]).stream().pipeThrough(new CompressionStream("gzip")),
+    ).arrayBuffer(),
+  );
+  const sourceSha256 = await sha256Hex(source);
+  return new Request("https://example.test/ingest", {
+    method: "POST",
+    body: JSON.stringify({
+      collector: {
+        name: "Loop Test",
+        github_id: "loop-test",
+        email,
+        installation_id: "00000000-0000-4000-8000-000000000001",
+      },
+      manifest: {
+        contract_version: CONTRACT_VERSION,
+        source_provider: "codex",
+        source_kind: "rollout",
+        source_stream_key: "stream-loop",
+        generation_key: "generation-loop",
+        generation_seq: 0,
+        start_offset: 0,
+        end_offset: source.byteLength,
+        source_byte_count: source.byteLength,
+        source_sha256: sourceSha256,
+        storage_encoding: "gzip",
+        stored_byte_count: stored.byteLength,
+        stored_sha256: await sha256Hex(stored),
+        record_count: 1,
+        records: [{
+          record_index: 0,
+          source_start_offset: 0,
+          source_end_offset: source.byteLength,
+          record_sha256: sourceSha256,
+          native_type: "event",
+          native_payload_type: null,
+          occurred_at: null,
+          parse_status: "ok",
+        }],
+        observed_native_session_id: null,
+        observed_parent_native_session_id: null,
+        first_occurred_at: null,
+        last_occurred_at: null,
+        codex_version: null,
+        source_version: null,
+        collector_version: "test",
+      },
+      stored_payload_base64: btoa(String.fromCharCode(...stored)),
+    }),
+  });
+}

@@ -64,12 +64,13 @@ function discardIngestBackend(broken: Backend): void {
 // postgres.js can raise a connection failure from a timer or socket callback
 // after the request that caused it has settled. Unhandled, the runtime kills
 // the worker and every request on it fails with a 503. Only database
-// connection errors are absorbed; anything else still crashes loudly.
+// connection errors are absorbed; anything else still crashes loudly. The
+// client that raised it is unknown here, so the request path (its own error
+// or its deadline) is what drops broken clients.
 function absorbDetachedConnectionError(event: Event, error: unknown): void {
   if (!isDatabaseConnectionError(error)) return;
   event.preventDefault();
   console.error("database connection failed outside a request", error);
-  if (backend) discardIngestBackend(backend);
 }
 globalThis.addEventListener(
   "unhandledrejection",
@@ -86,6 +87,12 @@ export const DATABASE_ATTEMPTS = 3;
 // still answers before the collector's 20 s HTTP timeout.
 export const DATABASE_RETRY_WINDOW_MS = 9_000;
 export const DATABASE_RETRY_AFTER_SECONDS = 5;
+// The collector gives up after 20 s; answer before it does. This also ends a
+// postgres.js reconnect loop (a pooler that closes cleanly during startup is
+// reconnected at once, forever, without a CONNECT_TIMEOUT) or a query stuck
+// on a client whose socket broke.
+export const REQUEST_DEADLINE_MS = 18_000;
+const DEADLINE = Symbol("deadline");
 
 function retryDelayMs(attempt: number): number {
   return 200 * attempt + Math.floor(Math.random() * 300);
@@ -100,13 +107,32 @@ async function withDatabase<T>(
   sleep: (milliseconds: number) => Promise<void>,
   now: () => number,
   requestStartedAt: number,
+  requestDeadlineMs: number,
   work: (current: Backend) => Promise<T>,
 ): Promise<T> {
   for (let attempt = 1;; attempt += 1) {
     const current = backendFactory();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(DEADLINE),
+        Math.max(0, requestStartedAt + requestDeadlineMs - now()),
+      );
+    });
+    const running = work(current);
+    running.catch(() => undefined); // settles after abandon when it loses
     try {
-      return await work(current);
+      return await Promise.race([running, deadline]);
     } catch (error) {
+      if (error === DEADLINE) {
+        discardBackend(current);
+        console.error(`ingest passed its deadline (attempt ${attempt})`);
+        throw new IngestError(
+          "ingest_timeout",
+          "ingest did not finish in time; retry later",
+          503,
+        );
+      }
       if (!isDatabaseConnectionError(error)) throw error;
       discardBackend(current);
       const retry = attempt < DATABASE_ATTEMPTS &&
@@ -125,6 +151,8 @@ async function withDatabase<T>(
         );
       }
       await sleep(retryDelayMs(attempt));
+    } finally {
+      clearTimeout(timer);
     }
   }
 }
@@ -142,12 +170,14 @@ export async function handleRequest(
     sleep = (milliseconds) =>
       new Promise((resolve) => setTimeout(resolve, milliseconds)),
     now = () => performance.now(),
+    requestDeadlineMs = REQUEST_DEADLINE_MS,
   }: {
     environment?: EnvironmentReader;
     backendFactory?: typeof ingestBackend;
     discardBackend?: typeof discardIngestBackend;
     sleep?: (milliseconds: number) => Promise<void>;
     now?: () => number;
+    requestDeadlineMs?: number;
   } = {},
 ): Promise<Response> {
   const requestStartedAt = now();
@@ -158,6 +188,7 @@ export async function handleRequest(
       sleep,
       now,
       requestStartedAt,
+      requestDeadlineMs,
       work,
     );
   try {
@@ -216,7 +247,10 @@ export async function handleRequest(
   } catch (error) {
     if (error instanceof IngestError) {
       const headers: Record<string, string> = { "Cache-Control": "no-store" };
-      if (error.code === "database_unavailable") {
+      if (
+        error.code === "database_unavailable" ||
+        error.code === "ingest_timeout"
+      ) {
         headers["Retry-After"] = String(DATABASE_RETRY_AFTER_SECONDS);
       }
       return Response.json(

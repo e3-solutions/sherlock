@@ -45,6 +45,8 @@ const CONNECTION_ERROR_CODES = new Set([
   "57P02", // crash_shutdown
   "57P03", // cannot_connect_now
 ]);
+const SUPAVISOR_TRANSIENT =
+  /^\((EDBHANDLEREXITED|ECHECKOUTTIMEOUT)\)|Max client connections reached/;
 const POSTGRES_JS_CONNECTION_FRAME = /\/postgres\/[0-9.]+\/src\/connection\.js/;
 
 export function isDatabaseConnectionError(error: unknown): boolean {
@@ -58,17 +60,18 @@ export function isDatabaseConnectionError(error: unknown): boolean {
     if (CONNECTION_ERROR_CODES.has(code) || code.startsWith("08")) {
       return true;
     }
-    // Supavisor reports its own failures as XX000 with an "(E...)" tag.
+    // Supavisor reports pool faults as XX000 with a tag. Configuration
+    // errors (unknown tenant, bad password) are not retried.
     if (
       code === "XX000" && typeof message === "string" &&
-      (/^\(E[A-Z_]+\)/.test(message) ||
-        message.includes("Max client connections reached"))
+      SUPAVISOR_TRANSIENT.test(message)
     ) {
       return true;
     }
   }
   // A postgres.js write on a socket that already closed (nextWrite on null).
   return error instanceof TypeError && typeof stack === "string" &&
+    typeof message === "string" && message.includes("(reading 'write')") &&
     POSTGRES_JS_CONNECTION_FRAME.test(stack);
 }
 
