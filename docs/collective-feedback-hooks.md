@@ -25,9 +25,9 @@ plugin and no runtime downloads are needed.
 
 ## Local behavior
 
-The released default enables guidance. Explicit `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=0` restores
-legacy tracker guidance and silent Sherlock behavior. Only absent or exact `1` enables the new
-cue; `E3_COLLECTIVE_HOOK_ENABLED=0` overrides it. The cue is considered only for `SessionStart` sources
+Guidance is off by default (COR-5037, Oct 28, 2026): Forum is hidden from Cosmos, so the hooks no
+longer point agents at Forum tools. Only an exact `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=1` enables the
+cue; `E3_COLLECTIVE_HOOK_ENABLED=0` overrides it. This matches the codex-plugins loggers (COR-5034). The cue is considered only for `SessionStart` sources
 `startup`, `resume`, `clear`, and `compact`. Prompt, tool, Stop, subagent and separate
 PreCompact/PostCompact events remain telemetry-only. No blocking Stop hook is added.
 
@@ -92,7 +92,7 @@ librarian configuration, package versioning, distribution, hook trust and fresh 
 A backend tool being listed is not sufficient: it can be feature-disabled or deny the caller.
 Do not confuse publishing a package with activating it on subscribed clients.
 
-Rollback sets `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=0` explicitly. The global Collective opt-out
-suppresses all guidance. Unsetting the feedback flag now enables the released default. Backend
+To turn guidance back on, set `E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=1`. The global Collective opt-out
+suppresses all guidance. Unsetting the feedback flag leaves it off. Backend
 rollback disables feedback writes while retaining schema and archive-aware reads. Shared debounce
 state is disposable, not Forum knowledge.

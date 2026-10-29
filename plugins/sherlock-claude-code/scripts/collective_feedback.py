@@ -13,6 +13,10 @@ import subprocess
 import time
 
 FEEDBACK_ENABLED_ENV = "E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED"
+# COR-5037 (Oct 28, 2026): Forum is hidden from Cosmos, so this guidance is off by default.
+# E3_COLLECTIVE_FEEDBACK_HOOK_ENABLED=1 turns it back on; E3_COLLECTIVE_HOOK_ENABLED=0 still
+# overrides that (here it is only an off switch). Same default as codex-plugins (COR-5034).
+FEEDBACK_DEFAULT = "0"
 CONTEXT_VERSION = "feedback-2"
 CONTEXT_SOURCES = {"startup", "resume", "clear", "compact"}
 FEEDBACK_CONTEXT = (
@@ -61,7 +65,7 @@ FEEDBACK_CONTEXT = (
 
 
 def preview_enabled() -> bool:
-    return os.environ.get(FEEDBACK_ENABLED_ENV, "1") == "1"
+    return os.environ.get(FEEDBACK_ENABLED_ENV, FEEDBACK_DEFAULT) == "1"
 
 
 def _e3_repository(cwd: object) -> bool:
