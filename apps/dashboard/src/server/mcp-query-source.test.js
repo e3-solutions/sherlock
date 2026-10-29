@@ -3,6 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import { FlameSourceError } from "./flame-source.js";
 import {
   MCP_QUERY_HISTORY_START,
+  MCP_USAGE_DEFAULT_WINDOW_MS,
+  MCP_USAGE_MAX_WINDOW_MS,
+  usageWindow,
   buildUsageResult,
   createSherlockQuerySource,
   decodeSessionCursor,
@@ -50,6 +53,33 @@ describe("Sherlock MCP query source", () => {
     }, NOW)).toThrow(FlameSourceError);
   });
 
+  it("defaults relative to the requested end and accepts exactly 7 days", () => {
+    const end = new Date(NOW.getTime() - 86400000);
+    expect(usageWindow({ end }, NOW).startAt)
+      .toEqual(new Date(end - MCP_USAGE_DEFAULT_WINDOW_MS));
+    expect(usageWindow({ start: new Date(end - MCP_USAGE_MAX_WINDOW_MS), end }, NOW).endAt)
+      .toEqual(end);
+    expect(() => usageWindow({ start: new Date(end - MCP_USAGE_MAX_WINDOW_MS - 1), end }, NOW))
+      .toThrowError(new FlameSourceError("flame_mcp_query_window_too_large"));
+  });
+
+  it.each(["fetchUsage", "fetchCoverage"])("%s rejects overlarge windows before database work", async (method) => {
+    const source = { transaction: vi.fn(), readiness: vi.fn() };
+    await expect(createSherlockQuerySource(source)[method]({ start: START, now: NOW }))
+      .rejects.toThrowError(new FlameSourceError("flame_mcp_query_window_too_large"));
+    expect(source.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each(["fetchUsage", "fetchCoverage"])("%s exposes database budget exhaustion explicitly", async (method) => {
+    const source = {
+      transaction: vi.fn().mockRejectedValue(new FlameSourceError("flame_database_timeout")),
+      readiness: vi.fn(),
+    };
+    await expect(createSherlockQuerySource(source)[method]({ now: NOW }))
+      .rejects.toThrowError(new FlameSourceError("flame_mcp_query_timeout"));
+    expect(source.transaction.mock.calls[0][1]).toMatchObject({ statementTimeoutMs: 20_000 });
+  });
+
   it("binds session cursors to the original filters and window", () => {
     const cursor = encodeSessionCursor({
       readAt: NOW,
@@ -59,7 +89,7 @@ describe("Sherlock MCP query source", () => {
     });
     expect(decodeSessionCursor(cursor, "bound-query")).toEqual({
       readAt: NOW,
-      createdAt: START,
+      createdAt: START.toISOString(),
       sessionId: SESSION_ID,
     });
     expect(() => decodeSessionCursor(cursor, "different-query"))
@@ -76,6 +106,7 @@ describe("Sherlock MCP query source", () => {
       actor_role: "primary",
       model: "gpt-5.6-sol",
       started_at: createdAt,
+      last_activity_at: "2026-09-01T19:00:00Z",
       ended_at: null,
       parent_session_id: null,
       created_at: createdAt,
@@ -103,6 +134,7 @@ describe("Sherlock MCP query source", () => {
       now: later,
     });
 
+    expect(first.sessions[0].lastActivityAt).toBe("2026-09-01T19:00:00.000Z");
     expect(first.window).toMatchObject({
       startInclusive: MCP_QUERY_HISTORY_START,
       endExclusive: NOW.toISOString(),
@@ -137,49 +169,20 @@ describe("Sherlock MCP query source", () => {
     expect(source.transaction).not.toHaveBeenCalled();
   });
 
-  it("continues a 24-hour cursor issued before the all-history default", async () => {
-    const legacyStart = new Date(NOW.getTime() - 24 * 60 * 60 * 1000);
-    const row = (sessionId, createdAt) => ({
-      session_id: sessionId,
-      person_id: "33333333-3333-4333-8333-333333333333",
-      display_name: "Ada",
-      normalizer_version: "sherlock.codex-rollout.v2",
-      actor_role: "primary",
-      model: "gpt-5.6-sol",
-      started_at: createdAt,
-      ended_at: null,
-      parent_session_id: null,
-      created_at: createdAt,
-    });
-    const unsafe = vi.fn()
-      .mockResolvedValueOnce([
-        row(SESSION_ID, "2026-09-01T10:00:00.000Z"),
-        row("22222222-2222-4222-8222-222222222222", "2026-09-01T09:00:00.000Z"),
-      ])
-      .mockResolvedValueOnce([]);
-    const source = {
-      workspaceId: "44444444-4444-4444-8444-444444444444",
-      expectedEmailDomain: "e3group.ai",
-      maxPeople: 500,
-      readiness: vi.fn(),
-      transaction: vi.fn(async (callback) => await callback({ unsafe })),
-    };
-    const querySource = createSherlockQuerySource(source);
-    const first = await querySource.fetchSessions({
-      start: legacyStart.toISOString(),
-      end: NOW.toISOString(),
-      limit: 1,
-      now: NOW,
-    });
+  it("rejects cursors issued for the old start-only session semantics", async () => {
+    const source = { readiness: vi.fn(), transaction: vi.fn() };
+    const cursor = "s1." + Buffer.from(JSON.stringify([
+      NOW.toISOString(), START.toISOString(), SESSION_ID, "old-fingerprint",
+    ])).toString("base64url");
+    await expect(createSherlockQuerySource(source).fetchSessions({ cursor, now: NOW }))
+      .rejects.toThrowError(new FlameSourceError("flame_mcp_query_cursor_invalid"));
+    expect(source.transaction).not.toHaveBeenCalled();
+  });
 
-    const second = await querySource.fetchSessions({
-      cursor: first.nextCursor,
-      limit: 1,
-      now: new Date(NOW.getTime() + 60_000),
-    });
-
-    expect(second.window).toEqual(first.window);
-    expect(second.window.startInclusive).toBe(legacyStart.toISOString());
+  it("preserves microsecond session cursor keys", () => {
+    const createdAt = "2026-09-01 12:30:00.123456+00";
+    const cursor = encodeSessionCursor({ readAt: NOW, createdAt, sessionId: SESSION_ID, fingerprint: "micro" });
+    expect(decodeSessionCursor(cursor, "micro").createdAt).toBe(createdAt);
   });
 
   it("keeps coverage partial when cumulative baselines or normalization are missing", () => {
@@ -359,11 +362,11 @@ describe("Sherlock MCP query source", () => {
       observedSessions: 2,
       observedUsageEvents: 4,
     });
-    expect(unsafe.mock.calls.at(-1)[1][1]).toBe(MCP_QUERY_HISTORY_START);
+    expect(unsafe.mock.calls.at(-1)[1][1]).toBe(new Date(NOW - MCP_USAGE_DEFAULT_WINDOW_MS).toISOString());
   });
 
-  it("passes the all-history default through to usage SQL", async () => {
-    const unsafe = vi.fn()
+  it("passes the bounded 24-hour default through to usage SQL", async () => {
+    const unsafe = vi.fn().mockResolvedValue([])
       .mockResolvedValueOnce([{ person_count: 0 }])
       .mockResolvedValueOnce([{
         pending_normalize_count: 0,
@@ -381,12 +384,13 @@ describe("Sherlock MCP query source", () => {
 
     const result = await createSherlockQuerySource(source).fetchUsage({ now: NOW });
 
+    expect(unsafe.mock.calls.some(([sql]) => sql === "set local work_mem = '16MB'")).toBe(true);
     expect(result.window).toMatchObject({
-      startInclusive: MCP_QUERY_HISTORY_START,
+      startInclusive: new Date(NOW - MCP_USAGE_DEFAULT_WINDOW_MS).toISOString(),
       endExclusive: NOW.toISOString(),
     });
-    expect(unsafe.mock.calls[2][1].slice(1, 3)).toEqual([
-      MCP_QUERY_HISTORY_START,
+    expect(unsafe.mock.calls.at(-1)[1].slice(1, 3)).toEqual([
+      new Date(NOW - MCP_USAGE_DEFAULT_WINDOW_MS).toISOString(),
       NOW.toISOString(),
     ]);
   });

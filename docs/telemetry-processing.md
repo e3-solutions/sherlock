@@ -272,3 +272,51 @@ Rolling collectors back stops new fragments. Rolling the server back first can
 reject already-spooled fragments; collectors retain that head and block only
 its stream rather than discarding raw telemetry, so server-first deployment and
 collector-first rollback are required.
+
+## Codex v4 usage rollout and optional backfill
+
+Deploy the v4-capable ingest normalizer, worker and dashboard readers before
+applying `20261028213100_codex_v4_native_usage.sql`. New Codex batches then get
+one v4 normalization job, including continued old sessions. Existing jobs drain
+at their original versions. Claude routing is unchanged. No raw-data rewrite,
+collector change, frame-version activation, or automatic historical replay is
+required. Frame v5 accepts v4 because its message/activity interpretation is
+identical to v3; usage observations never create frame evidence. Existing raw
+snapshot tokens keep their original source universe; new raw tokens v7 include
+v4 facts.
+
+Historical v3 `token_usage_record` facts remain `unknown` until explicitly
+reprocessed. To recover native-only historical sessions or remove input/cache
+component uncertainty at a v3/v4 cumulative boundary, an operator can queue all
+Codex batches for a reviewed **complete session**, with the three identity
+parameters set in psql. This appends v4 facts linked to the same source records;
+it never modifies receipts, locators, raw bytes, or old event facts. Do not
+reprocess only the reporting window: older counter baselines/model context and
+response duplicates may lie outside it.
+
+```sql
+-- Owner/admin, after deploying v4 support. Use a reviewed workspace, collector,
+-- and native session identity; run in bounded session batches as backfill work.
+insert into processing.telemetry_jobs (
+  workspace_id, job_kind, batch_id, normalizer_version, workload_class
+)
+select batch.workspace_id, 'normalize', batch.id,
+       'sherlock.codex-rollout.v4', 'backfill'
+from telemetry.ingest_batches batch
+where batch.workspace_id = :'workspace_id'::uuid
+  and batch.collector_key = :'collector_key'
+  and batch.observed_native_session_id = :'native_session_id'
+  and batch.source_provider = 'codex'
+on conflict (workspace_id, batch_id, normalizer_version)
+  where job_kind = 'normalize' do nothing;
+```
+
+Observe queued/leased/failed jobs with the queries above. Completed v4 jobs need
+no repeat; use the existing reviewed failed-job recovery procedure for failures.
+After the queue drains, compare `coverage` and `query_usage` for the bounded
+window. A session containing any valid non-replay token-count usage still uses
+that stream exclusively; a mixed or incomplete counter session does not switch
+to response increments to hide missing baselines. Native-only sessions use
+response IDs to deduplicate increments across duplicates and reuploaded ranges.
+Both facts remain available for audit. Rollback must keep v4 job/read support;
+do not replace the worker with a v3-only binary after routing is enabled.

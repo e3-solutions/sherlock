@@ -1,6 +1,8 @@
 import { type BatchManifest, CONTRACT_VERSION, sha256Hex } from "./contract.ts";
 import {
   CLAUDE_NORMALIZER_VERSION,
+  CODEX_V3_NORMALIZER_VERSION,
+  CODEX_V4_NORMALIZER_VERSION,
   LEGACY_CODEX_NORMALIZER_VERSION,
   legacyNormalizerVersionFor,
   NORMALIZER_VERSION,
@@ -1240,4 +1242,151 @@ Deno.test("Claude SubagentStop hooks anchor worker turns to the child session", 
   assert(projection.events[0].actor_role === "worker");
   assert(projection.events[0].event_subtype === "turn_complete");
   assert(projection.events[0].turn_id === `claude:prompt:${promptUuid}`);
+});
+
+Deno.test("Codex v4 projects response usage once, retaining legacy interpretations", async () => {
+  const usage = {
+    input_tokens: 100,
+    cached_input_tokens: 20,
+    cache_write_input_tokens: 30,
+    output_tokens: 40,
+    reasoning_output_tokens: 10,
+    total_tokens: 140,
+  };
+  const record = {
+    timestamp: "2026-10-17T12:00:00Z",
+    ordinal: 1,
+    type: "token_usage_record",
+    payload: {
+      thread_id: "child-session",
+      session_id: "child-session",
+      turn_id: "turn",
+      root_turn_id: "root",
+      response_id: "response",
+      usage,
+      turn_token_usage: { ...usage, total_tokens: 999 },
+      thread_token_usage: { ...usage, total_tokens: 9999 },
+    },
+  };
+  const data = await fixture([record, record, {
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: usage,
+        last_token_usage: usage,
+        model_context_window: 200000,
+      },
+    },
+  }]);
+  const v4 = await projectBatch(
+    data.manifest,
+    data.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  assert(v4.events.length === 3);
+  const response = v4.events[0];
+  assert(response.event_kind === "usage");
+  assert(response.event_subtype === "token_usage_record");
+  assert(
+    response.usage_scope === "response" &&
+      response.usage_is_cumulative === false,
+  );
+  assert(response.logical_event_key === v4.events[1].logical_event_key);
+  assert(response.usage_stream_key === v4.events[1].usage_stream_key);
+  assert(response.native_item_id === "response" && response.turn_id === "turn");
+  for (const event of [response, v4.events[2]]) {
+    assert(event.input_tokens === 50 && event.cached_input_tokens === 50);
+    assert(event.output_tokens === 30 && event.reasoning_tokens === 10);
+    assert(event.total_tokens === 140);
+    assert(event.attributes?.cache_write_input_tokens === 30);
+  }
+  assert(
+    v4.events[2].usage_scope === "session" && v4.events[2].usage_is_cumulative,
+  );
+  assert(v4.events[2].attributes?.model_context_window === 200000);
+  for (
+    const version of [
+      LEGACY_CODEX_NORMALIZER_VERSION,
+      NORMALIZER_VERSION,
+      CODEX_V3_NORMALIZER_VERSION,
+    ]
+  ) {
+    const old = await projectBatch(data.manifest, data.source, version);
+    assert(old.events[0].event_kind === "unknown");
+    assert(
+      old.events[2].input_tokens === 80 &&
+        old.events[2].cached_input_tokens === 20,
+    );
+  }
+});
+
+Deno.test("Codex v4 accepts absent cache writes but rejects malformed usage and missing response IDs", async () => {
+  const valid = { input_tokens: 10, output_tokens: 5, total_tokens: 15 };
+  const invalid = [
+    { ...valid, cache_write_input_tokens: -1 },
+    { ...valid, cached_input_tokens: 8, cache_write_input_tokens: 3 },
+    { ...valid, cache_write_input_tokens: "1" },
+    { ...valid, total_tokens: 16 },
+    { ...valid, reasoning_output_tokens: 6 },
+    { ...valid, output_tokens: null },
+  ];
+  const data = await fixture([
+    {
+      type: "token_usage_record",
+      payload: { response_id: "response", usage: valid },
+    },
+    { type: "token_usage_record", payload: { usage: valid } },
+    ...invalid.map((usage) => ({
+      type: "token_usage_record",
+      payload: { response_id: "response", usage },
+    })),
+    ...invalid.map((usage) => ({
+      type: "event_msg",
+      payload: { type: "token_count", info: { total_token_usage: usage } },
+    })),
+  ]);
+  const result = await projectBatch(
+    data.manifest,
+    data.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  assert(result.events[0].event_kind === "usage");
+  assert(result.events[0].cached_input_tokens === 0);
+  for (const event of result.events.slice(1)) {
+    assert(event.event_kind === "unknown" && event.error_code !== null);
+  }
+});
+
+Deno.test("Codex v4 keeps v3 runtime message classification", async () => {
+  const data = await fixture([
+    {
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        message: "<codex_internal_context>runtime</codex_internal_context>",
+      },
+    },
+    {
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: "<codex_internal_context>runtime</codex_internal_context>",
+        }],
+      },
+    },
+  ]);
+  const result = await projectBatch(
+    data.manifest,
+    data.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  assert(
+    result.events.every((event) =>
+      event.message_origin === RUNTIME_CONTEXT_MESSAGE_ORIGIN
+    ),
+  );
 });
