@@ -40,7 +40,7 @@ from sherlock_collector.rollout import (
     DEFAULT_MAX_FILES,
     RolloutCapturer,
 )
-from sherlock_collector.spool import DurableSpool, SpoolItem
+from sherlock_collector.spool import DurableSpool, SpoolItem, upload_backoff_seconds
 
 
 WORKSPACE_ID = "00000000-0000-4000-8000-000000000001"
@@ -400,6 +400,100 @@ class CollectorDrainTests(unittest.TestCase):
         self.assertIsNone(recovered.collector_failure)
         self.assertEqual(self.spool.upload_status()["status"], "ready")
         self.assertIn("recovered_at", self.spool.upload_status())
+
+    def test_upload_backoff_never_exceeds_five_minutes(self):
+        delays = [upload_backoff_seconds(attempts) for attempts in range(1, 30)]
+        self.assertEqual(delays[:5], [60, 120, 240, 300, 300])
+        self.assertEqual(max(delays), 300)
+
+    def test_a_run_that_uploads_before_failing_restarts_the_backoff(self):
+        for index in range(3):
+            self.enqueue(f"stream-{index}")
+        for _ in range(5):
+            with patch("sherlock_collector.spool.time.time", return_value=1000):
+                self.spool.defer_uploads(
+                    CollectorUploadError("HTTP 403", error_code="x", http_status=403)
+                )
+        self.assertEqual(self.spool.upload_status()["attempts"], 5)
+
+        class FailsAfterOne(SuccessTransport):
+            def upload(self, item):
+                if self.items:
+                    raise CollectorUploadError("HTTP 403", error_code="x", http_status=403)
+                return super().upload(item)
+
+        with patch("sherlock_collector.drain.time.time", return_value=2000), patch(
+            "sherlock_collector.spool.time.time", return_value=2000
+        ):
+            result = Drain(self.spool, FailsAfterOne(), max_workers=1).run()
+        self.assertEqual(result.uploaded, 1)
+        self.assertEqual(result.collector_failure["attempts"], 1)
+        self.assertEqual(result.collector_failure["next_upload_at"], 2060)
+
+    def test_brief_server_errors_delay_only_their_own_streams(self):
+        for index in range(6):
+            self.enqueue(f"stream-{index}")
+
+        class ColdBoot(SuccessTransport):
+            calls = 0
+
+            def upload(self, item):
+                self.calls += 1
+                if self.calls in {2, 4}:
+                    raise CollectorUploadError(
+                        "HTTP 503", error_code="BOOT_ERROR", http_status=503
+                    )
+                return super().upload(item)
+
+        result = Drain(self.spool, ColdBoot(), max_workers=1).run()
+        self.assertEqual(result.uploaded, 4)
+        self.assertEqual(result.requeued, 2)
+        self.assertIsNone(result.collector_failure)
+        self.assertEqual(self.spool.upload_status()["status"], "ready")
+        delayed = [self.spool.load(p) for p in self.spool.list_pending()]
+        self.assertEqual(len(delayed), 2)
+        for item in delayed:
+            self.assertEqual(item.metadata["last_upload_http_status"], 503)
+            self.assertLessEqual(item.metadata["next_upload_at"], time.time() + 300)
+
+    def test_server_errors_in_a_row_stop_every_stream(self):
+        for index in range(8):
+            self.enqueue(f"stream-{index}")
+
+        class Down:
+            calls = 0
+
+            def upload(self, item):
+                self.calls += 1
+                raise CollectorUploadError("HTTP 503", error_code=None, http_status=503)
+
+        transport = Down()
+        result = Drain(self.spool, transport, max_workers=1).run()
+        self.assertEqual(transport.calls, 4)
+        self.assertEqual(result.collector_failure["http_status"], 503)
+        self.assertEqual(len(self.spool.list_pending()), 8)
+
+    def test_delays_left_by_an_older_collector_are_already_due(self):
+        _, pending = self.enqueue("stream-a")
+        item = self.spool.load(pending)
+        self.spool.requeue(
+            self.spool.claim(pending),
+            item,
+            CollectorUploadError("HTTP 503", error_code=None, http_status=503),
+        )
+        path = self.spool.list_pending()[0]
+        raw = json.loads(path.read_text())
+        raw["metadata"]["next_upload_at"] = time.time() + 9 * 60 * 60
+        path.write_text(json.dumps(raw))
+        (self.spool.root / "upload-status.json").write_text(
+            json.dumps(
+                {"status": "blocked", "attempts": 10, "next_upload_at": time.time() + 7 * 60 * 60}
+            )
+        )
+        result = Drain(self.spool, SuccessTransport()).run()
+        self.assertEqual(result.uploaded, 1)
+        self.assertIsNone(result.collector_failure)
+        self.assertEqual(self.spool.upload_status()["status"], "ready")
 
     def test_collector_failure_only_finishes_already_in_flight_uploads(self):
         for index in range(12):
