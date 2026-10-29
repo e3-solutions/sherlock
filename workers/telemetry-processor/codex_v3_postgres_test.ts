@@ -40,13 +40,12 @@ const permission = await Deno.permissions.query({
 const databaseUrl = permission.state === "granted"
   ? Deno.env.get("SHERLOCK_TEST_DATABASE_URL")
   : undefined;
-Deno.test({
-  name:
-    "new uploads use one v3 interpretation in continuing sessions and retain old history",
+const continuingSessionTest = {
+  name: "continuing-session interpretation preserves old history",
   ignore: !databaseUrl,
   sanitizeOps: false,
   sanitizeResources: false,
-  async fn() {
+  async fn(version: string) {
     const sql = postgres(databaseUrl!, { prepare: false, max: 3 });
     const normalizer = new PostgresBatchNormalizer(sql);
     const repository = new PostgresBatchRepository(sql);
@@ -206,7 +205,10 @@ Deno.test({
       );
       const pinnedRaw = await rawDashboard.fetchDay({ now });
       const next = await upload([
-        { type: "event_msg", payload: { type: "user_message", message: goal } },
+        {
+          type: "event_msg",
+          payload: { type: "user_message", message: goal },
+        },
         {
           type: "response_item",
           payload: {
@@ -220,6 +222,22 @@ Deno.test({
           type: "event_msg",
           payload: { type: "user_message", message: human },
         },
+        { type: "turn_context", payload: { model: "usage-model" } },
+        ...[0, 1].map(() => ({
+          type: "token_usage_record",
+          payload: {
+            response_id: "response-usage",
+            turn_id: "usage-turn",
+            usage: {
+              input_tokens: 10,
+              cached_input_tokens: 2,
+              cache_write_input_tokens: 3,
+              output_tokens: 5,
+              reasoning_output_tokens: 1,
+              total_tokens: 15,
+            },
+          },
+        })),
       ]);
       // A native representation of the prior human submission arrives after cutover.
       const cross = await upload([{
@@ -238,10 +256,10 @@ Deno.test({
       );
       assert(
         jobs.length === 1 &&
-          jobs[0].normalizer_version === "sherlock.codex-rollout.v3",
+          jobs[0].normalizer_version === "sherlock.codex-rollout.v4",
         "continuing session must enqueue exactly one corrected job",
       );
-      // Even sessions predating the original v2 session cutover now route new uploads to v3.
+      // Even sessions predating the original v2 session cutover now route new uploads to v4.
       await sql.unsafe(
         "update telemetry.sessions set started_at=$3 where workspace_id=$1 and id=$2",
         [workspaceId, sessionId, new Date(start.getTime() - 3600000)],
@@ -253,7 +271,7 @@ Deno.test({
       );
       assert(
         continuedJobs.length === 1 &&
-          continuedJobs[0].normalizer_version === "sherlock.codex-rollout.v3",
+          continuedJobs[0].normalizer_version === "sherlock.codex-rollout.v4",
         "pre-cutover session received legacy or duplicate work",
       );
       // Restore the fixture's original source selection for its historical v2 fact.
@@ -278,12 +296,12 @@ Deno.test({
           batch.source,
           undefined,
           undefined,
-          "sherlock.codex-rollout.v3",
+          version,
         );
       }
       const current = await sql.unsafe(
-        "select * from telemetry.events where workspace_id=$1 and normalizer_version='sherlock.codex-rollout.v3'",
-        [workspaceId],
+        "select * from telemetry.events where workspace_id=$1 and normalizer_version=$2",
+        [workspaceId, version],
       );
       assert(
         current.length ===
@@ -292,7 +310,8 @@ Deno.test({
         "repeated normalization duplicated facts",
       );
       assert(
-        current.filter((e) => e.message_origin === "runtime_context").length ===
+        current.filter((e) => e.message_origin === "runtime_context")
+          .length ===
           2,
         "both runtime formats must be classified",
       );
@@ -329,7 +348,7 @@ Deno.test({
           id: 0n,
           workspace_id: workspaceId,
           session_id: sessionId,
-          normalizer_version: "sherlock.codex-rollout.v3",
+          normalizer_version: version,
           activity_version: ACTIVITY_VERSION,
           request_generation: 1n,
           job_kind: "reduce",
@@ -430,6 +449,46 @@ Deno.test({
         session.session.provider === "codex",
         "MCP provider missing for corrected data",
       );
+      const usageArgs = {
+        groupBy: "person_model",
+        start: start.toISOString(),
+        end: now.toISOString(),
+        now,
+      };
+      const usage = await query.fetchUsage(usageArgs);
+      if (version.endsWith("v4")) {
+        assert(
+          session.observedEventCounts.usage === 1,
+          "response replay counted twice in session detail",
+        );
+        assert(
+          usage.groups.length === 1 &&
+            usage.groups[0].model === "usage-model",
+          "native usage lost model context",
+        );
+        assert(
+          usage.groups[0].knownTokens.total === 15,
+          "native response usage must count once",
+        );
+        assert(
+          usage.groups[0].knownTokens.input === 5 &&
+            usage.groups[0].knownTokens.cachedInput === 5,
+          "cache-write buckets disagree",
+        );
+        const facts = await sql.unsafe(
+          `select e.source_record_id from telemetry.events e
+          join telemetry.native_records n on n.id=e.source_record_id and n.workspace_id=e.workspace_id
+          where e.workspace_id=$1 and e.event_subtype='token_usage_record' and e.event_kind='usage'
+            and e.normalizer_version=$2 and n.native_type='token_usage_record'`,
+          [workspaceId, version],
+        );
+        assert(
+          facts.length === 2,
+          "native response projections lost their auditable source links",
+        );
+      } else {
+        assert(usage.groups.length === 0, "v3 interpretation changed");
+      }
     } finally {
       await rawDashboard.close();
       await dashboard.close();
@@ -458,4 +517,14 @@ Deno.test({
       await sql.end();
     }
   },
-});
+};
+
+for (
+  const version of ["sherlock.codex-rollout.v3", "sherlock.codex-rollout.v4"]
+) {
+  Deno.test({
+    ...continuingSessionTest,
+    name: `${version} ${continuingSessionTest.name}`,
+    fn: () => continuingSessionTest.fn(version),
+  });
+}

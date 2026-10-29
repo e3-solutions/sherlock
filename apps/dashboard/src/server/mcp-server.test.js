@@ -91,9 +91,24 @@ describe("Bonaparte MCP tools", () => {
     expect(JSON.stringify(result)).toContain("search all stored history by default");
     expect(JSON.stringify(result)).not.toContain("capped at 24 hours");
     expect(JSON.stringify(result)).not.toContain("admin pilot gate");
-    for (const name of ["coverage", "list_sessions", "query_usage"]) {
-      expect(tools.get(name).config.description).toContain("any historical window");
-      expect(tools.get(name).config.description).toContain("all stored history");
+    expect(tools.get("list_sessions").config.description).toContain("all stored history");
+    for (const name of ["coverage", "query_usage"]) {
+      expect(tools.get(name).config.description).toContain("30 days");
+      expect(tools.get(name).config.description).toContain("trailing 7 days");
+      expect(tools.get(name).config.description).toContain("query_timeout");
+    }
+  });
+
+  it.each([
+    ["flame_mcp_query_window_too_large", "window_too_large"],
+    ["flame_mcp_query_timeout", "query_timeout"],
+  ])("exposes %s with actionable recovery", async (sourceCode, code) => {
+    const reject = () => vi.fn().mockRejectedValue(new FlameSourceError(sourceCode));
+    const tools = registeredTools({ fetchUsage: reject(), fetchCoverage: reject() });
+    for (const tool of ["query_usage", "coverage"]) {
+      const result = await tools.get(tool).handler({});
+      expect(errorOf(result)).toMatchObject({ code, retryable: false });
+      expect(errorOf(result).recovery).toContain("window");
     }
   });
 
@@ -394,6 +409,8 @@ describe("Sherlock search MCP tools", () => {
     ]);
     const text = JSON.stringify(docs.structuredContent);
     expect(text).toContain("metadata-only");
+    expect(text).toContain("trailing 7 days");
+    expect(text).toContain("up to 30 days");
     expect(text).toContain("1024 source bytes");
     expect(text).toContain("private principal is refused");
     expect(text).toContain("focused positive lexical terms of at most 8 words");
