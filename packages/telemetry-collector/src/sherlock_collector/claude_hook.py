@@ -153,6 +153,33 @@ def referenced_transcript(
     return candidate if candidate.is_file() else None
 
 
+def transcript_state(
+    claude_home: Path,
+    event_name: str,
+    payload: Mapping[str, object],
+    transcript_path: Path | None,
+) -> str:
+    """Why a terminal hook did or did not come with a transcript (COR-5061).
+
+    ``not_saved``: Claude named a transcript under ``projects`` that does not
+    exist after the terminal wait, as with ``--no-session-persistence`` runs
+    (for example claude-mem's headless observer). Those runs never write one,
+    so their sessions are not lost transcripts. It means "absent when the hook
+    ran": if transcript records for the session arrive later, they win.
+    """
+    if transcript_path is not None:
+        return "captured"
+    key = "agent_transcript_path" if event_name == "SubagentStop" else "transcript_path"
+    value = _text(payload.get(key))
+    if value is None:
+        return "not_named"
+    try:
+        Path(value).expanduser().resolve().relative_to((claude_home / "projects").resolve())
+    except (OSError, RuntimeError, ValueError):
+        return "outside_claude_home"
+    return "not_saved"
+
+
 def write_observation(
     state_root: Path,
     event_name: str,
@@ -160,6 +187,7 @@ def write_observation(
     raw_payload: bytes,
     *,
     transcript_path: Path | None,
+    state: str | None = None,
 ) -> Path:
     if event_name not in TERMINAL_EVENTS:
         raise ValueError("unsupported Claude terminal hook event")
@@ -198,6 +226,8 @@ def write_observation(
         "transcript_byte_count": transcript_byte_count,
         "transcript_sha256": transcript_sha256,
     }
+    if state is not None:
+        observation["transcript_state"] = state
     encoded = (
         json.dumps(observation, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode()

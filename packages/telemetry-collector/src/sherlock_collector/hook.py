@@ -13,6 +13,7 @@ from .claude_hook import (
     TERMINAL_EVENTS,
     observation_identity,
     referenced_transcript,
+    transcript_state,
     write_observation,
 )
 from .config import default_claude_home, default_codex_home, default_state_root
@@ -325,12 +326,14 @@ def _capture_hook(
         and raw_payload
     ):
         try:
+            transcript = referenced_transcript(home, event_name, payload)
             hook_observation = write_observation(
                 root,
                 event_name,
                 payload,
                 raw_payload,
-                transcript_path=referenced_transcript(home, event_name, payload),
+                transcript_path=transcript,
+                state=transcript_state(home, event_name, payload, transcript),
             )
             observation_paths = [
                 hook_observation,

@@ -321,6 +321,7 @@ async function projectClaudeHookRecord(
     collectorObservedAt,
     transcriptByteCount,
     transcriptSha256,
+    transcriptState,
   } = validation;
   const attributes: JsonObject = {
     dispatch_event_name: dispatchEventName,
@@ -331,6 +332,9 @@ async function projectClaudeHookRecord(
   }
   if (transcriptSha256 !== null) {
     attributes.transcript_sha256 = transcriptSha256;
+  }
+  if (transcriptState !== null) {
+    attributes.transcript_state = transcriptState;
   }
   if (dispatchEventName === "SessionEnd") {
     const reason = stringValue(payload.reason);
@@ -392,7 +396,29 @@ type ClaudeHookValidation = {
   collectorObservedAt: string;
   transcriptByteCount: number | null;
   transcriptSha256: string | null;
+  transcriptState: string | null;
 } | { valid: false; error: string };
+
+// Why a terminal hook came with or without a transcript (COR-5061). Optional:
+// older collectors omit it, and an unknown or inconsistent value is dropped
+// rather than rejecting the event.
+const CLAUDE_TRANSCRIPT_STATES = new Set([
+  "captured",
+  "not_saved",
+  "outside_claude_home",
+  "not_named",
+]);
+
+function claudeTranscriptState(
+  value: unknown,
+  transcriptByteCount: number | null,
+): string | null {
+  const state = stringValue(value);
+  if (state === null || !CLAUDE_TRANSCRIPT_STATES.has(state)) return null;
+  return (state === "captured") === (transcriptByteCount !== null)
+    ? state
+    : null;
+}
 
 async function validateClaudeHookEnvelope(
   envelope: JsonObject,
@@ -473,6 +499,10 @@ async function validateClaudeHookEnvelope(
     collectorObservedAt,
     transcriptByteCount,
     transcriptSha256,
+    transcriptState: claudeTranscriptState(
+      envelope.transcript_state,
+      transcriptByteCount,
+    ),
   };
 }
 

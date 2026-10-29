@@ -19,7 +19,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sherlock_collector import discovery as discovery_module
-from sherlock_collector.claude_hook import write_observation
+from sherlock_collector.claude_hook import transcript_state, write_observation
 from sherlock_collector.contract import (
     FRAGMENT_BYTES,
     MAX_SOURCE_BYTES,
@@ -1433,6 +1433,59 @@ class ClaudePluginTests(unittest.TestCase):
             rejected = json.loads(rejected_path.read_text(encoding="utf-8"))
             self.assertIsNone(rejected["turn_anchor_id"])
             self.assertIsNone(rejected["terminal_assistant_uuid"])
+
+    def test_transcript_state_tells_unsaved_runs_from_lost_transcripts(self):
+        with TemporaryDirectory() as temporary:
+            home = Path(temporary) / "claude"
+            project = home / "projects" / "-repo"
+            project.mkdir(parents=True)
+            saved = project / "11111111-1111-4111-8111-111111111111.jsonl"
+            saved.write_text("{}\n")
+            unsaved = project / "22222222-2222-4222-8222-222222222222.jsonl"
+            elsewhere = Path(temporary) / "other" / "x.jsonl"
+
+            def state(event, payload, found=None):
+                return transcript_state(home, event, payload, found)
+
+            self.assertEqual(state("Stop", {"transcript_path": str(saved)}, saved), "captured")
+            self.assertEqual(state("Stop", {"transcript_path": str(unsaved)}), "not_saved")
+            self.assertEqual(state("SessionEnd", {"transcript_path": str(elsewhere)}), "outside_claude_home")
+            self.assertEqual(state("Stop", {}), "not_named")
+            # A subagent names its own transcript.
+            self.assertEqual(
+                state("SubagentStop", {"transcript_path": str(saved), "agent_transcript_path": str(unsaved)}),
+                "not_saved",
+            )
+
+    def test_unsaved_run_observation_is_labelled(self):
+        # `claude -p --no-session-persistence` still fires Stop and names a
+        # transcript under projects that it never writes.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_home = root / "claude"
+            (claude_home / "projects" / "-repo").mkdir(parents=True)
+            state_root = root / "state"
+            session_id = "33333333-3333-4333-8333-333333333333"
+            payload = {
+                "hook_event_name": "Stop",
+                "session_id": session_id,
+                "stop_hook_active": False,
+                "transcript_path": str(claude_home / "projects" / "-repo" / f"{session_id}.jsonl"),
+            }
+            with patch("sherlock_collector.hook.subprocess.Popen"):
+                run_hook(
+                    "Stop",
+                    payload,
+                    provider="claude_code",
+                    claude_home=claude_home,
+                    state_root=state_root,
+                    raw_payload=json.dumps(payload).encode(),
+                    drain_command=[sys.executable, "-c", "pass"],
+                )
+            (observation,) = (state_root / "claude-hook-events").glob("*.jsonl")
+            value = json.loads(observation.read_text(encoding="utf-8"))
+            self.assertEqual(value["transcript_state"], "not_saved")
+            self.assertIsNone(value["transcript_byte_count"])
 
     def test_manual_claude_capture_uses_transcript_contract(self):
         with TemporaryDirectory() as temporary:
