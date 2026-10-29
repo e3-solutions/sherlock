@@ -1346,9 +1346,34 @@ Deno.test({
   },
 });
 
+// Every wait in the fake-pooler tests is bounded: a postgres.js reconnect
+// loop must fail the test, never hang CI.
+async function bounded<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  what: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(new Error(`${what} still pending after ${milliseconds} ms`)),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // A pooler that accepts TCP and then never answers, like Supavisor stalled in
-// auth_scram_first_wait; one that hangs up straight away; or one that starts
-// the session, drops it on the first query and stalls the reconnect.
+// auth_scram_first_wait; one that hangs up straight away (a reset on macOS,
+// a clean FIN on Linux); or one that starts the session, drops it on the
+// first query and stalls the reconnect.
 async function withFakePooler(
   behaviour: "stall" | "hang_up" | "drop_then_stall" | "close_cleanly",
   run: (url: string, accepted: () => number) => Promise<void>,
@@ -1387,7 +1412,9 @@ async function withFakePooler(
         // already closed by the client
       }
     }
-    await accepting;
+    await bounded(accepting, 2_000, "fake pooler shutdown").catch(
+      () => undefined,
+    );
   }
 }
 
@@ -1407,14 +1434,18 @@ async function failingAttribution(url: string): Promise<unknown> {
     connectTimeoutSeconds: 1,
   });
   try {
-    await repository.resolveAttribution(
-      { workspace_id: crypto.randomUUID(), collector_key_prefix: "fake" },
-      {
-        name: "Fake Pooler",
-        github_id: "fake-pooler",
-        email: "fake-pooler@example.com",
-        installation_id: crypto.randomUUID(),
-      },
+    await bounded(
+      repository.resolveAttribution(
+        { workspace_id: crypto.randomUUID(), collector_key_prefix: "fake" },
+        {
+          name: "Fake Pooler",
+          github_id: "fake-pooler",
+          email: "fake-pooler@example.com",
+          installation_id: crypto.randomUUID(),
+        },
+      ),
+      5_000,
+      "attribution against a fake pooler",
     );
   } catch (error) {
     return error;
@@ -1422,6 +1453,32 @@ async function failingAttribution(url: string): Promise<unknown> {
     repository.abandon();
   }
   throw new Error("a dead pooler must not resolve attribution");
+}
+
+// The whole request path, with its retry and deadline, against a fake pooler.
+async function requestThroughFakePooler(url: string): Promise<Response> {
+  let current: PostgresBatchRepository | null = null;
+  return await bounded(
+    (async () =>
+      handleRequest(await ingestRequest("pooler@e3group.ai"), {
+        environment: (name) =>
+          ({
+            SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
+            SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
+              "00000000-0000-4000-8000-000000000002",
+          })[name],
+        backendFactory: (() => {
+          current = PostgresBatchRepository.connect(url, {
+            connectTimeoutSeconds: 1,
+          });
+          return { batches: current, service: {} };
+        }) as never,
+        discardBackend: () => current?.abandon(),
+        requestDeadlineMs: 1_500,
+      }))(),
+    5_000,
+    "request against a fake pooler",
+  );
 }
 
 Deno.test({
@@ -1452,10 +1509,14 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     await withFakePooler("hang_up", async (url) => {
-      const error = await failingAttribution(url);
+      const response = await requestThroughFakePooler(url);
+      assert(response.status === 503, `status ${response.status}`);
+      // A reset fails each attempt fast and the retries run out; a clean
+      // close loops inside postgres.js until the deadline.
+      const { code } = (await response.json()).error;
       assert(
-        isDatabaseConnectionError(error),
-        `expected a connection error, got ${String(error)}`,
+        code === "database_unavailable" || code === "ingest_timeout",
+        `unexpected code ${code}`,
       );
     });
     await new Promise((resolve) => setTimeout(resolve, 1_500));
@@ -1492,28 +1553,8 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     await withFakePooler("close_cleanly", async (url, accepted) => {
-      let current: { batches: PostgresBatchRepository } | null = null;
       const started = performance.now();
-      const response = await handleRequest(
-        await ingestRequest("loop@e3group.ai"),
-        {
-          environment: (name) =>
-            ({
-              SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
-              SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
-                "00000000-0000-4000-8000-000000000002",
-            })[name],
-          backendFactory: (() => {
-            const batches = PostgresBatchRepository.connect(url, {
-              connectTimeoutSeconds: 1,
-            });
-            current = { batches };
-            return { batches, service: {} };
-          }) as never,
-          discardBackend: () => current?.batches.abandon(),
-          requestDeadlineMs: 1_500,
-        },
-      );
+      const response = await requestThroughFakePooler(url);
       const elapsed = performance.now() - started;
       assert(response.status === 503, `status ${response.status}`);
       assert((await response.json()).error.code === "ingest_timeout");
