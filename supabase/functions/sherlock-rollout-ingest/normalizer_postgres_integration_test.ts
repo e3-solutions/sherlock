@@ -9,9 +9,14 @@ import {
   IngestError,
   RECEIPT_VERSION,
   sha256Hex,
+  storagePath,
 } from "./contract.ts";
 import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
-import { PostgresBatchRepository } from "./postgres.ts";
+import {
+  isDatabaseConnectionError,
+  PostgresBatchRepository,
+} from "./postgres.ts";
+import { handleRequest } from "./index.ts";
 
 const permission = await Deno.permissions.query({
   name: "env",
@@ -20,6 +25,8 @@ const permission = await Deno.permissions.query({
 const databaseUrl = permission.state === "granted"
   ? Deno.env.get("SHERLOCK_TEST_DATABASE_URL")
   : null;
+const netGranted = (await Deno.permissions.query({ name: "net" })).state ===
+  "granted";
 type Sql = ReturnType<typeof postgres>;
 
 function assert(
@@ -1338,3 +1345,397 @@ Deno.test({
     }
   },
 });
+
+// Every wait in the fake-pooler tests is bounded: a postgres.js reconnect
+// loop must fail the test, never hang CI.
+async function bounded<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  what: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(new Error(`${what} still pending after ${milliseconds} ms`)),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// A pooler that accepts TCP and then never answers, like Supavisor stalled in
+// auth_scram_first_wait; one that hangs up straight away (a reset on macOS,
+// a clean FIN on Linux); or one that starts the session, drops it on the
+// first query and stalls the reconnect.
+async function withFakePooler(
+  behaviour: "stall" | "hang_up" | "drop_then_stall" | "close_cleanly",
+  run: (url: string, accepted: () => number) => Promise<void>,
+): Promise<void> {
+  const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+  const held: Deno.Conn[] = [];
+  let accepted = 0;
+  const accepting = (async () => {
+    for await (const conn of listener) {
+      accepted += 1;
+      if (behaviour === "hang_up") conn.close();
+      if (behaviour === "close_cleanly") {
+        // Read the startup message, then FIN without an error message.
+        conn.read(new Uint8Array(65_536)).then(() => conn.close()).catch(
+          () => undefined,
+        );
+        continue;
+      } else held.push(conn);
+      if (behaviour === "drop_then_stall" && accepted === 1) {
+        startThenDrop(conn).catch(() => undefined);
+      }
+    }
+  })().catch(() => undefined);
+  try {
+    const { port } = listener.addr as Deno.NetAddr;
+    await run(
+      `postgresql://ingest:secret@127.0.0.1:${port}/postgres`,
+      () => accepted,
+    );
+  } finally {
+    listener.close();
+    for (const conn of held) {
+      try {
+        conn.close();
+      } catch {
+        // already closed by the client
+      }
+    }
+    await bounded(accepting, 2_000, "fake pooler shutdown").catch(
+      () => undefined,
+    );
+  }
+}
+
+async function startThenDrop(conn: Deno.Conn): Promise<void> {
+  const buffer = new Uint8Array(65_536);
+  await conn.read(buffer); // StartupMessage
+  // AuthenticationOk, then ReadyForQuery (idle).
+  await conn.write(
+    new Uint8Array([82, 0, 0, 0, 8, 0, 0, 0, 0, 90, 0, 0, 0, 5, 73]),
+  );
+  await conn.read(buffer); // the first query
+  conn.close();
+}
+
+async function failingAttribution(url: string): Promise<unknown> {
+  const repository = PostgresBatchRepository.connect(url, {
+    connectTimeoutSeconds: 1,
+  });
+  try {
+    await bounded(
+      repository.resolveAttribution(
+        { workspace_id: crypto.randomUUID(), collector_key_prefix: "fake" },
+        {
+          name: "Fake Pooler",
+          github_id: "fake-pooler",
+          email: "fake-pooler@example.com",
+          installation_id: crypto.randomUUID(),
+        },
+      ),
+      5_000,
+      "attribution against a fake pooler",
+    );
+  } catch (error) {
+    return error;
+  } finally {
+    repository.abandon();
+  }
+  throw new Error("a dead pooler must not resolve attribution");
+}
+
+// The whole request path, with its retry and deadline, against a fake pooler.
+async function requestThroughFakePooler(url: string): Promise<Response> {
+  let current: PostgresBatchRepository | null = null;
+  return await bounded(
+    (async () =>
+      handleRequest(await ingestRequest("pooler@e3group.ai"), {
+        environment: (name) =>
+          ({
+            SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
+            SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
+              "00000000-0000-4000-8000-000000000002",
+          })[name],
+        backendFactory: (() => {
+          current = PostgresBatchRepository.connect(url, {
+            connectTimeoutSeconds: 1,
+          });
+          return { batches: current, service: {} };
+        }) as never,
+        discardBackend: () => current?.abandon(),
+        requestDeadlineMs: 1_500,
+      }))(),
+    5_000,
+    "request against a fake pooler",
+  );
+}
+
+Deno.test({
+  name: "stalled pooler handshake rejects in the request as a retryable error",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    await withFakePooler("stall", async (url) => {
+      const started = performance.now();
+      const error = await failingAttribution(url);
+      assert(
+        (error as { code?: string }).code === "CONNECT_TIMEOUT",
+        `expected CONNECT_TIMEOUT, got ${String(error)}`,
+      );
+      assert(isDatabaseConnectionError(error));
+      assert(performance.now() - started < 3_000, "connect_timeout ignored");
+    });
+    // Let any late postgres.js timer fire inside this test.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+  },
+});
+
+Deno.test({
+  name: "pooler hang-up rejects in the request as a retryable error",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    await withFakePooler("hang_up", async (url) => {
+      const response = await requestThroughFakePooler(url);
+      assert(response.status === 503, `status ${response.status}`);
+      // A reset fails each attempt fast and the retries run out; a clean
+      // close loops inside postgres.js until the deadline.
+      const { code } = (await response.json()).error;
+      assert(
+        code === "database_unavailable" || code === "ingest_timeout",
+        `unexpected code ${code}`,
+      );
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+  },
+});
+
+Deno.test({
+  // With postgres.js fetch_types on, this exact sequence rejects the
+  // un-awaited array-type lookup with CONNECT_TIMEOUT outside any request:
+  // the "event loop error" that killed edge workers (Oct 2026).
+  name: "a session dropped after startup fails only the request that used it",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    await withFakePooler("drop_then_stall", async (url) => {
+      const error = await failingAttribution(url);
+      assert(
+        isDatabaseConnectionError(error),
+        `expected a connection error, got ${String(error)}`,
+      );
+    });
+    // A detached rejection would surface here and fail the test.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+  },
+});
+
+Deno.test({
+  // postgres.js reconnects at once, without CONNECT_TIMEOUT, whenever the
+  // pooler closes cleanly during startup. The request deadline must end it.
+  name: "a pooler that closes cleanly during startup cannot hang the request",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    await withFakePooler("close_cleanly", async (url, accepted) => {
+      const started = performance.now();
+      const response = await requestThroughFakePooler(url);
+      const elapsed = performance.now() - started;
+      assert(response.status === 503, `status ${response.status}`);
+      assert((await response.json()).error.code === "ingest_timeout");
+      assert(elapsed < 3_000, `answered after ${elapsed} ms`);
+      // abandon() settles within a few event-loop turns; then no more.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const settled = accepted();
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(
+        accepted() === settled,
+        `reconnects continued after abandon: ${accepted() - settled}`,
+      );
+    });
+  },
+});
+
+Deno.test({
+  name: "Postgres exact retry of a committed batch returns its receipt",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { prepare: false, max: 2 });
+    const repository = PostgresBatchRepository.connect(databaseUrl!);
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const attribution = {
+      workspace_id: workspaceId,
+      person_id: personId,
+      collector_key: `retry-${workspaceId}`,
+    };
+    const source = new TextEncoder().encode('{"type":"event"}\n');
+    const sourceSha256 = await sha256Hex(source);
+    const manifest: BatchManifest = {
+      contract_version: CONTRACT_VERSION,
+      source_provider: "codex",
+      source_kind: "rollout",
+      source_stream_key: `stream-${workspaceId}`,
+      generation_key: `generation-${workspaceId}`,
+      generation_seq: 0,
+      start_offset: 0,
+      end_offset: source.byteLength,
+      source_byte_count: source.byteLength,
+      source_sha256: sourceSha256,
+      storage_encoding: "gzip",
+      stored_byte_count: 1,
+      stored_sha256: "a".repeat(64),
+      record_count: 1,
+      records: [{
+        record_index: 0,
+        source_start_offset: 0,
+        source_end_offset: source.byteLength,
+        record_sha256: sourceSha256,
+        native_type: "event",
+        native_payload_type: null,
+        occurred_at: null,
+        parse_status: "ok",
+      }],
+      observed_native_session_id: null,
+      observed_parent_native_session_id: null,
+      first_occurred_at: null,
+      last_occurred_at: null,
+      codex_version: null,
+      source_version: null,
+      collector_version: "retry-test",
+    };
+    const path = storagePath(attribution, manifest);
+    try {
+      await sql.unsafe(
+        `insert into telemetry.workspaces (id, slug, name)
+         values ($1, $2, 'Retry integration test')`,
+        [workspaceId, `retry-${workspaceId}`],
+      );
+      await sql.unsafe(
+        `insert into telemetry.people (id, workspace_id, identity_key)
+         values ($1, $2, 'retry-person')`,
+        [personId, workspaceId],
+      );
+
+      // The first commit lands; its response is lost to a dropped socket.
+      const first = await repository.commit(attribution, manifest, path, null);
+      // The retry runs the same request again, on a fresh connection.
+      const found = await repository.findExact(attribution, manifest);
+      const replayed = await repository.commit(
+        attribution,
+        manifest,
+        path,
+        null,
+      );
+
+      assert(found?.batch_id === first.batch_id, "exact lookup must match");
+      assert(
+        JSON.stringify(replayed) === JSON.stringify(first),
+        "replayed commit must return the original receipt",
+      );
+      const [{ count }] = await sql.unsafe(
+        `select count(*)::integer as count from telemetry.ingest_batches
+          where workspace_id = $1`,
+        [workspaceId],
+      );
+      assert(count === 1, `expected one committed batch, found ${count}`);
+    } finally {
+      // The commit trigger enqueued a live normalize job; leaving it would
+      // be claimed by the queue integration test. Cleanup must not fail
+      // silently.
+      try {
+        for (
+          const statement of [
+            "delete from processing.telemetry_jobs where workspace_id = $1",
+            "delete from telemetry.native_records where workspace_id = $1",
+            "delete from telemetry.ingest_batches where workspace_id = $1",
+            "delete from telemetry.people where workspace_id = $1",
+            "delete from telemetry.workspaces where id = $1",
+          ]
+        ) {
+          await sql.unsafe(statement, [workspaceId]);
+        }
+        const [{ left }] = await sql.unsafe(
+          `select count(*)::integer as left from processing.telemetry_jobs
+            where workspace_id = $1`,
+          [workspaceId],
+        );
+        assert(left === 0, `left ${left} processing jobs behind`);
+      } finally {
+        await Promise.allSettled([repository.close(), sql.end()]);
+      }
+    }
+  },
+});
+
+async function ingestRequest(email: string): Promise<Request> {
+  const source = new TextEncoder().encode("test\n");
+  const stored = new Uint8Array(
+    await new Response(
+      new Blob([source]).stream().pipeThrough(new CompressionStream("gzip")),
+    ).arrayBuffer(),
+  );
+  const sourceSha256 = await sha256Hex(source);
+  return new Request("https://example.test/ingest", {
+    method: "POST",
+    body: JSON.stringify({
+      collector: {
+        name: "Loop Test",
+        github_id: "loop-test",
+        email,
+        installation_id: "00000000-0000-4000-8000-000000000001",
+      },
+      manifest: {
+        contract_version: CONTRACT_VERSION,
+        source_provider: "codex",
+        source_kind: "rollout",
+        source_stream_key: "stream-loop",
+        generation_key: "generation-loop",
+        generation_seq: 0,
+        start_offset: 0,
+        end_offset: source.byteLength,
+        source_byte_count: source.byteLength,
+        source_sha256: sourceSha256,
+        storage_encoding: "gzip",
+        stored_byte_count: stored.byteLength,
+        stored_sha256: await sha256Hex(stored),
+        record_count: 1,
+        records: [{
+          record_index: 0,
+          source_start_offset: 0,
+          source_end_offset: source.byteLength,
+          record_sha256: sourceSha256,
+          native_type: "event",
+          native_payload_type: null,
+          occurred_at: null,
+          parse_status: "ok",
+        }],
+        observed_native_session_id: null,
+        observed_parent_native_session_id: null,
+        first_occurred_at: null,
+        last_occurred_at: null,
+        codex_version: null,
+        source_version: null,
+        collector_version: "test",
+      },
+      stored_payload_base64: btoa(String.fromCharCode(...stored)),
+    }),
+  });
+}

@@ -17,6 +17,63 @@ type Sql = ReturnType<typeof postgres>;
 type Queryable = Pick<Sql, "unsafe">;
 
 export const EDGE_FUNCTION_DATABASE_POOL_MAX = 1;
+// Supavisor sometimes stalls a new client in SCRAM auth for more than 5 s.
+// Eight seconds outwaits short stalls and still leaves the request time for
+// one fresh connection before the collector's 20 s HTTP timeout.
+export const EDGE_FUNCTION_DATABASE_CONNECT_TIMEOUT_SECONDS = 8;
+
+// Connection-level failures from postgres.js, the Deno socket layer, Postgres
+// and Supavisor. None of them means the batch was rejected, and every ingest
+// write is idempotent, so the caller may retry the whole request.
+const CONNECTION_ERROR_CODES = new Set([
+  "CONNECT_TIMEOUT",
+  "CONNECTION_CLOSED",
+  "CONNECTION_DESTROYED",
+  "CONNECTION_ENDED",
+  "EBADF",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTCONN",
+  "EPIPE",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "53300", // too_many_connections
+  "57P01", // admin_shutdown
+  "57P02", // crash_shutdown
+  "57P03", // cannot_connect_now
+]);
+const SUPAVISOR_TRANSIENT =
+  /^\((EDBHANDLEREXITED|ECHECKOUTTIMEOUT)\)|Max client connections reached/;
+const POSTGRES_JS_CONNECTION_FRAME = /\/postgres\/[0-9.]+\/src\/connection\.js/;
+
+export function isDatabaseConnectionError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const { code, message, stack } = error as {
+    code?: unknown;
+    message?: unknown;
+    stack?: unknown;
+  };
+  if (typeof code === "string") {
+    if (CONNECTION_ERROR_CODES.has(code) || code.startsWith("08")) {
+      return true;
+    }
+    // Supavisor reports pool faults as XX000 with a tag. Configuration
+    // errors (unknown tenant, bad password) are not retried.
+    if (
+      code === "XX000" && typeof message === "string" &&
+      SUPAVISOR_TRANSIENT.test(message)
+    ) {
+      return true;
+    }
+  }
+  // A postgres.js write on a socket that already closed (nextWrite on null).
+  return error instanceof TypeError && typeof stack === "string" &&
+    typeof message === "string" && message.includes("(reading 'write')") &&
+    POSTGRES_JS_CONNECTION_FRAME.test(stack);
+}
 
 export function edgeFunctionDatabaseUrl(databaseUrl: string): string {
   let url: URL;
@@ -220,19 +277,33 @@ export class PostgresBatchRepository
   implements BatchRepository, ExclusionsRepository {
   constructor(private readonly sql: Sql) {}
 
-  static connect(databaseUrl: string): PostgresBatchRepository {
+  static connect(
+    databaseUrl: string,
+    {
+      connectTimeoutSeconds = EDGE_FUNCTION_DATABASE_CONNECT_TIMEOUT_SECONDS,
+    }: { connectTimeoutSeconds?: number } = {},
+  ): PostgresBatchRepository {
     return new PostgresBatchRepository(
       postgres(edgeFunctionDatabaseUrl(databaseUrl), {
         prepare: false,
         max: EDGE_FUNCTION_DATABASE_POOL_MAX,
         idle_timeout: 5,
-        connect_timeout: 5,
+        connect_timeout: connectTimeoutSeconds,
+        // The array-type lookup postgres.js runs on each new connection is
+        // not awaited, so a connection lost during it escapes as an
+        // unhandled rejection and kills the worker. Ingest uses no arrays.
+        fetch_types: false,
       }),
     );
   }
 
   async close(): Promise<void> {
     await this.sql.end();
+  }
+
+  // Drops a broken client at once: pending queries reject, nothing waits.
+  abandon(): void {
+    this.sql.end({ timeout: 0 }).catch(() => undefined);
   }
 
   // Additive and scoped to the caller's own person; the definer function
