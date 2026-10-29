@@ -164,7 +164,8 @@ def transcript_state(
     ``not_saved``: Claude named a transcript under ``projects`` that does not
     exist after the terminal wait, as with ``--no-session-persistence`` runs
     (for example claude-mem's headless observer). Those runs never write one,
-    so their sessions are not lost transcripts.
+    so their sessions are not lost transcripts. It means "absent when the hook
+    ran": if transcript records for the session arrive later, they win.
     """
     if transcript_path is not None:
         return "captured"
