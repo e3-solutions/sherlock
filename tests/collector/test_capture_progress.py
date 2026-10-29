@@ -464,6 +464,72 @@ class DeadLetterVisibilityTests(unittest.TestCase):
             repairs = repair_overlap_dead_letters(spool)
             self.assertEqual(repairs["requeued_batches"], 0)
             self.assertEqual(len(spool.list_pending()), 1)
+            # Still open until the queued copy commits.
+            self.assertEqual(repair_overlap_dead_letters(spool)["examined"], 1)
+
+    def test_a_queued_copy_that_fails_does_not_lose_the_tail(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            spool, lines, first, first_stored, longer, longer_stored = self.overlap_fixture(state)
+            spool.enqueue(first, first_stored)
+            spool.enqueue(longer, longer_stored)
+
+            class Transport:
+                def upload(self, item):
+                    if item.manifest.end_offset == first.end_offset:
+                        return receipt(item.manifest)
+                    raise PermanentUploadError(
+                        "ingest returned HTTP 409", error_code="range_overlap", http_status=409
+                    )
+
+            Drain(spool, Transport()).run()
+            tail, tail_stored = build_source_batch(
+                lines[2],
+                source_stream_key="stream-overlap",
+                generation_key="generation-overlap",
+                generation_seq=0,
+                start_offset=first.end_offset,
+                source_provider="codex",
+                source_kind="rollout",
+                observed_native_session_id="11111111-1111-4111-8111-111111111111",
+            )
+            spool.enqueue(tail, tail_stored)
+            repair_overlap_dead_letters(spool)
+
+            class RejectsTail:
+                def upload(self, item):
+                    raise PermanentUploadError(
+                        "ingest returned HTTP 400", error_code="invalid_payload", http_status=400
+                    )
+
+            Drain(spool, RejectsTail()).run()
+            self.assertEqual(spool.list_pending(), [])
+            # The queued copy is gone, so the dead letter re-sends its own tail.
+            self.assertEqual(repair_overlap_dead_letters(spool)["requeued_batches"], 1)
+            (resent,) = spool.list_pending()
+            self.assertEqual(
+                spool.load(resent).manifest.start_offset, first.end_offset
+            )
+
+    def test_a_queued_batch_that_will_be_rejected_covers_nothing(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            spool, lines, first, first_stored, longer, longer_stored = self.overlap_fixture(state)
+            spool.enqueue(first, first_stored)
+            spool.enqueue(longer, longer_stored)
+
+            class Transport:
+                def upload(self, item):
+                    if item.manifest.end_offset == first.end_offset:
+                        return receipt(item.manifest)
+                    raise PermanentUploadError(
+                        "ingest returned HTTP 409", error_code="range_overlap", http_status=409
+                    )
+
+            Drain(spool, Transport()).run()
+            # Another capture from offset 0 is queued; it overlaps the receipt.
+            spool.enqueue(longer, longer_stored)
+            self.assertEqual(repair_overlap_dead_letters(spool)["requeued_batches"], 1)
 
     def test_overlap_without_a_local_receipt_is_marked_unrepairable(self):
         with TemporaryDirectory() as directory:

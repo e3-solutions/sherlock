@@ -131,6 +131,7 @@ def repair_overlap_dead_letters(
         summary["examined"] += 1
         manifest = item.manifest
         outcome: dict[str, object] = {"repaired_at": utc_now()}
+        waiting = False
         try:
             if any(record.parse_status == "fragment" for record in manifest.records):
                 raise ContractError("fragment batches are not repaired")
@@ -151,13 +152,23 @@ def repair_overlap_dead_letters(
             boundaries = {record.source_start_offset for record in manifest.records}
             ends = {record.source_end_offset for record in manifest.records}
             source = gzip.decompress(item.stored_payload)
-            gaps = _uncovered(
-                manifest.start_offset, manifest.end_offset, [*covered, *claimed[key]]
-            )
+            own_gaps = _uncovered(manifest.start_offset, manifest.end_offset, covered)
+            # A queued range that overlaps a committed one without repeating it
+            # will be rejected itself, so it covers nothing.
+            queued = [
+                span
+                for span in claimed[key]
+                if span in covered
+                or not any(begin < span[1] and finish > span[0] for begin, finish in covered)
+            ]
+            gaps = _uncovered(manifest.start_offset, manifest.end_offset, [*covered, *queued])
             if any(begin not in boundaries or finish not in ends for begin, finish in gaps):
                 # Queued ranges may split records differently; fall back to
                 # committed receipts only, as before.
-                gaps = _uncovered(manifest.start_offset, manifest.end_offset, covered)
+                gaps = own_gaps
+            # Until committed receipts alone cover this dead letter, leave it
+            # open: a queued copy can still fail, and this one re-sends then.
+            waiting = gaps != own_gaps
             requeued: list[list[int]] = []
             for begin, finish in gaps:
                 if begin not in boundaries or finish not in ends:
@@ -186,6 +197,8 @@ def repair_overlap_dead_letters(
                 requeued.append([begin, finish])
             outcome.update(status="requeued", ranges=requeued)
             summary["requeued_batches"] += len(requeued)
+            if waiting:
+                continue
         except (ContractError, OSError, ValueError) as error:
             outcome.update(status="unrepairable", reason=str(error)[:120])
             summary["unrepairable"] += 1
