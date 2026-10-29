@@ -139,8 +139,11 @@ generation: the remainder through the next newline stays a split record, while
 all subsequent capture uses complete lines. Existing raw artifacts stay immutable,
 and the ledger records `legacy_unterminated_cursor_continued` for audit.
 
-Upload failures retry with persisted exponential backoff (one minute through one
-day). Shared endpoint, auth and identity failures stop new upload scheduling;
+Upload failures retry with persisted exponential backoff (one minute, doubling,
+at most five minutes). A run that uploads anything restarts the count, and up to
+three 5xx responses in a row (Supabase cold boots) delay only their own streams.
+Delays longer than five minutes left by an older collector are treated as due.
+Shared endpoint, auth and identity failures stop new upload scheduling;
 already running requests finish, and all rejected items stay queued. A shared
 cooldown in `sherlock/telemetry/queue/upload-status.json` also applies to subsequent
 hook drains and newly captured streams. `reconcile` reports `collector_failure`

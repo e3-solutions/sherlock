@@ -150,8 +150,13 @@ class SpoolItem:
         return cls(manifest, stored, metadata)
 
 
+# A brief Supabase 503 must not stall uploads for hours (COR-5058): retries
+# double from one minute and stop growing at five.
+MAX_UPLOAD_BACKOFF_SECONDS = 5 * 60
+
+
 def upload_backoff_seconds(attempts: int) -> int:
-    return min(24 * 60 * 60, 60 * 2 ** min(attempts - 1, 11))
+    return min(MAX_UPLOAD_BACKOFF_SECONDS, 60 * 2 ** min(max(attempts, 1) - 1, 3))
 
 
 def upload_error_details(error: Exception) -> dict:
@@ -371,10 +376,13 @@ class DurableSpool:
                 f"cannot read collector upload status: {error}"
             ) from error
 
-    def defer_uploads(self, error: Exception) -> dict:
+    def defer_uploads(self, error: Exception, *, progressed: bool = False) -> dict:
         previous = self.upload_status()
+        # A run that uploaded something before failing starts the count again.
         attempts = (
-            previous.get("attempts", 0) + 1 if previous["status"] == "blocked" else 1
+            previous.get("attempts", 0) + 1
+            if previous["status"] == "blocked" and not progressed
+            else 1
         )
         status = {
             **upload_error_details(error),
