@@ -29,7 +29,13 @@ from .rollout import (
     RolloutCapturer,
     SourceSnapshot,
 )
+from . import pending_sources
+from .exclusions import EXCLUDED, EXCLUDED_PROJECT, NOT_ALLOWED
 from .spool import DurableSpool, _atomic_json, secure_lock
+
+# Owner-policy outcomes that will not change on retry (a policy edit is picked
+# up by the periodic reconciler). Unverified ancestry may resolve later.
+FINAL_POLICY_REASONS = frozenset({EXCLUDED, EXCLUDED_PROJECT, NOT_ALLOWED})
 
 
 CODEX_HOOK_EVENTS = {
@@ -179,6 +185,46 @@ def capture_and_spawn_drain(
     return outcome
 
 
+def _remember_uncaptured(
+    root: Path,
+    state_name: str,
+    capturer: RolloutCapturer,
+    outcome: CaptureResult | None,
+    hook_paths: Sequence[str],
+    reminders: Sequence[pending_sources.PendingSource],
+    native_ids: Mapping[str, str],
+    parent_ids: Mapping[str, str],
+    *,
+    terminal: bool,
+) -> None:
+    """Leave a marker for hook-named sources this capture did not finish.
+
+    A locked capture skipped every named source, so all of them are marked. An
+    unlocked one marks only what a terminal event left unfinished: earlier
+    events of a live session are followed by later hooks naming the same file.
+    """
+    if outcome is None or outcome.locked:
+        pending_sources.remember(root, state_name, hook_paths, native_ids, parent_ids)
+        return
+    unfinished = [
+        path
+        for path in hook_paths
+        if terminal
+        and path not in capturer.completed_paths
+        and capturer.source_issues.get(path) not in FINAL_POLICY_REASONS
+        and os.path.lexists(path)
+    ]
+    if unfinished:
+        pending_sources.remember(root, state_name, unfinished, native_ids, parent_ids)
+    pending_sources.settle(
+        reminders,
+        visited=capturer.visited_paths,
+        completed=capturer.completed_paths,
+        source_issues=capturer.source_issues,
+        blocked_reasons=FINAL_POLICY_REASONS,
+    )
+
+
 def _capture_hook(
     event_name: str,
     payload: Mapping[str, object],
@@ -237,6 +283,39 @@ def _capture_hook(
     environment = os.environ.copy()
     if drain_environment:
         environment.update(drain_environment)
+    source_state_name = "claude-transcript" if provider == "claude_code" else "rollout"
+    allowed_root = (
+        home / "projects"
+        if provider == "claude_code"
+        and not (home / "projects").is_symlink()
+        and (home / "projects").is_dir()
+        else home if provider == "codex" else None
+    )
+    hook_paths = [str(path) for path in discovery.paths[: discovery.priority_count]]
+    # Sources an earlier hook named but could not capture (lock contention)
+    # come right after this hook's own sources.
+    reminders = [
+        entry
+        for entry in pending_sources.load(
+            root, source_state_name, allowed_root=allowed_root
+        )
+        if entry.path not in hook_paths
+    ]
+    capture_paths = [
+        *hook_paths,
+        *(entry.path for entry in reminders),
+        *(
+            str(path)
+            for path in discovery.paths[discovery.priority_count :]
+        ),
+    ]
+    source_native_ids = dict(discovery.native_session_ids)
+    source_parent_ids = dict(discovery.parent_native_session_ids)
+    for entry in reminders:
+        if entry.native_session_id:
+            source_native_ids.setdefault(entry.path, entry.native_session_id)
+        if entry.parent_native_session_id:
+            source_parent_ids.setdefault(entry.path, entry.parent_native_session_id)
     hook_outcome = CaptureResult()
     hook_observation: Path | None = None
     hook_errors = 0
@@ -288,37 +367,41 @@ def _capture_hook(
             )
         except (OSError, ValueError):
             hook_errors += 1
+    capturer = RolloutCapturer(
+        root,
+        DurableSpool(root / "queue"),
+        source_provider=provider,
+        source_kind="transcript" if provider == "claude_code" else "rollout",
+        state_name=source_state_name,
+        capture_unterminated_tail=False,
+        allowed_root=allowed_root,
+    )
     outcome = capture_and_spawn_drain(
-        RolloutCapturer(
-            root,
-            DurableSpool(root / "queue"),
-            source_provider=provider,
-            source_kind="transcript" if provider == "claude_code" else "rollout",
-            state_name=(
-                "claude-transcript" if provider == "claude_code" else "rollout"
-            ),
-            capture_unterminated_tail=False,
-            allowed_root=(
-                home / "projects"
-                if provider == "claude_code"
-                and not (home / "projects").is_symlink()
-                and (home / "projects").is_dir()
-                else home if provider == "codex" else None
-            ),
-        ),
-        discovery.paths,
+        capturer,
+        capture_paths,
         drain_command,
-        native_session_ids=discovery.native_session_ids,
-        parent_native_session_ids=discovery.parent_native_session_ids,
+        native_session_ids=source_native_ids,
+        parent_native_session_ids=source_parent_ids,
         source_snapshots=discovery.source_snapshots,
         drain_environment=environment,
         best_effort=True,
-        priority_count=discovery.priority_count,
+        priority_count=len(hook_paths) + len(reminders),
         backlog_workload_class=(
             "backfill"
             if event_name == "SessionStart"
             else None
         ),
+    )
+    _remember_uncaptured(
+        root,
+        source_state_name,
+        capturer,
+        outcome,
+        hook_paths,
+        reminders,
+        source_native_ids,
+        source_parent_ids,
+        terminal=event_name in TERMINAL_EVENTS,
     )
     if (
         outcome.locked

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 import uuid
 from collections import Counter
@@ -29,6 +30,22 @@ from .collection_receipt import (
 STALL_AFTER_SECONDS = 60 * 60
 MAX_REPORTED_ERRORS = 5
 MAX_REPORTED_ERROR_CHARS = 200
+
+
+def dead_letter_code(
+    http_status: object,
+    error_code: object,
+    error_type: object = None,
+) -> str:
+    """A short, content-free reason key such as ``409_range_overlap``."""
+    code = error_code if isinstance(error_code, str) and error_code else None
+    if isinstance(http_status, int) and code:
+        return f"{http_status}_{code}"[:80]
+    if code:
+        return code[:80]
+    if isinstance(http_status, int):
+        return f"http_{http_status}"
+    return str(error_type or "unknown")[:80]
 
 
 def utc_now() -> str:
@@ -156,6 +173,9 @@ class DurableSpool:
         self.processing = self.root / "processing"
         self.dead_letter = self.root / "dead-letter"
         self.receipts = self.root / "receipts"
+        # Drain workers quarantine concurrently; the drain lock already keeps
+        # other processes out, so this guards the stats file within one drain.
+        self._stats_lock = threading.Lock()
         for directory in (
             self.pending,
             self.processing,
@@ -423,6 +443,135 @@ class DurableSpool:
         if destination.exists():
             destination = self.dead_letter / f"{path.stem}.{uuid.uuid4().hex}.json"
         _durable_replace(path, destination)
+        self._count_dead_letter(error)
+
+    @property
+    def dead_letter_stats_path(self) -> Path:
+        return self.root / "dead-letter-stats.json"
+
+    def _count_dead_letter(self, error: Exception) -> None:
+        """Keep a cumulative, content-free count of dead letters by reason code."""
+        code = dead_letter_code(
+            getattr(error, "http_status", None),
+            getattr(error, "error_code", None),
+            type(error).__name__,
+        )
+        with self._stats_lock:
+            try:
+                previous = json.loads(self.dead_letter_stats_path.read_text())
+                if not isinstance(previous, dict) or not isinstance(
+                    previous.get("by_code"), dict
+                ):
+                    raise ValueError("invalid dead-letter stats")
+            except (OSError, ValueError):
+                previous = {"total": 0, "by_code": {}}
+            by_code = {
+                str(key): value
+                for key, value in previous["by_code"].items()
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+            by_code[code] = by_code.get(code, 0) + 1
+            total = previous.get("total")
+            total = total if isinstance(total, int) and not isinstance(total, bool) else 0
+            try:
+                _atomic_json(
+                    self.dead_letter_stats_path,
+                    {
+                        "stats_version": 1,
+                        "total": total + 1,
+                        "by_code": by_code,
+                        "last_code": code,
+                        "last_dead_lettered_at": utc_now(),
+                    },
+                )
+            except OSError:
+                # Counting never blocks quarantine; the folder itself is the record.
+                pass
+
+    @property
+    def dead_letter_index_path(self) -> Path:
+        return self.root / "dead-letter-index.json"
+
+    def dead_letter_index(self) -> dict[str, dict[str, Any]]:
+        """Reason code per dead-letter file, parsing each file only once.
+
+        Dead letters keep whole payloads, so re-reading every one on each
+        reconcile or health check would cost as much as the payloads. The index
+        is keyed by file name and size; it holds no payload bytes.
+        """
+        try:
+            cached = json.loads(self.dead_letter_index_path.read_text())
+            entries = cached.get("entries") if isinstance(cached, dict) else None
+            if not isinstance(entries, dict):
+                entries = {}
+        except (OSError, ValueError):
+            entries = {}
+        current: dict[str, dict[str, Any]] = {}
+        changed = False
+        for path in self.dead_letter.glob("*.json"):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            entry = entries.get(path.name)
+            if isinstance(entry, dict) and entry.get("size") == size:
+                current[path.name] = entry
+                continue
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                metadata = value.get("metadata") or {}
+                details = metadata.get("dead_letter") or value.get("dead_letter") or {}
+                repaired = metadata.get("overlap_repair") is not None
+            except (OSError, ValueError, AttributeError):
+                details, repaired = {}, False
+            current[path.name] = {
+                "size": size,
+                "code": dead_letter_code(
+                    details.get("http_status"),
+                    details.get("error_code"),
+                    details.get("error_type") or "unreadable",
+                ),
+                "failed_at": details.get("failed_at")
+                if isinstance(details.get("failed_at"), str)
+                else None,
+                "overlap_repaired": repaired,
+            }
+            changed = True
+        if changed or set(current) != set(entries):
+            try:
+                _atomic_json(
+                    self.dead_letter_index_path,
+                    {"index_version": 1, "entries": current},
+                )
+            except OSError:
+                pass
+        return current
+
+    def dead_letter_summary(self) -> dict[str, Any]:
+        """Counts of dead-lettered batches by reason code; no payload bytes."""
+        codes: Counter[str] = Counter()
+        oldest: str | None = None
+        for entry in self.dead_letter_index().values():
+            codes[str(entry.get("code"))] += 1
+            failed_at = entry.get("failed_at")
+            if isinstance(failed_at, str) and (oldest is None or failed_at < oldest):
+                oldest = failed_at
+        try:
+            cumulative = json.loads(self.dead_letter_stats_path.read_text())
+            if not isinstance(cumulative, dict):
+                cumulative = {}
+        except (OSError, ValueError):
+            cumulative = {}
+        return {
+            "dead_letter_batches": sum(codes.values()),
+            "dead_letter_codes": dict(sorted(codes.items())),
+            "oldest_dead_letter_at": oldest,
+            "dead_letters_total": cumulative.get("total")
+            if isinstance(cumulative.get("total"), int)
+            else 0,
+            "dead_letters_total_by_code": cumulative.get("by_code") or {},
+            "last_dead_lettered_at": cumulative.get("last_dead_lettered_at"),
+        }
 
     def acknowledge(self, path: Path) -> None:
         _durable_unlink(path)

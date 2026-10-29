@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import fcntl
+import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,7 +18,7 @@ from .contract import (
 )
 from . import exclusion_report
 from .exclusions import EXCLUDED_PROJECT, ExclusionPolicy, load_policy, observed_cwds
-from .spool import DurableSpool, SpoolItem, secure_lock
+from .spool import DurableSpool, SpoolItem, dead_letter_code, secure_lock
 
 
 class TransientUploadError(RuntimeError):
@@ -58,6 +59,8 @@ class DrainResult:
     # Best-effort report of excluded session ids so Sherlock hides copies it
     # already received: none, unchanged, reported, skipped or failed:<code>.
     exclusions_report: str | None = None
+    # Batches dead-lettered by this run, by reason (e.g. 409_range_overlap).
+    dead_letter_codes: dict | None = None
 
 
 class Drain:
@@ -80,6 +83,17 @@ class Drain:
         self._policy = ExclusionPolicy()
         self._held: set[Path] = set()
         self._project_held_sessions: set[str] = set()
+        self._dead_letter_codes: Counter[str] = Counter()
+        self._codes_lock = threading.Lock()
+
+    def _note_dead_letter(self, error: Exception) -> None:
+        code = dead_letter_code(
+            getattr(error, "http_status", None),
+            getattr(error, "error_code", None),
+            type(error).__name__,
+        )
+        with self._codes_lock:
+            self._dead_letter_codes[code] += 1
 
     def run(self, *, max_items: int = 1024, max_seconds: float = 300) -> DrainResult:
         if max_items < 1 or max_seconds <= 0:
@@ -90,11 +104,13 @@ class Drain:
         self._policy = self.exclusion_policy or load_policy()
         self._held = set()
         self._project_held_sessions = set()
+        self._dead_letter_codes = Counter()
         result = self._run(max_items, max_seconds)
         return replace(
             result,
             held_by_policy=len(self._held),
             exclusions_report=self._report_exclusions(result),
+            dead_letter_codes=dict(sorted(self._dead_letter_codes.items())) or None,
         )
 
     def _report_exclusions(self, result: DrainResult) -> str:
@@ -325,20 +341,24 @@ class Drain:
         except (TransientUploadError, ReceiptMismatch) as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
+                self._note_dead_letter(error)
                 return "dead-lettered"
             self.spool.requeue(claimed, item, error)
             return "requeued"
         except PermanentUploadError as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
+                self._note_dead_letter(error)
                 return "dead-lettered"
             # Keep immutable manifest/payload evidence with an auditable reason,
             # and let later ranges proceed. Inventory still exposes the gap.
             self.spool.quarantine(claimed, item, error)
+            self._note_dead_letter(error)
             return "dead-lettered"
         except ContractError as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
+                self._note_dead_letter(error)
                 return "dead-lettered"
             # A local receipt conflict is an audit problem, not a server rejection.
             self.spool.requeue(claimed, item, error)
@@ -346,6 +366,7 @@ class Drain:
         except Exception as error:
             if item is None:
                 self.spool.quarantine(claimed, None, error)
+                self._note_dead_letter(error)
                 return "dead-lettered"
             self.spool.requeue(claimed, item, TransientUploadError(str(error)))
             return "requeued"
