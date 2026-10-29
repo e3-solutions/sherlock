@@ -64,6 +64,27 @@ def _committed_ranges(spool: DurableSpool) -> dict[tuple, list[tuple[int, int]]]
     return ranges
 
 
+def _queued_ranges(spool: DurableSpool) -> dict[tuple, list[tuple[int, int]]]:
+    """Byte ranges already waiting to upload. Re-sending them again would only
+    collect another range_overlap once the queued copy commits (COR-5060)."""
+    ranges: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
+    for path in [*spool.list_pending(), *sorted(spool.processing.glob("*.json"))]:
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))["manifest"]
+            key = (
+                manifest["source_kind"],
+                manifest["source_stream_key"],
+                manifest["generation_key"],
+                int(manifest["generation_seq"]),
+            )
+            ranges[key].append(
+                (int(manifest["start_offset"]), int(manifest["end_offset"]))
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return ranges
+
+
 def repair_overlap_dead_letters(
     spool: DurableSpool,
     *,
@@ -103,10 +124,14 @@ def repair_overlap_dead_letters(
     if not candidates:
         return summary
     committed = _committed_ranges(spool)
+    # Ranges that will reach the server anyway: queued batches, and tails this
+    # run re-sends. Several dead letters often share one start offset.
+    claimed = _queued_ranges(spool)
     for path, value, item in candidates:
         summary["examined"] += 1
         manifest = item.manifest
         outcome: dict[str, object] = {"repaired_at": utc_now()}
+        waiting = False
         try:
             if any(record.parse_status == "fragment" for record in manifest.records):
                 raise ContractError("fragment batches are not repaired")
@@ -127,10 +152,25 @@ def repair_overlap_dead_letters(
             boundaries = {record.source_start_offset for record in manifest.records}
             ends = {record.source_end_offset for record in manifest.records}
             source = gzip.decompress(item.stored_payload)
+            own_gaps = _uncovered(manifest.start_offset, manifest.end_offset, covered)
+            # A queued range that overlaps a committed one without repeating it
+            # will be rejected itself, so it covers nothing.
+            queued = [
+                span
+                for span in claimed[key]
+                if span in covered
+                or not any(begin < span[1] and finish > span[0] for begin, finish in covered)
+            ]
+            gaps = _uncovered(manifest.start_offset, manifest.end_offset, [*covered, *queued])
+            if any(begin not in boundaries or finish not in ends for begin, finish in gaps):
+                # Queued ranges may split records differently; fall back to
+                # committed receipts only, as before.
+                gaps = own_gaps
+            # Until committed receipts alone cover this dead letter, leave it
+            # open: a queued copy can still fail, and this one re-sends then.
+            waiting = gaps != own_gaps
             requeued: list[list[int]] = []
-            for begin, finish in _uncovered(
-                manifest.start_offset, manifest.end_offset, covered
-            ):
+            for begin, finish in gaps:
                 if begin not in boundaries or finish not in ends:
                     raise ContractError("uncovered range is not record aligned")
                 tail = source[
@@ -153,9 +193,12 @@ def repair_overlap_dead_letters(
                     collector_version=manifest.collector_version,
                 )
                 spool.enqueue(repaired, stored, workload_class="backfill")
+                claimed[key].append((begin, finish))
                 requeued.append([begin, finish])
             outcome.update(status="requeued", ranges=requeued)
             summary["requeued_batches"] += len(requeued)
+            if waiting:
+                continue
         except (ContractError, OSError, ValueError) as error:
             outcome.update(status="unrepairable", reason=str(error)[:120])
             summary["unrepairable"] += 1
