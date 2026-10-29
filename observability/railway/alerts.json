@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "template_only": true,
+  "owner_boundary": "Railway owns terminal deployment state only. Grafana owns dashboard availability, pipeline freshness, database pressure, grouping, repeats, and resolved notifications.",
+  "activation_gate": "Do not send Railway events directly to #bonaparte-alerts until either an existing operated receiver proves exact production environment and dashboard/worker service filtering, or the Railway project contains only production and only those two services.",
+  "delivery": {
+    "channel": "#bonaparte-alerts",
+    "direct_slack_muxer_allowed": false,
+    "reason": "Railway project webhooks span every environment and direct Slack does not implement the simulated environment/service filter. Enable only through an existing operated filtered receiver, or after proving the project contains production alone and only dashboard/worker; otherwise keep Railway notifications email/in-app.",
+    "send_success_events": false
+  },
+  "events": [
+    {
+      "type": "Deployment.failed",
+      "desired": true,
+      "severity": "warning",
+      "environments": [
+        "production"
+      ],
+      "services": [
+        "dashboard",
+        "worker"
+      ],
+      "repeat": false,
+      "resolved": false,
+      "runbook_action": "Inspect build and deploy logs, then fix forward or redeploy the last known-good image. Do not mutate queue history or raw telemetry."
+    }
+  ],
+  "explicitly_omitted": [
+    "deployment started",
+    "deployment succeeded",
+    "individual restart",
+    "deployment crashed",
+    "cpu threshold",
+    "ram threshold",
+    "disk threshold",
+    "network threshold"
+  ]
+}
