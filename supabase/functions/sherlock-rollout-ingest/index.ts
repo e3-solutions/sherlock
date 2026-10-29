@@ -81,7 +81,8 @@ globalThis.addEventListener(
 );
 
 export const DATABASE_ATTEMPTS = 3;
-// A retry starts only this early in the request, so a second 8 s connect
+// A retry starts only this early in the request (counted from its arrival,
+// since reading and hashing the body come first), so a second 8 s connect
 // still answers before the collector's 20 s HTTP timeout.
 export const DATABASE_RETRY_WINDOW_MS = 9_000;
 export const DATABASE_RETRY_AFTER_SECONDS = 5;
@@ -98,9 +99,9 @@ async function withDatabase<T>(
   discardBackend: (broken: Backend) => void,
   sleep: (milliseconds: number) => Promise<void>,
   now: () => number,
+  requestStartedAt: number,
   work: (current: Backend) => Promise<T>,
 ): Promise<T> {
-  const startedAt = now();
   for (let attempt = 1;; attempt += 1) {
     const current = backendFactory();
     try {
@@ -109,7 +110,7 @@ async function withDatabase<T>(
       if (!isDatabaseConnectionError(error)) throw error;
       discardBackend(current);
       const retry = attempt < DATABASE_ATTEMPTS &&
-        now() - startedAt < DATABASE_RETRY_WINDOW_MS;
+        now() - requestStartedAt < DATABASE_RETRY_WINDOW_MS;
       console.error(
         `database connection failed (attempt ${attempt}, ${
           retry ? "retrying" : "giving up"
@@ -149,8 +150,16 @@ export async function handleRequest(
     now?: () => number;
   } = {},
 ): Promise<Response> {
+  const requestStartedAt = now();
   const database = <T>(work: (current: Backend) => Promise<T>) =>
-    withDatabase(backendFactory, discardBackend, sleep, now, work);
+    withDatabase(
+      backendFactory,
+      discardBackend,
+      sleep,
+      now,
+      requestStartedAt,
+      work,
+    );
   try {
     if (request.method !== "POST") {
       return Response.json({ error: { code: "method_not_allowed" } }, {
