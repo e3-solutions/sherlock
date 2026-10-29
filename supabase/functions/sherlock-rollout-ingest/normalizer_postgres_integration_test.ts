@@ -1657,21 +1657,30 @@ Deno.test({
       );
       assert(count === 1, `expected one committed batch, found ${count}`);
     } finally {
-      await sql.unsafe(
-        "delete from telemetry.native_records where workspace_id = $1",
-        [workspaceId],
-      ).catch(() => undefined);
-      await sql.unsafe(
-        "delete from telemetry.ingest_batches where workspace_id = $1",
-        [workspaceId],
-      ).catch(() => undefined);
-      await sql.unsafe("delete from telemetry.people where workspace_id = $1", [
-        workspaceId,
-      ]).catch(() => undefined);
-      await sql.unsafe("delete from telemetry.workspaces where id = $1", [
-        workspaceId,
-      ]).catch(() => undefined);
-      await Promise.allSettled([repository.close(), sql.end()]);
+      // The commit trigger enqueued a live normalize job; leaving it would
+      // be claimed by the queue integration test. Cleanup must not fail
+      // silently.
+      try {
+        for (
+          const statement of [
+            "delete from processing.telemetry_jobs where workspace_id = $1",
+            "delete from telemetry.native_records where workspace_id = $1",
+            "delete from telemetry.ingest_batches where workspace_id = $1",
+            "delete from telemetry.people where workspace_id = $1",
+            "delete from telemetry.workspaces where id = $1",
+          ]
+        ) {
+          await sql.unsafe(statement, [workspaceId]);
+        }
+        const [{ left }] = await sql.unsafe(
+          `select count(*)::integer as left from processing.telemetry_jobs
+            where workspace_id = $1`,
+          [workspaceId],
+        );
+        assert(left === 0, `left ${left} processing jobs behind`);
+      } finally {
+        await Promise.allSettled([repository.close(), sql.end()]);
+      }
     }
   },
 });
