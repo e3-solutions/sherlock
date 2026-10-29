@@ -1,10 +1,22 @@
-import { CONTRACT_VERSION, IngestError, sha256Hex } from "./contract.ts";
 import {
+  type BatchManifest,
+  CONTRACT_VERSION,
+  IngestError,
+  sha256Hex,
+} from "./contract.ts";
+import {
+  DATABASE_ATTEMPTS,
+  DATABASE_RETRY_WINDOW_MS,
   handleRequest,
   ingestDatabaseUrl,
   parseWorkloadClassHint,
 } from "./index.ts";
-import { exclusionsError, PostgresBatchRepository } from "./postgres.ts";
+import {
+  exclusionsError,
+  isDatabaseConnectionError,
+  PostgresBatchRepository,
+} from "./postgres.ts";
+import { IngestService } from "./service.ts";
 
 function assert(
   condition: unknown,
@@ -383,4 +395,278 @@ Deno.test("the repository records as the ingest role with a text array", async (
   assert(receipt.accepted === 2 && receipt.total === 2);
   assert(statements[0][0] === "set local role sherlock_ingest");
   assert(statements[1][1]?.[2] === `{${CHILD},${ROOT}}`);
+});
+
+function connectionError(code: string): Error {
+  return Object.assign(new Error(`write ${code} pooler:6543`), { code });
+}
+
+const ATTRIBUTION = {
+  workspace_id: "00000000-0000-4000-8000-000000000001",
+  person_id: "00000000-0000-4000-8000-000000000003",
+  collector_key: "team-test",
+};
+
+function retryOptions(
+  backendFactory: () => unknown,
+  { elapsedPerAttemptMs = 0 } = {},
+) {
+  const record = { discarded: 0, sleeps: [] as number[] };
+  let clock = 0;
+  return {
+    record,
+    options: {
+      environment: ENVIRONMENT,
+      backendFactory: backendFactory as never,
+      discardBackend: () => {
+        record.discarded += 1;
+        clock += elapsedPerAttemptMs;
+      },
+      sleep: (milliseconds: number) => {
+        record.sleeps.push(milliseconds);
+        return Promise.resolve();
+      },
+      now: () => clock,
+    },
+  };
+}
+
+Deno.test("connection-level failures are classified as retryable", () => {
+  for (
+    const code of [
+      "CONNECT_TIMEOUT",
+      "CONNECTION_CLOSED",
+      "CONNECTION_DESTROYED",
+      "ECONNRESET",
+      "EBADF",
+      "08006",
+      "57P01",
+      "53300",
+    ]
+  ) {
+    assert(isDatabaseConnectionError(connectionError(code)), code);
+  }
+  const supavisor = Object.assign(
+    new Error("(EDBHANDLEREXITED) connection to database closed"),
+    { code: "XX000" },
+  );
+  assert(isDatabaseConnectionError(supavisor));
+  const nextWrite = new TypeError(
+    "Cannot read properties of null (reading 'write')",
+  );
+  nextWrite.stack =
+    `TypeError: Cannot read properties of null (reading 'write')\n    at nextWrite (file:///var/tmp/sb-compile-edge-runtime/node_modules/localhost/postgres/3.4.7/src/connection.js:255:22)`;
+  assert(isDatabaseConnectionError(nextWrite));
+
+  for (
+    const error of [
+      new TypeError("Cannot read properties of null (reading 'write')"),
+      Object.assign(new Error("canceling statement"), { code: "57014" }),
+      Object.assign(new Error("internal"), { code: "XX000" }),
+      new IngestError("range_overlap", "overlap", 409),
+      new Error("boom"),
+      "CONNECT_TIMEOUT",
+      null,
+    ]
+  ) {
+    assert(!isDatabaseConnectionError(error), String(error));
+  }
+});
+
+Deno.test("a connection failure is retried on a fresh backend", async () => {
+  let factoryCalls = 0;
+  const { record, options } = retryOptions(() => {
+    factoryCalls += 1;
+    const attempt = factoryCalls;
+    return {
+      batches: {
+        resolveAttribution: () =>
+          attempt === 1
+            ? Promise.reject(connectionError("CONNECT_TIMEOUT"))
+            : Promise.resolve(ATTRIBUTION),
+      },
+      service: {
+        ingest: (attribution: Record<string, string>) =>
+          Promise.resolve({ status: "committed", ...attribution }),
+      },
+    };
+  });
+  const response = await handleRequest(
+    await requestFor("user@e3group.ai"),
+    options,
+  );
+  assert(response.status === 200, `status ${response.status}`);
+  assert(factoryCalls === 2 && record.discarded === 1);
+  assert(record.sleeps.length === 1 && record.sleeps[0] >= 200);
+  assert(record.sleeps[0] < 500);
+});
+
+Deno.test("a retried identical batch returns its receipt, not a 409", async () => {
+  // The first attempt commits, then the pooler drops the socket before the
+  // response arrives. The retry must find the exact committed range.
+  let committed: Record<string, unknown> | null = null;
+  let commits = 0;
+  let lostResponse = false;
+  let uploads = 0;
+  const batches = {
+    resolveAttribution: () => Promise.resolve(ATTRIBUTION),
+    findExact: () => Promise.resolve(committed),
+    commit: (attribution: typeof ATTRIBUTION, manifest: BatchManifest) => {
+      commits += 1;
+      if (committed) {
+        return Promise.reject(
+          new IngestError("range_overlap", "overlap", 409),
+        );
+      }
+      committed = {
+        ...attribution,
+        status: "committed",
+        batch_id: "00000000-0000-4000-8000-0000000000b1",
+        end_offset: manifest.end_offset,
+      };
+      if (!lostResponse) {
+        lostResponse = true;
+        return Promise.reject(connectionError("CONNECTION_CLOSED"));
+      }
+      return Promise.resolve(committed);
+    },
+  };
+  const service = new IngestService({
+    ensure: () => {
+      uploads += 1;
+      return Promise.resolve();
+    },
+  }, batches as never);
+  const { record, options } = retryOptions(() => ({ batches, service }));
+
+  const response = await handleRequest(
+    await requestFor("user@e3group.ai"),
+    options,
+  );
+
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await response.json();
+  assert(body.batch_id === "00000000-0000-4000-8000-0000000000b1");
+  assert(commits === 1, "the retry must not attempt a second insert");
+  assert(uploads === 1, "the retry must not upload again after commit");
+  assert(record.discarded === 1);
+});
+
+Deno.test("persistent connection failure answers 503 database_unavailable", async () => {
+  let factoryCalls = 0;
+  const { record, options } = retryOptions(() => {
+    factoryCalls += 1;
+    return {
+      batches: {
+        resolveAttribution: () =>
+          Promise.reject(connectionError("CONNECT_TIMEOUT")),
+      },
+      service: {},
+    };
+  });
+  const response = await handleRequest(
+    await requestFor("user@e3group.ai"),
+    options,
+  );
+  assert(response.status === 503);
+  assert(response.headers.get("Retry-After") === "5");
+  assert(response.headers.get("Cache-Control") === "no-store");
+  const body = await response.json();
+  assert(body.error.code === "database_unavailable");
+  assert(!JSON.stringify(body).includes("pooler"));
+  assert(factoryCalls === DATABASE_ATTEMPTS);
+  assert(record.discarded === DATABASE_ATTEMPTS);
+  assert(record.sleeps.length === DATABASE_ATTEMPTS - 1);
+});
+
+Deno.test("no retry starts once the retry window has passed", async () => {
+  let factoryCalls = 0;
+  const { options } = retryOptions(() => {
+    factoryCalls += 1;
+    return {
+      batches: {
+        resolveAttribution: () =>
+          Promise.reject(connectionError("CONNECT_TIMEOUT")),
+      },
+      service: {},
+    };
+  }, { elapsedPerAttemptMs: DATABASE_RETRY_WINDOW_MS });
+  const response = await handleRequest(
+    await requestFor("user@e3group.ai"),
+    options,
+  );
+  assert(response.status === 503);
+  assert(factoryCalls === 1);
+});
+
+Deno.test("exclusions retry a connection failure too", async () => {
+  const calls: { attribution: unknown; ids: readonly string[] }[] = [];
+  let attempts = 0;
+  const backend = exclusionsBackend(calls, () => {
+    attempts += 1;
+    return attempts === 1
+      ? Promise.reject(connectionError("ECONNRESET"))
+      : Promise.resolve({ accepted: 0, total: 1 });
+  });
+  const { record, options } = retryOptions(backend);
+  const response = await handleRequest(exclusionsRequest([ROOT]), options);
+  assert(response.status === 200);
+  assert((await response.json()).total === 1);
+  assert(calls.length === 2 && record.discarded === 1);
+});
+
+Deno.test("non-connection failures are not retried", async () => {
+  for (
+    const [error, status] of [
+      [new IngestError("range_overlap", "overlap", 409), 409],
+      [Object.assign(new Error("slow"), { code: "57014" }), 500],
+      [new Error("boom"), 500],
+    ] as [Error, number][]
+  ) {
+    let factoryCalls = 0;
+    const { record, options } = retryOptions(() => {
+      factoryCalls += 1;
+      return {
+        batches: { resolveAttribution: () => Promise.reject(error) },
+        service: {},
+      };
+    });
+    const response = await handleRequest(
+      await requestFor("user@e3group.ai"),
+      options,
+    );
+    assert(response.status === status, `${error.message}: ${response.status}`);
+    assert(factoryCalls === 1 && record.discarded === 0);
+    assert(response.headers.get("Retry-After") === null);
+  }
+});
+
+Deno.test("detached postgres.js connection errors do not crash the worker", () => {
+  const detached = new PromiseRejectionEvent("unhandledrejection", {
+    promise: Promise.resolve(),
+    reason: connectionError("CONNECT_TIMEOUT"),
+    cancelable: true,
+  });
+  globalThis.dispatchEvent(detached);
+  assert(detached.defaultPrevented, "connection rejection must be absorbed");
+
+  const nextWrite = new TypeError(
+    "Cannot read properties of null (reading 'write')",
+  );
+  nextWrite.stack =
+    `TypeError: x\n    at nextWrite (file:///node_modules/postgres/3.4.7/src/connection.js:1:1)`;
+  const thrown = new ErrorEvent("error", {
+    error: nextWrite,
+    cancelable: true,
+  });
+  globalThis.dispatchEvent(thrown);
+  assert(thrown.defaultPrevented, "nextWrite crash must be absorbed");
+
+  const unrelated = new PromiseRejectionEvent("unhandledrejection", {
+    promise: Promise.resolve(),
+    reason: new Error("a real bug"),
+    cancelable: true,
+  });
+  globalThis.dispatchEvent(unrelated);
+  assert(!unrelated.defaultPrevented, "other crashes must stay visible");
 });
