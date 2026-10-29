@@ -376,6 +376,95 @@ class DeadLetterVisibilityTests(unittest.TestCase):
             marked = json.loads(dead.read_text())["metadata"]["overlap_repair"]
             self.assertEqual(marked["status"], "requeued")
 
+    def test_overlapping_dead_letters_are_repaired_without_new_rejections(self):
+        # An interrupted capture re-read the same start several times, each time
+        # reaching further. Repairing every tail against receipts alone re-sent
+        # overlapping tails, and each one after the first got a fresh 409, one
+        # reconcile run per step (COR-5060).
+        with TemporaryDirectory() as directory:
+            spool = DurableSpool(Path(directory) / "queue")
+            lines = [
+                json.dumps({"type": "user", "n": index}).encode() + b"\n"
+                for index in range(5)
+            ]
+            common = dict(
+                source_stream_key="stream-overlap",
+                generation_key="generation-overlap",
+                generation_seq=0,
+                start_offset=0,
+                source_provider="codex",
+                source_kind="rollout",
+                observed_native_session_id="11111111-1111-4111-8111-111111111111",
+            )
+            for count in (2, 3, 4, 5):
+                spool.enqueue(*build_source_batch(b"".join(lines[:count]), **common))
+
+            class Server:
+                """Commits like the ingest: exact repeats succeed, overlaps are 409."""
+
+                def __init__(self):
+                    self.committed: list[tuple[int, int]] = []
+                    self.rejected = 0
+
+                def upload(self, item):
+                    span = (item.manifest.start_offset, item.manifest.end_offset)
+                    if span not in self.committed and any(
+                        begin < span[1] and end > span[0] for begin, end in self.committed
+                    ):
+                        self.rejected += 1
+                        raise PermanentUploadError(
+                            "ingest returned HTTP 409", error_code="range_overlap", http_status=409
+                        )
+                    if span not in self.committed:
+                        self.committed.append(span)
+                    return receipt(item.manifest)
+
+            server = Server()
+            Drain(spool, server).run()
+            self.assertEqual(server.rejected, 3)
+            for _ in range(3):
+                repair_overlap_dead_letters(spool)
+                Drain(spool, server).run()
+            self.assertEqual(server.rejected, 3)
+            self.assertEqual(spool.list_pending(), [])
+            covered = sorted(server.committed)
+            self.assertEqual(covered[0][0], 0)
+            self.assertEqual(covered[-1][1], len(b"".join(lines)))
+            for (_, end), (begin, _) in zip(covered, covered[1:]):
+                self.assertEqual(end, begin)
+
+    def test_a_tail_already_queued_is_not_requeued(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            spool, lines, first, first_stored, longer, longer_stored = self.overlap_fixture(state)
+            spool.enqueue(first, first_stored)
+            spool.enqueue(longer, longer_stored)
+
+            class Transport:
+                def upload(self, item):
+                    if item.manifest.end_offset == first.end_offset:
+                        return receipt(item.manifest)
+                    raise PermanentUploadError(
+                        "ingest returned HTTP 409", error_code="range_overlap", http_status=409
+                    )
+
+            Drain(spool, Transport()).run()
+            # A live capture already queued the tail before the repair ran.
+            tail, tail_stored = build_source_batch(
+                lines[2],
+                source_stream_key="stream-overlap",
+                generation_key="generation-overlap",
+                generation_seq=0,
+                start_offset=first.end_offset,
+                source_provider="codex",
+                source_kind="rollout",
+                observed_native_session_id="11111111-1111-4111-8111-111111111111",
+            )
+            spool.enqueue(tail, tail_stored)
+            repairs = repair_overlap_dead_letters(spool)
+            self.assertEqual(repairs["requeued_batches"], 0)
+            self.assertEqual(len(spool.list_pending()), 1)
+
     def test_overlap_without_a_local_receipt_is_marked_unrepairable(self):
         with TemporaryDirectory() as directory:
             state = Path(directory)
