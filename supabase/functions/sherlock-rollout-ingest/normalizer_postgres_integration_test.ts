@@ -1375,7 +1375,12 @@ async function bounded<T>(
 // a clean FIN on Linux); or one that starts the session, drops it on the
 // first query and stalls the reconnect.
 async function withFakePooler(
-  behaviour: "stall" | "hang_up" | "drop_then_stall" | "close_cleanly",
+  behaviour:
+    | "stall"
+    | "hang_up"
+    | "drop_then_stall"
+    | "close_cleanly"
+    | "drop_mid_transaction",
   run: (url: string, accepted: () => number) => Promise<void>,
 ): Promise<void> {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
@@ -1392,6 +1397,9 @@ async function withFakePooler(
         );
         continue;
       } else held.push(conn);
+      if (behaviour === "drop_mid_transaction") {
+        beginThenDrop(conn).catch(() => undefined);
+      }
       if (behaviour === "drop_then_stall" && accepted === 1) {
         startThenDrop(conn).catch(() => undefined);
       }
@@ -1416,6 +1424,41 @@ async function withFakePooler(
       () => undefined,
     );
   }
+}
+
+function message(type: string, body: Uint8Array = new Uint8Array()) {
+  const bytes = new Uint8Array(5 + body.byteLength);
+  bytes[0] = type.charCodeAt(0);
+  new DataView(bytes.buffer).setInt32(1, 4 + body.byteLength);
+  bytes.set(body, 5);
+  return bytes;
+}
+
+// Starts a session, answers BEGIN, then drops the socket on the next
+// statement. postgres.js then rolls the transaction back on the closed
+// socket: npm 3.4.7 throws from a timer there ("reading 'write'" in
+// nextWrite), which killed edge workers 23 times on Nov 2.
+async function beginThenDrop(conn: Deno.Conn): Promise<void> {
+  const buffer = new Uint8Array(65_536);
+  await conn.read(buffer); // StartupMessage
+  await conn.write(
+    new Uint8Array([
+      ...message("R", new Uint8Array([0, 0, 0, 0])), // AuthenticationOk
+      ...message("Z", new Uint8Array([73])), // ReadyForQuery, idle
+    ]),
+  );
+  await conn.read(buffer); // BEGIN (Parse/Bind/Describe/Execute/Sync)
+  await conn.write(
+    new Uint8Array([
+      ...message("1"), // ParseComplete
+      ...message("2"), // BindComplete
+      ...message("n"), // NoData
+      ...message("C", new TextEncoder().encode("BEGIN\0")),
+      ...message("Z", new Uint8Array([84])), // ReadyForQuery, in transaction
+    ]),
+  );
+  await conn.read(buffer); // the next statement
+  conn.close();
 }
 
 async function startThenDrop(conn: Deno.Conn): Promise<void> {
@@ -1457,7 +1500,6 @@ async function failingAttribution(url: string): Promise<unknown> {
 
 // The whole request path, with its retry and deadline, against a fake pooler.
 async function requestThroughFakePooler(url: string): Promise<Response> {
-  let current: PostgresBatchRepository | null = null;
   return await bounded(
     (async () =>
       handleRequest(await ingestRequest("pooler@e3group.ai"), {
@@ -1467,13 +1509,13 @@ async function requestThroughFakePooler(url: string): Promise<Response> {
             SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
               "00000000-0000-4000-8000-000000000002",
           })[name],
-        backendFactory: (() => {
-          current = PostgresBatchRepository.connect(url, {
+        backendFactory: (() => ({
+          batches: PostgresBatchRepository.connect(url, {
             connectTimeoutSeconds: 1,
-          });
-          return { batches: current, service: {} };
-        }) as never,
-        discardBackend: () => current?.abandon(),
+          }),
+          service: {},
+        })) as never,
+        // The production discardBackend: a deadline retires the client.
         requestDeadlineMs: 1_500,
       }))(),
     5_000,
@@ -1545,6 +1587,41 @@ Deno.test({
 });
 
 Deno.test({
+  name: "a connection lost mid-transaction fails the request, not the worker",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    // index.ts absorbs such errors in Deno, but the Supabase edge runtime
+    // still kills the worker, so none may happen at all.
+    const detached: unknown[] = [];
+    const record = (event: Event) =>
+      detached.push(
+        (event as ErrorEvent).error ?? (event as PromiseRejectionEvent).reason,
+      );
+    globalThis.addEventListener("error", record);
+    globalThis.addEventListener("unhandledrejection", record);
+    try {
+      await withFakePooler("drop_mid_transaction", async (url) => {
+        const error = await failingAttribution(url);
+        assert(
+          isDatabaseConnectionError(error),
+          `expected a connection error, got ${String(error)}`,
+        );
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(
+        detached.length === 0,
+        `postgres.js raised outside the request: ${detached.map(String)}`,
+      );
+    } finally {
+      globalThis.removeEventListener("error", record);
+      globalThis.removeEventListener("unhandledrejection", record);
+    }
+  },
+});
+
+Deno.test({
   // postgres.js reconnects at once, without CONNECT_TIMEOUT, whenever the
   // pooler closes cleanly during startup. The request deadline must end it.
   name: "a pooler that closes cleanly during startup cannot hang the request",
@@ -1559,13 +1636,52 @@ Deno.test({
       assert(response.status === 503, `status ${response.status}`);
       assert((await response.json()).error.code === "ingest_timeout");
       assert(elapsed < 3_000, `answered after ${elapsed} ms`);
-      // abandon() settles within a few event-loop turns; then no more.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // A deadline retires the client: 5 s grace, then it is destroyed.
+      await new Promise((resolve) => setTimeout(resolve, 5_500));
       const settled = accepted();
       await new Promise((resolve) => setTimeout(resolve, 1_000));
       assert(
         accepted() === settled,
         `reconnects continued after abandon: ${accepted() - settled}`,
+      );
+    });
+  },
+});
+
+Deno.test({
+  // A query queued on a retired client must not reconnect forever after a
+  // graceful end resolves (review of #150 reproduced 3,705 reconnects).
+  name: "a retired client is destroyed after its grace, even mid-reconnect",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    await withFakePooler("close_cleanly", async (url, accepted) => {
+      const repository = PostgresBatchRepository.connect(url, {
+        connectTimeoutSeconds: 1,
+      });
+      const queued = repository.findExact(
+        {
+          workspace_id: crypto.randomUUID(),
+          person_id: crypto.randomUUID(),
+          collector_key: "retire",
+        },
+        {} as BatchManifest,
+      ).then(() => null, (error) => error);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert(accepted() > 1, "the fake pooler must be looping");
+      repository.retire(300);
+      const error = await bounded(queued, 3_000, "query on a retired client");
+      assert(
+        isDatabaseConnectionError(error),
+        `expected a connection error, got ${String(error)}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const settled = accepted();
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(
+        accepted() === settled,
+        `reconnects continued after retire: ${accepted() - settled}`,
       );
     });
   },

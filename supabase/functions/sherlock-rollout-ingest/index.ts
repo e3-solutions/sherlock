@@ -56,9 +56,15 @@ function ingestBackend(): Backend {
 }
 
 // The next request reconnects instead of reusing a client whose socket broke.
-function discardIngestBackend(broken: Backend): void {
-  if (backend === broken) backend = null;
-  broken.batches.abandon();
+// A client dropped only because one request ran out of time is retired
+// gently: other requests in this isolate share it and may be mid-transaction.
+function discardIngestBackend(
+  dropped: Backend,
+  reason: "broken" | "deadline" = "broken",
+): void {
+  if (backend === dropped) backend = null;
+  if (reason === "deadline") dropped.batches.retire();
+  else dropped.batches.abandon();
 }
 
 // postgres.js can raise a connection failure from a timer or socket callback
@@ -82,11 +88,32 @@ globalThis.addEventListener(
 );
 
 export const DATABASE_ATTEMPTS = 3;
-// A retry starts only this early in the request (counted from its arrival,
-// since reading and hashing the body come first), so a second 8 s connect
-// still answers before the collector's 20 s HTTP timeout.
-export const DATABASE_RETRY_WINDOW_MS = 9_000;
+// A retry starts only while this much of the request's deadline is left. The
+// deadline still bounds the retry, so a slow reconnect answers 503 in time.
+export const DATABASE_RETRY_MIN_REMAINING_MS = 3_000;
 export const DATABASE_RETRY_AFTER_SECONDS = 5;
+// The database and its pooler are in us-east-1. An upload makes ~25
+// sequential pooler round trips; served from ap-south-1 (most traffic on
+// Nov 2) each costs ~250 ms, so requests took a p50 of 8.4 s against 0.6 s in
+// us-east-1, and held the per-person attribution lock for ~1.8 s. One hop to
+// us-east-1 is cheaper. Set SHERLOCK_INGEST_DATABASE_REGION=off to disable.
+export const DEFAULT_DATABASE_REGION = "us-east-1";
+export const FORWARDED_FROM_HEADER = "x-sherlock-forwarded-from";
+// The forwarding request's time left, so the forwarded one answers first.
+export const FORWARDED_DEADLINE_HEADER = "x-sherlock-deadline-ms";
+// Ingesting here after a failed forward needs time for a slow connect.
+export const FORWARD_FALLBACK_MIN_REMAINING_MS = 8_000;
+const FORWARDED_REQUEST_HEADERS = [
+  "content-type",
+  "accept",
+  "user-agent",
+  "x-sherlock-workload-class",
+];
+const FORWARDED_RESPONSE_HEADERS = [
+  "content-type",
+  "cache-control",
+  "retry-after",
+];
 // The collector gives up after 20 s; answer before it does. This also ends a
 // postgres.js reconnect loop (a pooler that closes cleanly during startup is
 // reconnected at once, forever, without a CONNECT_TIMEOUT) or a query stuck
@@ -103,20 +130,21 @@ function retryDelayMs(attempt: number): number {
 // even after COMMIT was sent, is safe to retry on a fresh connection.
 async function withDatabase<T>(
   backendFactory: () => Backend,
-  discardBackend: (broken: Backend) => void,
+  discardBackend: (dropped: Backend, reason: "broken" | "deadline") => void,
   sleep: (milliseconds: number) => Promise<void>,
   now: () => number,
   requestStartedAt: number,
   requestDeadlineMs: number,
   work: (current: Backend) => Promise<T>,
 ): Promise<T> {
+  const remainingMs = () => requestStartedAt + requestDeadlineMs - now();
   for (let attempt = 1;; attempt += 1) {
     const current = backendFactory();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(
         () => reject(DEADLINE),
-        Math.max(0, requestStartedAt + requestDeadlineMs - now()),
+        Math.max(0, remainingMs()),
       );
     });
     const running = work(current);
@@ -125,7 +153,7 @@ async function withDatabase<T>(
       return await Promise.race([running, deadline]);
     } catch (error) {
       if (error === DEADLINE) {
-        discardBackend(current);
+        discardBackend(current, "deadline");
         console.error(`ingest passed its deadline (attempt ${attempt})`);
         throw new IngestError(
           "ingest_timeout",
@@ -134,9 +162,9 @@ async function withDatabase<T>(
         );
       }
       if (!isDatabaseConnectionError(error)) throw error;
-      discardBackend(current);
+      discardBackend(current, "broken");
       const retry = attempt < DATABASE_ATTEMPTS &&
-        now() - requestStartedAt < DATABASE_RETRY_WINDOW_MS;
+        remainingMs() >= DATABASE_RETRY_MIN_REMAINING_MS;
       console.error(
         `database connection failed (attempt ${attempt}, ${
           retry ? "retrying" : "giving up"
@@ -171,6 +199,7 @@ export async function handleRequest(
       new Promise((resolve) => setTimeout(resolve, milliseconds)),
     now = () => performance.now(),
     requestDeadlineMs = REQUEST_DEADLINE_MS,
+    fetcher = fetch,
   }: {
     environment?: EnvironmentReader;
     backendFactory?: typeof ingestBackend;
@@ -178,9 +207,14 @@ export async function handleRequest(
     sleep?: (milliseconds: number) => Promise<void>;
     now?: () => number;
     requestDeadlineMs?: number;
+    fetcher?: typeof fetch;
   } = {},
 ): Promise<Response> {
   const requestStartedAt = now();
+  requestDeadlineMs = Math.min(
+    requestDeadlineMs,
+    forwardedDeadlineMs(request) ?? requestDeadlineMs,
+  );
   const database = <T>(work: (current: Backend) => Promise<T>) =>
     withDatabase(
       backendFactory,
@@ -197,7 +231,29 @@ export async function handleRequest(
         status: 405,
       });
     }
-    const body = await readJsonBounded(request);
+    if (requestDeadlineMs < DATABASE_RETRY_MIN_REMAINING_MS) {
+      // Too little time to do anything but drop the shared client.
+      throw new IngestError(
+        "ingest_timeout",
+        "ingest did not finish in time; retry later",
+        503,
+      );
+    }
+    const bytes = await readBodyBounded(request);
+    const forwardTo = databaseRegionToForwardTo(request, environment);
+    if (forwardTo) {
+      const forwarded = await forwardToDatabaseRegion(
+        request,
+        bytes,
+        forwardTo,
+        required("SUPABASE_URL", environment),
+        environment("SB_REGION") ?? "",
+        fetcher,
+        () => requestStartedAt + requestDeadlineMs - now(),
+      );
+      if (forwarded) return forwarded;
+    }
+    const body = parseJson(bytes);
     const routing = () =>
       workspaceRoutingConfig(
         required("SHERLOCK_E3_WORKSPACE_ID", environment),
@@ -278,7 +334,116 @@ export function parseWorkloadClassHint(
   );
 }
 
-async function readJsonBounded(request: Request): Promise<unknown> {
+// Only a forwarded request may shorten its own deadline, never lengthen it.
+function forwardedDeadlineMs(request: Request): number | null {
+  if (!request.headers.has(FORWARDED_FROM_HEADER)) return null;
+  const value = Number(request.headers.get(FORWARDED_DEADLINE_HEADER));
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+// Forward only from a known region that is not the database's, and never a
+// request that was already forwarded (x-region is honoured, but a request
+// that lands elsewhere anyway must not bounce).
+export function databaseRegionToForwardTo(
+  request: Request,
+  environment: EnvironmentReader,
+): string | null {
+  const target = environment("SHERLOCK_INGEST_DATABASE_REGION") ??
+    DEFAULT_DATABASE_REGION;
+  const here = environment("SB_REGION");
+  if (!here || target === "off" || here === target) return null;
+  if (request.headers.has(FORWARDED_FROM_HEADER)) return null;
+  return target;
+}
+
+// Returns the forwarded request's own answer, or null to process here when
+// the database region could not be reached or the platform answered instead
+// of the function (a gateway 429/5xx, say). Processing twice is safe: every
+// write is idempotent. Without time for that, it answers 503.
+async function forwardToDatabaseRegion(
+  request: Request,
+  bytes: Uint8Array,
+  region: string,
+  supabaseUrl: string,
+  here: string,
+  fetcher: typeof fetch,
+  remainingMs: () => number,
+): Promise<Response | null> {
+  const timeoutMs = Math.max(0, remainingMs());
+  if (timeoutMs - 1_000 < DATABASE_RETRY_MIN_REMAINING_MS) {
+    throw new IngestError(
+      "ingest_timeout",
+      "ingest did not finish in time; retry later",
+      503,
+    );
+  }
+  const headers = new Headers({ "x-region": region });
+  headers.set(FORWARDED_FROM_HEADER, here || "unknown");
+  headers.set(
+    FORWARDED_DEADLINE_HEADER,
+    String(Math.max(1, Math.floor(timeoutMs - 1_000))),
+  );
+  for (const name of FORWARDED_REQUEST_HEADERS) {
+    const value = request.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  const url = new URL(supabaseUrl);
+  url.pathname = "/functions/v1/sherlock-rollout-ingest";
+  url.search = "";
+  url.searchParams.set("forceFunctionRegion", region);
+  try {
+    const response = await fetcher(url, {
+      method: "POST",
+      headers,
+      body: bytes as Uint8Array<ArrayBuffer>,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const answer = new Uint8Array(await response.arrayBuffer());
+    if (response.status === 200 || isFunctionError(answer)) {
+      const passed = new Headers();
+      for (const name of FORWARDED_RESPONSE_HEADERS) {
+        const value = response.headers.get(name);
+        if (value !== null) passed.set(name, value);
+      }
+      return new Response(answer, { status: response.status, headers: passed });
+    }
+    console.error(
+      `forward to ${region} answered ${response.status} without an ingest error`,
+    );
+  } catch (error) {
+    if ((error as { name?: unknown })?.name === "TimeoutError") {
+      console.error(`forward to ${region} passed the deadline`);
+      throw new IngestError(
+        "ingest_timeout",
+        "ingest did not finish in time; retry later",
+        503,
+      );
+    }
+    console.error(`forward to ${region} failed`, error);
+  }
+  if (remainingMs() < FORWARD_FALLBACK_MIN_REMAINING_MS) {
+    throw new IngestError(
+      "ingest_timeout",
+      "ingest did not finish in time; retry later",
+      503,
+    );
+  }
+  console.error(`ingesting in ${here || "this region"} instead`);
+  return null;
+}
+
+// This function's own error bodies are {"error":{"code":...}}; anything else
+// came from the platform in front of it.
+function isFunctionError(body: Uint8Array): boolean {
+  try {
+    const value = JSON.parse(new TextDecoder().decode(body));
+    return typeof value?.error?.code === "string";
+  } catch {
+    return false;
+  }
+}
+
+async function readBodyBounded(request: Request): Promise<Uint8Array> {
   const declaredLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
     throw new IngestError(
@@ -313,6 +478,10 @@ async function readJsonBounded(request: Request): Promise<unknown> {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return bytes;
+}
+
+function parseJson(bytes: Uint8Array): unknown {
   try {
     return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {
