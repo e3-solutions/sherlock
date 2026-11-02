@@ -1375,7 +1375,12 @@ async function bounded<T>(
 // a clean FIN on Linux); or one that starts the session, drops it on the
 // first query and stalls the reconnect.
 async function withFakePooler(
-  behaviour: "stall" | "hang_up" | "drop_then_stall" | "close_cleanly",
+  behaviour:
+    | "stall"
+    | "hang_up"
+    | "drop_then_stall"
+    | "close_cleanly"
+    | "drop_mid_transaction",
   run: (url: string, accepted: () => number) => Promise<void>,
 ): Promise<void> {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
@@ -1392,6 +1397,9 @@ async function withFakePooler(
         );
         continue;
       } else held.push(conn);
+      if (behaviour === "drop_mid_transaction") {
+        beginThenDrop(conn).catch(() => undefined);
+      }
       if (behaviour === "drop_then_stall" && accepted === 1) {
         startThenDrop(conn).catch(() => undefined);
       }
@@ -1416,6 +1424,41 @@ async function withFakePooler(
       () => undefined,
     );
   }
+}
+
+function message(type: string, body: Uint8Array = new Uint8Array()) {
+  const bytes = new Uint8Array(5 + body.byteLength);
+  bytes[0] = type.charCodeAt(0);
+  new DataView(bytes.buffer).setInt32(1, 4 + body.byteLength);
+  bytes.set(body, 5);
+  return bytes;
+}
+
+// Starts a session, answers BEGIN, then drops the socket on the next
+// statement. postgres.js then rolls the transaction back on the closed
+// socket: npm 3.4.7 throws from a timer there ("reading 'write'" in
+// nextWrite), which killed edge workers 23 times on Nov 2.
+async function beginThenDrop(conn: Deno.Conn): Promise<void> {
+  const buffer = new Uint8Array(65_536);
+  await conn.read(buffer); // StartupMessage
+  await conn.write(
+    new Uint8Array([
+      ...message("R", new Uint8Array([0, 0, 0, 0])), // AuthenticationOk
+      ...message("Z", new Uint8Array([73])), // ReadyForQuery, idle
+    ]),
+  );
+  await conn.read(buffer); // BEGIN (Parse/Bind/Describe/Execute/Sync)
+  await conn.write(
+    new Uint8Array([
+      ...message("1"), // ParseComplete
+      ...message("2"), // BindComplete
+      ...message("n"), // NoData
+      ...message("C", new TextEncoder().encode("BEGIN\0")),
+      ...message("Z", new Uint8Array([84])), // ReadyForQuery, in transaction
+    ]),
+  );
+  await conn.read(buffer); // the next statement
+  conn.close();
 }
 
 async function startThenDrop(conn: Deno.Conn): Promise<void> {
@@ -1541,6 +1584,41 @@ Deno.test({
     });
     // A detached rejection would surface here and fail the test.
     await new Promise((resolve) => setTimeout(resolve, 1_500));
+  },
+});
+
+Deno.test({
+  name: "a connection lost mid-transaction fails the request, not the worker",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    // index.ts absorbs such errors in Deno, but the Supabase edge runtime
+    // still kills the worker, so none may happen at all.
+    const detached: unknown[] = [];
+    const record = (event: Event) =>
+      detached.push(
+        (event as ErrorEvent).error ?? (event as PromiseRejectionEvent).reason,
+      );
+    globalThis.addEventListener("error", record);
+    globalThis.addEventListener("unhandledrejection", record);
+    try {
+      await withFakePooler("drop_mid_transaction", async (url) => {
+        const error = await failingAttribution(url);
+        assert(
+          isDatabaseConnectionError(error),
+          `expected a connection error, got ${String(error)}`,
+        );
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(
+        detached.length === 0,
+        `postgres.js raised outside the request: ${detached.map(String)}`,
+      );
+    } finally {
+      globalThis.removeEventListener("error", record);
+      globalThis.removeEventListener("unhandledrejection", record);
+    }
   },
 });
 

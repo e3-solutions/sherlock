@@ -1,4 +1,10 @@
-import postgres from "npm:postgres@3.4.7";
+// postgres.js 3.4.9 plus the upstream nextWrite fix: a query issued on a
+// transaction whose socket just closed (the rollback after a dropped
+// connection) otherwise throws from a timer and kills the edge worker, which
+// no global error listener prevents in the Supabase edge runtime. Same pin as
+// workers/telemetry-processor. https://github.com/porsager/postgres/pull/1168
+// @deno-types="npm:postgres@3.4.9"
+import postgres from "postgres-fixed";
 import { type CollectorGrant, collectorKeyForIdentity } from "./attribution.ts";
 import {
   type Attribution,
@@ -47,7 +53,9 @@ const CONNECTION_ERROR_CODES = new Set([
 ]);
 const SUPAVISOR_TRANSIENT =
   /^\((EDBHANDLEREXITED|ECHECKOUTTIMEOUT)\)|Max client connections reached/;
-const POSTGRES_JS_CONNECTION_FRAME = /\/postgres\/[0-9.]+\/src\/connection\.js/;
+// npm builds (".../postgres/3.4.7/src/") and the pinned fork (".../postgres/<sha>/src/").
+const POSTGRES_JS_CONNECTION_FRAME =
+  /\/postgres\/[0-9a-f.]+\/src\/connection\.js/;
 
 export function isDatabaseConnectionError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -304,6 +312,13 @@ export class PostgresBatchRepository
   // Drops a broken client at once: pending queries reject, nothing waits.
   abandon(): void {
     this.sql.end({ timeout: 0 }).catch(() => undefined);
+  }
+
+  // Stops a client that is not known to be broken: queries already running
+  // on it get a few seconds to finish, then it is destroyed. That still ends
+  // a reconnect loop or a query stuck on a dead socket.
+  retire(): void {
+    this.sql.end({ timeout: 5 }).catch(() => undefined);
   }
 
   // Additive and scoped to the caller's own person; the definer function

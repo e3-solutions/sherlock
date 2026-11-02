@@ -6,10 +6,12 @@ import {
 } from "./contract.ts";
 import {
   DATABASE_ATTEMPTS,
-  DATABASE_RETRY_WINDOW_MS,
+  DATABASE_RETRY_MIN_REMAINING_MS,
+  FORWARDED_FROM_HEADER,
   handleRequest,
   ingestDatabaseUrl,
   parseWorkloadClassHint,
+  REQUEST_DEADLINE_MS,
 } from "./index.ts";
 import {
   exclusionsError,
@@ -411,15 +413,20 @@ function retryOptions(
   backendFactory: () => unknown,
   { elapsedPerAttemptMs = 0 } = {},
 ) {
-  const record = { discarded: 0, sleeps: [] as number[] };
+  const record = {
+    discarded: 0,
+    reasons: [] as string[],
+    sleeps: [] as number[],
+  };
   let clock = 0;
   return {
     record,
     options: {
       environment: ENVIRONMENT,
       backendFactory: backendFactory as never,
-      discardBackend: () => {
+      discardBackend: (_: unknown, reason?: string) => {
         record.discarded += 1;
+        record.reasons.push(reason ?? "");
         clock += elapsedPerAttemptMs;
       },
       sleep: (milliseconds: number) => {
@@ -586,7 +593,7 @@ Deno.test("persistent connection failure answers 503 database_unavailable", asyn
   assert(record.sleeps.length === DATABASE_ATTEMPTS - 1);
 });
 
-Deno.test("no retry starts once the retry window has passed", async () => {
+Deno.test("no retry starts with too little of the deadline left", async () => {
   let factoryCalls = 0;
   const { options } = retryOptions(() => {
     factoryCalls += 1;
@@ -597,13 +604,71 @@ Deno.test("no retry starts once the retry window has passed", async () => {
       },
       service: {},
     };
-  }, { elapsedPerAttemptMs: DATABASE_RETRY_WINDOW_MS });
+  }, {
+    elapsedPerAttemptMs: REQUEST_DEADLINE_MS - DATABASE_RETRY_MIN_REMAINING_MS +
+      1,
+  });
   const response = await handleRequest(
     await requestFor("user@e3group.ai"),
     options,
   );
   assert(response.status === 503);
   assert(factoryCalls === 1);
+});
+
+Deno.test("a client destroyed 10 s into a request is still retried", async () => {
+  // On Nov 2, requests that lost their client to a neighbour's deadline
+  // gave up because they were past a fixed 9 s window.
+  let factoryCalls = 0;
+  const { record, options } = retryOptions(() => {
+    factoryCalls += 1;
+    const attempt = factoryCalls;
+    return {
+      batches: {
+        resolveAttribution: () =>
+          attempt === 1
+            ? Promise.reject(connectionError("CONNECTION_DESTROYED"))
+            : Promise.resolve(ATTRIBUTION),
+      },
+      service: {
+        ingest: (attribution: Record<string, string>) =>
+          Promise.resolve({ status: "committed", ...attribution }),
+      },
+    };
+  }, { elapsedPerAttemptMs: 10_000 });
+  const response = await handleRequest(
+    await requestFor("user@e3group.ai"),
+    options,
+  );
+  assert(response.status === 200, `status ${response.status}`);
+  assert(factoryCalls === 2);
+  assert(record.reasons.join() === "broken");
+});
+
+Deno.test("CONNECTION_ENDED from a retired client is retried", async () => {
+  let factoryCalls = 0;
+  const { options } = retryOptions(() => {
+    factoryCalls += 1;
+    const attempt = factoryCalls;
+    return {
+      batches: {
+        resolveAttribution: () =>
+          attempt === 1
+            ? Promise.reject(connectionError("CONNECTION_ENDED"))
+            : Promise.resolve(ATTRIBUTION),
+      },
+      service: {
+        ingest: (attribution: Record<string, string>) =>
+          Promise.resolve({ status: "committed", ...attribution }),
+      },
+    };
+  });
+  const response = await handleRequest(
+    await requestFor("user@e3group.ai"),
+    options,
+  );
+  assert(response.status === 200);
+  assert(factoryCalls === 2);
 });
 
 Deno.test("exclusions retry a connection failure too", async () => {
@@ -678,8 +743,9 @@ Deno.test("detached postgres.js connection errors do not crash the worker", () =
   assert(!unrelated.defaultPrevented, "other crashes must stay visible");
 });
 
-Deno.test("a request that outlives its deadline answers 503 and drops the client", async () => {
+Deno.test("a request that outlives its deadline answers 503 and retires the client", async () => {
   let discarded = 0;
+  let reason = "";
   const started = performance.now();
   const response = await handleRequest(await requestFor("user@e3group.ai"), {
     environment: ENVIRONMENT,
@@ -687,8 +753,9 @@ Deno.test("a request that outlives its deadline answers 503 and drops the client
       batches: { resolveAttribution: () => new Promise(() => {}) },
       service: {},
     })) as never,
-    discardBackend: () => {
+    discardBackend: (_, why) => {
       discarded += 1;
+      reason = why ?? "";
     },
     requestDeadlineMs: 50,
   });
@@ -696,5 +763,158 @@ Deno.test("a request that outlives its deadline answers 503 and drops the client
   assert(response.headers.get("Retry-After") === "5");
   assert((await response.json()).error.code === "ingest_timeout");
   assert(discarded === 1);
+  assert(reason === "deadline", "a neighbour's client is retired, not killed");
   assert(performance.now() - started < 1_000);
+});
+
+const FORWARD_ENVIRONMENT =
+  (region: string, extra: Record<string, string> = {}) => (name: string) =>
+    ({
+      SHERLOCK_E3_WORKSPACE_ID: "00000000-0000-4000-8000-000000000001",
+      SHERLOCK_SIXTYFOUR_WORKSPACE_ID: "00000000-0000-4000-8000-000000000002",
+      SUPABASE_URL: "https://project.supabase.co",
+      SB_REGION: region,
+      ...extra,
+    })[name];
+
+function noBackend(): never {
+  throw new Error("the database must not be touched here");
+}
+
+Deno.test("a request served outside us-east-1 is forwarded there once", async () => {
+  const request = await requestFor("user@e3group.ai");
+  request.headers.set("x-sherlock-workload-class", "backfill");
+  const sent = await request.clone().arrayBuffer();
+  let call: { url: string; init: RequestInit } | null = null;
+  const response = await handleRequest(request, {
+    environment: FORWARD_ENVIRONMENT("ap-south-1"),
+    backendFactory: noBackend as never,
+    fetcher: ((url: URL, init: RequestInit) => {
+      call = { url: String(url), init };
+      return Promise.resolve(
+        Response.json({ status: "committed", batch_id: "b1" }, {
+          status: 200,
+          headers: {
+            "Cache-Control": "no-store",
+            "x-sb-edge-region": "us-east-1",
+          },
+        }),
+      );
+    }) as typeof fetch,
+  });
+  assert(response.status === 200);
+  assert((await response.json()).batch_id === "b1");
+  assert(response.headers.get("Cache-Control") === "no-store");
+  assert(call !== null);
+  const { url, init } = call as { url: string; init: RequestInit };
+  assert(
+    url ===
+      "https://project.supabase.co/functions/v1/sherlock-rollout-ingest?forceFunctionRegion=us-east-1",
+    url,
+  );
+  const headers = new Headers(init.headers);
+  assert(headers.get("x-region") === "us-east-1");
+  assert(headers.get(FORWARDED_FROM_HEADER) === "ap-south-1");
+  assert(headers.get("x-sherlock-workload-class") === "backfill");
+  assert(
+    new Uint8Array(init.body as Uint8Array).toString() ===
+      new Uint8Array(sent).toString(),
+    "the forwarded body must be byte-identical",
+  );
+});
+
+Deno.test("forwarded answers pass through, including 409 and 503", async () => {
+  for (
+    const [status, code] of [[409, "range_overlap"], [
+      503,
+      "ingest_timeout",
+    ]] as const
+  ) {
+    const response = await handleRequest(await requestFor("user@e3group.ai"), {
+      environment: FORWARD_ENVIRONMENT("ap-south-1"),
+      backendFactory: noBackend as never,
+      fetcher: (() =>
+        Promise.resolve(
+          Response.json({ error: { code } }, {
+            status,
+            headers: { "Retry-After": "5" },
+          }),
+        )) as typeof fetch,
+    });
+    assert(response.status === status);
+    assert((await response.json()).error.code === code);
+    assert(
+      response.headers.get("Retry-After") === "5",
+      "Retry-After must survive the hop",
+    );
+  }
+});
+
+Deno.test("no forward in us-east-1, when already forwarded, or when disabled", async () => {
+  const cases: [string, Record<string, string>, boolean][] = [
+    ["us-east-1", {}, false],
+    ["ap-south-1", { SHERLOCK_INGEST_DATABASE_REGION: "off" }, false],
+    ["ap-south-1", {}, true],
+  ];
+  for (const [region, extra, alreadyForwarded] of cases) {
+    const request = await requestFor("user@e3group.ai");
+    if (alreadyForwarded) {
+      request.headers.set(FORWARDED_FROM_HEADER, "ap-south-1");
+    }
+    let fetched = false;
+    const response = await handleRequest(request, {
+      environment: FORWARD_ENVIRONMENT(region, extra),
+      backendFactory: (() => ({
+        batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+        service: {
+          ingest: (attribution: Record<string, string>) =>
+            Promise.resolve({ status: "committed", ...attribution }),
+        },
+      })) as never,
+      fetcher: (() => {
+        fetched = true;
+        return Promise.reject(new Error("must not forward"));
+      }) as typeof fetch,
+    });
+    assert(response.status === 200, `${region} ${response.status}`);
+    assert(!fetched, `${region} must not forward`);
+  }
+});
+
+Deno.test("an unreachable database region falls back to ingesting here", async () => {
+  let ingested = 0;
+  const response = await handleRequest(await requestFor("user@e3group.ai"), {
+    environment: FORWARD_ENVIRONMENT("ap-south-1"),
+    backendFactory: (() => ({
+      batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+      service: {
+        ingest: (attribution: Record<string, string>) => {
+          ingested += 1;
+          return Promise.resolve({ status: "committed", ...attribution });
+        },
+      },
+    })) as never,
+    fetcher: (() =>
+      Promise.reject(new TypeError("error sending request"))) as typeof fetch,
+  });
+  assert(response.status === 200);
+  assert(ingested === 1);
+});
+
+Deno.test("a forward that outlives the deadline answers 503 without ingesting here", async () => {
+  const response = await handleRequest(await requestFor("user@e3group.ai"), {
+    environment: FORWARD_ENVIRONMENT("ap-south-1"),
+    backendFactory: noBackend as never,
+    requestDeadlineMs: 50,
+    fetcher: ((_: URL, init: RequestInit) =>
+      new Promise((_, reject) => {
+        init.signal?.addEventListener(
+          "abort",
+          () => reject(init.signal?.reason),
+        );
+      })) as typeof fetch,
+  });
+  assert(response.status === 503);
+  assert((await response.json()).error.code === "ingest_timeout");
+  assert(response.headers.get("Retry-After") === "5");
 });

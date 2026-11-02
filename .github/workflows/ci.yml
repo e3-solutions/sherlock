@@ -60,7 +60,7 @@ jobs:
 
       - name: Type-check Deno entrypoints
         run: |
-          deno check supabase/functions/sherlock-rollout-ingest/index.ts
+          deno check --config supabase/functions/sherlock-rollout-ingest/deno.json supabase/functions/sherlock-rollout-ingest/index.ts
           deno check --config workers/telemetry-processor/deno.json workers/telemetry-processor/main.ts
           deno check scripts/reduce-activity.ts
           deno check scripts/backfill-frame-evidence.ts
@@ -74,7 +74,7 @@ jobs:
 
       - name: Run Deno unit tests
         run: |
-          deno test supabase/functions/sherlock-rollout-ingest
+          deno test --config supabase/functions/sherlock-rollout-ingest/deno.json supabase/functions/sherlock-rollout-ingest
           deno test supabase/functions/sherlock-activity-reducer
           deno test --config workers/telemetry-processor/deno.json --allow-read=railway.toml workers/telemetry-processor
 
@@ -123,7 +123,7 @@ jobs:
         env:
           SHERLOCK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
         run: >-
-          deno test --allow-env --allow-net
+          deno test --config supabase/functions/sherlock-rollout-ingest/deno.json --allow-env --allow-net
           supabase/functions/sherlock-rollout-ingest/normalizer_postgres_integration_test.ts
 
       - name: Run queue database integration test
