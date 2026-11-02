@@ -211,7 +211,10 @@ export async function handleRequest(
   } = {},
 ): Promise<Response> {
   const requestStartedAt = now();
-  requestDeadlineMs = forwardedDeadlineMs(request) ?? requestDeadlineMs;
+  requestDeadlineMs = Math.min(
+    requestDeadlineMs,
+    forwardedDeadlineMs(request) ?? requestDeadlineMs,
+  );
   const database = <T>(work: (current: Backend) => Promise<T>) =>
     withDatabase(
       backendFactory,
@@ -227,6 +230,14 @@ export async function handleRequest(
       return Response.json({ error: { code: "method_not_allowed" } }, {
         status: 405,
       });
+    }
+    if (requestDeadlineMs < DATABASE_RETRY_MIN_REMAINING_MS) {
+      // Too little time to do anything but drop the shared client.
+      throw new IngestError(
+        "ingest_timeout",
+        "ingest did not finish in time; retry later",
+        503,
+      );
     }
     const bytes = await readBodyBounded(request);
     const forwardTo = databaseRegionToForwardTo(request, environment);
@@ -327,9 +338,7 @@ export function parseWorkloadClassHint(
 function forwardedDeadlineMs(request: Request): number | null {
   if (!request.headers.has(FORWARDED_FROM_HEADER)) return null;
   const value = Number(request.headers.get(FORWARDED_DEADLINE_HEADER));
-  return Number.isSafeInteger(value) && value > 0
-    ? Math.min(value, REQUEST_DEADLINE_MS)
-    : null;
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 // Forward only from a known region that is not the database's, and never a
@@ -361,6 +370,13 @@ async function forwardToDatabaseRegion(
   remainingMs: () => number,
 ): Promise<Response | null> {
   const timeoutMs = Math.max(0, remainingMs());
+  if (timeoutMs - 1_000 < DATABASE_RETRY_MIN_REMAINING_MS) {
+    throw new IngestError(
+      "ingest_timeout",
+      "ingest did not finish in time; retry later",
+      503,
+    );
+  }
   const headers = new Headers({ "x-region": region });
   headers.set(FORWARDED_FROM_HEADER, here || "unknown");
   headers.set(

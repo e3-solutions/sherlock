@@ -107,14 +107,16 @@ jobs:
         # Deno tests do not prove the deployed runtime can load the function:
         # the pinned postgres.js fork needs Node globals the edge runtime only
         # gives npm packages. A GET boots the worker; 405 means it loaded.
+        # Kong answers 503 until the served container is up, so only 405
+        # ends the wait; a function that cannot boot never answers 405.
         run: |
           supabase functions serve sherlock-rollout-ingest --no-verify-jwt > "$RUNNER_TEMP/serve.log" 2>&1 &
           serve=$!
           code=000
           for attempt in $(seq 1 60); do
             code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:54321/functions/v1/sherlock-rollout-ingest || true)
-            if [ "$code" = 405 ] || [ "${code#5}" != "$code" ]; then break; fi
-            sleep 2
+            if [ "$code" = 405 ]; then break; fi
+            sleep 3
           done
           kill "$serve" || true
           tail -n 30 "$RUNNER_TEMP/serve.log"

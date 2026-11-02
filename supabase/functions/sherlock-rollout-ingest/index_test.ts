@@ -759,7 +759,12 @@ Deno.test("a request that outlives its deadline answers 503 and retires the clie
       discarded += 1;
       reason = why ?? "";
     },
-    requestDeadlineMs: 50,
+    // 3.1 s deadline, of which reading the request "took" 3.05 s.
+    requestDeadlineMs: 3_100,
+    now: (() => {
+      let calls = 0;
+      return () => (calls++ === 0 ? 0 : 3_050);
+    })(),
   });
   assert(response.status === 503, `status ${response.status}`);
   assert(response.headers.get("Retry-After") === "5");
@@ -912,7 +917,7 @@ Deno.test("a forward that outlives the deadline answers 503 without ingesting he
   const response = await handleRequest(await requestFor("user@e3group.ai"), {
     environment: FORWARD_ENVIRONMENT("ap-south-1"),
     backendFactory: noBackend as never,
-    requestDeadlineMs: 50,
+    requestDeadlineMs: 4_100,
     fetcher: ((_: URL, init: RequestInit) =>
       new Promise((_, reject) => {
         init.signal?.addEventListener(
@@ -929,7 +934,7 @@ Deno.test("a forward that outlives the deadline answers 503 without ingesting he
 Deno.test("a forwarded request keeps to the deadline it was given", async () => {
   const request = await requestFor("user@e3group.ai");
   request.headers.set(FORWARDED_FROM_HEADER, "ap-south-1");
-  request.headers.set(FORWARDED_DEADLINE_HEADER, "50");
+  request.headers.set(FORWARDED_DEADLINE_HEADER, "3100");
   const started = performance.now();
   const response = await handleRequest(request, {
     environment: FORWARD_ENVIRONMENT("us-east-1"),
@@ -941,7 +946,18 @@ Deno.test("a forwarded request keeps to the deadline it was given", async () => 
   });
   assert(response.status === 503);
   assert((await response.json()).error.code === "ingest_timeout");
-  assert(performance.now() - started < 1_000, "the 18 s default was used");
+  assert(performance.now() - started < 4_000, "the 18 s default was used");
+
+  // A deadline too short to use answers at once, without the database.
+  const tiny = await requestFor("user@e3group.ai");
+  tiny.headers.set(FORWARDED_FROM_HEADER, "ap-south-1");
+  tiny.headers.set(FORWARDED_DEADLINE_HEADER, "1");
+  const refused = await handleRequest(tiny, {
+    environment: FORWARD_ENVIRONMENT("us-east-1"),
+    backendFactory: noBackend as never,
+  });
+  assert(refused.status === 503);
+  assert((await refused.json()).error.code === "ingest_timeout");
 
   // Only a forwarded request may shorten it, and never past 18 s.
   const direct = await requestFor("user@e3group.ai");
