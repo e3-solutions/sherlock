@@ -110,7 +110,7 @@ jobs:
         # Kong answers 503 until the served container is up, so only 405
         # ends the wait; a function that cannot boot never answers 405.
         run: |
-          supabase functions serve sherlock-rollout-ingest --no-verify-jwt > "$RUNNER_TEMP/serve.log" 2>&1 &
+          supabase functions serve --no-verify-jwt > "$RUNNER_TEMP/serve.log" 2>&1 &
           serve=$!
           code=000
           for attempt in $(seq 1 60); do
