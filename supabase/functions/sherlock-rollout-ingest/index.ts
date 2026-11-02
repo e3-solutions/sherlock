@@ -99,6 +99,10 @@ export const DATABASE_RETRY_AFTER_SECONDS = 5;
 // us-east-1 is cheaper. Set SHERLOCK_INGEST_DATABASE_REGION=off to disable.
 export const DEFAULT_DATABASE_REGION = "us-east-1";
 export const FORWARDED_FROM_HEADER = "x-sherlock-forwarded-from";
+// The forwarding request's time left, so the forwarded one answers first.
+export const FORWARDED_DEADLINE_HEADER = "x-sherlock-deadline-ms";
+// Ingesting here after a failed forward needs time for a slow connect.
+export const FORWARD_FALLBACK_MIN_REMAINING_MS = 8_000;
 const FORWARDED_REQUEST_HEADERS = [
   "content-type",
   "accept",
@@ -207,6 +211,7 @@ export async function handleRequest(
   } = {},
 ): Promise<Response> {
   const requestStartedAt = now();
+  requestDeadlineMs = forwardedDeadlineMs(request) ?? requestDeadlineMs;
   const database = <T>(work: (current: Backend) => Promise<T>) =>
     withDatabase(
       backendFactory,
@@ -233,7 +238,7 @@ export async function handleRequest(
         required("SUPABASE_URL", environment),
         environment("SB_REGION") ?? "",
         fetcher,
-        Math.max(0, requestStartedAt + requestDeadlineMs - now()),
+        () => requestStartedAt + requestDeadlineMs - now(),
       );
       if (forwarded) return forwarded;
     }
@@ -318,6 +323,15 @@ export function parseWorkloadClassHint(
   );
 }
 
+// Only a forwarded request may shorten its own deadline, never lengthen it.
+function forwardedDeadlineMs(request: Request): number | null {
+  if (!request.headers.has(FORWARDED_FROM_HEADER)) return null;
+  const value = Number(request.headers.get(FORWARDED_DEADLINE_HEADER));
+  return Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, REQUEST_DEADLINE_MS)
+    : null;
+}
+
 // Forward only from a known region that is not the database's, and never a
 // request that was already forwarded (x-region is honoured, but a request
 // that lands elsewhere anyway must not bounce).
@@ -333,9 +347,10 @@ export function databaseRegionToForwardTo(
   return target;
 }
 
-// Returns the database region's answer, or null to process here when that
-// region cannot be reached at all. Processing twice is safe: every write is
-// idempotent. Out of time, it answers 503 rather than start again here.
+// Returns the forwarded request's own answer, or null to process here when
+// the database region could not be reached or the platform answered instead
+// of the function (a gateway 429/5xx, say). Processing twice is safe: every
+// write is idempotent. Without time for that, it answers 503.
 async function forwardToDatabaseRegion(
   request: Request,
   bytes: Uint8Array,
@@ -343,10 +358,15 @@ async function forwardToDatabaseRegion(
   supabaseUrl: string,
   here: string,
   fetcher: typeof fetch,
-  timeoutMs: number,
+  remainingMs: () => number,
 ): Promise<Response | null> {
+  const timeoutMs = Math.max(0, remainingMs());
   const headers = new Headers({ "x-region": region });
   headers.set(FORWARDED_FROM_HEADER, here || "unknown");
+  headers.set(
+    FORWARDED_DEADLINE_HEADER,
+    String(Math.max(1, Math.floor(timeoutMs - 1_000))),
+  );
   for (const name of FORWARDED_REQUEST_HEADERS) {
     const value = request.headers.get(name);
     if (value !== null) headers.set(name, value);
@@ -363,12 +383,17 @@ async function forwardToDatabaseRegion(
       signal: AbortSignal.timeout(timeoutMs),
     });
     const answer = new Uint8Array(await response.arrayBuffer());
-    const passed = new Headers();
-    for (const name of FORWARDED_RESPONSE_HEADERS) {
-      const value = response.headers.get(name);
-      if (value !== null) passed.set(name, value);
+    if (response.status === 200 || isFunctionError(answer)) {
+      const passed = new Headers();
+      for (const name of FORWARDED_RESPONSE_HEADERS) {
+        const value = response.headers.get(name);
+        if (value !== null) passed.set(name, value);
+      }
+      return new Response(answer, { status: response.status, headers: passed });
     }
-    return new Response(answer, { status: response.status, headers: passed });
+    console.error(
+      `forward to ${region} answered ${response.status} without an ingest error`,
+    );
   } catch (error) {
     if ((error as { name?: unknown })?.name === "TimeoutError") {
       console.error(`forward to ${region} passed the deadline`);
@@ -378,8 +403,27 @@ async function forwardToDatabaseRegion(
         503,
       );
     }
-    console.error(`forward to ${region} failed; ingesting here`, error);
-    return null;
+    console.error(`forward to ${region} failed`, error);
+  }
+  if (remainingMs() < FORWARD_FALLBACK_MIN_REMAINING_MS) {
+    throw new IngestError(
+      "ingest_timeout",
+      "ingest did not finish in time; retry later",
+      503,
+    );
+  }
+  console.error(`ingesting in ${here || "this region"} instead`);
+  return null;
+}
+
+// This function's own error bodies are {"error":{"code":...}}; anything else
+// came from the platform in front of it.
+function isFunctionError(body: Uint8Array): boolean {
+  try {
+    const value = JSON.parse(new TextDecoder().decode(body));
+    return typeof value?.error?.code === "string";
+  } catch {
+    return false;
   }
 }
 

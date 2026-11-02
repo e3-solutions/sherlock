@@ -1500,7 +1500,6 @@ async function failingAttribution(url: string): Promise<unknown> {
 
 // The whole request path, with its retry and deadline, against a fake pooler.
 async function requestThroughFakePooler(url: string): Promise<Response> {
-  let current: PostgresBatchRepository | null = null;
   return await bounded(
     (async () =>
       handleRequest(await ingestRequest("pooler@e3group.ai"), {
@@ -1510,13 +1509,13 @@ async function requestThroughFakePooler(url: string): Promise<Response> {
             SHERLOCK_SIXTYFOUR_WORKSPACE_ID:
               "00000000-0000-4000-8000-000000000002",
           })[name],
-        backendFactory: (() => {
-          current = PostgresBatchRepository.connect(url, {
+        backendFactory: (() => ({
+          batches: PostgresBatchRepository.connect(url, {
             connectTimeoutSeconds: 1,
-          });
-          return { batches: current, service: {} };
-        }) as never,
-        discardBackend: () => current?.abandon(),
+          }),
+          service: {},
+        })) as never,
+        // The production discardBackend: a deadline retires the client.
         requestDeadlineMs: 1_500,
       }))(),
     5_000,
@@ -1637,13 +1636,52 @@ Deno.test({
       assert(response.status === 503, `status ${response.status}`);
       assert((await response.json()).error.code === "ingest_timeout");
       assert(elapsed < 3_000, `answered after ${elapsed} ms`);
-      // abandon() settles within a few event-loop turns; then no more.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // A deadline retires the client: 5 s grace, then it is destroyed.
+      await new Promise((resolve) => setTimeout(resolve, 5_500));
       const settled = accepted();
       await new Promise((resolve) => setTimeout(resolve, 1_000));
       assert(
         accepted() === settled,
         `reconnects continued after abandon: ${accepted() - settled}`,
+      );
+    });
+  },
+});
+
+Deno.test({
+  // A query queued on a retired client must not reconnect forever after a
+  // graceful end resolves (review of #150 reproduced 3,705 reconnects).
+  name: "a retired client is destroyed after its grace, even mid-reconnect",
+  ignore: !netGranted,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    await withFakePooler("close_cleanly", async (url, accepted) => {
+      const repository = PostgresBatchRepository.connect(url, {
+        connectTimeoutSeconds: 1,
+      });
+      const queued = repository.findExact(
+        {
+          workspace_id: crypto.randomUUID(),
+          person_id: crypto.randomUUID(),
+          collector_key: "retire",
+        },
+        {} as BatchManifest,
+      ).then(() => null, (error) => error);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert(accepted() > 1, "the fake pooler must be looping");
+      repository.retire(300);
+      const error = await bounded(queued, 3_000, "query on a retired client");
+      assert(
+        isDatabaseConnectionError(error),
+        `expected a connection error, got ${String(error)}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const settled = accepted();
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(
+        accepted() === settled,
+        `reconnects continued after retire: ${accepted() - settled}`,
       );
     });
   },

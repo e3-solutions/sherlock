@@ -3,6 +3,7 @@
 // connection) otherwise throws from a timer and kills the edge worker, which
 // no global error listener prevents in the Supabase edge runtime. Same pin as
 // workers/telemetry-processor. https://github.com/porsager/postgres/pull/1168
+import "./node_globals.ts";
 // @deno-types="npm:postgres@3.4.9"
 import postgres from "postgres-fixed";
 import { type CollectorGrant, collectorKeyForIdentity } from "./attribution.ts";
@@ -315,10 +316,12 @@ export class PostgresBatchRepository
   }
 
   // Stops a client that is not known to be broken: queries already running
-  // on it get a few seconds to finish, then it is destroyed. That still ends
-  // a reconnect loop or a query stuck on a dead socket.
-  retire(): void {
-    this.sql.end({ timeout: 5 }).catch(() => undefined);
+  // on it get a few seconds to finish, then it is destroyed regardless. A
+  // graceful end() is not enough: once the running transaction commits it
+  // resolves, and postgres.js then reconnects for a queued query, forever if
+  // the pooler keeps closing cleanly.
+  retire(graceMs = 5_000): void {
+    setTimeout(() => this.abandon(), graceMs);
   }
 
   // Additive and scoped to the caller's own person; the definer function

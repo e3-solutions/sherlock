@@ -7,6 +7,8 @@ import {
 import {
   DATABASE_ATTEMPTS,
   DATABASE_RETRY_MIN_REMAINING_MS,
+  FORWARD_FALLBACK_MIN_REMAINING_MS,
+  FORWARDED_DEADLINE_HEADER,
   FORWARDED_FROM_HEADER,
   handleRequest,
   ingestDatabaseUrl,
@@ -815,6 +817,11 @@ Deno.test("a request served outside us-east-1 is forwarded there once", async ()
   const headers = new Headers(init.headers);
   assert(headers.get("x-region") === "us-east-1");
   assert(headers.get(FORWARDED_FROM_HEADER) === "ap-south-1");
+  const deadline = Number(headers.get(FORWARDED_DEADLINE_HEADER));
+  assert(
+    deadline > 15_000 && deadline < REQUEST_DEADLINE_MS - 900,
+    `forwarded deadline ${deadline} must leave the caller time to answer`,
+  );
   assert(headers.get("x-sherlock-workload-class") === "backfill");
   assert(
     new Uint8Array(init.body as Uint8Array).toString() ===
@@ -917,4 +924,81 @@ Deno.test("a forward that outlives the deadline answers 503 without ingesting he
   assert(response.status === 503);
   assert((await response.json()).error.code === "ingest_timeout");
   assert(response.headers.get("Retry-After") === "5");
+});
+
+Deno.test("a forwarded request keeps to the deadline it was given", async () => {
+  const request = await requestFor("user@e3group.ai");
+  request.headers.set(FORWARDED_FROM_HEADER, "ap-south-1");
+  request.headers.set(FORWARDED_DEADLINE_HEADER, "50");
+  const started = performance.now();
+  const response = await handleRequest(request, {
+    environment: FORWARD_ENVIRONMENT("us-east-1"),
+    backendFactory: (() => ({
+      batches: { resolveAttribution: () => new Promise(() => {}) },
+      service: {},
+    })) as never,
+    discardBackend: () => {},
+  });
+  assert(response.status === 503);
+  assert((await response.json()).error.code === "ingest_timeout");
+  assert(performance.now() - started < 1_000, "the 18 s default was used");
+
+  // Only a forwarded request may shorten it, and never past 18 s.
+  const direct = await requestFor("user@e3group.ai");
+  direct.headers.set(FORWARDED_DEADLINE_HEADER, "50");
+  const fine = await handleRequest(direct, {
+    environment: FORWARD_ENVIRONMENT("us-east-1"),
+    backendFactory: (() => ({
+      batches: {
+        resolveAttribution: () =>
+          new Promise((resolve) => setTimeout(() => resolve(ATTRIBUTION), 100)),
+      },
+      service: {
+        ingest: (attribution: Record<string, string>) =>
+          Promise.resolve({ status: "committed", ...attribution }),
+      },
+    })) as never,
+  });
+  assert(fine.status === 200, "a direct request ignores the header");
+});
+
+Deno.test("a platform answer from the database region is not passed through", async () => {
+  // A gateway 429 or 502 has no ingest error body; the collector would treat
+  // an unknown 4xx as fatal for the whole drain.
+  for (const status of [429, 502, 404]) {
+    let ingested = 0;
+    const response = await handleRequest(await requestFor("user@e3group.ai"), {
+      environment: FORWARD_ENVIRONMENT("ap-south-1"),
+      backendFactory: (() => ({
+        batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+        service: {
+          ingest: (attribution: Record<string, string>) => {
+            ingested += 1;
+            return Promise.resolve({ status: "committed", ...attribution });
+          },
+        },
+      })) as never,
+      fetcher: (() =>
+        Promise.resolve(
+          new Response("rate limited", { status }),
+        )) as typeof fetch,
+    });
+    assert(response.status === 200, `${status} -> ${response.status}`);
+    assert(ingested === 1, `${status} must fall back to ingesting here`);
+  }
+});
+
+Deno.test("without time to ingest here, a failed forward answers 503", async () => {
+  let clock = 0;
+  const response = await handleRequest(await requestFor("user@e3group.ai"), {
+    environment: FORWARD_ENVIRONMENT("ap-south-1"),
+    backendFactory: noBackend as never,
+    now: () => clock,
+    fetcher: (() => {
+      clock = REQUEST_DEADLINE_MS - FORWARD_FALLBACK_MIN_REMAINING_MS + 1;
+      return Promise.reject(new TypeError("connection reset"));
+    }) as typeof fetch,
+  });
+  assert(response.status === 503);
+  assert((await response.json()).error.code === "ingest_timeout");
 });

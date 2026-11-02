@@ -103,6 +103,24 @@ jobs:
           supabase start --exclude
           realtime,imgproxy,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
 
+      - name: Boot rollout ingest in the edge runtime
+        # Deno tests do not prove the deployed runtime can load the function:
+        # the pinned postgres.js fork needs Node globals the edge runtime only
+        # gives npm packages. A GET boots the worker; 405 means it loaded.
+        run: |
+          supabase functions serve sherlock-rollout-ingest --no-verify-jwt > "$RUNNER_TEMP/serve.log" 2>&1 &
+          serve=$!
+          code=000
+          for attempt in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:54321/functions/v1/sherlock-rollout-ingest || true)
+            if [ "$code" = 405 ] || [ "${code#5}" != "$code" ]; then break; fi
+            sleep 2
+          done
+          kill "$serve" || true
+          tail -n 30 "$RUNNER_TEMP/serve.log"
+          echo "GET answered $code"
+          test "$code" = 405
+
       - name: Run database schema tests
         run: supabase test db --local supabase/tests/database/schema.test.sql
 
