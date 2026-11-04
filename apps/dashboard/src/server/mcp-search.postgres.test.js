@@ -878,13 +878,16 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
           collector_key, native_session_id, role_version)
         select ${workspace}, ${person.id}, ${START}, 'primary', 'excerpt-plan', 'session-' || g, 'test'
         from generate_series(1, 50) g`;
-      // 50,000 decoy messages and one rare target.
+      // 50,000 decoy messages before the window and one rare target in it.
       await tx`
         insert into excerpt_search_plan.events (workspace_id, session_id, source_record_id, normalizer_version,
           projection_index, source_priority, event_kind, content_excerpt, occurred_at, server_received_at)
         select ${workspace}, s.id, g, 'excerpt-plan', 0, 0, case when g % 5 = 0 then 'agent_message' else 'message' end,
           case when g = 25000 then 'zebrararetoken target' else 'routine decoy chatter ' || g end,
-          ${"2026-01-01T06:00:00Z"}::timestamptz, ${"2026-01-01T23:00:00Z"}::timestamptz
+          -- Decoys span the 200 days before the window, as production history
+          -- dwarfs one day; a window holding the whole table rightly seq-scans.
+          ${"2026-01-01T06:00:00Z"}::timestamptz - case when g = 25000 then interval '0' else (g % 200 + 1) * interval '1 day' end,
+          ${"2026-01-01T23:00:00Z"}::timestamptz
         from generate_series(1, 50001) g
         join (select id, row_number() over (order by id) - 1 slot from excerpt_search_plan.sessions) s on s.slot = g % 50`;
       // Flush the GIN fast-update pending list as vacuum does for the production index;
