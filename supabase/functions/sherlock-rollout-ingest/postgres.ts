@@ -282,6 +282,89 @@ async function findExactBatch(
   return row;
 }
 
+// A batch whose range clashes with a committed one in its stream is refused.
+// Committed batches are never deleted, so a clash seen without the stream
+// lock still holds when the commit takes it.
+async function assertNoRangeConflict(
+  sql: Queryable,
+  attribution: Attribution,
+  manifest: BatchManifest,
+): Promise<void> {
+  const mappingConflict = await sql.unsafe(
+    `select 1
+       from telemetry.ingest_batches
+      where workspace_id = $1 and collector_key = $2 and source_kind = $3
+        and source_stream_key = $4
+        and ((generation_seq = $5 and generation_key <> $6)
+          or (generation_key = $6 and generation_seq <> $5))
+      limit 1`,
+    [
+      attribution.workspace_id,
+      attribution.collector_key,
+      manifest.source_kind,
+      manifest.source_stream_key,
+      manifest.generation_seq,
+      manifest.generation_key,
+    ],
+  );
+  if (mappingConflict.length > 0) {
+    throw new IngestError(
+      "generation_mapping_conflict",
+      "generation sequence and opaque key mapping is inconsistent",
+      409,
+    );
+  }
+
+  const overlap = await sql.unsafe(
+    `select 1
+       from telemetry.ingest_batches
+      where workspace_id = $1 and collector_key = $2 and source_kind = $3
+        and source_stream_key = $4 and generation_seq = $5
+        and int8range(start_offset, end_offset, '[)') && int8range($6, $7, '[)')
+      limit 1`,
+    [
+      attribution.workspace_id,
+      attribution.collector_key,
+      manifest.source_kind,
+      manifest.source_stream_key,
+      manifest.generation_seq,
+      manifest.start_offset,
+      manifest.end_offset,
+    ],
+  );
+  if (overlap.length > 0) {
+    throw new IngestError(
+      "range_overlap",
+      "batch byte range overlaps a committed range in this generation",
+      409,
+    );
+  }
+}
+
+// The exact batch's committed row, or null when the batch is new. A batch the
+// commit would refuse is refused here, before its upload (about 40% of
+// requests on Nov 4 were 409s).
+export async function findExactBeforeUpload(
+  sql: Queryable,
+  attribution: Attribution,
+  manifest: BatchManifest,
+  firstLookup: typeof findExactBatch = findExactBatch,
+): Promise<Record<string, unknown> | null> {
+  const row = await firstLookup(sql, attribution, manifest);
+  if (row) return row;
+  try {
+    await assertNoRangeConflict(sql, attribution, manifest);
+  } catch (error) {
+    if (!(error instanceof IngestError) || error.status !== 409) throw error;
+    // The exact batch may have committed between the two reads; its replay
+    // gets the receipt, as the commit would answer.
+    const committed = await findExactBatch(sql, attribution, manifest);
+    if (committed) return committed;
+    throw error;
+  }
+  return null;
+}
+
 export class PostgresBatchRepository
   implements BatchRepository, ExclusionsRepository {
   constructor(private readonly sql: Sql) {}
@@ -460,7 +543,7 @@ export class PostgresBatchRepository
   ): Promise<CommittedReceipt | null> {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_ingest");
-      const row = await findExactBatch(tx, attribution, manifest);
+      const row = await findExactBeforeUpload(tx, attribution, manifest);
       return row ? receiptFromRow(row) : null;
     });
   }
@@ -484,55 +567,7 @@ export class PostgresBatchRepository
         return receiptFromRow(row);
       }
 
-      const mappingConflict = await tx.unsafe(
-        `select 1
-           from telemetry.ingest_batches
-          where workspace_id = $1 and collector_key = $2 and source_kind = $3
-            and source_stream_key = $4
-            and ((generation_seq = $5 and generation_key <> $6)
-              or (generation_key = $6 and generation_seq <> $5))
-          limit 1`,
-        [
-          attribution.workspace_id,
-          attribution.collector_key,
-          manifest.source_kind,
-          manifest.source_stream_key,
-          manifest.generation_seq,
-          manifest.generation_key,
-        ],
-      );
-      if (mappingConflict.length > 0) {
-        throw new IngestError(
-          "generation_mapping_conflict",
-          "generation sequence and opaque key mapping is inconsistent",
-          409,
-        );
-      }
-
-      const overlap = await tx.unsafe(
-        `select 1
-           from telemetry.ingest_batches
-          where workspace_id = $1 and collector_key = $2 and source_kind = $3
-            and source_stream_key = $4 and generation_seq = $5
-            and int8range(start_offset, end_offset, '[)') && int8range($6, $7, '[)')
-          limit 1`,
-        [
-          attribution.workspace_id,
-          attribution.collector_key,
-          manifest.source_kind,
-          manifest.source_stream_key,
-          manifest.generation_seq,
-          manifest.start_offset,
-          manifest.end_offset,
-        ],
-      );
-      if (overlap.length > 0) {
-        throw new IngestError(
-          "range_overlap",
-          "batch byte range overlaps a committed range in this generation",
-          409,
-        );
-      }
+      await assertNoRangeConflict(tx, attribution, manifest);
 
       const batchId = crypto.randomUUID();
       const inserted = await tx.unsafe(

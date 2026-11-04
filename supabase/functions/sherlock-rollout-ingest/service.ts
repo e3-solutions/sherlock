@@ -9,12 +9,19 @@ import {
 } from "./contract.ts";
 
 export interface ImmutableStorage {
-  ensure(path: string, bytes: Uint8Array, storedSha256: string): Promise<void>;
+  ensure(
+    path: string,
+    bytes: Uint8Array,
+    storedSha256: string,
+    remainingMs?: () => number,
+  ): Promise<void>;
 }
 
 export type WorkloadClassHint = "live" | "backfill" | null;
 
 export interface BatchRepository {
+  // Returns the receipt of an exact replay. Throws the commit's 409 when the
+  // batch conflicts with committed ranges, so it is never uploaded.
   findExact(
     attribution: Attribution,
     manifest: BatchManifest,
@@ -51,12 +58,18 @@ export class IngestService {
     manifest: BatchManifest,
     storedPayload: Uint8Array,
     workloadClassHint: WorkloadClassHint = null,
+    remainingMs: () => number = () => Number.POSITIVE_INFINITY,
   ): Promise<CommittedReceipt> {
     await validateStoredBatch(manifest, storedPayload);
     let receipt = await this.batches.findExact(attribution, manifest);
     if (!receipt) {
       const path = storagePath(attribution, manifest);
-      await this.storage.ensure(path, storedPayload, manifest.stored_sha256);
+      await this.storage.ensure(
+        path,
+        storedPayload,
+        manifest.stored_sha256,
+        remainingMs,
+      );
       receipt = await this.batches.commit(
         attribution,
         manifest,

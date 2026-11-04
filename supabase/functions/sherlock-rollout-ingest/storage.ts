@@ -3,6 +3,37 @@ import type { ImmutableStorage } from "./service.ts";
 
 const STORAGE_BUCKET = "telemetry-raw";
 const MAX_STORAGE_ERROR_BYTES = 4 * 1024;
+// Storage object writes stall for tens of minutes at a time (Nov 2 19:30-22:30
+// and Nov 4 18:00 UTC: write p50 3-12 s, p99 ~60 s, while reads and duplicate
+// rejections stayed fast). An upload left to run into the request deadline
+// also retired the isolate's shared database client, so it now ends early
+// enough to answer 503 storage_unavailable with time kept for the commit.
+// Only a fast failure is retried: an upload aborted here keeps running in
+// Storage, so a second write after a timeout would queue behind the first.
+export const STORAGE_ATTEMPTS = 2;
+// Time kept back for the batch commit after the object is stored.
+export const STORAGE_COMMIT_RESERVE_MS = 3_000;
+// A shorter attempt than this is not worth starting.
+export const STORAGE_MIN_ATTEMPT_MS = 2_000;
+// Storage itself gives up on a write after 60 s.
+export const STORAGE_MAX_ATTEMPT_MS = 60_000;
+// Rate limits and gateway answers Storage gives while degraded.
+const TRANSIENT_STATUSES = new Set([408, 429]);
+
+export type RemainingMs = () => number;
+
+function storageUnavailable(reason: string): IngestError {
+  return new IngestError(
+    "storage_unavailable",
+    `Storage did not accept the batch in time (${reason}); retry later`,
+    503,
+  );
+}
+
+function isAbort(error: unknown): boolean {
+  return error instanceof DOMException &&
+    (error.name === "TimeoutError" || error.name === "AbortError");
+}
 
 function objectUrl(supabaseUrl: string, path: string): string {
   const encoded = path.split("/").map(encodeURIComponent).join("/");
@@ -119,6 +150,9 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
   constructor(
     private readonly supabaseUrl: string,
     private readonly serviceRoleKey: string,
+    // Looked up per call so tests that replace globalThis.fetch still apply.
+    private readonly fetcher: typeof fetch = (input, init) =>
+      fetch(input, init),
   ) {}
 
   private headers(): Record<string, string> {
@@ -128,22 +162,81 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
     };
   }
 
+  // Milliseconds the next Storage call may take, or null when too little of
+  // the request is left to start one.
+  private attemptBudgetMs(remainingMs: RemainingMs): number | null {
+    const budget = Math.floor(Math.min(
+      STORAGE_MAX_ATTEMPT_MS,
+      remainingMs() - STORAGE_COMMIT_RESERVE_MS,
+    ));
+    return budget >= STORAGE_MIN_ATTEMPT_MS ? budget : null;
+  }
+
+  // An immutable POST is safe to repeat: if the failed attempt did store the
+  // object, the retry gets a duplicate answer and verifies the bytes.
+  private async upload(
+    path: string,
+    bytes: Uint8Array,
+    remainingMs: RemainingMs,
+  ): Promise<Response> {
+    let budget = this.attemptBudgetMs(remainingMs);
+    for (let attempt = 1;; attempt += 1) {
+      if (budget === null) throw storageUnavailable("no time left");
+      let reason: string;
+      let retryable = true;
+      try {
+        const response = await this.fetcher(
+          objectUrl(this.supabaseUrl, path),
+          {
+            method: "POST",
+            headers: {
+              ...this.headers(),
+              "Content-Type": "application/gzip",
+              "Cache-Control": "private, max-age=31536000, immutable",
+              "x-upsert": "false",
+            },
+            // Deno 2.5's Linux DOM types narrow BodyInit more than the runtime.
+            body: bytes as BodyInit,
+            signal: AbortSignal.timeout(budget),
+          },
+        );
+        if (
+          response.status < 500 && !TRANSIENT_STATUSES.has(response.status)
+        ) {
+          return response;
+        }
+        await cancelBody(response);
+        reason = `upload answered ${response.status}`;
+      } catch (error) {
+        if (isAbort(error)) {
+          reason = `upload took over ${budget} ms`;
+          retryable = false;
+        } else if (error instanceof TypeError) {
+          // fetch reports DNS, TLS and connection failures as TypeError.
+          reason = `upload request failed: ${error.message}`;
+        } else {
+          throw error;
+        }
+      }
+      budget = retryable && attempt < STORAGE_ATTEMPTS
+        ? this.attemptBudgetMs(remainingMs)
+        : null;
+      console.error(
+        `storage upload attempt ${attempt} failed: ${reason}${
+          budget === null ? "" : ", retrying"
+        }`,
+      );
+      if (budget === null) throw storageUnavailable(reason);
+    }
+  }
+
   async ensure(
     path: string,
     bytes: Uint8Array,
     storedSha256: string,
+    remainingMs: RemainingMs = () => Number.POSITIVE_INFINITY,
   ): Promise<void> {
-    const response = await fetch(objectUrl(this.supabaseUrl, path), {
-      method: "POST",
-      headers: {
-        ...this.headers(),
-        "Content-Type": "application/gzip",
-        "Cache-Control": "private, max-age=31536000, immutable",
-        "x-upsert": "false",
-      },
-      // Deno 2.5's Linux DOM types narrow BodyInit more than the runtime.
-      body: bytes as BodyInit,
-    });
+    const response = await this.upload(path, bytes, remainingMs);
     if (response.ok) return;
     const alreadyExists = response.status === 409;
     if (alreadyExists) await cancelBody(response);
@@ -156,17 +249,31 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
       throw new IngestError(
         "storage_upload_failed",
         `immutable Storage upload failed (${response.status})`,
-        response.status >= 500 ? 503 : 500,
+        500,
       );
     }
-    const existing = await fetch(objectUrl(this.supabaseUrl, path), {
-      headers: {
-        ...this.headers(),
-        // The inclusive end requests at most the expected bytes plus one, so a
-        // longer object is detectable without downloading the remainder.
-        Range: `bytes=0-${bytes.byteLength}`,
-      },
-    });
+    const verifyBudget = this.attemptBudgetMs(remainingMs);
+    if (verifyBudget === null) throw storageUnavailable("no time to verify");
+    let existing: Response;
+    try {
+      existing = await this.fetcher(objectUrl(this.supabaseUrl, path), {
+        headers: {
+          ...this.headers(),
+          // The inclusive end requests at most the expected bytes plus one, so
+          // a longer object is detectable without downloading the remainder.
+          Range: `bytes=0-${bytes.byteLength}`,
+        },
+        signal: AbortSignal.timeout(verifyBudget),
+      });
+    } catch (error) {
+      throw new IngestError(
+        "storage_verify_failed",
+        isAbort(error)
+          ? "existing Storage object could not be read in time"
+          : "existing Storage object could not be read",
+        503,
+      );
+    }
     if (!existing.ok) {
       await cancelBody(existing);
       if (existing.status === 416) throw integrityConflict();

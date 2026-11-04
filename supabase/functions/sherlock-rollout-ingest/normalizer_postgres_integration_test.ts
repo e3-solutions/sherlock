@@ -13,6 +13,7 @@ import {
 } from "./contract.ts";
 import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
 import {
+  findExactBeforeUpload,
   isDatabaseConnectionError,
   PostgresBatchRepository,
 } from "./postgres.ts";
@@ -1668,7 +1669,11 @@ Deno.test({
         },
         {} as BatchManifest,
       ).then(() => null, (error) => error);
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Wait for the loop itself, not a fixed time: a loaded machine can
+      // take longer than 200 ms to make the second connection.
+      for (let waited = 0; accepted() <= 1 && waited < 3_000; waited += 50) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       assert(accepted() > 1, "the fake pooler must be looping");
       repository.retire(300);
       const error = await bounded(queued, 3_000, "query on a retired client");
@@ -1772,6 +1777,53 @@ Deno.test({
         [workspaceId],
       );
       assert(count === 1, `expected one committed batch, found ${count}`);
+
+      // An identical request that committed after this one's first lookup
+      // overlaps itself; the re-check must still answer with its receipt.
+      const raced = await sql.begin((tx) =>
+        findExactBeforeUpload(
+          tx as never,
+          attribution,
+          manifest,
+          () => Promise.resolve(null),
+        )
+      );
+      assert(
+        raced?.id === first.batch_id,
+        "a batch committed between the reads must get its receipt, not a 409",
+      );
+
+      // A batch the commit would refuse is refused before its upload.
+      const refusals: Array<[string, BatchManifest]> = [
+        ["range_overlap", { ...manifest, end_offset: manifest.end_offset - 1 }],
+        ["generation_mapping_conflict", {
+          ...manifest,
+          generation_key: `other-${workspaceId}`,
+        }],
+      ];
+      for (const [code, refused] of refusals) {
+        let refusal: unknown = null;
+        try {
+          await repository.findExact(attribution, refused);
+        } catch (error) {
+          refusal = error;
+        }
+        assert(
+          refusal instanceof IngestError && refusal.code === code &&
+            refusal.status === 409,
+          `findExact should refuse ${code} with a 409, got ${refusal}`,
+        );
+        let committed: unknown = null;
+        try {
+          await repository.commit(attribution, refused, path, null);
+        } catch (error) {
+          committed = error;
+        }
+        assert(
+          committed instanceof IngestError && committed.code === code,
+          `commit should refuse ${code} the same way, got ${committed}`,
+        );
+      }
     } finally {
       // The commit trigger enqueued a live normalize job; leaving it would
       // be claimed by the queue integration test. Cleanup must not fail

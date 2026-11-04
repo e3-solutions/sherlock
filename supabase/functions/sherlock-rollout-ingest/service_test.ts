@@ -767,3 +767,40 @@ Deno.test("ingest accepts Claude hook evidence but rejects Codex hook batches", 
     assert(error.code === "unsupported_contract");
   }
 });
+
+Deno.test("a batch refused before upload is never stored", async () => {
+  const { attribution, manifest, stored } = await fixture();
+  const storage = new MemoryStorage();
+  const batches = new MemoryBatches();
+  batches.findExact = () =>
+    Promise.reject(new IngestError("range_overlap", "overlap", 409));
+  const service = new IngestService(storage, batches);
+  let refusal: unknown = null;
+  try {
+    await service.ingest(attribution, manifest, stored);
+  } catch (error) {
+    refusal = error;
+  }
+  assert(refusal instanceof IngestError && refusal.status === 409);
+  assert(storage.calls === 0, "a refused batch must not be uploaded");
+  assert(batches.commits === 0, "a refused batch must not be committed");
+});
+
+Deno.test("the upload is given the request's time left", async () => {
+  const { attribution, manifest, stored } = await fixture();
+  let seen: number | null = null;
+  const storage: ImmutableStorage = {
+    ensure: (_path, _bytes, _sha, remainingMs) => {
+      seen = remainingMs?.() ?? null;
+      return Promise.resolve();
+    },
+  };
+  await new IngestService(storage, new MemoryBatches()).ingest(
+    attribution,
+    manifest,
+    stored,
+    null,
+    () => 12_345,
+  );
+  assert(seen === 12_345, `upload saw ${seen}`);
+});
