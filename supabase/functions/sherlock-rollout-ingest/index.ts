@@ -1,5 +1,18 @@
-import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
-import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
+import {
+  type CollectorGrant,
+  collectorKeyForIdentity,
+  publicCollectorGrant,
+  workspaceRoutingConfig,
+} from "./attribution.ts";
+import {
+  type Attribution,
+  type BatchManifest,
+  type CollectorIdentity,
+  IngestError,
+  MAX_REQUEST_BYTES,
+  parseEnvelope,
+  sha256Hex,
+} from "./contract.ts";
 import { MemoryBudget } from "./memory_budget.ts";
 import { parseExclusionsRequest, requestOperation } from "./exclusions.ts";
 import {
@@ -313,17 +326,26 @@ export async function handleRequest(
       request.headers.get("x-sherlock-workload-class"),
     );
     const receipt = await database(async (current) => {
-      const attribution = await current.batches.resolveAttribution(
-        grant,
-        envelope.collector,
-      );
-      return await current.service.ingest(
-        attribution,
-        envelope.manifest,
-        envelope.stored_payload,
-        workloadClassHint,
-        () => requestStartedAt + requestDeadlineMs - now(),
-      );
+      let attribution: Attribution | null = null;
+      try {
+        attribution = await current.batches.resolveAttribution(
+          grant,
+          envelope.collector,
+        );
+        return await current.service.ingest(
+          attribution,
+          envelope.manifest,
+          envelope.stored_payload,
+          workloadClassHint,
+          () => requestStartedAt + requestDeadlineMs - now(),
+        );
+      } catch (error) {
+        if (error instanceof IngestError && error.status === 409) {
+          // Not awaited: logging must not hold the answer past its deadline.
+          void logConflict(error, grant, envelope.collector, envelope.manifest);
+        }
+        throw error;
+      }
     });
     return Response.json(receipt, {
       status: 200,
@@ -349,6 +371,41 @@ export async function handleRequest(
     );
   } finally {
     release();
+  }
+}
+
+// A short, stable stand-in for an identifier in logs.
+async function logKey(value: string): Promise<string> {
+  return (await sha256Hex(new TextEncoder().encode(value))).slice(0, 12);
+}
+
+// One line per refused batch, so repeated 409s can be traced to a collector
+// and a reason (Nov 4: 8,942 a day from one address, 15 distinct batches).
+// Keys are hashed; no email, path or content is logged.
+async function logConflict(
+  error: IngestError,
+  grant: CollectorGrant,
+  identity: CollectorIdentity,
+  manifest: BatchManifest,
+): Promise<void> {
+  try {
+    const collectorKey = await collectorKeyForIdentity(grant, identity);
+    console.warn(JSON.stringify({
+      event: "ingest_conflict",
+      code: error.code,
+      collector: await logKey(`${grant.workspace_id}/${collectorKey}`),
+      stream: await logKey(
+        `${manifest.source_kind}/${manifest.source_stream_key}`,
+      ),
+      source_kind: manifest.source_kind,
+      generation_seq: manifest.generation_seq,
+      start_offset: manifest.start_offset,
+      end_offset: manifest.end_offset,
+      record_count: manifest.record_count,
+      collector_version: manifest.collector_version,
+    }));
+  } catch {
+    // Logging must never change the answer.
   }
 }
 

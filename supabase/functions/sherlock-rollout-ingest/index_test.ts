@@ -1151,3 +1151,83 @@ Deno.test("a forwarded request takes no share of the budget", async () => {
   assert(response.status === 200, `got ${response.status}`);
   assert(budget.reservedBytes === 0);
 });
+
+async function conflictLines(
+  failure: { attribution?: IngestError; ingest?: IngestError },
+): Promise<{ status: number; lines: string[] }> {
+  const { options } = retryOptions(() => ({
+    batches: {
+      resolveAttribution: () =>
+        failure.attribution
+          ? Promise.reject(failure.attribution)
+          : Promise.resolve(ATTRIBUTION),
+    },
+    service: {
+      ingest: () =>
+        failure.ingest
+          ? Promise.reject(failure.ingest)
+          : Promise.resolve({ batch_id: "batch" }),
+    },
+  }));
+  const lines: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: unknown[]) => lines.push(values.join(" "));
+  try {
+    const response = await handleRequest(
+      await requestFor("user@e3group.ai"),
+      options,
+    );
+    // The conflict line is written without holding the answer.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return { status: response.status, lines };
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+Deno.test("a refused batch logs its reason and hashed keys, nothing identifying", async () => {
+  const first = await conflictLines({
+    ingest: new IngestError("range_overlap", "overlap", 409),
+  });
+  assert(first.status === 409, `got ${first.status}`);
+  assert(first.lines.length === 1, `got ${first.lines.length} lines`);
+  const line = JSON.parse(first.lines[0]);
+  assert(line.event === "ingest_conflict" && line.code === "range_overlap");
+  assert(/^[0-9a-f]{12}$/.test(line.collector), `collector ${line.collector}`);
+  assert(/^[0-9a-f]{12}$/.test(line.stream), `stream ${line.stream}`);
+  assert(line.generation_seq === 0 && line.start_offset === 0);
+  for (
+    const secret of [
+      "user@e3group.ai",
+      "00000000-0000-4000-8000-000000000001",
+      "Test User",
+      "test-user",
+      "stream-test",
+    ]
+  ) {
+    assert(!first.lines[0].includes(secret), `log must not contain ${secret}`);
+  }
+  // The same collector and stream always log the same keys, so repeats line up.
+  const again = await conflictLines({
+    ingest: new IngestError("range_overlap", "overlap", 409),
+  });
+  const repeat = JSON.parse(again.lines[0]);
+  assert(repeat.collector === line.collector && repeat.stream === line.stream);
+});
+
+Deno.test("a 409 while resolving the person is logged too", async () => {
+  const { status, lines } = await conflictLines({
+    attribution: new IngestError("identity_conflict", "two people", 409),
+  });
+  assert(status === 409, `got ${status}`);
+  assert(lines.length === 1, `got ${lines.length} lines`);
+  assert(JSON.parse(lines[0]).code === "identity_conflict");
+});
+
+Deno.test("only 409s are logged as conflicts", async () => {
+  const { status, lines } = await conflictLines({
+    ingest: new IngestError("invalid_manifest", "bad", 400),
+  });
+  assert(status === 400, `got ${status}`);
+  assert(lines.length === 0, `logged ${lines.length} lines`);
+});
