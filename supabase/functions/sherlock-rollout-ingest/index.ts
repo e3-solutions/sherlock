@@ -1,7 +1,13 @@
-import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
+import {
+  type CollectorGrant,
+  collectorKeyForIdentity,
+  publicCollectorGrant,
+  workspaceRoutingConfig,
+} from "./attribution.ts";
 import {
   type Attribution,
   type BatchManifest,
+  type CollectorIdentity,
   IngestError,
   MAX_REQUEST_BYTES,
   parseEnvelope,
@@ -320,11 +326,12 @@ export async function handleRequest(
       request.headers.get("x-sherlock-workload-class"),
     );
     const receipt = await database(async (current) => {
-      const attribution = await current.batches.resolveAttribution(
-        grant,
-        envelope.collector,
-      );
+      let attribution: Attribution | null = null;
       try {
+        attribution = await current.batches.resolveAttribution(
+          grant,
+          envelope.collector,
+        );
         return await current.service.ingest(
           attribution,
           envelope.manifest,
@@ -334,7 +341,8 @@ export async function handleRequest(
         );
       } catch (error) {
         if (error instanceof IngestError && error.status === 409) {
-          await logConflict(error, attribution, envelope.manifest);
+          // Not awaited: logging must not hold the answer past its deadline.
+          void logConflict(error, grant, envelope.collector, envelope.manifest);
         }
         throw error;
       }
@@ -376,16 +384,16 @@ async function logKey(value: string): Promise<string> {
 // Keys are hashed; no email, path or content is logged.
 async function logConflict(
   error: IngestError,
-  attribution: Attribution,
+  grant: CollectorGrant,
+  identity: CollectorIdentity,
   manifest: BatchManifest,
 ): Promise<void> {
   try {
+    const collectorKey = await collectorKeyForIdentity(grant, identity);
     console.warn(JSON.stringify({
       event: "ingest_conflict",
       code: error.code,
-      collector: await logKey(
-        `${attribution.workspace_id}/${attribution.collector_key}`,
-      ),
+      collector: await logKey(`${grant.workspace_id}/${collectorKey}`),
       stream: await logKey(
         `${manifest.source_kind}/${manifest.source_stream_key}`,
       ),
