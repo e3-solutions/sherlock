@@ -142,6 +142,8 @@ class HttpTransportTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         body = json.loads(request.data)
         self.assertNotIn("Authorization", request.headers)
+        # COR-5166: run in the database's region, not the nearest one.
+        self.assertEqual(request.get_header("X-region"), "us-east-1")
         self.assertEqual(body["collector"]["email"], "test@example.com")
         self.assertEqual(body["collector"]["github_id"], "test-user")
         self.assertEqual(value["status"], "committed")
