@@ -348,6 +348,11 @@ s3_access_key = "env(S3_ACCESS_KEY)"
 # Configures AWS_SECRET_ACCESS_KEY for S3 bucket
 s3_secret_key = "env(S3_SECRET_KEY)"
 
+[functions.sherlock-collector-activity]
+# A dedicated caller token is verified by the function (COR-5105).
+verify_jwt = false
+entrypoint = "./functions/sherlock-collector-activity/index.ts"
+
 [functions.sherlock-rollout-ingest]
 verify_jwt = false
 entrypoint = "./functions/sherlock-rollout-ingest/index.ts"

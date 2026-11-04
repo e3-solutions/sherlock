@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(146);
+select plan(151);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -1163,6 +1163,32 @@ select ok(passed, 'invalid hashes are rejected')
 from constraint_results where test_name = 'invalid hash';
 select ok(passed, 'spans cannot attribute a session to another workspace person')
 from constraint_results where test_name = 'span ownership mismatch';
+
+-- COR-5105: stall-alert counters are service-role only and refresh on a schedule.
+select ok(
+  not has_function_privilege('anon', 'public.sherlock_collector_activity(timestamptz,text[])', 'execute')
+  and not has_function_privilege('authenticated', 'public.sherlock_collector_activity(timestamptz,text[])', 'execute'),
+  'collector activity is not callable by anon or authenticated'
+);
+select ok(
+  has_function_privilege('service_role', 'public.sherlock_collector_activity(timestamptz,text[])', 'execute'),
+  'collector activity is callable by the service role'
+);
+select ok(
+  not has_table_privilege('anon', 'telemetry.collector_session_last', 'select')
+  and not has_table_privilege('anon', 'telemetry.collector_commit_hours', 'select'),
+  'anon cannot read collector rollups'
+);
+select ok(
+  exists (select 1 from cron.job where jobname = 'sherlock-collector-commit-hours' and active),
+  'collector rollup refresh is scheduled'
+);
+select is(
+  public.sherlock_collector_activity(now() - interval '1 day', array['00000000-0000-4000-8000-000000000000'])
+    -> 'sessions',
+  '{}'::jsonb,
+  'unknown sessions map to nothing'
+);
 
 select * from finish();
 
