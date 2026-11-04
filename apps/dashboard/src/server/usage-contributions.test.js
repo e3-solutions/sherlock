@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { URL as FileURL } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
@@ -13,9 +13,12 @@ import {
   tokenCountExistsPredicate,
 } from "./mcp-query-source.js";
 
-const MIGRATION = readFileSync(new FileURL(
+// The dashboard image builds and tests apps/dashboard alone; the repository
+// checkout (CI and local) has the migration.
+const MIGRATION_URL = new FileURL(
   "../../../../supabase/migrations/20261104214500_usage_contributions.sql", import.meta.url,
-), "utf8");
+);
+const MIGRATION = existsSync(MIGRATION_URL) ? readFileSync(MIGRATION_URL, "utf8") : null;
 const NOW = new Date("2026-09-01T20:00:00.000Z");
 
 function source(stateRows) {
@@ -40,7 +43,7 @@ function source(stateRows) {
 }
 
 describe("precomputed usage contributions", () => {
-  it("embeds the live assessment SQL verbatim, so the two cannot drift", () => {
+  it.skipIf(MIGRATION === null)("embeds the live assessment SQL verbatim, so the two cannot drift", () => {
     // Editing USAGE_ASSESSED_SQL / USAGE_CONTRIBUTIONS_SQL requires a new
     // migration that replaces analytics.compute_usage_contributions().
     expect(MIGRATION).toContain(`${USAGE_ASSESSED_SQL}, ${USAGE_CONTRIBUTIONS_SQL}`);

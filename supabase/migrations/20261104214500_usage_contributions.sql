@@ -10,15 +10,21 @@
 -- which events fall in the window, and whether a stream's first observation
 -- counts (session started inside the window) or is a missing baseline.
 --
--- refresh_usage_contributions() runs every minute from pg_cron:
---   1. incremental: sessions with new usage/turn_context events since the
---      event watermark are recomputed in full;
---   2. backfill: walks usage history backwards an hour at a time, computing
---      sessions not yet computed. backfill_cursor is the coverage boundary:
---      every session with usage at or after it has been computed.
+-- Keeping it current:
+--   * Statement triggers on telemetry.events mark a session dirty in the same
+--     transaction that inserts or updates its usage/turn_context events, so a
+--     late-committing event cannot be missed. Each mark carries a sequence
+--     number; the refresh clears only the mark it computed from.
+--   * refresh_usage_contributions() runs every minute from pg_cron. It
+--     recomputes dirty sessions oldest mark first, once they have been quiet
+--     for 30 s or marked for 90 s, then backfills one hour of history per run,
+--     newest first. backfill_cursor is the coverage boundary: every session
+--     with usage at or after it has been computed.
 -- The dashboard uses the table only for windows starting at or after
--- backfill_cursor while the refresh is current, and otherwise keeps the live
--- query. A normalizer cutover change clears the table and restarts backfill.
+-- backfill_cursor while the refresh is current and no session has waited more
+-- than 5 minutes; otherwise it keeps the live query. A normalizer cutover
+-- change or a new USAGE_CONTRIBUTIONS_VERSION clears the table and restarts
+-- backfill.
 --
 -- The assessment SQL below is USAGE_ASSESSED_SQL + USAGE_CONTRIBUTIONS_SQL from
 -- apps/dashboard/src/server/mcp-query-source.js, verbatim (enforced by
@@ -63,14 +69,24 @@ create index if not exists usage_contributions_session_idx
 create table if not exists analytics.usage_contribution_sessions (
   workspace_id uuid not null,
   session_id uuid not null,
-  max_event_id bigint not null,
   computed_at timestamptz not null default now(),
   primary key (workspace_id, session_id)
 );
 
+create sequence if not exists analytics.usage_contribution_mark_seq;
+create table if not exists analytics.usage_contribution_dirty (
+  workspace_id uuid not null,
+  session_id uuid not null,
+  mark_seq bigint not null,
+  first_marked_at timestamptz not null,
+  last_marked_at timestamptz not null,
+  primary key (workspace_id, session_id)
+);
+create index if not exists usage_contribution_dirty_first_marked_idx
+  on analytics.usage_contribution_dirty (workspace_id, first_marked_at);
+
 create table if not exists analytics.usage_contribution_state (
   workspace_id uuid primary key,
-  event_watermark bigint not null,
   backfill_cursor timestamptz not null,
   backfill_floor timestamptz,
   cutover_fingerprint text not null,
@@ -80,17 +96,22 @@ create table if not exists analytics.usage_contribution_state (
 alter table analytics.usage_contributions enable row level security;
 alter table analytics.usage_contribution_sessions enable row level security;
 alter table analytics.usage_contribution_state enable row level security;
+alter table analytics.usage_contribution_dirty enable row level security;
 revoke all on table analytics.usage_contributions, analytics.usage_contribution_sessions,
-  analytics.usage_contribution_state from public;
+  analytics.usage_contribution_state, analytics.usage_contribution_dirty from public;
+revoke all on sequence analytics.usage_contribution_mark_seq from public;
 do $revoke$
 begin
   if exists (select from pg_catalog.pg_roles where rolname = 'anon') then
     revoke all on table analytics.usage_contributions, analytics.usage_contribution_sessions,
-      analytics.usage_contribution_state from anon, authenticated, service_role;
+      analytics.usage_contribution_state, analytics.usage_contribution_dirty
+      from anon, authenticated, service_role;
+    revoke all on sequence analytics.usage_contribution_mark_seq from anon, authenticated, service_role;
   end if;
 end
 $revoke$;
-grant select on table analytics.usage_contributions, analytics.usage_contribution_state to sherlock_reader;
+grant select on table analytics.usage_contributions, analytics.usage_contribution_state,
+  analytics.usage_contribution_dirty to sherlock_reader;
 drop policy if exists usage_contributions_reader_select on analytics.usage_contributions;
 create policy usage_contributions_reader_select on analytics.usage_contributions
   for select to sherlock_reader using (exists (
@@ -100,6 +121,9 @@ create policy usage_contributions_reader_select on analytics.usage_contributions
 drop policy if exists usage_contribution_state_reader_select on analytics.usage_contribution_state;
 create policy usage_contribution_state_reader_select on analytics.usage_contribution_state
   for select to sherlock_reader using (true);
+drop policy if exists usage_contribution_dirty_reader_select on analytics.usage_contribution_dirty;
+create policy usage_contribution_dirty_reader_select on analytics.usage_contribution_dirty
+  for select to sherlock_reader using (true);
 
 create or replace function analytics.usage_cutover_fingerprint(p_workspace_id uuid)
 returns text
@@ -108,8 +132,11 @@ stable
 security definer
 set search_path = ''
 as $body$
-select pg_catalog.md5(coalesce(pg_catalog.string_agg(
-  c.source_provider || '|' || c.from_normalizer_version || '|' || c.to_normalizer_version || '|' || c.cutover_at::text,
+-- USAGE_CONTRIBUTIONS_VERSION: bump in any migration that replaces the
+-- assessment in compute_usage_contributions(), so stored rows are rebuilt.
+select pg_catalog.md5('usage-contributions-v1:' || coalesce(pg_catalog.string_agg(
+  c.source_provider || '|' || c.from_normalizer_version || '|' || c.to_normalizer_version || '|'
+    || pg_catalog.extract(epoch from c.cutover_at)::text,
   ',' order by c.source_provider, c.to_normalizer_version), ''))
   from analytics.normalizer_cutovers c
  where c.workspace_id = p_workspace_id
@@ -129,18 +156,10 @@ begin
   if p_workspace_id is null or p_session_ids is null or pg_catalog.cardinality(p_session_ids) = 0 then
     return 0;
   end if;
-  -- Taken first: an event committed during the computation is above it and
-  -- makes the session eligible again on the next incremental run.
-  insert into analytics.usage_contribution_sessions as cs (workspace_id, session_id, max_event_id, computed_at)
-  select p_workspace_id, ids.session_id, coalesce((
-           select pg_catalog.max(e.id) from telemetry.events e
-            where e.workspace_id = p_workspace_id and e.session_id = ids.session_id
-              and not e.is_replay
-              and (e.event_kind = 'usage' or e.event_kind = 'lifecycle' and e.event_subtype = 'turn_context')
-         ), 0), pg_catalog.now()
+  insert into analytics.usage_contribution_sessions as cs (workspace_id, session_id, computed_at)
+  select p_workspace_id, ids.session_id, pg_catalog.now()
     from pg_catalog.unnest(p_session_ids) ids(session_id)
-  on conflict (workspace_id, session_id) do update
-     set max_event_id = excluded.max_event_id, computed_at = excluded.computed_at;
+  on conflict (workspace_id, session_id) do update set computed_at = excluded.computed_at;
 
   delete from analytics.usage_contributions u
    where u.workspace_id = p_workspace_id and u.session_id = any (p_session_ids);
@@ -427,16 +446,14 @@ declare
   v_workspace uuid;
   v_state analytics.usage_contribution_state;
   v_fingerprint text;
-  v_high bigint;
-  v_scan_to bigint;
   v_sessions uuid[];
+  v_dirty uuid[];
+  v_marks bigint[];
   v_total integer := 0;
 begin
   if not pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtext('sherlock.usage_contributions')) then
     return 0;
   end if;
-  select pg_catalog.max(e.id) into v_high from telemetry.events e;
-
   for v_workspace in select w.id from telemetry.workspaces w order by w.id loop
     v_fingerprint := analytics.usage_cutover_fingerprint(v_workspace);
     select * into v_state from analytics.usage_contribution_state st
@@ -446,9 +463,9 @@ begin
       delete from analytics.usage_contributions u where u.workspace_id = v_workspace;
       delete from analytics.usage_contribution_sessions cs where cs.workspace_id = v_workspace;
       insert into analytics.usage_contribution_state as st (
-        workspace_id, event_watermark, backfill_cursor, backfill_floor, cutover_fingerprint, refreshed_at
+        workspace_id, backfill_cursor, backfill_floor, cutover_fingerprint, refreshed_at
       ) values (
-        v_workspace, coalesce(v_high, 0),
+        v_workspace,
         greatest(pg_catalog.now(), coalesce((
           select e.occurred_at from telemetry.events e
            where e.workspace_id = v_workspace and e.event_kind = 'usage' and not e.is_replay
@@ -461,32 +478,28 @@ begin
         v_fingerprint, null
       )
       on conflict (workspace_id) do update set
-        event_watermark = excluded.event_watermark, backfill_cursor = excluded.backfill_cursor,
+        backfill_cursor = excluded.backfill_cursor,
         backfill_floor = excluded.backfill_floor, cutover_fingerprint = excluded.cutover_fingerprint,
         refreshed_at = null;
       select * into v_state from analytics.usage_contribution_state st where st.workspace_id = v_workspace;
     end if;
 
-    -- 1. Incremental. Rescan 20k ids below the watermark: identity values are
-    -- allocated before commit, so a slow transaction can land below it.
-    v_scan_to := least(coalesce(v_high, 0), v_state.event_watermark + 200000);
-    select pg_catalog.array_agg(t.session_id) into v_sessions from (
-      select distinct e.session_id
-        from telemetry.events e
-       where e.id > greatest(v_state.event_watermark - 20000, 0) and e.id <= v_scan_to
-         and e.workspace_id = v_workspace and e.session_id is not null and not e.is_replay
-         and (e.event_kind = 'usage' or e.event_kind = 'lifecycle' and e.event_subtype = 'turn_context')
-         and not exists (
-           select 1 from analytics.usage_contribution_sessions cs
-            where cs.workspace_id = v_workspace and cs.session_id = e.session_id
-              and cs.max_event_id >= e.id)
-       limit p_max_sessions
-    ) t;
-    v_total := v_total + analytics.compute_usage_contributions(v_workspace, v_sessions);
-    if coalesce(pg_catalog.cardinality(v_sessions), 0) < p_max_sessions then
-      update analytics.usage_contribution_state st set event_watermark = greatest(st.event_watermark, v_scan_to)
-       where st.workspace_id = v_workspace;
-    end if;
+    -- 1. Dirty sessions, oldest mark first, once quiet for 30 s or marked
+    -- for 90 s. Only the mark that was read is cleared: a session marked again
+    -- meanwhile has a new mark_seq and stays dirty.
+    select pg_catalog.array_agg(t.session_id order by t.first_marked_at),
+           pg_catalog.array_agg(t.mark_seq order by t.first_marked_at)
+      into v_dirty, v_marks
+      from (
+        select d.session_id, d.mark_seq, d.first_marked_at
+          from analytics.usage_contribution_dirty d
+         where d.workspace_id = v_workspace
+           and (d.last_marked_at < pg_catalog.now() - interval '30 seconds'
+                or d.first_marked_at < pg_catalog.now() - interval '90 seconds')
+         order by d.first_marked_at
+         limit p_max_sessions
+      ) t;
+    v_total := v_total + analytics.compute_usage_contributions(v_workspace, v_dirty);
 
     -- 2. Backfill one step of history, newest first.
     if v_state.backfill_floor is not null and v_state.backfill_cursor > v_state.backfill_floor then
@@ -512,6 +525,13 @@ begin
 
     update analytics.usage_contribution_state st set refreshed_at = pg_catalog.now()
      where st.workspace_id = v_workspace;
+    -- Last, so a concurrent ingest waits on these row locks only until commit.
+    if v_dirty is not null then
+      delete from analytics.usage_contribution_dirty d
+       using pg_catalog.unnest(v_dirty, v_marks) m(session_id, mark_seq)
+       where d.workspace_id = v_workspace and d.session_id = m.session_id
+         and d.mark_seq = m.mark_seq;
+    end if;
   end loop;
   return v_total;
 end
@@ -529,6 +549,45 @@ begin
   end if;
 end
 $revoke_functions$;
+
+-- Statement-level, so one ingest statement upserts each touched session once,
+-- in session order (concurrent statements lock dirty rows in the same order).
+create or replace function analytics.mark_usage_contribution_sessions()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $body$
+begin
+  insert into analytics.usage_contribution_dirty as d (
+    workspace_id, session_id, mark_seq, first_marked_at, last_marked_at
+  )
+  select t.workspace_id, t.session_id, pg_catalog.nextval('analytics.usage_contribution_mark_seq'),
+         pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp()
+    from (
+      select distinct n.workspace_id, n.session_id
+        from changed_events n
+       where n.session_id is not null
+         and (n.event_kind = 'usage' or n.event_kind = 'lifecycle' and n.event_subtype = 'turn_context')
+       order by n.workspace_id, n.session_id
+    ) t
+  on conflict (workspace_id, session_id) do update
+     set mark_seq = excluded.mark_seq, last_marked_at = excluded.last_marked_at;
+  return null;
+end
+$body$;
+revoke all on function analytics.mark_usage_contribution_sessions() from public;
+
+drop trigger if exists events_mark_usage_contributions_insert on telemetry.events;
+create trigger events_mark_usage_contributions_insert
+  after insert on telemetry.events
+  referencing new table as changed_events
+  for each statement execute function analytics.mark_usage_contribution_sessions();
+drop trigger if exists events_mark_usage_contributions_update on telemetry.events;
+create trigger events_mark_usage_contributions_update
+  after update on telemetry.events
+  referencing new table as changed_events
+  for each statement execute function analytics.mark_usage_contribution_sessions();
 
 create extension if not exists pg_cron;
 select cron.schedule(
