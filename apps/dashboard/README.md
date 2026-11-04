@@ -261,15 +261,22 @@ least 32 characters and configure the MCP client to send it as
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
 The excerpt tools (`search_sessions`, `get_session_evidence`,
-`list_prompt_evidence`) are rate-limited per caller: 400 calls and 60 distinct
-sessions per rolling hour, returning `rate_limited` with `retryAfterSeconds`.
-A session counts when it is read with `get_session_evidence` or named as the
-`sessionId` filter of a search; open searches spend calls only.
-Cosmos names the caller in a signed `x-e3-identity-pass` header, verified with
-`SHERLOCK_IDENTITY_PASS_SECRET` (32+ characters, shared with the gateway).
-Requests without a valid pass share one bucket of 120 sessions and 800 calls
-per hour. Each read writes a `sherlock_excerpt_read` log line with the caller,
-the Cosmos request id, and session and owner person ids, never content.
+`list_prompt_evidence`) are rate-limited per standard-tier caller: 400 calls and
+60 distinct sessions per rolling hour, returning `rate_limited` with
+`retryAfterSeconds`. A session counts when it is read with
+`get_session_evidence` or named as the `sessionId` filter of a search; open
+searches spend calls only. Cosmos admin callers are not limited.
+Cosmos names the caller and tier in a signed `x-e3-identity-pass` header,
+verified with `SHERLOCK_IDENTITY_PASS_SECRET` (32+ characters, shared with the
+gateway). Requests without a valid pass share one bucket of 120 sessions and 800
+calls per hour.
+
+Every excerpt read, admin or not, is appended to `sherlock_audit.excerpt_reads`
+(one row per session read: time, caller, tier, tool, outcome, Cosmos request id,
+session id, owner person id; never content) and logged as a
+`sherlock_excerpt_read` line. Admin callers answer "whose sessions were read, by
+whom, when" with `list_excerpt_reads` (`view: "summary"` groups by caller and
+owner; `view: "reads"` lists reads; windows up to 31 days).
 
 The endpoint exposes bounded Sherlock metadata and usage tools, the existing
 Bonaparte evidence tools, and three colleague-work investigation tools. Their complete input, output, pagination, error, and

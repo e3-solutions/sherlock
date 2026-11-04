@@ -339,14 +339,14 @@ afterEach(async () => {
   })));
 });
 
-async function connect(searchSource, { guard = null, identitySecret = "", pass = null } = {}) {
+async function connect(searchSource, { guard = null, identitySecret = "", pass = null, auditStore = null } = {}) {
   const token = "s".repeat(MCP_TOKEN_MIN_LENGTH);
   const source = createCachedMcpSource({
     cache: { read: vi.fn() },
     source: { fetchPromptEvidence: vi.fn() },
     ...(searchSource ? { searchSource } : {}),
   });
-  const protocol = createBonaparteMcpProtocol(source, { guard });
+  const protocol = createBonaparteMcpProtocol(source, { guard, auditStore });
   openProtocols.push(protocol);
   const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token, identitySecret });
   const httpServer = createServer((request, response) => void route(request, response));
@@ -369,9 +369,9 @@ async function connect(searchSource, { guard = null, identitySecret = "", pass =
 
 const IDENTITY_SECRET = "i".repeat(32);
 
-function identityPass(principal, requestId) {
+function identityPass(principal, requestId, tier = "standard") {
   const body = Buffer.from(JSON.stringify({
-    v: 1, a: "sherlock", e: [], p: principal, r: requestId, t: "standard",
+    v: 1, a: "sherlock", e: [], p: principal, r: requestId, t: tier,
     x: Math.floor(Date.now() / 1000) + 120,
   })).toString("base64url");
   return `e3id.${body}.${createHmac("sha256", IDENTITY_SECRET).update(body).digest("base64url")}`;
@@ -822,7 +822,9 @@ describe("Sherlock excerpt rate limit", () => {
       ownerPersonIds: [SHARAD],
     });
     expect(reads.filter((event) => event.caller === "bo")).toHaveLength(1);
-    expect(reads.at(-1)).toMatchObject({ tool: "search_sessions", ownerPersonIds: [SHARAD] });
+    expect(reads.filter((event) => event.outcome === "ok").at(-1))
+      .toMatchObject({ tool: "search_sessions", ownerPersonIds: [SHARAD] });
+    expect(reads.filter((event) => event.outcome === "rate_limited")).toHaveLength(2);
     expect(events.filter((event) => event.event === "sherlock_excerpt_rate_limited")
       .map((event) => [event.caller, event.tool])).toEqual([
       ["ada", "get_session_evidence"], ["ada", "search_sessions"],
@@ -859,6 +861,51 @@ describe("Sherlock excerpt rate limit", () => {
     expect((await read(forged, SESSION)).isError).not.toBe(true);
     expect(errorOf(await read(bare, OTHER))).toMatchObject({ code: "rate_limited" });
     expect(events[0]).toMatchObject({ caller: null, attributed: false, requestId: null });
+  });
+
+  it("exempts admin callers from the limit but audits every read", async () => {
+    const rows = [];
+    const guard = createExcerptGuard({ limits: LIMITS, log: () => {}, audit: { push: (batch) => rows.push(...batch) } });
+    const admin = await connect(searchDatabase().source, {
+      guard, identitySecret: IDENTITY_SECRET, pass: identityPass("root", "req-root", "admin"),
+    });
+    for (const sessionId of [SESSION, OTHER, THIRD, PARENT, CHILD]) {
+      expect((await read(admin, sessionId)).isError).not.toBe(true);
+    }
+    expect(rows).toHaveLength(5);
+    expect(rows.every((row) => row.caller === "root" && row.caller_tier === "admin" &&
+      row.request_id === "req-root" && row.outcome === "ok" && row.owner_person_id === SHARAD)).toBe(true);
+    expect(JSON.stringify(rows)).not.toContain("excerpt");
+  });
+
+  it("serves the excerpt-read audit to admin callers only", async () => {
+    const guard = createExcerptGuard({ limits: LIMITS, log: () => {} });
+    const summary = {
+      view: "summary",
+      window: { startInclusive: "2026-11-04T00:00:00.000Z", endExclusive: "2026-11-05T00:00:00.000Z" },
+      truncated: false,
+      groups: [{
+        caller: "ada", ownerPersonId: SHARAD, reads: 3, distinctSessions: 2, rateLimited: 0,
+        firstReadAt: "2026-11-04T10:00:00.000Z", lastReadAt: "2026-11-04T11:00:00.000Z",
+      }],
+    };
+    const auditStore = { list: vi.fn().mockResolvedValue(summary) };
+    const options = { guard, identitySecret: IDENTITY_SECRET, auditStore };
+    const standard = await connect(searchDatabase().source, { ...options, pass: identityPass("ada", "r1") });
+    const bare = await connect(searchDatabase().source, options);
+    const admin = await connect(searchDatabase().source, { ...options, pass: identityPass("root", "r2", "admin") });
+
+    for (const client of [standard, bare]) {
+      expect(errorOf(await client.callTool({ name: "list_excerpt_reads", arguments: {} })))
+        .toMatchObject({ code: "forbidden" });
+    }
+    expect(auditStore.list).not.toHaveBeenCalled();
+    const result = await admin.callTool({
+      name: "list_excerpt_reads", arguments: { ownerPersonId: SHARAD },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toEqual(summary);
+    expect(auditStore.list).toHaveBeenCalledWith(expect.objectContaining({ ownerPersonId: SHARAD }));
   });
 
   it("logs failed reads without owners", async () => {

@@ -2124,6 +2124,7 @@ export class DirectFlameSource {
     signal,
     statementTimeoutMs = DEFAULT_STATEMENT_TIMEOUT_MS,
     pool = this.sql,
+    readOnly = true,
   } = {}) {
     try {
       if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");
@@ -2134,7 +2135,11 @@ export class DirectFlameSource {
         // No parameters means postgres.js uses the simple protocol. PostgreSQL
         // runs these transaction-local settings together on the pinned backend.
         await runQuery(tx,
-          `set transaction isolation level repeatable read, read only; ` +
+          // Only the excerpt-read audit writes, and only through its
+          // security-definer function; everything else stays read-only.
+          (readOnly !== false
+            ? `set transaction isolation level repeatable read, read only; `
+            : `set transaction isolation level read committed, read write; `) +
           `set local statement_timeout = '${statementTimeoutMs}ms'; set local role ${DATABASE_ROLE}`,
           undefined, signal);
         if (signal?.aborted) throw new FlameSourceError("flame_request_aborted");

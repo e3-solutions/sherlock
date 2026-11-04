@@ -103,12 +103,18 @@ export class ExcerptRateLimitError extends Error {
   }
 }
 
+export function isAdminCaller(caller) {
+  return caller?.attributed === true && caller.tier === "admin";
+}
+
 // Sliding one-hour window per caller, held in memory on the single dashboard
 // instance. A restart forgets the window, which only ever loosens the limit.
+// Cosmos admin callers are not limited, but every read is still audited.
 export function createExcerptGuard({
   limits = EXCERPT_LIMITS,
   now = Date.now,
   log = (event) => console.log(JSON.stringify(event)),
+  audit = null,
 } = {}) {
   const callers = new Map();
 
@@ -136,6 +142,7 @@ export function createExcerptGuard({
     // Counts the call (and a newly requested session) before any read runs,
     // so failed or slow reads still consume budget.
     admit(caller, { tool, sessionId = null }) {
+      if (isAdminCaller(caller)) return;
       const at = now();
       const entry = bucket(caller);
       prune(entry, at - limits.windowMs);
@@ -171,8 +178,13 @@ export function createExcerptGuard({
       }
     },
 
-    // Audit trail: identifiers only, never excerpt content.
-    record(caller, { tool, outcome, sessionIds = [], ownerPersonIds = [] }) {
+    // Audit trail: identifiers only, never excerpt content. One durable row
+    // per session read (or one row when no session was resolved).
+    record(caller, { tool, outcome, reads = [] }) {
+      const readAt = new Date(now()).toISOString();
+      const unique = [...new Map(reads.map((read) => [
+        `${read.sessionId ?? ""}:${read.ownerPersonId ?? ""}`, read,
+      ])).values()];
       log({
         event: "sherlock_excerpt_read",
         tool,
@@ -181,30 +193,51 @@ export function createExcerptGuard({
         tier: caller.tier,
         attributed: caller.attributed,
         requestId: caller.requestId,
-        sessionIds: [...new Set(sessionIds)],
-        ownerPersonIds: [...new Set(ownerPersonIds)],
+        sessionIds: [...new Set(unique.map((read) => read.sessionId).filter(Boolean))],
+        ownerPersonIds: [...new Set(unique.map((read) => read.ownerPersonId).filter(Boolean))],
       });
+      audit?.push((unique.length > 0 ? unique : [{ sessionId: null, ownerPersonId: null }])
+        .map((read) => ({
+          read_at: readAt,
+          tool,
+          outcome,
+          caller: caller.principal,
+          caller_tier: caller.tier,
+          request_id: caller.requestId,
+          session_id: read.sessionId ?? null,
+          owner_person_id: read.ownerPersonId ?? null,
+        })));
     },
   });
 }
 
-// Owner and session identifiers from an excerpt tool's result, for the audit line.
-export function excerptReadIds(tool, args, result) {
+function requestedSession(args) {
+  return typeof args?.sessionId === "string" ? args.sessionId.toLowerCase() : null;
+}
+
+// (session, owner) pairs an excerpt call read, from its result or, when the
+// call failed or was refused, from its arguments.
+export function excerptReads(tool, args, result) {
   if (tool === "get_session_evidence") {
-    return {
-      sessionIds: [result?.session?.sessionId ?? args?.sessionId].filter(Boolean),
-      ownerPersonIds: [result?.session?.personId].filter(Boolean),
-    };
+    const sessionId = result?.session?.sessionId ?? requestedSession(args);
+    return sessionId ? [{ sessionId, ownerPersonId: result?.session?.personId ?? null }] : [];
   }
   if (tool === "search_sessions") {
-    const sessionIds = [];
-    const ownerPersonIds = [];
-    for (const match of result?.results ?? []) {
-      sessionIds.push(match.sessionId);
-      ownerPersonIds.push(match.personId);
-      for (const alternative of match.alternativeSources ?? []) sessionIds.push(alternative.sessionId);
+    if (!result) {
+      const sessionId = requestedSession(args);
+      return sessionId ? [{ sessionId, ownerPersonId: null }] : [];
     }
-    return { sessionIds: sessionIds.filter(Boolean), ownerPersonIds: ownerPersonIds.filter(Boolean) };
+    const reads = [];
+    // Identical-excerpt groups are per person, so alternatives share the owner.
+    for (const match of result.results ?? []) {
+      reads.push({ sessionId: match.sessionId, ownerPersonId: match.personId });
+      for (const alternative of match.excerptGroup?.alternativeSources ?? match.alternativeSources ?? []) {
+        reads.push({ sessionId: alternative.sessionId, ownerPersonId: match.personId });
+      }
+    }
+    return reads.filter((read) => read.sessionId);
   }
-  return { sessionIds: [], ownerPersonIds: [args?.personId].filter(Boolean) };
+  return typeof args?.personId === "string"
+    ? [{ sessionId: null, ownerPersonId: args.personId.toLowerCase() }]
+    : [];
 }

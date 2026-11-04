@@ -7,7 +7,7 @@ import {
   UNATTRIBUTED_CALLER,
   callerFromHeaders,
   createExcerptGuard,
-  excerptReadIds,
+  excerptReads,
   verifyIdentityPass,
 } from "./mcp-excerpt-guard.js";
 
@@ -120,28 +120,60 @@ describe("excerpt guard", () => {
     guard.admit(caller("ada"), { tool: "search_sessions" });
   });
 
-  it("logs identifiers only", () => {
-    const events = [];
-    const guard = createExcerptGuard({ limits: LIMITS, now: () => 0, log: (event) => events.push(event) });
-    guard.record({ ...caller("ada"), requestId: "req-1" }, {
-      tool: "search_sessions", outcome: "ok", sessionIds: ["s1", "s1", "s2"], ownerPersonIds: ["p1", "p1"],
-    });
-    expect(events).toEqual([{
-      event: "sherlock_excerpt_read", tool: "search_sessions", outcome: "ok", caller: "ada",
-      tier: "standard", attributed: true, requestId: "req-1", sessionIds: ["s1", "s2"], ownerPersonIds: ["p1"],
-    }]);
+  it("never limits admin callers", () => {
+    const guard = createExcerptGuard({ limits: LIMITS, now: () => 0, log: () => {} });
+    const admin = { ...caller("root"), tier: "admin" };
+    for (let index = 0; index < 20; index += 1) {
+      guard.admit(admin, { tool: "get_session_evidence", sessionId: `s${index}` });
+    }
+    // An unsigned "admin" claim is not possible: only attributed callers carry a tier.
+    expect(() => {
+      for (let index = 0; index < 5; index += 1) {
+        guard.admit({ ...UNATTRIBUTED_CALLER, tier: "admin" }, { tool: "search_sessions" });
+      }
+    }).toThrow(ExcerptRateLimitError);
   });
 
-  it("extracts session and owner ids from each excerpt tool result", () => {
-    expect(excerptReadIds("get_session_evidence", { sessionId: "s1" }, {
+  it("logs identifiers only and queues one audit row per session read", () => {
+    const events = [];
+    const rows = [];
+    const guard = createExcerptGuard({
+      limits: LIMITS, now: () => 0, log: (event) => events.push(event), audit: { push: (batch) => rows.push(...batch) },
+    });
+    guard.record({ ...caller("ada"), requestId: "req-1" }, {
+      tool: "search_sessions", outcome: "ok", reads: [
+        { sessionId: "s1", ownerPersonId: "p1" }, { sessionId: "s1", ownerPersonId: "p1" },
+        { sessionId: "s2", ownerPersonId: "p1" },
+      ],
+    });
+    guard.record(UNATTRIBUTED_CALLER, { tool: "search_sessions", outcome: "rate_limited", reads: [] });
+    expect(events[0]).toEqual({
+      event: "sherlock_excerpt_read", tool: "search_sessions", outcome: "ok", caller: "ada",
+      tier: "standard", attributed: true, requestId: "req-1", sessionIds: ["s1", "s2"], ownerPersonIds: ["p1"],
+    });
+    expect(rows).toEqual([
+      { read_at: "1970-01-01T00:00:00.000Z", tool: "search_sessions", outcome: "ok", caller: "ada",
+        caller_tier: "standard", request_id: "req-1", session_id: "s1", owner_person_id: "p1" },
+      { read_at: "1970-01-01T00:00:00.000Z", tool: "search_sessions", outcome: "ok", caller: "ada",
+        caller_tier: "standard", request_id: "req-1", session_id: "s2", owner_person_id: "p1" },
+      { read_at: "1970-01-01T00:00:00.000Z", tool: "search_sessions", outcome: "rate_limited", caller: null,
+        caller_tier: null, request_id: null, session_id: null, owner_person_id: null },
+    ]);
+  });
+
+  it("extracts session and owner pairs from each excerpt tool result", () => {
+    expect(excerptReads("get_session_evidence", { sessionId: "S1" }, {
       session: { sessionId: "s1", personId: "p1" }, events: [{ contentExcerpt: "secret" }],
-    })).toEqual({ sessionIds: ["s1"], ownerPersonIds: ["p1"] });
-    expect(excerptReadIds("get_session_evidence", { sessionId: "s1" }, null))
-      .toEqual({ sessionIds: ["s1"], ownerPersonIds: [] });
-    expect(excerptReadIds("search_sessions", {}, {
-      results: [{ sessionId: "s1", personId: "p1", alternativeSources: [{ sessionId: "s2" }] }],
-    })).toEqual({ sessionIds: ["s1", "s2"], ownerPersonIds: ["p1"] });
-    expect(excerptReadIds("list_prompt_evidence", { personId: "p3" }, { prompts: [] }))
-      .toEqual({ sessionIds: [], ownerPersonIds: ["p3"] });
+    })).toEqual([{ sessionId: "s1", ownerPersonId: "p1" }]);
+    expect(excerptReads("get_session_evidence", { sessionId: "S1" }, null))
+      .toEqual([{ sessionId: "s1", ownerPersonId: null }]);
+    expect(excerptReads("search_sessions", {}, {
+      results: [{ sessionId: "s1", personId: "p1", excerptGroup: { alternativeSources: [{ sessionId: "s2" }] } }],
+    })).toEqual([{ sessionId: "s1", ownerPersonId: "p1" }, { sessionId: "s2", ownerPersonId: "p1" }]);
+    expect(excerptReads("search_sessions", { sessionId: "s9" }, null))
+      .toEqual([{ sessionId: "s9", ownerPersonId: null }]);
+    expect(excerptReads("search_sessions", {}, null)).toEqual([]);
+    expect(excerptReads("list_prompt_evidence", { personId: "p3" }, { prompts: [] }))
+      .toEqual([{ sessionId: null, ownerPersonId: "p3" }]);
   });
 });
