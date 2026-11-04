@@ -398,6 +398,15 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
           "relatedHidden", "childOfHidden", "bobSession", "atEnd"]);
       await expectEquivalent(tx, fixture, { query: "zebrafind -alpha" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { query: "\"unrelated synthetic\" or nothinghere" }, ["noHit"]);
+      // Windows over 25 hours take the GIN path; shorter ones (all of the above)
+      // read the window by time. Both must return the same rows.
+      const wide = { start: "2025-12-30T00:00:00Z" };
+      await expectEquivalent(tx, fixture, wide, [...all, "bobSession"]);
+      await expectEquivalent(tx, fixture, { ...wide, person: fixture.people.alice.id }, all);
+      await expectEquivalent(tx, fixture, { ...wide, session: fixture.sessions.alice2.id }, ["otherSession"]);
+      await expectEquivalent(tx, fixture, { ...wide, domain: "sixtyfour.ai" }, ["sixty"]);
+      await expectEquivalent(tx, fixture, { ...wide, query: "zebrafind -alpha" }, [...all, "bobSession"]);
+      await expectEquivalent(tx, fixture, { start: "2025-12-31T11:00:00Z" }, [...all, "bobSession"]);
     });
   });
 
