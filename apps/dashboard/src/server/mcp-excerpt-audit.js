@@ -121,6 +121,9 @@ export function createExcerptAuditWriter({
   let timer = null;
   let flushing = null;
   let failing = false;
+  // Rows at the head of the buffer currently being written; overflow never
+  // drops them, so a successful write removes exactly what it wrote.
+  let inFlight = 0;
 
   function schedule() {
     if (timer !== null || buffer.length === 0) return;
@@ -134,6 +137,7 @@ export function createExcerptAuditWriter({
   async function drain() {
     while (buffer.length > 0) {
       const batch = buffer.slice(0, maxBatch);
+      inFlight = batch.length;
       try {
         await store.write(batch);
         buffer = buffer.slice(batch.length);
@@ -143,6 +147,8 @@ export function createExcerptAuditWriter({
         log({ event: "sherlock_excerpt_audit_write_failed", rows: batch.length, code: error?.code ?? null });
         schedule();
         return;
+      } finally {
+        inFlight = 0;
       }
     }
   }
@@ -157,8 +163,8 @@ export function createExcerptAuditWriter({
       if (rows.length === 0) return;
       buffer.push(...rows);
       if (buffer.length > maxBuffered) {
-        const dropped = buffer.length - maxBuffered;
-        buffer = buffer.slice(dropped);
+        const dropped = Math.min(buffer.length - maxBuffered, buffer.length - inFlight);
+        buffer = [...buffer.slice(0, inFlight), ...buffer.slice(inFlight + dropped)];
         log({ event: "sherlock_excerpt_audit_dropped", rows: dropped });
       }
       // After a failed write, wait for the scheduled retry instead of

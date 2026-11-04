@@ -5,6 +5,8 @@ private telemetry schemas. It is a single workspace-scoped service: every query
 uses SHERLOCK_WORKSPACE_ID, requires the service's approved
 SHERLOCK_DASHBOARD_EMAIL_DOMAIN, and uses one small connection pool whose
 transactions are repeatable-read, read-only, and pinned to `sherlock_reader`.
+The one exception is the MCP excerpt-read audit, which appends rows only through
+`sherlock_audit.record_excerpt_reads()` in a short read-write transaction.
 
 The browser and MCP clients never receive database credentials. The page and
 all browser APIs are public and unauthenticated, including lazy interval and

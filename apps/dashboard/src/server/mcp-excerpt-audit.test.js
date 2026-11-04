@@ -128,6 +128,26 @@ describe("excerpt audit writer", () => {
     }
   });
 
+  it("never drops rows that are being written", async () => {
+    const written = [];
+    let release;
+    const store = {
+      write: (rows) => new Promise((resolve) => {
+        release = () => { written.push(...rows); resolve(rows.length); };
+      }),
+    };
+    const writer = createExcerptAuditWriter({ store, flushMs: 60_000, maxBatch: 2, maxBuffered: 3, log: () => {} });
+    writer.push([{ id: 1 }, { id: 2 }]);
+    // Overflow while ids 1 and 2 are in flight drops id 3, the oldest queued row.
+    writer.push([{ id: 3 }, { id: 4 }]);
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    release();
+    await writer.close();
+    expect(written.map((row) => row.id)).toEqual([1, 2, 4]);
+  });
+
   it("drops the oldest rows past its buffer bound and says so", async () => {
     const events = [];
     const writer = createExcerptAuditWriter({

@@ -80,7 +80,10 @@ begin
   insert into sherlock_audit.excerpt_reads (
     read_at, workspace_id, tool, outcome, caller, caller_tier, request_id, session_id, owner_person_id
   )
-  select r.read_at, p_workspace_id, r.tool, r.outcome, r.caller, r.caller_tier, r.request_id,
+  -- Callers report when the read happened (rows are batched for a few
+  -- seconds); a time outside the last hour cannot backdate or postdate it.
+  select least(greatest(r.read_at, pg_catalog.now() - interval '1 hour'), pg_catalog.now()),
+         p_workspace_id, r.tool, r.outcome, r.caller, r.caller_tier, r.request_id,
          r.session_id, r.owner_person_id
     from pg_catalog.jsonb_to_recordset(p_rows) as r(
       read_at timestamptz, tool text, outcome text, caller text, caller_tier text,

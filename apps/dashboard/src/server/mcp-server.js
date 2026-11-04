@@ -548,8 +548,9 @@ const auditOutputSchema = z.object({
   view: z.enum(["summary", "reads"]),
   window: z.object({ startInclusive: ISO_TIMESTAMP, endExclusive: ISO_TIMESTAMP }).strict(),
   truncated: z.boolean(),
+  // The table bounds caller to 256 code points; zod counts UTF-16 units.
   groups: z.array(z.object({
-    caller: z.string().max(256).nullable(),
+    caller: z.string().max(512).nullable(),
     ownerPersonId: UUID.nullable(),
     reads: z.number().int().nonnegative(),
     distinctSessions: z.number().int().nonnegative(),
@@ -559,7 +560,7 @@ const auditOutputSchema = z.object({
   }).strict()).max(AUDIT_MAX_LIMIT).optional(),
   reads: z.array(z.object({
     readAt: ISO_TIMESTAMP,
-    caller: z.string().max(256).nullable(),
+    caller: z.string().max(512).nullable(),
     callerTier: z.string().max(32).nullable(),
     tool: z.enum(["search_sessions", "get_session_evidence", "list_prompt_evidence"]),
     outcome: z.enum(["ok", "error", "rate_limited"]),
