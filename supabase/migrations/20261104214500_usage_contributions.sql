@@ -136,7 +136,7 @@ as $body$
 -- assessment in compute_usage_contributions(), so stored rows are rebuilt.
 select pg_catalog.md5('usage-contributions-v1:' || coalesce(pg_catalog.string_agg(
   c.source_provider || '|' || c.from_normalizer_version || '|' || c.to_normalizer_version || '|'
-    || pg_catalog.extract(epoch from c.cutover_at)::text,
+    || extract(epoch from c.cutover_at)::text,
   ',' order by c.source_provider, c.to_normalizer_version), ''))
   from analytics.normalizer_cutovers c
  where c.workspace_id = p_workspace_id
