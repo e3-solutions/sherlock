@@ -261,8 +261,10 @@ least 32 characters and configure the MCP client to send it as
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
 The excerpt tools (`search_sessions`, `get_session_evidence`,
-`list_prompt_evidence`) are rate-limited per caller: 60 distinct sessions and
-400 calls per rolling hour, returning `rate_limited` with `retryAfterSeconds`.
+`list_prompt_evidence`) are rate-limited per caller: 400 calls and 60 distinct
+sessions per rolling hour, returning `rate_limited` with `retryAfterSeconds`.
+A session counts when it is read with `get_session_evidence` or named as the
+`sessionId` filter of a search; open searches spend calls only.
 Cosmos names the caller in a signed `x-e3-identity-pass` header, verified with
 `SHERLOCK_IDENTITY_PASS_SECRET` (32+ characters, shared with the gateway).
 Requests without a valid pass share one bucket of 120 sessions and 800 calls

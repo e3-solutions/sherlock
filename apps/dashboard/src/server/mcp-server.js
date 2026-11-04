@@ -314,7 +314,7 @@ const queryUsageOutputSchema = z.object({
 
 const USAGE_WINDOW_DOCUMENTATION = "Usage and coverage default to the trailing 24 hours, accept historical windows up to 7 days, and return window_too_large or query_timeout with narrowing guidance. Paginated session queries search all stored history by default. Row, group, transaction-time, workspace, and roster safety bounds still apply.";
 
-const EXCERPT_LIMIT_DOCUMENTATION = `Excerpt tools (search_sessions, get_session_evidence, list_prompt_evidence) are limited per Cosmos caller to ${EXCERPT_LIMITS.sessionsPerWindow} distinct sessions and ${EXCERPT_LIMITS.callsPerWindow} calls per rolling hour; rate_limited carries retryAfterSeconds. Each read is logged with caller and session-owner ids, never content.`;
+const EXCERPT_LIMIT_DOCUMENTATION = `Excerpt tools (search_sessions, get_session_evidence, list_prompt_evidence) are limited per Cosmos caller to ${EXCERPT_LIMITS.sessionsPerWindow} distinct sessions (read with get_session_evidence or named as a search sessionId filter) and ${EXCERPT_LIMITS.callsPerWindow} calls per rolling hour; rate_limited carries retryAfterSeconds. Each read is logged with caller and session-owner ids, never content.`;
 
 const QUERY_DOCUMENTATION = Object.freeze({
   schemaVersion: MCP_QUERY_SCHEMA_VERSION,
@@ -483,12 +483,14 @@ function documentation(source) {
 
 // Excerpt tools return other people's session content: each call is admitted
 // against the caller's hourly budget first, and every outcome is logged by id.
+// A session-targeted read (evidence, or a search filtered to one sessionId)
+// also spends the distinct-session budget; open searches spend calls only.
 async function guardedExcerptRead(guard, tool, args, read) {
   if (guard === null) return await read();
   const caller = currentCaller();
   guard.admit(caller, {
     tool,
-    sessionId: tool === "get_session_evidence" && typeof args?.sessionId === "string"
+    sessionId: tool !== "list_prompt_evidence" && typeof args?.sessionId === "string"
       ? args.sessionId.toLowerCase()
       : null,
   });

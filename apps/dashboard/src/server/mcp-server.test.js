@@ -831,6 +831,21 @@ describe("Sherlock excerpt rate limit", () => {
     expect(JSON.stringify(events)).not.toContain("paddleocr");
   });
 
+  it("counts a search filtered to one session against the session budget", async () => {
+    const guard = createExcerptGuard({ limits: LIMITS, log: () => {} });
+    const client = await connect(searchDatabase().source, {
+      guard, identitySecret: IDENTITY_SECRET, pass: identityPass("ada", "req"),
+    });
+    const search = (sessionId) => client.callTool({
+      name: "search_sessions", arguments: { query: "ocr", sessionId },
+    });
+    expect((await search(SESSION)).isError).not.toBe(true);
+    expect((await read(client, OTHER.toUpperCase())).isError).not.toBe(true);
+    expect((await search(OTHER)).isError).not.toBe(true);
+    expect(errorOf(await search(THIRD))).toMatchObject({ code: "rate_limited" });
+    expect(errorOf(await read(client, THIRD))).toMatchObject({ code: "rate_limited" });
+  });
+
   it("puts callers without a valid pass into one shared bucket", async () => {
     const events = [];
     const guard = createExcerptGuard({ limits: LIMITS, log: (event) => events.push(event) });
