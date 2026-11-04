@@ -336,6 +336,39 @@ def reconcile(
         return result
 
 
+def upload_progress(previous: dict, result: dict, now: str) -> dict:
+    """When this collector last uploaded, and since when its uploads have failed.
+
+    Carried across runs in the status file so a central check can tell a stuck
+    queue from an idle one: a run that only meets owner-held or delayed batches
+    keeps both times, an upload or an empty queue clears the failure, and a
+    run whose uploads were rejected or blocked starts it (COR-5105).
+    """
+    drain = result.get("drain")
+    last_uploaded_at = previous.get("last_uploaded_at")
+    failing_since = previous.get("upload_failing_since")
+    if not isinstance(last_uploaded_at, str):
+        last_uploaded_at = None
+    if not isinstance(failing_since, str):
+        failing_since = None
+    if isinstance(drain, dict) and not drain.get("locked"):
+        if drain.get("uploaded"):
+            last_uploaded_at, failing_since = now, None
+        elif drain.get("requeued") or drain.get("collector_failure"):
+            failing_since = failing_since or now
+        elif not result.get("pending_uploads"):
+            failing_since = None
+    return {"last_uploaded_at": last_uploaded_at, "upload_failing_since": failing_since}
+
+
+def _previous_status(root: Path) -> dict:
+    try:
+        value = json.loads((root / STATUS_NAME).read_text())
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def write_collector_status(
     root: Path,
     provider: str,
@@ -344,10 +377,12 @@ def write_collector_status(
 ) -> None:
     """Persist counters (never content) for Jolly Roger's check-in to read."""
     drain = result.get("drain") or {}
+    now = utc_now()
     status = {
         "status_version": 1,
         "provider": provider,
-        "updated_at": utc_now(),
+        "updated_at": now,
+        **upload_progress(_previous_status(root), result, now),
         "reconcile_status": result.get("status"),
         "eligible_unfinished_sources": result.get("eligible_unfinished_sources"),
         "unfinished_sources": result.get("unfinished_sources"),

@@ -62,6 +62,7 @@ jobs:
         run: |
           deno check --config supabase/functions/sherlock-rollout-ingest/deno.json supabase/functions/sherlock-rollout-ingest/index.ts
           deno check --config workers/telemetry-processor/deno.json workers/telemetry-processor/main.ts
+          deno check supabase/functions/sherlock-collector-activity/index.ts
           deno check scripts/reduce-activity.ts
           deno check scripts/backfill-frame-evidence.ts
           deno check scripts/backfill-session-scm.ts
@@ -76,6 +77,7 @@ jobs:
         run: |
           deno test --config supabase/functions/sherlock-rollout-ingest/deno.json supabase/functions/sherlock-rollout-ingest
           deno test supabase/functions/sherlock-activity-reducer
+          deno test supabase/functions/sherlock-collector-activity
           deno test --config workers/telemetry-processor/deno.json --allow-read=railway.toml workers/telemetry-processor
 
       - name: Verify dashboard

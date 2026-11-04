@@ -26,7 +26,7 @@ from sherlock_collector.drain import (
 )
 from sherlock_collector.hook import run_hook
 from sherlock_collector.inventory import collection_inventory
-from sherlock_collector.reconcile import reconcile
+from sherlock_collector.reconcile import reconcile, upload_progress
 from sherlock_collector.rollout import RolloutCapturer
 from sherlock_collector.spool import DurableSpool, secure_lock
 from test_collector import SuccessTransport, batch, receipt
@@ -154,6 +154,67 @@ class ReconcileTests(unittest.TestCase):
                 recovered = reconcile(home, state, "codex", transport)
             self.assertEqual(recovered["status"], "complete")
             self.assertEqual(recovered["drain"]["uploaded"], 2)
+
+    def test_status_file_records_when_uploads_last_worked_and_since_when_they_fail(self):
+        with TemporaryDirectory() as directory:
+            home, state = Path(directory) / "home", Path(directory) / "state"
+            native_file(home, "codex")
+
+            def status():
+                return json.loads((state / "collector-status.json").read_text())
+
+            class Forbidden:
+                def upload(self, item):
+                    raise CollectorUploadError(
+                        "HTTP 401", error_code="invalid_jwt", http_status=401
+                    )
+
+            reconcile(home, state, "codex", SuccessTransport())
+            worked = status()
+            self.assertIsNotNone(worked["last_uploaded_at"])
+            self.assertIsNone(worked["upload_failing_since"])
+            native_file(home, "codex")
+            reconcile(home, state, "codex", Forbidden())
+            failing = status()
+            self.assertEqual(failing["last_uploaded_at"], worked["last_uploaded_at"])
+            self.assertIsNotNone(failing["upload_failing_since"])
+            # A blocked run inside its backoff keeps the original failure time.
+            reconcile(home, state, "codex", SuccessTransport())
+            self.assertEqual(
+                status()["upload_failing_since"], failing["upload_failing_since"]
+            )
+            with patch(
+                "sherlock_collector.drain.time.time", return_value=time.time() + 3600
+            ):
+                reconcile(home, state, "codex", SuccessTransport())
+            recovered = status()
+            self.assertIsNone(recovered["upload_failing_since"])
+            self.assertGreater(recovered["last_uploaded_at"], worked["last_uploaded_at"])
+
+    def test_upload_progress_keeps_times_through_idle_and_locked_runs(self):
+        previous = {"last_uploaded_at": "A", "upload_failing_since": "B"}
+        now = "C"
+        # Only held or delayed batches: nothing was attempted, keep both.
+        idle = {"drain": {"uploaded": 0, "requeued": 0}, "pending_uploads": 3}
+        self.assertEqual(upload_progress(previous, idle, now), previous)
+        locked = {"drain": {"locked": True}, "pending_uploads": 3}
+        self.assertEqual(upload_progress(previous, locked, now), previous)
+        self.assertEqual(upload_progress(previous, {"drain": None}, now), previous)
+        empty = {"drain": {"uploaded": 0, "requeued": 0}, "pending_uploads": 0}
+        self.assertEqual(
+            upload_progress(previous, empty, now),
+            {"last_uploaded_at": "A", "upload_failing_since": None},
+        )
+        rejected = {"drain": {"uploaded": 0, "requeued": 2}, "pending_uploads": 2}
+        self.assertEqual(
+            upload_progress({}, rejected, now),
+            {"last_uploaded_at": None, "upload_failing_since": "C"},
+        )
+        garbage = {"last_uploaded_at": 5, "upload_failing_since": ["x"]}
+        self.assertEqual(
+            upload_progress(garbage, idle, now),
+            {"last_uploaded_at": None, "upload_failing_since": None},
+        )
 
     def test_abandoned_processing_is_recovered_on_idle_machine(self):
         with TemporaryDirectory() as directory:
