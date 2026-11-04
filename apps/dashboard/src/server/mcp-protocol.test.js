@@ -176,7 +176,7 @@ describe("Bonaparte MCP protocol", () => {
     });
     expect(partialUsage.isError).not.toBe(true);
     expect(partialUsage.structuredContent).toMatchObject({
-      usageDerivationVersion: "sherlock.usage-reconciliation.v1",
+      usageDerivationVersion: "sherlock.usage-reconciliation.v2",
       groups: [{
         tokens: { input: null, cachedInput: null, output: null, reasoning: null, total: null },
         knownTokens: { input: 40, cachedInput: 0, output: 30, reasoning: 5, total: 75 },

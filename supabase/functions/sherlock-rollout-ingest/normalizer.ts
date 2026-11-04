@@ -7,8 +7,9 @@ import {
 
 export const LEGACY_CODEX_NORMALIZER_VERSION = "sherlock.codex-rollout.v1";
 export const NORMALIZER_VERSION = "sherlock.codex-rollout.v2";
-// New queue jobs explicitly target v3; legacy jobs keep reproducible outputs.
+// Queue jobs explicitly select a version; legacy jobs keep reproducible outputs.
 export const CODEX_V3_NORMALIZER_VERSION = "sherlock.codex-rollout.v3";
+export const CODEX_V4_NORMALIZER_VERSION = "sherlock.codex-rollout.v4";
 export const ROLE_VERSION = "sherlock.codex-role.v1";
 export const CLAUDE_NORMALIZER_VERSION = "sherlock.claude-code-transcript.v1";
 export const CLAUDE_ROLE_VERSION = "sherlock.claude-code-role.v1";
@@ -194,6 +195,7 @@ export function normalizerVersionsFor(manifest: BatchManifest): string[] {
   return manifest.source_provider === "claude_code"
     ? [CLAUDE_NORMALIZER_VERSION]
     : [
+      CODEX_V4_NORMALIZER_VERSION,
       CODEX_V3_NORMALIZER_VERSION,
       NORMALIZER_VERSION,
       LEGACY_CODEX_NORMALIZER_VERSION,
@@ -215,7 +217,8 @@ export function isRuntimeContextMessage(
   if (!openingTag) return false;
   const name = openingTag[1].toLowerCase();
   return RUNTIME_CONTEXT_ENVELOPE_NAMES.has(name) ||
-    normalizerVersion === CODEX_V3_NORMALIZER_VERSION &&
+    (normalizerVersion === CODEX_V3_NORMALIZER_VERSION ||
+        normalizerVersion === CODEX_V4_NORMALIZER_VERSION) &&
       name === "codex_internal_context";
 }
 
@@ -1014,6 +1017,29 @@ async function projectRecord(
       cwd: stringValue(payload?.cwd) ?? base.cwd,
     };
   }
+  if (
+    nativeType === "token_usage_record" &&
+    normalizerVersion === CODEX_V4_NORMALIZER_VERSION
+  ) {
+    const responseId = stringValue(payload?.response_id);
+    const usage = codexUsage(objectValue(payload?.usage), true);
+    if (!responseId || !usage) {
+      return { ...base, error_code: "invalid_token_usage_record" };
+    }
+    // Only the response increment is additive. Turn/thread totals in this same
+    // record overlap it and remain recoverable through source_record_id.
+    return {
+      ...base,
+      ...usage,
+      event_kind: "usage",
+      event_subtype: nativeType,
+      native_item_id: responseId,
+      logical_event_key: `usage:response:${responseId}`,
+      usage_stream_key: `${canonicalScopeKey}:response:${responseId}`,
+      usage_scope: "response",
+      usage_is_cumulative: false,
+    };
+  }
   if (nativeType === "event_msg") {
     return await projectEventMessage(
       base,
@@ -1049,7 +1075,8 @@ async function projectEventMessage(
       event_subtype: payloadType,
       message_role: role,
       message_origin: role === "user"
-        ? normalizerVersion === CODEX_V3_NORMALIZER_VERSION &&
+        ? (normalizerVersion === CODEX_V3_NORMALIZER_VERSION ||
+            normalizerVersion === CODEX_V4_NORMALIZER_VERSION) &&
             isRuntimeContextMessage(content, normalizerVersion)
           ? RUNTIME_CONTEXT_MESSAGE_ORIGIN
           : "human"
@@ -1058,7 +1085,7 @@ async function projectEventMessage(
     };
   }
   if (payloadType === "token_count") {
-    const usage = cumulativeUsage(payload);
+    const usage = cumulativeUsage(payload, normalizerVersion);
     if (!usage) {
       return { ...base, error_code: "invalid_token_count" };
     }
@@ -1158,11 +1185,32 @@ async function projectResponseItem(
 
 function cumulativeUsage(
   payload: JsonObject | null,
+  normalizerVersion: string,
 ): Partial<EventProjection> | null {
   const info = objectValue(payload?.info);
-  const total = objectValue(info?.total_token_usage);
+  const usage = codexUsage(
+    objectValue(info?.total_token_usage),
+    normalizerVersion === CODEX_V4_NORMALIZER_VERSION,
+  );
+  if (!usage) return null;
+  const contextWindow = nonNegativeInteger(info?.model_context_window);
+  return {
+    ...usage,
+    attributes: contextWindow === null
+      ? usage.attributes
+      : { ...usage.attributes, model_context_window: contextWindow },
+  };
+}
+
+function codexUsage(
+  total: JsonObject | null,
+  includeCacheWrites: boolean,
+): Partial<EventProjection> | null {
   const rawInput = nonNegativeInteger(total?.input_tokens);
   const cached = optionalNonNegativeInteger(total, "cached_input_tokens");
+  const cacheWrite = includeCacheWrites
+    ? optionalNonNegativeInteger(total, "cache_write_input_tokens")
+    : 0;
   const rawOutput = nonNegativeInteger(total?.output_tokens);
   const reasoning = optionalNonNegativeInteger(
     total,
@@ -1171,19 +1219,19 @@ function cumulativeUsage(
   const totalTokens = nonNegativeInteger(total?.total_tokens);
   if (
     rawInput === null || cached === null || rawOutput === null ||
-    reasoning === null || totalTokens === null || cached > rawInput ||
+    reasoning === null || totalTokens === null || cacheWrite === null ||
+    cached + cacheWrite > rawInput ||
     reasoning > rawOutput || rawInput + rawOutput !== totalTokens
   ) return null;
-  const contextWindow = nonNegativeInteger(info?.model_context_window);
   return {
-    input_tokens: rawInput - cached,
-    cached_input_tokens: cached,
+    input_tokens: rawInput - cached - cacheWrite,
+    cached_input_tokens: cached + cacheWrite,
     output_tokens: rawOutput - reasoning,
     reasoning_tokens: reasoning,
     total_tokens: totalTokens,
-    attributes: contextWindow === null
-      ? null
-      : { model_context_window: contextWindow },
+    attributes: includeCacheWrites
+      ? { cache_write_input_tokens: cacheWrite }
+      : null,
   };
 }
 

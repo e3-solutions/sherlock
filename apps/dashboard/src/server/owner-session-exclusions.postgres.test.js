@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { URL as FileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { COVERAGE_SQL, LIST_SESSIONS_SQL, QUERY_USAGE_SQL } from "./mcp-query-source.js";
 
 // COR-5002: owner-excluded sessions are hidden from every reader surface that
 // already hides restricted people. Everything runs on the synthetic production
@@ -375,6 +376,71 @@ describePostgres("owner session exclusions", { timeout: 180_000 }, () => {
       const seshSessions = await asRole(tx, SESH, (sp) => sp`
         select id from telemetry.sessions where workspace_id = ${f.home}`);
       expect(sorted(seshSessions.map((r) => r.id))).toEqual(pick(f, "sessions", ["keep", "bob"]));
+    });
+  });
+
+  it("keeps excluded sessions out of usage, coverage and activity-based list_sessions", async () => {
+    await inRollback(sql, async (tx) => {
+      await installProductionShape(tx);
+      await tx.unsafe(EXCLUSIONS_MIGRATION);
+      const f = await seedFixture(tx);
+      const claude = "sherlock.claude-code-transcript.v1";
+      const usageKeys = ["root", "child", "keep", "bob"];
+      await tx`update telemetry.ingest_batches set source_provider = 'claude_code', source_kind = 'transcript'
+        where workspace_id = ${f.home} and id in ${tx(usageKeys.map((key) => f.batches[key].id))}`;
+      // Each session uses 10 tokens at 06:00, after it started at 00:00.
+      for (const key of usageKeys) {
+        await tx`
+          insert into telemetry.events (
+            workspace_id, session_id, source_record_id, normalizer_version, projection_index,
+            source_priority, event_kind, event_subtype, actor_role, model, is_replay,
+            usage_stream_key, usage_scope, usage_is_cumulative, input_tokens, cached_input_tokens,
+            output_tokens, reasoning_tokens, total_tokens, occurred_at, server_received_at
+          ) values (
+            ${f.home}, ${f.sessions[key].id}, ${f.batches[key].records[2]}, ${claude}, 0,
+            100, 'usage', 'message_usage', 'primary', 'claude-test', false,
+            'main', 'session', false, 10, 0, 0, 0, 10, '2026-01-01T06:00:00Z', '2026-01-01T23:00:00Z'
+          )`;
+      }
+      // 05:00-07:00 contains the activity but no session start, so list_sessions
+      // must find these sessions through the new activity branch.
+      const start = "2026-01-01T05:00:00.000Z";
+      const end = "2026-01-01T07:00:00.000Z";
+      // Production's reader batch policy (person-level only), which the shared
+      // production shape above leaves out because no other test reads batches.
+      await tx.unsafe(`create policy sherlock_product_reader on telemetry.ingest_batches for select to ${READER}
+        using (not (person_id in (select sherlock_access.protected_person_ids())))`);
+      const readAt = new Date().toISOString();
+      const read = async () => asRole(tx, READER, async (sp) => {
+        const usage = await sp.unsafe(QUERY_USAGE_SQL, [f.home, start, end, "e3group.ai"]);
+        const [coverage] = await sp.unsafe(COVERAGE_SQL, [f.home, start, end, "e3group.ai", [claude]]);
+        const listed = await sp.unsafe(LIST_SESSIONS_SQL, [
+          f.home, start, end, readAt, "e3group.ai", null, null, null, null, 100, [claude],
+        ]);
+        return {
+          usageSessions: sorted(usage.flatMap((row) => row.session_ids)),
+          usageTokens: usage.reduce((sum, row) => sum + Number(row.total_tokens), 0),
+          coverage: { sessions: Number(coverage.observed_sessions), events: Number(coverage.observed_usage_events) },
+          listed: sorted(listed.map((row) => row.session_id)),
+        };
+      });
+
+      expect(await read()).toEqual({
+        usageSessions: pick(f, "sessions", usageKeys),
+        usageTokens: 40,
+        coverage: { sessions: 4, events: 4 },
+        // Sessions with only message events in the window are not model activity.
+        listed: pick(f, "sessions", usageKeys),
+      });
+
+      await record(tx, f, "alice", [f.sessions.root.native]);
+      const visible = ["keep", "bob"];
+      expect(await read()).toEqual({
+        usageSessions: pick(f, "sessions", visible),
+        usageTokens: 20,
+        coverage: { sessions: 2, events: 2 },
+        listed: pick(f, "sessions", visible),
+      });
     });
   });
 

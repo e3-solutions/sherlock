@@ -338,7 +338,7 @@ export const SEARCH_DOCUMENTATION = Object.freeze({
     "No raw Storage or SQL execution is exposed. diagnostics, coverage, list_sessions, get_session, and query_usage remain metadata-only: they omit message and prompt content, filesystem paths, and repository remotes.",
     "The pre-existing list_prompt_evidence tool still returns bounded, explicitly untrusted prompt excerpts.",
     `search_sessions and get_session_evidence return stored message excerpts of at most ${MAX_EXCERPT_SOURCE_BYTES} source bytes each, labeled untrusted_session_content. They are not full transcripts, and bytes beyond a stored excerpt are not searchable.`,
-    "Time-window queries search all stored history by default and accept any valid historical duration; row, group, candidate, transaction-time, workspace, and roster safety bounds still apply.",
+    "Search time-window queries search all stored history by default and accept any valid historical duration; row, group, candidate, transaction-time, workspace, and roster safety bounds still apply.",
     "The existing privacy exception remains: restricted people and their sessions stay invisible to every tool, and excerpt search from the private principal is refused.",
     "The shared bearer is a transport gate, not principal-scoped authorization; Cosmos provides authenticated org-wide access and call auditing.",
   ],

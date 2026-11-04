@@ -9,6 +9,7 @@ import {
   FRAME_LEGACY_CODEX_NORMALIZER_VERSION,
   FRAME_NORMALIZER_VERSIONS,
   FRAME_PAIRING_NEIGHBORHOOD_SECONDS,
+  FRAME_USAGE_CODEX_NORMALIZER_VERSION,
   FRAME_VERSION,
   FRAME_WINDOW_HOURS,
 } from "../packages/frame-evidence/constants.js";
@@ -113,7 +114,10 @@ select batch.id::text batch_id
                batch.source_provider = 'claude_code'
                and event.normalizer_version = '${FRAME_CLAUDE_NORMALIZER_VERSION}'
                or batch.source_provider = 'codex'
-               and (event.normalizer_version = '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+               and (event.normalizer_version in (
+                 '${FRAME_USAGE_CODEX_NORMALIZER_VERSION}',
+                 '${FRAME_CORRECTED_CODEX_NORMALIZER_VERSION}'
+               )
                  or (
                  cutover.cutover_at is null
                  or coalesce(

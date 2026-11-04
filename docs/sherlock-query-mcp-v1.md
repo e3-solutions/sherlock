@@ -15,13 +15,60 @@ is a separate surface, described in
 3. Call `query_usage`, normally with `groupBy: "person_model"`.
 4. Use `list_sessions` and `get_session` only for metadata drill-down.
 
-Every time-window query defaults to all stored Sherlock history, from
-`1970-01-01T00:00:00.000Z` through the server read time. Callers may still provide
-an explicit historical start and end, with no duration cap. Future and
-non-positive windows remain invalid. Row, group, transaction-time, workspace,
-and roster safety bounds still apply.
+`query_usage` and `coverage` default to the trailing 24 hours before `end`
+(server read time if omitted). Explicit historical windows up to 7 days are
+supported. Larger windows fail before querying with `window_too_large`; callers
+must request smaller windows. The response always states the actual interval;
+explicit windows are never silently clamped. Future and non-positive windows
+remain invalid.
+
+Both tools use a 20-second per-statement database budget. Dense windows or
+unusually long touched sessions can exceed it and return `query_timeout`, with
+instructions to narrow the window or have the operator inspect the usage indexes.
+This is an explicit refusal, never a truncated success or a generic `unavailable`.
+Connection or other database failures still return `unavailable`.
+
+`list_sessions` continues to default to all stored Sherlock history, from
+`1970-01-01T00:00:00.000Z` through the server read time, with no duration cap.
+Row, group, transaction-time, workspace, and roster safety bounds still apply.
 `list_sessions` uses a query-bound keyset cursor; callers must reuse the exact
-window and filters from the preceding page.
+window and filters from the preceding page. Eligibility is session start in
+`[start, end)` **or** a non-replay model-activity event (usage, or a
+`turn_context` lifecycle event) with source `occurred_at` in that window. This
+includes resumed older sessions. Hook-only sessions with no transcript have no
+model activity and still qualify only by start time. Source time keeps delayed imports
+in their historical window; receipt time alone and undated events do not imply
+activity in a recent window. Activity/provider lookups also exclude receipts
+newer than the first-page `readAt`.
+
+Ordering stays descending `(created_at, session_id)`, independent of mutable
+activity times. The `s2` cursor preserves PostgreSQL microseconds through text
+binding, fingerprints the new activity semantics, and rejects old `s1` cursors
+with `cursor_invalid`; restart pagination after upgrading. Fixed filters and
+window bounds remain required. This is keyset pagination over observed facts,
+not a retained cross-request MVCC snapshot: late normalization of older receipts
+and mutable session metadata may change eligibility between requests. Immutable
+sort keys prevent duplicate sessions when activity is appended. `lastActivityAt`
+is the latest non-replay source timestamp **inside the list window**, or null;
+`get_session` returns the latest non-replay source timestamp across all history.
+`get_session` has no start-time window filter. Dashboard Flame listings already
+select event activity in their window rather than session start dates.
+
+List eligibility uses per-session bounded probes of the partial
+`events_usage_history_idx(workspace_id, session_id, occurred_at)` (usage and
+turn context only) instead of materializing every event in a multi-million-event
+window. Probing every session through the full
+`events_session_occurred_idx` instead took more than 15 seconds for a 7-day
+window in production (Oct 28 2026, 52k sessions, 34M events, cold cache). The
+latest-activity probe runs only for the limited page.
+
+A disposable local PostgreSQL 17 benchmark of this exact list query, under the
+reader role and 20-second timeout, used 50,000 sessions (25,000 active, including
+5,000 resumed old sessions), 14 million events over 14 days, and the existing
+index shapes. A 101-row first page took 164 ms; a deep page of resumed sessions
+took 230 ms. EXPLAIN ANALYZE confirmed session/time index probes. This synthetic
+benchmark uses narrow event rows and no production privacy overlays; it verifies
+the access pattern and event-volume bound, not a production latency guarantee.
 
 ## Tools
 
@@ -34,7 +81,7 @@ window and filters from the preceding page.
   does not run cumulative-token arithmetic; `query_usage` supplies the
   query-specific partial/missing assessment and detailed reasons.
 - `list_sessions`: up to 100 safe metadata records per page. The allowlist is
-  session ID, person ID/display name, provider, actor role, model, start/end,
+  session ID, person ID/display name, provider, actor role, model, start/end, last activity,
   and parent session ID.
 - `get_session`: the same safe metadata for one configured-workspace session,
   plus aggregate message/tool-call/usage event counts. A foreign-workspace ID
@@ -57,7 +104,9 @@ tools above are unchanged and remain metadata-only.
 The query uses the same immutable active-projection rule as Sherlock's frame
 projector: Claude transcript v1; Codex v2 at or after the recorded workspace
 cutover; and Codex v1 before cutover, with v2 used only for an individual source
-record that has no non-replay v1 projection. Replay rows and lower-priority
+record that has no non-replay v1 projection. A non-replay Codex v3 projection
+supersedes v1/v2 for that source record regardless of the v1-to-v2 cutover;
+no v2-to-v3 cutover row is required. Replay rows and lower-priority
 canonical duplicates are excluded, including from the pre-window baseline.
 Canonical winners are selected against all visible active projections before
 window attribution, using the winner's timestamp. For example, an incremental
@@ -71,7 +120,7 @@ Claude message-scoped usage is incremental and is summed. Codex session-scoped
 usage is cumulative and is differenced within each independent usage stream.
 Normalizer version is projection provenance, not a separate native counter, so
 an active pre-cutover v2 fallback continues the same v1 cumulative stream.
-Usage derivation `sherlock.usage-reconciliation.v1` reads the history of sessions
+Usage derivation `sherlock.usage-reconciliation.v2` reads the history of sessions
 with in-window usage so uncertainty cannot disappear when a window moves. It
 collapses repeated native occurrences by session scope, native byte range, full
 record hash, event kind, and projection index. Upload batch/transport identifiers
@@ -83,6 +132,24 @@ is reconciled before applying both timestamp bounds, including observations
 whose timestamps run backward relative to their native positions. Each delta
 belongs to the timestamp window of its current observation; that does not prove
 when the underlying work occurred.
+
+Codex v4 additionally reads `token_usage_record.payload.usage` as a response
+increment keyed by response ID. Duplicate/replayed responses count once. Turn
+and thread cumulative totals in the same record are not additive. If any valid,
+non-replay token-count fact exists anywhere in a session, **only token-count
+usage** contributes for that session. This preference is assessed once per
+touched session; native response increments are a fallback for sessions without
+that stream. Both `coverage` and `query_usage` use the same rule, including
+out-of-window winners. Counter gaps/regressions remain partial; response data
+does not hide them. A late counter arrival may revise earlier fallback results.
+
+V4 classifies Codex cache reads plus writes as cached input, consistent with
+Claude cache reads plus creation. Both are subsets of Codex inclusive input;
+total tokens do not increase. At an old/v4 cumulative boundary, only the
+input/cache component baselines are unknown for that transition; inclusive
+total/output still difference continuously. Reprocessing the complete session
+with v4 removes that uncertainty without rewriting older facts. See
+[operator steps](telemetry-processing.md#codex-v4-usage-rollout-and-optional-backfill).
 
 Codex models come from the preceding `turn_context` in native source order,
 including context from earlier uploads and before the window. Batch-final and
@@ -160,3 +227,79 @@ health probing.
   source files, reproject history, or deploy collector upgrades. Bounded
   excerpt search for the shared organization-wide MCP bearer is a separate
   surface; see [`sherlock-investigation-mcp.md`](sherlock-investigation-mcp.md).
+
+## Query execution and rollout
+
+Usage discovery starts with non-replay usage timestamps, using
+`telemetry.events_usage_window_idx`, before joining sessions to the authorized
+roster. `events_usage_history_idx` limits touched-session reads to usage and turn
+context, without dropping any history needed for canonical winners, source
+conflicts, model attribution, or cumulative baselines. Coverage ranks active
+usage once across window observations and possible out-of-window canonical
+competitors, then applies the requested window. It does not repeat active-normalizer
+checks for every possible winner. Claude rows bypass Codex projection probes. The roster bound and the existing
+`analytics.read_dashboard_freshness` receipt (including per-person activity and
+pending normalization) retain their existing semantics and access boundary.
+
+Apply the usage-index migration through the normal Supabase migration runner
+before rollout. Like the existing recent-session index migration, it uses
+`CREATE INDEX CONCURRENTLY` outside a transaction, validates existing definitions,
+and repairs only an inactive invalid build under a short lock timeout. Do not
+wrap the migration in a transaction. Index payloads exclude token/content fields
+to bound write/storage overhead; the history index also retains B-tree deduplication
+by omitting INCLUDE payloads. Single-use reconciliation stages are inlined to
+avoid repeatedly spilling wide histories while window functions retain their
+ordering boundaries. Source-conflict windows use byte-range peer groups to
+retain the same hash/overlap assessment without joining wide histories to
+grouped positions. Incremental observations retain source/model assessment but
+skip cumulative-only lag/regression work. Usage reconciliation sets
+transaction-local `work_mem` to 16MB per sort/hash operation (the direct-source pool allows two concurrent
+transactions), then PostgreSQL resets it at transaction end. Raw records and
+projected events are unchanged.
+
+### Local validation snapshot (2026-10-18 UTC)
+
+PostgreSQL 17 / Node 24.15.0, with 12 people, 72,000 sessions across 90 days,
+2.256 million projected events and 1.128 million usage events (80% Claude,
+20% Codex). The 1 / 7 / 30-day windows contained 36,000 / 252,000 / 1,080,000
+usage observations. Both SQL versions had the new indexes installed for this
+comparison; these are local synthetic timings, not production latency claims.
+
+- Original SQL coverage: 0.49 / 3.59 / 13.07 seconds; usage: 0.86 / 7.19 /
+  statement timeout at 20 seconds.
+- Final full tool calls, including roster checks, freshness receipts, and result
+  construction: coverage 0.38 / 2.53 / 8.20 seconds; usage 0.49 / 3.17 / 15.55
+  seconds. All expected observations were counted; the 30-day accepted token
+  total was 108 million.
+
+The PostgreSQL suite compares both queries directly with frozen originals from
+commit `04491385f921e692982c188ba1027c5e6bbf4e1a`, using the constrained reader.
+It covers normalizer cutovers/corrections, replay exclusion, Claude message
+identity, boundary/undated winners, null canonical keys, native-range conflicts,
+backward timestamps, missing baselines/components, and counter regressions.
+Read-only production timing attempts without the new indexes still timed out;
+apply the migration before evaluating production performance.
+
+### Production measurement (2026-10-28 UTC, before the indexes)
+
+Read-only, as `postgres` (no reader row security), on a 1-hour live window
+of the e3group.ai workspace, with window discovery approximated through
+`events_recent_sessions_idx`:
+
+- Coverage: 2,659 usage observations in 66 sessions, 1.13 s. Most of it is
+  the per-observation `native_records`/`ingest_batches` lookups and
+  normalizer probes (~0.3 ms per observation, largely disk reads; the
+  instance has 2 GB of shared buffers against a 19 GB events heap and a
+  15 GB native-records heap). A day holds roughly 50-65k observations, so
+  a 1-day coverage call is expected near 10-20 s and 7 days cannot finish
+  inside 20 s. That is why the default is 24 hours and the cap 7 days.
+- Usage: the same 66 sessions have 41,596 usage/turn-context rows of
+  history. Joining only that history to `native_records` and
+  `ingest_batches` took 15.0 s (31,901 buffer reads). Reading complete
+  touched-session history therefore cannot fit a 1-day window in 20 s on
+  this instance, with or without the new indexes. `query_usage` returns
+  `query_timeout` for such windows; making it routinely answer needs
+  precomputed per-session usage (or a bounded baseline), not more indexes.
+
+Re-measure after applying the index migration before relying on these
+estimates.
