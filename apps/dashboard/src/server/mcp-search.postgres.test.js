@@ -12,6 +12,7 @@ const describePostgres = DATABASE_URL ? describe : describe.skip;
 const migration = (name) => DATABASE_URL ? readFileSync(new FileURL(`../../../../supabase/migrations/${name}`, import.meta.url), "utf8") : null;
 const MIGRATION = migration("20261012135923_add_bounded_excerpt_search.sql");
 const PRODUCT_ROLE_MIGRATION = migration("20261012140548_filter_excerpt_search_product_roles.sql");
+const WINDOW_FIRST_MIGRATION = migration("20261104223000_window_first_excerpt_search.sql");
 const BOUNDED_LOOKUP_MIGRATION = migration("20261012065436_bound_protected_record_lookup.sql");
 const SEARCH = "analytics.search_excerpt_candidates(uuid, text, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer)";
 const GATE = "analytics._assert_excerpt_search_policy_shape()";
@@ -107,6 +108,7 @@ async function installMigration(tx) {
   await tx.unsafe(`drop function if exists ${SEARCH}; drop function if exists ${GATE};`);
   await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
+  await tx.unsafe(WINDOW_FIRST_MIGRATION);
 }
 
 async function installPrivacyShape(tx, { tables = ["events", "sessions", "people"], schema = "telemetry" } = {}) {
@@ -362,6 +364,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       const before = await catalogSnapshot(tx);
       await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
+  await tx.unsafe(WINDOW_FIRST_MIGRATION);
       expect(await catalogSnapshot(tx)).toEqual(before);
 
       const acl = await tx.unsafe(`
@@ -398,8 +401,9 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
           "relatedHidden", "childOfHidden", "bobSession", "atEnd"]);
       await expectEquivalent(tx, fixture, { query: "zebrafind -alpha" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { query: "\"unrelated synthetic\" or nothinghere" }, ["noHit"]);
-      // Windows over 25 hours take the GIN path; shorter ones (all of the above)
-      // read the window by time. Both must return the same rows.
+      // Windows over 25 hours take the GIN path; 25 hours or less (all of the
+      // above, and the exact boundary below) read the window by time. Both
+      // must return the same rows.
       const wide = { start: "2025-12-30T00:00:00Z" };
       await expectEquivalent(tx, fixture, wide, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { ...wide, person: fixture.people.alice.id }, all);
@@ -407,6 +411,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await expectEquivalent(tx, fixture, { ...wide, domain: "sixtyfour.ai" }, ["sixty"]);
       await expectEquivalent(tx, fixture, { ...wide, query: "zebrafind -alpha" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { start: "2025-12-31T11:00:00Z" }, [...all, "bobSession"]);
+      await expectEquivalent(tx, fixture, { start: "2025-12-31T10:59:59.999Z" }, [...all, "bobSession"]);
     });
   });
 
@@ -715,6 +720,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       const before = await catalogSnapshot(tx);
       await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
+  await tx.unsafe(WINDOW_FIRST_MIGRATION);
       expect(await catalogSnapshot(tx)).toEqual(before);
       const fixture = await seedFixture(tx);
       await tx`insert into sherlock_access.restricted_people values (${fixture.home}, ${fixture.people.bob.id})`;
@@ -890,7 +896,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe("analyze excerpt_search_plan.people; analyze excerpt_search_plan.sessions; analyze excerpt_search_plan.events;");
 
       const params = ["p_workspace", "p_start", "p_end", "p_read_at", "p_domain", "p_person", "p_session", "p_limit",
-        "v_query", "v_protected_records", "v_hidden_sessions", "v_protected_people"];
+        "v_query", "v_protected_records", "v_hidden_sessions", "v_protected_people", "v_window_first"];
       const body = params.reduce(
         (text, name, index) => text.replace(new RegExp(`\\b${name}\\b`, "g"), () => `$${index + 1}`),
         statement.replaceAll("telemetry.", "excerpt_search_plan."),
@@ -899,14 +905,20 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe(`
         set local plan_cache_mode = force_custom_plan;
         prepare excerpt_plan(uuid, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer,
-          tsquery, bigint[], uuid[], uuid[]) as ${body}`);
-      const owner = [];
-      for (let call = 0; call < 7; call += 1) {
+          tsquery, bigint[], uuid[], uuid[], boolean) as ${body}`);
+      const execute = async (call, windowFirst) => {
         const [{ "QUERY PLAN": plan }] = await tx.unsafe(`
           explain (analyze, buffers, format json) execute excerpt_plan('${workspace}', '${START}', '${END}', '${READ_AT}',
             'e3group.ai', ${call % 2 ? `'${person.id}'` : "null"}, null, 2000,
-            websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}')`);
-        owner.push({ rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) });
+            websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}', ${windowFirst})`);
+        return { rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) };
+      };
+      // Seven calls each: past the five custom plans a generic plan could replace.
+      const owner = [];
+      const windowFirst = [];
+      for (let call = 0; call < 7; call += 1) {
+        owner.push(await execute(call, false));
+        windowFirst.push(await execute(call, true));
       }
       const direct = `explain (format json) select e.id from excerpt_search_plan.events e
         where e.workspace_id = '${workspace}' and e.event_kind in ('message', 'agent_message')
@@ -914,7 +926,9 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       const [{ "QUERY PLAN": ownerDirect }] = await tx.unsafe(direct);
       const reader = await asReader(tx, (sp) => sp.unsafe(direct));
       expect(reader.error).toBeUndefined();
-      return { owner, ownerDirect: planNodes(ownerDirect), reader: planNodes(reader.value[0]["QUERY PLAN"]) };
+      return {
+        owner, windowFirst, ownerDirect: planNodes(ownerDirect), reader: planNodes(reader.value[0]["QUERY PLAN"]),
+      };
     });
 
     expect(plans.owner).toHaveLength(7);
@@ -923,6 +937,15 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       expect(usesSearchIndex(nodes)).toBe(true);
       expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
         .not.toContain("Seq Scan");
+    }
+    // A short window is read by time: the window index, never the GIN index or a full scan.
+    expect(plans.windowFirst).toHaveLength(7);
+    for (const { rows, nodes } of plans.windowFirst) {
+      expect(rows).toBe(1);
+      expect(usesSearchIndex(nodes)).toBe(false);
+      const events = nodes.filter((node) => node["Relation Name"] === "events");
+      expect(events.map((node) => node["Node Type"])).not.toContain("Seq Scan");
+      expect(events.some((node) => /occurred_at/.test(node["Index Name"] ?? ""))).toBe(true);
     }
     expect(usesSearchIndex(plans.ownerDirect)).toBe(true);
     // Negative control: the same predicate as the reader cannot use the GIN index under RLS.

@@ -57,11 +57,13 @@ begin
   -- event kind, so a common word looks ~18x rarer than it is ('deploy':
   -- 3,052 estimated, 55,910 actual) and it always walks the GIN index, which
   -- has no time column: a 1-day window then visited ~44k heap blocks across
-  -- all history and timed out cold. A short window or one session reads that
-  -- slice of messages instead (events_message_window_idx or the session
-  -- index; ~24k messages per day, about 2 s cold). Wider windows keep the GIN
-  -- path, which is right for rare words.
-  v_window_first := p_session is not null or p_end - p_start <= interval '25 hours';
+  -- all history and timed out cold. A window of 25 hours or less reads that
+  -- slice of messages instead through events_message_window_idx: ~24k
+  -- messages a day on Nov 4, about 2 s cold. Re-tune if a day of messages
+  -- passes ~60k (cold reads then near the 10 s statement timeout). Wider
+  -- windows, and a sessionId without a short window (a session may span
+  -- weeks), keep the GIN path, which is right for rare words.
+  v_window_first := p_end - p_start <= interval '25 hours';
 
   v_privacy := analytics._assert_excerpt_search_policy_shape();
   if v_privacy then
