@@ -10,6 +10,7 @@ import {
   FlameSourceError,
   validateDashboardEmailDomain,
 } from "./src/server/flame-source.js";
+import { createExcerptAuditStore, createExcerptAuditWriter } from "./src/server/mcp-excerpt-audit.js";
 import {
   IDENTITY_PASS_SECRET_MIN_LENGTH,
   createExcerptGuard,
@@ -103,8 +104,15 @@ const mcpSource = source && cache ? createCachedMcpSource({
   providerUsageSource,
   searchSource: createSherlockSearchSource(source),
 }) : null;
+const excerptAuditStore = mcpSource ? createExcerptAuditStore(source) : null;
+const excerptAuditWriter = excerptAuditStore
+  ? createExcerptAuditWriter({ store: excerptAuditStore })
+  : null;
 const mcpProtocol = mcpSource
-  ? createBonaparteMcpProtocol(mcpSource, { guard: createExcerptGuard() })
+  ? createBonaparteMcpProtocol(mcpSource, {
+      guard: createExcerptGuard({ audit: excerptAuditWriter }),
+      auditStore: excerptAuditStore,
+    })
   : null;
 
 const SECURITY_HEADERS = {
@@ -355,7 +363,9 @@ async function shutdown(signal) {
   await cache?.close();
   await freshnessCache?.close();
   await drained;
-  await Promise.all([mcpProtocol?.close(), source?.close()]);
+  await mcpProtocol?.close();
+  await excerptAuditWriter?.close();
+  await source?.close();
 }
 
 process.once("SIGINT", () => shutdown("SIGINT"));
