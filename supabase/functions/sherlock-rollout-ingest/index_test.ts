@@ -1018,3 +1018,42 @@ Deno.test("without time to ingest here, a failed forward answers 503", async () 
   assert(response.status === 503);
   assert((await response.json()).error.code === "ingest_timeout");
 });
+
+Deno.test("a Storage stall answers 503 with Retry-After and keeps the shared client", async () => {
+  let remainingSeen: number | null = null;
+  let factoryCalls = 0;
+  const { record, options } = retryOptions(() => {
+    factoryCalls += 1;
+    return {
+      batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+      service: {
+        ingest: (
+          _attribution: unknown,
+          _manifest: unknown,
+          _payload: unknown,
+          _hint: unknown,
+          remainingMs: () => number,
+        ) => {
+          remainingSeen = remainingMs();
+          return Promise.reject(
+            new IngestError(
+              "storage_unavailable",
+              "Storage did not accept the batch in time",
+              503,
+            ),
+          );
+        },
+      },
+    };
+  });
+  const response = await handleRequest(
+    await requestFor("user@e3group.ai"),
+    options,
+  );
+  assert(response.status === 503);
+  assert(response.headers.get("Retry-After") === "5");
+  assert((await response.json()).error.code === "storage_unavailable");
+  assert(remainingSeen === REQUEST_DEADLINE_MS, `saw ${remainingSeen} ms left`);
+  assert(factoryCalls === 1, "a Storage failure is not a database retry");
+  assert(record.discarded === 0, "the shared database client is kept");
+});

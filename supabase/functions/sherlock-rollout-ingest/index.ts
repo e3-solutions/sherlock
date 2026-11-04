@@ -92,6 +92,12 @@ export const DATABASE_ATTEMPTS = 3;
 // deadline still bounds the retry, so a slow reconnect answers 503 in time.
 export const DATABASE_RETRY_MIN_REMAINING_MS = 3_000;
 export const DATABASE_RETRY_AFTER_SECONDS = 5;
+const RETRYABLE_ERROR_CODES = new Set([
+  "database_unavailable",
+  "ingest_timeout",
+  "storage_unavailable",
+  "storage_verify_failed",
+]);
 // The database and its pooler are in us-east-1. An upload makes ~25
 // sequential pooler round trips; served from ap-south-1 (most traffic on
 // Nov 2) each costs ~250 ms, so requests took a p50 of 8.4 s against 0.6 s in
@@ -294,6 +300,7 @@ export async function handleRequest(
         envelope.manifest,
         envelope.stored_payload,
         workloadClassHint,
+        () => requestStartedAt + requestDeadlineMs - now(),
       );
     });
     return Response.json(receipt, {
@@ -304,8 +311,7 @@ export async function handleRequest(
     if (error instanceof IngestError) {
       const headers: Record<string, string> = { "Cache-Control": "no-store" };
       if (
-        error.code === "database_unavailable" ||
-        error.code === "ingest_timeout"
+        RETRYABLE_ERROR_CODES.has(error.code)
       ) {
         headers["Retry-After"] = String(DATABASE_RETRY_AFTER_SECONDS);
       }
