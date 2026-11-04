@@ -1,5 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
+import { callerFromHeaders, runWithCaller } from "./mcp-excerpt-guard.js";
+
 export const MCP_TOKEN_MIN_LENGTH = 32;
 const MCP_TOKEN_MAX_LENGTH = 512;
 
@@ -37,7 +39,7 @@ function verifyMcpRequest({ authorization, origin, token }) {
   return { ok: true };
 }
 
-export function createMcpHttpRoute({ protocolHandler, token }) {
+export function createMcpHttpRoute({ protocolHandler, token, identitySecret = "" }) {
   return async function mcpHttpRoute(request, response) {
     const receipt = verifyMcpRequest({
       authorization: headerValue(request.headers?.authorization),
@@ -50,8 +52,10 @@ export function createMcpHttpRoute({ protocolHandler, token }) {
     }
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
+    // The signed caller pass is only meaningful behind a valid shared bearer.
+    const caller = callerFromHeaders(request.headers, { secret: identitySecret });
     try {
-      await protocolHandler(request, response);
+      await runWithCaller(caller, () => protocolHandler(request, response));
     } catch {
       if (response.headersSent) {
         response.destroy?.();

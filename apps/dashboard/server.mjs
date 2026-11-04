@@ -10,6 +10,10 @@ import {
   FlameSourceError,
   validateDashboardEmailDomain,
 } from "./src/server/flame-source.js";
+import {
+  IDENTITY_PASS_SECRET_MIN_LENGTH,
+  createExcerptGuard,
+} from "./src/server/mcp-excerpt-guard.js";
 import { createMcpHttpRoute } from "./src/server/mcp-http.js";
 import { createBonaparteMcpProtocol } from "./src/server/mcp-server.js";
 import { createSherlockQuerySource } from "./src/server/mcp-query-source.js";
@@ -30,6 +34,10 @@ const workspaceId = process.env.SHERLOCK_WORKSPACE_ID ?? "";
 const dashboardEmailDomain = process.env.SHERLOCK_DASHBOARD_EMAIL_DOMAIN ?? "";
 const databaseUrl = process.env.SUPABASE_DB_URL ?? "";
 const mcpToken = process.env.SHERLOCK_MCP_TOKEN ?? "";
+const mcpIdentitySecret = (process.env.SHERLOCK_IDENTITY_PASS_SECRET ?? "").trim();
+if (mcpIdentitySecret.length < IDENTITY_PASS_SECRET_MIN_LENGTH) {
+  console.log(JSON.stringify({ event: "mcp_identity_pass_unconfigured", sharedExcerptBucket: true }));
+}
 const maxPeople = Number.parseInt(process.env.SHERLOCK_DASHBOARD_MAX_PEOPLE ?? "500", 10);
 const projectionEnabled = process.env.SHERLOCK_FRAME_PROJECTION_ENABLED !== "false";
 const validWorkspaceId =
@@ -95,7 +103,9 @@ const mcpSource = source && cache ? createCachedMcpSource({
   providerUsageSource,
   searchSource: createSherlockSearchSource(source),
 }) : null;
-const mcpProtocol = mcpSource ? createBonaparteMcpProtocol(mcpSource) : null;
+const mcpProtocol = mcpSource
+  ? createBonaparteMcpProtocol(mcpSource, { guard: createExcerptGuard() })
+  : null;
 
 const SECURITY_HEADERS = {
   "Content-Security-Policy":
@@ -124,6 +134,7 @@ const mcpRoute = createMcpHttpRoute({
     sendJson(response, 503, { error: "mcp_not_configured" });
   }),
   token: mcpToken,
+  identitySecret: mcpIdentitySecret,
 });
 
 function requestAbortSignal(request, response) {

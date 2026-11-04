@@ -260,6 +260,17 @@ least 32 characters and configure the MCP client to send it as
 `Authorization: Bearer <token>`. Browser-origin requests are rejected; the
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
+The excerpt tools (`search_sessions`, `get_session_evidence`,
+`list_prompt_evidence`) are rate-limited per caller: 400 calls and 60 distinct
+sessions per rolling hour, returning `rate_limited` with `retryAfterSeconds`.
+A session counts when it is read with `get_session_evidence` or named as the
+`sessionId` filter of a search; open searches spend calls only.
+Cosmos names the caller in a signed `x-e3-identity-pass` header, verified with
+`SHERLOCK_IDENTITY_PASS_SECRET` (32+ characters, shared with the gateway).
+Requests without a valid pass share one bucket of 120 sessions and 800 calls
+per hour. Each read writes a `sherlock_excerpt_read` log line with the caller,
+the Cosmos request id, and session and owner person ids, never content.
+
 The endpoint exposes bounded Sherlock metadata and usage tools, the existing
 Bonaparte evidence tools, and three colleague-work investigation tools. Their complete input, output, pagination, error, and
 limitation contracts are documented in

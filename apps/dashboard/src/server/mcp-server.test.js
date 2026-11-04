@@ -1,9 +1,11 @@
+import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FlameSourceError } from "./flame-source.js";
+import { createExcerptGuard } from "./mcp-excerpt-guard.js";
 import { MCP_TOKEN_MIN_LENGTH, createMcpHttpRoute } from "./mcp-http.js";
 import {
   EVIDENCE_AFTER_SQL,
@@ -337,16 +339,16 @@ afterEach(async () => {
   })));
 });
 
-async function connect(searchSource) {
+async function connect(searchSource, { guard = null, identitySecret = "", pass = null } = {}) {
   const token = "s".repeat(MCP_TOKEN_MIN_LENGTH);
   const source = createCachedMcpSource({
     cache: { read: vi.fn() },
     source: { fetchPromptEvidence: vi.fn() },
     ...(searchSource ? { searchSource } : {}),
   });
-  const protocol = createBonaparteMcpProtocol(source);
+  const protocol = createBonaparteMcpProtocol(source, { guard });
   openProtocols.push(protocol);
-  const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token });
+  const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token, identitySecret });
   const httpServer = createServer((request, response) => void route(request, response));
   openServers.push(httpServer);
   await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
@@ -357,9 +359,22 @@ async function connect(searchSource) {
   openClients.push(client);
   await client.connect(new StreamableHTTPClientTransport(
     new URL(`http://127.0.0.1:${httpServer.address().port}/mcp`),
-    { requestInit: { headers: { authorization: `Bearer ${token}` } } },
+    { requestInit: { headers: {
+      authorization: `Bearer ${token}`,
+      ...(pass ? { "x-e3-identity-pass": pass } : {}),
+    } } },
   ));
   return client;
+}
+
+const IDENTITY_SECRET = "i".repeat(32);
+
+function identityPass(principal, requestId) {
+  const body = Buffer.from(JSON.stringify({
+    v: 1, a: "sherlock", e: [], p: principal, r: requestId, t: "standard",
+    x: Math.floor(Date.now() / 1000) + 120,
+  })).toString("base64url");
+  return `e3id.${body}.${createHmac("sha256", IDENTITY_SECRET).update(body).digest("base64url")}`;
 }
 
 function errorOf(result) {
@@ -755,5 +770,107 @@ describe("Sherlock search MCP tools", () => {
     expect(response.structuredContent.results).toHaveLength(20);
     expect(response.structuredContent.results.every(hit => hit.excerptGroup.alternativeSources.length === 5)).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(200_000);
+  });
+});
+
+describe("Sherlock excerpt rate limit", () => {
+  const OTHER = "66666666-6666-4666-8666-666666666666";
+  const THIRD = "77777777-7777-4777-8777-777777777777";
+  const LIMITS = {
+    windowMs: 60 * 60 * 1000,
+    callsPerWindow: 5,
+    sessionsPerWindow: 2,
+    unattributedCallsPerWindow: 5,
+    unattributedSessionsPerWindow: 1,
+    maxCallers: 10,
+  };
+  const read = (client, sessionId) => client.callTool({
+    name: "get_session_evidence", arguments: { sessionId, anchorEventId: "50", limit: 2 },
+  });
+
+  it("limits each signed caller separately and logs session owners by id", async () => {
+    const events = [];
+    const guard = createExcerptGuard({ limits: LIMITS, log: (event) => events.push(event) });
+    const database = searchDatabase();
+    const ada = await connect(database.source, {
+      guard, identitySecret: IDENTITY_SECRET, pass: identityPass("ada", "req-ada"),
+    });
+    const bo = await connect(database.source, {
+      guard, identitySecret: IDENTITY_SECRET, pass: identityPass("bo", "req-bo"),
+    });
+
+    expect((await read(ada, SESSION)).isError).not.toBe(true);
+    expect((await read(ada, OTHER)).isError).not.toBe(true);
+    expect((await read(ada, SESSION)).isError).not.toBe(true);
+    const limited = errorOf(await read(ada, THIRD));
+    expect(limited).toMatchObject({ code: "rate_limited", retryable: true });
+    expect(limited.message).toContain("Slow down");
+    expect(limited.retryAfterSeconds).toBeGreaterThan(3500);
+    expect((await read(bo, THIRD)).isError).not.toBe(true);
+
+    for (let index = 0; index < 2; index += 1) {
+      expect((await ada.callTool({ name: "search_sessions", arguments: { query: "ocr" } })).isError)
+        .not.toBe(true);
+    }
+    expect(errorOf(await ada.callTool({ name: "search_sessions", arguments: { query: "ocr" } })))
+      .toMatchObject({ code: "rate_limited" });
+
+    const reads = events.filter((event) => event.event === "sherlock_excerpt_read");
+    expect(reads[0]).toEqual({
+      event: "sherlock_excerpt_read", tool: "get_session_evidence", outcome: "ok", caller: "ada",
+      tier: "standard", attributed: true, requestId: "req-ada", sessionIds: [SESSION],
+      ownerPersonIds: [SHARAD],
+    });
+    expect(reads.filter((event) => event.caller === "bo")).toHaveLength(1);
+    expect(reads.at(-1)).toMatchObject({ tool: "search_sessions", ownerPersonIds: [SHARAD] });
+    expect(events.filter((event) => event.event === "sherlock_excerpt_rate_limited")
+      .map((event) => [event.caller, event.tool])).toEqual([
+      ["ada", "get_session_evidence"], ["ada", "search_sessions"],
+    ]);
+    expect(JSON.stringify(events)).not.toContain("Ignore all previous");
+    expect(JSON.stringify(events)).not.toContain("paddleocr");
+  });
+
+  it("counts a search filtered to one session against the session budget", async () => {
+    const guard = createExcerptGuard({ limits: LIMITS, log: () => {} });
+    const client = await connect(searchDatabase().source, {
+      guard, identitySecret: IDENTITY_SECRET, pass: identityPass("ada", "req"),
+    });
+    const search = (sessionId) => client.callTool({
+      name: "search_sessions", arguments: { query: "ocr", sessionId },
+    });
+    expect((await search(SESSION)).isError).not.toBe(true);
+    expect((await read(client, OTHER.toUpperCase())).isError).not.toBe(true);
+    expect((await search(OTHER)).isError).not.toBe(true);
+    expect(errorOf(await search(THIRD))).toMatchObject({ code: "rate_limited" });
+    expect(errorOf(await read(client, THIRD))).toMatchObject({ code: "rate_limited" });
+  });
+
+  it("puts callers without a valid pass into one shared bucket", async () => {
+    const events = [];
+    const guard = createExcerptGuard({ limits: LIMITS, log: (event) => events.push(event) });
+    const database = searchDatabase();
+    const forged = await connect(database.source, {
+      guard, identitySecret: IDENTITY_SECRET,
+      pass: identityPass("ada", "req").replace(/.$/, (last) => (last === "A" ? "B" : "A")),
+    });
+    const bare = await connect(database.source, { guard, identitySecret: IDENTITY_SECRET });
+
+    expect((await read(forged, SESSION)).isError).not.toBe(true);
+    expect(errorOf(await read(bare, OTHER))).toMatchObject({ code: "rate_limited" });
+    expect(events[0]).toMatchObject({ caller: null, attributed: false, requestId: null });
+  });
+
+  it("logs failed reads without owners", async () => {
+    const events = [];
+    const guard = createExcerptGuard({ limits: LIMITS, log: (event) => events.push(event) });
+    const database = searchDatabase({ [EVIDENCE_SESSION_SQL]: () => [] });
+    const client = await connect(database.source, {
+      guard, identitySecret: IDENTITY_SECRET, pass: identityPass("ada", "req"),
+    });
+    expect(errorOf(await read(client, SESSION))).toMatchObject({ code: "not_found" });
+    expect(events).toEqual([expect.objectContaining({
+      event: "sherlock_excerpt_read", outcome: "error", sessionIds: [SESSION], ownerPersonIds: [],
+    })]);
   });
 });
