@@ -106,7 +106,7 @@ describe("Bonaparte MCP protocol", () => {
     };
     const querySource = createSherlockQuerySource(directSource);
     const source = createCachedMcpSource({ cache, source: directSource, querySource });
-    const protocol = createBonaparteMcpProtocol(source);
+    const protocol = createBonaparteMcpProtocol(source, { retiredTools: true });
     openProtocols.push(protocol);
     const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token });
     const httpServer = createServer((request, response) => void route(request, response));
