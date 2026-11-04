@@ -151,6 +151,31 @@ describe("excerpt audit writer", () => {
     expect(written.map((row) => row.id)).toEqual([1, 2, 4]);
   });
 
+  it("drops a batch the database rejects as invalid and keeps writing", async () => {
+    const events = [];
+    const written = [];
+    const store = {
+      write: vi.fn(async (rows) => {
+        if (rows[0].id === 1) {
+          throw Object.assign(new Error("wrapped"), {
+            code: "flame_database_unavailable", cause: { code: "23514", routine: "ExecConstraints" },
+          });
+        }
+        written.push(...rows);
+        return rows.length;
+      }),
+    };
+    const writer = createExcerptAuditWriter({ store, flushMs: 60_000, maxBatch: 1, log: (event) => events.push(event) });
+    writer.push([{ id: 1 }]);
+    writer.push([{ id: 2 }]);
+    await writer.close();
+    expect(written).toEqual([{ id: 2 }]);
+    expect(events).toEqual([
+      { event: "sherlock_excerpt_audit_write_failed", rows: 1, code: "flame_database_unavailable", sqlstate: "23514", routine: "ExecConstraints" },
+      { event: "sherlock_excerpt_audit_dropped", rows: 1 },
+    ]);
+  });
+
   it("drops the oldest rows past its buffer bound and says so", async () => {
     const events = [];
     const writer = createExcerptAuditWriter({
