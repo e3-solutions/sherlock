@@ -251,7 +251,7 @@ export const SEARCH_ERRORS = Object.freeze({
   timeout: {
     message: "The Sherlock search exceeded its time bound.",
     retryable: true,
-    recovery: "Narrow the request with personId, sessionId, a shorter window, or more specific terms, then retry.",
+    recovery: "Narrow the request with a window of 25 hours or less, sessionId, personId, or more specific terms, then retry. A window of 25 hours or less is read by time rather than by every stored match of the terms, which is what makes common terms slow.",
   },
   unavailable: {
     message: "Sherlock search is temporarily unavailable.",
