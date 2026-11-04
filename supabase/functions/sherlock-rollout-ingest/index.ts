@@ -100,7 +100,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "storage_verify_failed",
   "ingest_busy",
 ]);
-// Body bytes this worker serves at once. A batch peaks at a few times its
+// Body bytes this worker decodes at once. A batch peaks at a few times its
 // body size; see memory_budget.ts.
 export const INGEST_MEMORY_BUDGET_BYTES = 24 * 1024 * 1024;
 // A request waiting for the budget stops while this much time is left to
@@ -257,13 +257,11 @@ export async function handleRequest(
         503,
       );
     }
-    release = await memoryBudget.reserve(
-      reservedBodyBytes(request),
-      requestStartedAt + requestDeadlineMs - now() - BUSY_WAIT_RESERVE_MS,
-    );
     let bytes: Uint8Array | null = await readBodyBounded(request);
     const forwardTo = databaseRegionToForwardTo(request, environment);
     if (forwardTo) {
+      // Forwarding holds the body once and decodes nothing, so it takes no
+      // share of the budget.
       const forwarded = await forwardToDatabaseRegion(
         request,
         bytes,
@@ -275,6 +273,10 @@ export async function handleRequest(
       );
       if (forwarded) return forwarded;
     }
+    release = await memoryBudget.reserve(
+      bytes.byteLength,
+      requestStartedAt + requestDeadlineMs - now() - BUSY_WAIT_RESERVE_MS,
+    );
     let body: unknown = parseJson(bytes);
     // Only the decoded batch is needed from here; the raw body and its
     // base64 text would otherwise stay in memory until the response.
@@ -348,14 +350,6 @@ export async function handleRequest(
   } finally {
     release();
   }
-}
-
-// The declared body size, or the most a body may be when none is declared.
-function reservedBodyBytes(request: Request): number {
-  const declared = Number(request.headers.get("content-length"));
-  return Number.isSafeInteger(declared) && declared > 0
-    ? Math.min(declared, MAX_REQUEST_BYTES)
-    : MAX_REQUEST_BYTES;
 }
 
 export function parseWorkloadClassHint(
@@ -521,7 +515,10 @@ async function readBodyBounded(request: Request): Promise<Uint8Array> {
     }
     total += value.byteLength;
   }
-  if (buffer) return buffer.subarray(0, total);
+  if (buffer) {
+    // A shorter body than declared is copied so the spare bytes are freed.
+    return total === buffer.byteLength ? buffer : buffer.slice(0, total);
+  }
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {

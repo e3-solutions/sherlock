@@ -132,7 +132,7 @@ export async function validateStoredBatch(
 // an oversized source (413) as before.
 export async function decompressBounded(
   storedPayload: Uint8Array,
-  expectedBytes = MAX_SOURCE_BYTES,
+  expectedBytes: number,
 ): Promise<Uint8Array> {
   try {
     const reader = new Blob([storedPayload as Uint8Array<ArrayBuffer>])
