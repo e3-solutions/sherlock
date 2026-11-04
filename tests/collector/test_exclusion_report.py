@@ -336,6 +336,7 @@ class HttpReportTests(unittest.TestCase):
         self.assertEqual(request.get_method(), "POST")
         self.assertIsNone(request.get_header("Authorization"))
         self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertEqual(request.get_header("X-region"), "us-east-1")
         self.assertEqual(
             json.loads(request.data),
             {"op": "exclusions", "collector": IDENTITY.to_dict(), "excluded_session_ids": ids},

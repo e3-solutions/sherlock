@@ -12,6 +12,12 @@ from .drain import CollectorUploadError, PermanentUploadError, TransientUploadEr
 from .exclusion_report import ExclusionReportError
 from .spool import SpoolItem
 
+# Run ingest in the region of its database (COR-5166). Without this the edge
+# runtime picks the region nearest the machine; about a third of uploads ran
+# in ap-south-1, where the platform refused some with 503 before the function
+# started, and the rest paid a forward hop to us-east-1.
+INGEST_REGION = "us-east-1"
+
 
 # Exact status/code pairs emitted by the ingest contract, service, storage and
 # repository. Unknown responses fail closed: a proxy's 413 or an identity 409
@@ -68,6 +74,7 @@ class HttpTransport:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "sherlock-telemetry-collector/0.1.0",
+            "x-region": INGEST_REGION,
         }
         workload_class = item.metadata.get("workload_class")
         if workload_class in {"live", "backfill"}:
@@ -139,6 +146,7 @@ class HttpTransport:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": "sherlock-telemetry-collector/0.1.0",
+                "x-region": INGEST_REGION,
             },
         )
         try:
