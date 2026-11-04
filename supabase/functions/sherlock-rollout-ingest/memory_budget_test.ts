@@ -10,11 +10,19 @@ function assert(
 
 const reserved = (budget: MemoryBudget): number => budget.reservedBytes;
 
-const settled = (promise: Promise<unknown>) =>
-  Promise.race([
-    promise.then(() => "granted", () => "refused"),
-    new Promise((resolve) => setTimeout(() => resolve("waiting"), 20)),
-  ]);
+async function settled(promise: Promise<unknown>): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => "granted", () => "refused"),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve("waiting"), 20);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 Deno.test("a request larger than the budget still runs alone", async () => {
   const budget = new MemoryBudget(10);
