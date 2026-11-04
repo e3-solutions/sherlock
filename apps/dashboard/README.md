@@ -263,7 +263,7 @@ least 32 characters and configure the MCP client to send it as
 endpoint is for origin-free agent clients and server-to-server MCP hosts.
 
 The excerpt tools (`search_sessions`, `get_session_evidence`,
-`list_prompt_evidence`) are rate-limited per standard-tier caller: 400 calls and
+`list_prompt_evidence`, when enabled) are rate-limited per standard-tier caller: 400 calls and
 60 distinct sessions per rolling hour, returning `rate_limited` with
 `retryAfterSeconds`. A session counts when it is read with
 `get_session_evidence` or named as the `sessionId` filter of a search; open
@@ -299,6 +299,10 @@ limitation contracts are documented in
   differencing cumulative Codex streams and surfacing missing baselines or
   regressions as partial coverage.
 
+Retired from the default tool list (COR-5174, no calls in the 7 days to Nov 4,
+2026); the code stays and `createBonaparteMcpProtocol(source, { retiredTools:
+true })` registers them again:
+
 - `list_usage_evidence` keyset-pages the eagerly refreshed canonical timeline
   snapshot at 20 people per response and returns explicit session counts,
   prompt counts, and prompt-bearing buckets without rerunning the aggregate.
@@ -306,6 +310,7 @@ limitation contracts are documented in
   returned by the first tool. It returns the earliest five canonical
   primary-human prompt excerpts from that bucket and reports how many were
   omitted. Conversation context is intentionally excluded from v1.
+- `list_provider_usage` reads recovered provider plan-usage percentages.
 
 Every tool advertises strict input and output schemas and read-only,
 non-destructive, idempotent, closed-world annotations. Results are returned as
@@ -317,8 +322,8 @@ The endpoint never reads raw Storage objects and never writes feedback or
 derived judgments to Sherlock. Sherlock query tools search all stored history
 by default and accept explicit historical windows without a duration cap;
 future and non-positive windows remain invalid. Group, page, transaction-time,
-workspace, and roster bounds are enforced server-side. The separate Bonaparte
-`list_usage_evidence` tool remains a server-defined 24-hour dashboard snapshot.
+workspace, and roster bounds are enforced server-side. The retired Bonaparte
+`list_usage_evidence` tool is a server-defined 24-hour dashboard snapshot.
 The shared bearer token is a transport gate, not principal-scoped authorization.
 Cosmos provides authenticated org-wide access and durable call auditing; direct
 clients still require authorization, ingress request-size limits, rate limits,

@@ -42,12 +42,14 @@ function payload() {
   };
 }
 
-function registeredTools(source) {
+// These suites cover the retired evidence tools too (COR-5174 keeps them
+// available behind retiredTools); the default surface is tested separately.
+function registeredTools(source, { retiredTools = true } = {}) {
   const tools = new Map();
   const server = {
     registerTool: vi.fn((name, config, handler) => tools.set(name, { config, handler })),
   };
-  registerBonaparteTools(server, source);
+  registerBonaparteTools(server, source, { retiredTools });
   return tools;
 }
 
@@ -201,6 +203,25 @@ describe("Bonaparte MCP tools", () => {
   });
 });
 
+it("hides the retired evidence tools by default and stops documenting them", async () => {
+  const tools = registeredTools({ fetchUsageEvidence: vi.fn(), fetchProviderUsage: vi.fn() }, { retiredTools: false });
+  const retired = ["list_usage_evidence", "list_prompt_evidence", "list_provider_usage"];
+  expect([...tools.keys()].filter((name) => retired.includes(name))).toEqual([]);
+  const docs = (await tools.get("documentation").handler({})).structuredContent;
+  expect(JSON.stringify(docs)).not.toMatch(/list_usage_evidence|list_prompt_evidence|list_provider_usage/);
+  expect(docs.tools.map((tool) => tool.name)).toEqual([
+    "diagnostics", "coverage", "list_sessions", "get_session", "query_usage",
+  ]);
+
+  const client = await connect(searchDatabase().source, { retiredTools: false });
+  const listed = (await client.listTools()).tools.map((tool) => tool.name);
+  expect(listed.filter((name) => retired.includes(name))).toEqual([]);
+  expect(listed).toEqual(expect.arrayContaining(["query_usage", "search_sessions", "get_session_evidence"]));
+  const searchDocs = (await client.callTool({ name: "documentation", arguments: {} })).structuredContent;
+  expect(JSON.stringify(searchDocs)).not.toMatch(/list_usage_evidence|list_prompt_evidence|list_provider_usage/);
+  expect(client.getInstructions()).not.toContain("list_prompt_evidence");
+});
+
 it("exposes and documents provider usage separately from token queries", async () => {
  const data={schemaVersion:"provider-plan-usage-v1",snapshots:[{weeklyLimitPercent:19.44527799749026,tokenCountsAvailable:false}]};
  const fetchProviderUsage=vi.fn().mockResolvedValue(data);const tools=registeredTools({fetchProviderUsage});
@@ -339,14 +360,16 @@ afterEach(async () => {
   })));
 });
 
-async function connect(searchSource, { guard = null, identitySecret = "", pass = null, auditStore = null } = {}) {
+async function connect(searchSource, {
+  guard = null, identitySecret = "", pass = null, auditStore = null, retiredTools = true,
+} = {}) {
   const token = "s".repeat(MCP_TOKEN_MIN_LENGTH);
   const source = createCachedMcpSource({
     cache: { read: vi.fn() },
     source: { fetchPromptEvidence: vi.fn() },
     ...(searchSource ? { searchSource } : {}),
   });
-  const protocol = createBonaparteMcpProtocol(source, { guard, auditStore });
+  const protocol = createBonaparteMcpProtocol(source, { guard, auditStore, retiredTools });
   openProtocols.push(protocol);
   const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token, identitySecret });
   const httpServer = createServer((request, response) => void route(request, response));
