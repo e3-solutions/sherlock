@@ -112,7 +112,10 @@ describe("excerpt audit writer", () => {
       expect(store.write).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(100);
       expect(store.write).toHaveBeenCalledTimes(1);
-      expect(events).toEqual([{ event: "sherlock_excerpt_audit_write_failed", rows: 1, code: "flame_database_unavailable" }]);
+      expect(events).toEqual([{
+        event: "sherlock_excerpt_audit_write_failed", rows: 1, code: "flame_database_unavailable",
+        sqlstate: null, routine: null,
+      }]);
       // While failing, a full batch waits for the retry timer.
       writer.push([{ id: 2 }]);
       expect(store.write).toHaveBeenCalledTimes(1);

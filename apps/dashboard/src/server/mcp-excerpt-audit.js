@@ -144,7 +144,14 @@ export function createExcerptAuditWriter({
         failing = false;
       } catch (error) {
         failing = true;
-        log({ event: "sherlock_excerpt_audit_write_failed", rows: batch.length, code: error?.code ?? null });
+        // SQLSTATE and routine only: database messages can echo row values.
+        log({
+          event: "sherlock_excerpt_audit_write_failed",
+          rows: batch.length,
+          code: error?.code ?? null,
+          sqlstate: error?.cause?.code ?? null,
+          routine: error?.cause?.routine ?? null,
+        });
         schedule();
         return;
       } finally {
