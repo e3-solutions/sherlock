@@ -73,9 +73,11 @@ end
 $$;
 
 reset lock_timeout;
+set maintenance_work_mem = '256MB';
 
 create index concurrently if not exists events_message_window_idx
   on telemetry.events (workspace_id, occurred_at, id)
   where event_kind in ('message', 'agent_message') and not is_replay;
 
+reset maintenance_work_mem;
 reset statement_timeout;
