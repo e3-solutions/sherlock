@@ -21,6 +21,8 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
   // COR-5162: the stored per-event contributions must answer identically.
   await sql.unsafe(`select analytics.compute_usage_contributions($1::uuid, array(
     select s.id from telemetry.sessions s where s.workspace_id = $1::uuid))`, [workspaceId]);
+  // Smoke the minute refresh too: it must complete, including clearing marks.
+  await sql.unsafe("select analytics.refresh_usage_contributions(5)");
   await sql.begin(async (tx) => {
     await tx.unsafe("set transaction isolation level repeatable read, read only; set local role sherlock_reader");
     const before = await tx.unsafe(oldUsage, params);
