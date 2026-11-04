@@ -331,6 +331,25 @@ export function parseCollectorIdentity(value: unknown): CollectorIdentity {
   };
 }
 
+const BASE64_VALUES = (() => {
+  const values = new Int16Array(128).fill(-1);
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (let index = 0; index < alphabet.length; index += 1) {
+    values[alphabet.charCodeAt(index)] = index;
+  }
+  return values;
+})();
+
+function isAsciiWhitespace(code: number): boolean {
+  return code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d ||
+    code === 0x20;
+}
+
+// Decodes like atob (WHATWG forgiving-base64) straight into the result.
+// The edge runtime has no Uint8Array.fromBase64, and the old fallback,
+// Uint8Array.from(atob(...)), built a byte string and a list of every byte:
+// a 16 MiB batch peaked over 500 MiB against the worker's 256 MB limit.
 export function decodeBase64Bytes(value: string): Uint8Array {
   const typedArray = Uint8Array as Uint8ArrayConstructor & {
     fromBase64?: (encoded: string) => Uint8Array;
@@ -339,14 +358,40 @@ export function decodeBase64Bytes(value: string): Uint8Array {
     return typedArray.fromBase64(value);
   }
 
-  try {
-    return Uint8Array.from(
-      atob(value),
-      (character) => character.charCodeAt(0),
-    );
-  } catch {
+  let characters = 0;
+  let padding = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (isAsciiWhitespace(code)) continue;
+    if (code === 0x3d) {
+      padding += 1;
+    } else if (padding > 0 || code >= 128 || BASE64_VALUES[code] < 0) {
+      throw new SyntaxError("Invalid base64 string");
+    }
+    characters += 1;
+  }
+  if (padding > 0 && (padding > 2 || characters % 4 !== 0)) {
     throw new SyntaxError("Invalid base64 string");
   }
+  const dataCharacters = characters - padding;
+  if (dataCharacters % 4 === 1) throw new SyntaxError("Invalid base64 string");
+
+  const bytes = new Uint8Array(Math.floor(dataCharacters * 3 / 4));
+  let buffer = 0;
+  let bits = 0;
+  let written = 0;
+  for (let index = 0; written < bytes.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (isAsciiWhitespace(code)) continue;
+    buffer = (buffer << 6) | BASE64_VALUES[code];
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes[written] = (buffer >> bits) & 0xff;
+      written += 1;
+    }
+  }
+  return bytes;
 }
 
 function decodeBase64(value: unknown): Uint8Array {

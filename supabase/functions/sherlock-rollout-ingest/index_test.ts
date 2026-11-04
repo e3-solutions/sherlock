@@ -2,9 +2,11 @@ import {
   type BatchManifest,
   CONTRACT_VERSION,
   IngestError,
+  MAX_REQUEST_BYTES,
   sha256Hex,
 } from "./contract.ts";
 import {
+  BUSY_WAIT_RESERVE_MS,
   DATABASE_ATTEMPTS,
   DATABASE_RETRY_MIN_REMAINING_MS,
   FORWARD_FALLBACK_MIN_REMAINING_MS,
@@ -1056,4 +1058,96 @@ Deno.test("a Storage stall answers 503 with Retry-After and keeps the shared cli
   assert(remainingSeen === REQUEST_DEADLINE_MS, `saw ${remainingSeen} ms left`);
   assert(factoryCalls === 1, "a Storage failure is not a database retry");
   assert(record.discarded === 0, "the shared database client is kept");
+});
+
+Deno.test("a busy worker answers 503 ingest_busy and every request releases its budget", async () => {
+  const { MemoryBudget } = await import("./memory_budget.ts");
+  const budget = new MemoryBudget(1);
+  const reserved = (current: typeof budget): number => current.reservedBytes;
+  const { options } = retryOptions(() => ({
+    batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+    service: {
+      ingest: () => Promise.resolve({ batch_id: "batch" }),
+    },
+  }));
+  const ok = await handleRequest(await requestFor("user@e3group.ai"), {
+    ...options,
+    memoryBudget: budget,
+  });
+  assert(ok.status === 200, `got ${ok.status}`);
+  assert(reserved(budget) === 0, "a finished request releases its bytes");
+
+  const held = await budget.reserve(1, 1_000);
+  // 100 ms of waiting is left after the time kept for ingesting.
+  const busy = await handleRequest(await requestFor("user@e3group.ai"), {
+    ...options,
+    memoryBudget: budget,
+    requestDeadlineMs: BUSY_WAIT_RESERVE_MS + 100,
+  });
+  held();
+  assert(busy.status === 503, `got ${busy.status}`);
+  assert(busy.headers.get("Retry-After") === "5");
+  assert((await busy.json()).error.code === "ingest_busy");
+  assert(reserved(budget) === 0);
+});
+
+Deno.test("an oversized body is refused with 413 even while the worker is busy", async () => {
+  const { MemoryBudget } = await import("./memory_budget.ts");
+  const budget = new MemoryBudget(1);
+  const held = await budget.reserve(1, 1_000);
+  const request = new Request("https://example.test/ingest", {
+    method: "POST",
+    headers: { "content-length": String(MAX_REQUEST_BYTES + 1) },
+    body: "{}",
+  });
+  const response = await handleRequest(request, {
+    environment: ENVIRONMENT,
+    backendFactory: noBackend as never,
+    memoryBudget: budget,
+  });
+  held();
+  assert(response.status === 413, `got ${response.status}`);
+  assert((await response.json()).error.code === "payload_too_large");
+});
+
+Deno.test("a body without a declared length reserves only its real size", async () => {
+  const { MemoryBudget } = await import("./memory_budget.ts");
+  const budget = new MemoryBudget(MAX_REQUEST_BYTES);
+  const held = await budget.reserve(MAX_REQUEST_BYTES - 64 * 1024, 1_000);
+  const sized = await requestFor("user@e3group.ai");
+  const bytes = new Uint8Array(await sized.arrayBuffer());
+  const streamed = new Request("https://example.test/ingest", {
+    method: "POST",
+    body: ReadableStream.from([bytes.subarray(0, 100), bytes.subarray(100)]),
+  });
+  assert(!streamed.headers.has("content-length"));
+  const { options } = retryOptions(() => ({
+    batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+    service: { ingest: () => Promise.resolve({ batch_id: "batch" }) },
+  }));
+  const response = await handleRequest(streamed, {
+    ...options,
+    memoryBudget: budget,
+    requestDeadlineMs: BUSY_WAIT_RESERVE_MS + 100,
+  });
+  held();
+  assert(response.status === 200, `got ${response.status}`);
+});
+
+Deno.test("a forwarded request takes no share of the budget", async () => {
+  const { MemoryBudget } = await import("./memory_budget.ts");
+  const budget = new MemoryBudget(1);
+  const held = await budget.reserve(1, 1_000);
+  const response = await handleRequest(await requestFor("user@e3group.ai"), {
+    environment: FORWARD_ENVIRONMENT("ap-south-1"),
+    backendFactory: noBackend as never,
+    memoryBudget: budget,
+    fetcher: (() =>
+      Promise.resolve(
+        Response.json({ status: "committed", batch_id: "b1" }),
+      )) as typeof fetch,
+  });
+  held();
+  assert(response.status === 200, `got ${response.status}`);
+  assert(budget.reservedBytes === 0);
 });

@@ -804,3 +804,92 @@ Deno.test("the upload is given the request's time left", async () => {
   );
   assert(seen === 12_345, `upload saw ${seen}`);
 });
+
+function withoutFromBase64<T>(work: () => T): T {
+  const typedArray = Uint8Array as unknown as Record<string, unknown>;
+  const native = typedArray.fromBase64;
+  delete typedArray.fromBase64;
+  try {
+    return work();
+  } finally {
+    if (native !== undefined) typedArray.fromBase64 = native;
+  }
+}
+
+Deno.test("the edge-runtime base64 decoder matches atob", () => {
+  const outcome = (decode: () => Uint8Array) => {
+    try {
+      return decode().join(",");
+    } catch {
+      // atob throws InvalidCharacterError; the decoder throws SyntaxError,
+      // which decodeBase64 maps to 400 invalid_payload.
+      return "invalid";
+    }
+  };
+  const random = crypto.getRandomValues(new Uint8Array(4099));
+  let binary = "";
+  for (const byte of random) binary += String.fromCharCode(byte);
+  const cases = [
+    "",
+    "QQ",
+    "QQ=",
+    "QQ==",
+    "QUI",
+    "QUI=",
+    "QUJD",
+    " Q U\nJ\tD\r\f",
+    "QUJD=",
+    "QQ===",
+    "Q",
+    "Q===",
+    "QU=I",
+    "QUJ-",
+    "QUJ_",
+    "QUJé",
+    "QR==",
+    btoa(binary),
+    btoa(binary.slice(1)),
+    btoa(binary.slice(2)),
+  ];
+  withoutFromBase64(() => {
+    for (const value of cases) {
+      const expected = outcome(() =>
+        Uint8Array.from(atob(value), (character) => character.charCodeAt(0))
+      );
+      assert(
+        outcome(() => decodeBase64Bytes(value)) === expected,
+        `decoding ${JSON.stringify(value.slice(0, 20))} differs from atob`,
+      );
+    }
+  });
+});
+
+Deno.test("a source that is not the declared size is refused, not trimmed", async () => {
+  const { manifest } = await fixture();
+  const source = new TextEncoder().encode("0123456789\n");
+  const stored = new Uint8Array(
+    await new Response(
+      new Blob([source]).stream().pipeThrough(new CompressionStream("gzip")),
+    ).arrayBuffer(),
+  );
+  for (const declared of [source.byteLength - 1, source.byteLength + 1]) {
+    const lying = {
+      ...manifest,
+      end_offset: declared,
+      source_byte_count: declared,
+      source_sha256: await sha256Hex(source),
+      stored_byte_count: stored.byteLength,
+      stored_sha256: await sha256Hex(stored),
+    };
+    try {
+      await validateStoredBatch(lying, stored);
+      assert(false, `a ${declared}-byte claim should fail`);
+    } catch (error) {
+      assert(error instanceof IngestError, `received ${error}`);
+      assert(
+        error.code === "source_integrity_mismatch" && error.status === 400,
+        `received ${error.code}`,
+      );
+    }
+  }
+});

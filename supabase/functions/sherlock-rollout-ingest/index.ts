@@ -1,5 +1,6 @@
 import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
 import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
+import { MemoryBudget } from "./memory_budget.ts";
 import { parseExclusionsRequest, requestOperation } from "./exclusions.ts";
 import {
   edgeFunctionDatabaseUrl,
@@ -97,7 +98,15 @@ const RETRYABLE_ERROR_CODES = new Set([
   "ingest_timeout",
   "storage_unavailable",
   "storage_verify_failed",
+  "ingest_busy",
 ]);
+// Body bytes this worker decodes at once. A batch peaks at a few times its
+// body size; see memory_budget.ts.
+export const INGEST_MEMORY_BUDGET_BYTES = 24 * 1024 * 1024;
+// A request waiting for the budget stops while this much time is left to
+// ingest it, and answers 503 ingest_busy instead.
+export const BUSY_WAIT_RESERVE_MS = 8_000;
+const workerMemory = new MemoryBudget(INGEST_MEMORY_BUDGET_BYTES);
 // The database and its pooler are in us-east-1. An upload makes ~25
 // sequential pooler round trips; served from ap-south-1 (most traffic on
 // Nov 2) each costs ~250 ms, so requests took a p50 of 8.4 s against 0.6 s in
@@ -206,6 +215,7 @@ export async function handleRequest(
     now = () => performance.now(),
     requestDeadlineMs = REQUEST_DEADLINE_MS,
     fetcher = fetch,
+    memoryBudget = workerMemory,
   }: {
     environment?: EnvironmentReader;
     backendFactory?: typeof ingestBackend;
@@ -214,6 +224,7 @@ export async function handleRequest(
     now?: () => number;
     requestDeadlineMs?: number;
     fetcher?: typeof fetch;
+    memoryBudget?: MemoryBudget;
   } = {},
 ): Promise<Response> {
   const requestStartedAt = now();
@@ -231,6 +242,7 @@ export async function handleRequest(
       requestDeadlineMs,
       work,
     );
+  let release = () => {};
   try {
     if (request.method !== "POST") {
       return Response.json({ error: { code: "method_not_allowed" } }, {
@@ -245,9 +257,11 @@ export async function handleRequest(
         503,
       );
     }
-    const bytes = await readBodyBounded(request);
+    let bytes: Uint8Array | null = await readBodyBounded(request);
     const forwardTo = databaseRegionToForwardTo(request, environment);
     if (forwardTo) {
+      // Forwarding holds the body once and decodes nothing, so it takes no
+      // share of the budget.
       const forwarded = await forwardToDatabaseRegion(
         request,
         bytes,
@@ -259,7 +273,14 @@ export async function handleRequest(
       );
       if (forwarded) return forwarded;
     }
-    const body = parseJson(bytes);
+    release = await memoryBudget.reserve(
+      bytes.byteLength,
+      requestStartedAt + requestDeadlineMs - now() - BUSY_WAIT_RESERVE_MS,
+    );
+    let body: unknown = parseJson(bytes);
+    // Only the decoded batch is needed from here; the raw body and its
+    // base64 text would otherwise stay in memory until the response.
+    bytes = null;
     const routing = () =>
       workspaceRoutingConfig(
         required("SHERLOCK_E3_WORKSPACE_ID", environment),
@@ -286,6 +307,7 @@ export async function handleRequest(
       });
     }
     const envelope = parseEnvelope(body);
+    body = undefined;
     const grant = publicCollectorGrant(routing(), envelope.collector);
     const workloadClassHint = parseWorkloadClassHint(
       request.headers.get("x-sherlock-workload-class"),
@@ -325,6 +347,8 @@ export async function handleRequest(
       { error: { code: "internal_error", message: "ingest failed" } },
       { status: 500, headers: { "Cache-Control": "no-store" } },
     );
+  } finally {
+    release();
   }
 }
 
@@ -461,14 +485,18 @@ async function readBodyBounded(request: Request): Promise<Uint8Array> {
   if (!request.body) {
     throw new IngestError("invalid_request", "request body must be JSON", 400);
   }
+  // One buffer of the declared size; chunks are joined only when the
+  // length is missing or wrong.
+  let buffer = Number.isSafeInteger(declaredLength) && declaredLength > 0
+    ? new Uint8Array(declaredLength)
+    : null;
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    total += value.byteLength;
-    if (total > MAX_REQUEST_BYTES) {
+    if (total + value.byteLength > MAX_REQUEST_BYTES) {
       await reader.cancel();
       throw new IngestError(
         "payload_too_large",
@@ -476,7 +504,20 @@ async function readBodyBounded(request: Request): Promise<Uint8Array> {
         413,
       );
     }
-    chunks.push(value);
+    if (buffer && total + value.byteLength <= buffer.byteLength) {
+      buffer.set(value, total);
+    } else {
+      if (buffer) {
+        chunks.push(buffer.subarray(0, total));
+        buffer = null;
+      }
+      chunks.push(value);
+    }
+    total += value.byteLength;
+  }
+  if (buffer) {
+    // A shorter body than declared is copied so the spare bytes are freed.
+    return total === buffer.byteLength ? buffer : buffer.slice(0, total);
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
