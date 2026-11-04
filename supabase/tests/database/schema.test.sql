@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(151);
+select plan(152);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -209,6 +209,17 @@ select ok(
       and indexname = 'events_message_search_idx'
   ),
   'normalized message search has a partial GIN index'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'telemetry'
+      and tablename = 'events'
+      and indexname = 'events_message_window_idx'
+      and indexdef like '%(workspace_id, occurred_at, id)%'
+      and indexdef like '%WHERE ((event_kind = ANY (ARRAY[''message''::text, ''agent_message''::text])) AND (NOT is_replay))%'
+  ),
+  'date-ranged message search has a window index to AND with the GIN match'
 );
 select ok(
   exists (
