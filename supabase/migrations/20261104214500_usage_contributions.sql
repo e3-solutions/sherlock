@@ -17,12 +17,12 @@
 --     number; the refresh clears only the mark it computed from.
 --   * refresh_usage_contributions() runs every minute from pg_cron. It
 --     recomputes dirty sessions oldest mark first, once they have been quiet
---     for 30 s or marked for 90 s, then backfills one hour of history per run,
+--     for 60 s or marked for 3 minutes, then backfills one hour of history per run,
 --     newest first. backfill_cursor is the coverage boundary: every session
 --     with usage at or after it has been computed.
 -- The dashboard uses the table only for windows starting at or after
 -- backfill_cursor while the refresh is current and no session has waited more
--- than 5 minutes; otherwise it keeps the live query. A normalizer cutover
+-- than 10 minutes; otherwise it keeps the live query. A normalizer cutover
 -- change or a new USAGE_CONTRIBUTIONS_VERSION clears the table and restarts
 -- backfill.
 --
@@ -484,8 +484,8 @@ begin
       select * into v_state from analytics.usage_contribution_state st where st.workspace_id = v_workspace;
     end if;
 
-    -- 1. Dirty sessions, oldest mark first, once quiet for 30 s or marked
-    -- for 90 s. Only the mark that was read is cleared: a session marked again
+    -- 1. Dirty sessions, oldest mark first, once quiet for 60 s or marked
+    -- for 3 minutes (an active session is recomputed at most that often). Only the mark that was read is cleared: a session marked again
     -- meanwhile has a new mark_seq and stays dirty.
     select pg_catalog.array_agg(t.session_id order by t.first_marked_at),
            pg_catalog.array_agg(t.mark_seq order by t.first_marked_at)
@@ -494,8 +494,8 @@ begin
         select d.session_id, d.mark_seq, d.first_marked_at
           from analytics.usage_contribution_dirty d
          where d.workspace_id = v_workspace
-           and (d.last_marked_at < pg_catalog.now() - interval '30 seconds'
-                or d.first_marked_at < pg_catalog.now() - interval '90 seconds')
+           and (d.last_marked_at < pg_catalog.now() - interval '60 seconds'
+                or d.first_marked_at < pg_catalog.now() - interval '3 minutes')
          order by d.first_marked_at
          limit p_max_sessions
       ) t;

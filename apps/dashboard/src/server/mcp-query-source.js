@@ -820,8 +820,8 @@ export const PRECOMPUTED_USAGE_SQL = precomputedUsageSql();
 
 // The precomputed table answers a window only when backfill has covered its
 // start, the minute refresh is current, and no session has waited more than
-// 5 minutes to be recomputed; otherwise the live query runs. Sessions marked
-// in the last ~90 s may not be reflected yet.
+// 10 minutes to be recomputed; otherwise the live query runs. Activity from
+// the last ~3 minutes may not be reflected yet.
 export const USAGE_CONTRIBUTION_STATE_SQL = `
 select st.backfill_cursor, st.refreshed_at
   from analytics.usage_contribution_state st
@@ -829,7 +829,7 @@ select st.backfill_cursor, st.refreshed_at
    and st.backfill_cursor <= $2::timestamptz
    and not exists (
      select 1 from analytics.usage_contribution_dirty d
-      where d.workspace_id = $1 and d.first_marked_at < now() - interval '5 minutes'
+      where d.workspace_id = $1 and d.first_marked_at < now() - interval '10 minutes'
    )
 `;
 
