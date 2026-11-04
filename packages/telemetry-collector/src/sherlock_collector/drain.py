@@ -99,6 +99,7 @@ class Drain:
         self.source_home = Path(source_home) if source_home is not None else None
         self._policy = ExclusionPolicy()
         self._held: set[Path] = set()
+        self._held_streams: set[tuple[str, str]] = set()
         self._project_held_sessions: set[str] = set()
         self._dead_letter_codes: Counter[str] = Counter()
         self._codes_lock = threading.Lock()
@@ -120,6 +121,9 @@ class Drain:
         # Held batches stay pending, unsent, and block only their own stream.
         self._policy = self.exclusion_policy or load_policy()
         self._held = set()
+        # Every batch of a held stream counts as held, not only its frontier, so
+        # the reported queue minus held is what could upload (COR-5105).
+        self._held_streams: set[tuple[str, str]] = set()
         self._project_held_sessions = set()
         self._dead_letter_codes = Counter()
         self._server_errors_in_a_row = 0
@@ -235,6 +239,9 @@ class Drain:
                 invalid.append(path)
                 continue
             stream = manifest.stream_identity
+            if stream in self._held_streams:
+                self._held.add(path)
+                continue
             if stream in blocked_streams:
                 continue
             reason = self._policy.active and self._policy.blocked_reason(
@@ -263,6 +270,7 @@ class Drain:
                 if reason == EXCLUDED_PROJECT and manifest.observed_native_session_id:
                     self._project_held_sessions.add(manifest.observed_native_session_id)
                 self._held.add(path)
+                self._held_streams.add(stream)
                 blocked_streams.add(stream)
                 continue
             # A delayed frontier blocks its own later byte ranges only.

@@ -378,11 +378,12 @@ def write_collector_status(
     """Persist counters (never content) for Jolly Roger's check-in to read."""
     drain = result.get("drain") or {}
     now = utc_now()
+    previous = _previous_status(root)
     status = {
         "status_version": 1,
         "provider": provider,
         "updated_at": now,
-        **upload_progress(_previous_status(root), result, now),
+        **upload_progress(previous, result, now),
         "reconcile_status": result.get("status"),
         "eligible_unfinished_sources": result.get("eligible_unfinished_sources"),
         "unfinished_sources": result.get("unfinished_sources"),
@@ -390,7 +391,11 @@ def write_collector_status(
         "last_progress_at": result.get("last_progress_at"),
         "pending_source_markers": result.get("pending_source_markers"),
         "pending_uploads": result.get("pending_uploads"),
-        "held_by_policy": drain.get("held_by_policy"),
+        # A drain that did not look at the queue (locked by another drain, or
+        # no transport) keeps the last count rather than reporting none held.
+        "held_by_policy": drain.get("held_by_policy")
+        if drain and not drain.get("locked")
+        else previous.get("held_by_policy"),
         "dead_letters": dead_letter_summary["dead_letter_batches"],
         "dead_letter_codes": dead_letter_summary["dead_letter_codes"],
         "dead_letters_total": dead_letter_summary["dead_letters_total"],

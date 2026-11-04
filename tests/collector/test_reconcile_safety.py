@@ -449,6 +449,24 @@ class ProjectExclusionTests(unittest.TestCase):
         self.assertEqual(result.held_by_policy, 1)
         self.assertEqual(len(spool.list_pending()), 1)
 
+    def test_every_queued_batch_of_a_held_stream_counts_as_held(self):
+        # COR-5105: the stall alert subtracts held batches from the queue, so a
+        # held stream with several queued ranges must count all of them.
+        home, state = self.root / "codex", self.root / "state"
+        path, _ = codex_rollout(home, meta={"cwd": str(self.project)})
+        reconcile(home, state, "codex", None)
+        for _ in range(2):
+            with path.open("ab") as handle:
+                handle.write(b"{}\n")
+            reconcile(home, state, "codex", None)
+        spool = DurableSpool(state / "queue")
+        self.assertEqual(len(spool.list_pending()), 3)
+        result = Drain(
+            spool, SuccessTransport(), exclusion_policy=self.policy(self.project), source_home=home
+        ).run()
+        self.assertEqual(result.held_by_policy, 3)
+        self.assertEqual(len(spool.list_pending()), 3)
+
     def test_claude_sessions_and_subagents_in_excluded_projects_are_not_collected(self):
         home = self.root / "claude"
         excluded, kept, pending = (str(uuid.uuid4()) for _ in range(3))
