@@ -1057,3 +1057,37 @@ Deno.test("a Storage stall answers 503 with Retry-After and keeps the shared cli
   assert(factoryCalls === 1, "a Storage failure is not a database retry");
   assert(record.discarded === 0, "the shared database client is kept");
 });
+
+Deno.test("a busy worker answers 503 ingest_busy and every request releases its budget", async () => {
+  const { MemoryBudget } = await import("./memory_budget.ts");
+  const budget = new MemoryBudget(1);
+  const reserved = (current: typeof budget): number => current.reservedBytes;
+  const { options } = retryOptions(() => ({
+    batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+    service: {
+      ingest: () => Promise.resolve({ batch_id: "batch" }),
+    },
+  }));
+  const ok = await handleRequest(await requestFor("user@e3group.ai"), {
+    ...options,
+    memoryBudget: budget,
+  });
+  assert(ok.status === 200, `got ${ok.status}`);
+  assert(reserved(budget) === 0, "a finished request releases its bytes");
+
+  const held = await budget.reserve(1, 1_000);
+  const busy = await handleRequest(await requestFor("user@e3group.ai"), {
+    ...options,
+    memoryBudget: budget,
+    requestDeadlineMs: REQUEST_DEADLINE_MS,
+    now: (() => {
+      let clock = 0;
+      return () => (clock += 5_000);
+    })(),
+  });
+  held();
+  assert(busy.status === 503, `got ${busy.status}`);
+  assert(busy.headers.get("Retry-After") === "5");
+  assert((await busy.json()).error.code === "ingest_busy");
+  assert(reserved(budget) === 0);
+});

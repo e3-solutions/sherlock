@@ -95,7 +95,10 @@ export async function validateStoredBatch(
       400,
     );
   }
-  const source = await decompressBounded(storedPayload);
+  const source = await decompressBounded(
+    storedPayload,
+    manifest.source_byte_count,
+  );
   if (
     source.byteLength !== manifest.source_byte_count ||
     (await sha256Hex(source)) !== manifest.source_sha256
@@ -123,19 +126,35 @@ export async function validateStoredBatch(
   return source;
 }
 
+// Decompresses into one buffer of the size the manifest declares, so a large
+// batch holds its source once rather than as chunks plus a joined copy.
+// Bytes past that size are only counted, to tell a lying manifest (400) from
+// an oversized source (413) as before.
 export async function decompressBounded(
   storedPayload: Uint8Array,
+  expectedBytes = MAX_SOURCE_BYTES,
 ): Promise<Uint8Array> {
   try {
     const reader = new Blob([storedPayload as Uint8Array<ArrayBuffer>])
       .stream()
       .pipeThrough(new DecompressionStream("gzip"))
       .getReader();
-    const chunks: Uint8Array[] = [];
+    const result = new Uint8Array(
+      Math.max(0, Math.min(expectedBytes, MAX_SOURCE_BYTES)),
+    );
     let total = 0;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (total < result.byteLength) {
+        result.set(
+          value.subarray(
+            0,
+            Math.min(value.byteLength, result.byteLength - total),
+          ),
+          total,
+        );
+      }
       total += value.byteLength;
       if (total > MAX_SOURCE_BYTES) {
         await reader.cancel();
@@ -145,15 +164,16 @@ export async function decompressBounded(
           413,
         );
       }
-      chunks.push(value);
     }
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.byteLength;
+    if (total > result.byteLength) {
+      throw new IngestError(
+        "source_integrity_mismatch",
+        "uncompressed source size/hash does not match the manifest",
+        400,
+      );
     }
-    return result;
+    // A shorter source fails the caller's size check.
+    return result.subarray(0, total);
   } catch (error) {
     if (error instanceof IngestError) throw error;
     throw new IngestError(
