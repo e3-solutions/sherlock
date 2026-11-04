@@ -168,7 +168,7 @@ describe("Bonaparte MCP tools", () => {
         code: "snapshot_expired",
         message: "The evidence snapshot has expired.",
         retryable: false,
-        recovery: "Restart with list_usage_evidence to obtain a new snapshotToken.",
+        recovery: "Restart from the tool that returned the snapshotToken to obtain a new one.",
       },
     });
   });
