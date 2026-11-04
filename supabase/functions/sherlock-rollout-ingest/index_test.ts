@@ -1151,3 +1151,64 @@ Deno.test("a forwarded request takes no share of the budget", async () => {
   assert(response.status === 200, `got ${response.status}`);
   assert(budget.reservedBytes === 0);
 });
+
+Deno.test("a refused batch logs its reason and hashed keys, nothing identifying", async () => {
+  const { options } = retryOptions(() => ({
+    batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+    service: {
+      ingest: () =>
+        Promise.reject(new IngestError("range_overlap", "overlap", 409)),
+    },
+  }));
+  const lines: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: unknown[]) => lines.push(values.join(" "));
+  let response: Response;
+  try {
+    response = await handleRequest(
+      await requestFor("user@e3group.ai"),
+      options,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert(response.status === 409, `got ${response.status}`);
+  assert(lines.length === 1, `expected one conflict line, got ${lines.length}`);
+  const line = JSON.parse(lines[0]);
+  assert(line.event === "ingest_conflict" && line.code === "range_overlap");
+  assert(/^[0-9a-f]{12}$/.test(line.collector), `collector ${line.collector}`);
+  assert(/^[0-9a-f]{12}$/.test(line.stream), `stream ${line.stream}`);
+  assert(line.generation_seq === 0 && line.start_offset === 0);
+  for (
+    const secret of [
+      "user@e3group.ai",
+      ATTRIBUTION.collector_key,
+      "stream-test",
+    ]
+  ) {
+    assert(!lines[0].includes(secret), `log must not contain ${secret}`);
+  }
+});
+
+Deno.test("only 409s are logged as conflicts", async () => {
+  const { options } = retryOptions(() => ({
+    batches: { resolveAttribution: () => Promise.resolve(ATTRIBUTION) },
+    service: {
+      ingest: () =>
+        Promise.reject(new IngestError("invalid_manifest", "bad", 400)),
+    },
+  }));
+  const lines: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: unknown[]) => lines.push(values.join(" "));
+  try {
+    const response = await handleRequest(
+      await requestFor("user@e3group.ai"),
+      options,
+    );
+    assert(response.status === 400);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert(lines.length === 0, `logged ${lines.length} lines`);
+});

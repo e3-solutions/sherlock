@@ -1,5 +1,12 @@
 import { publicCollectorGrant, workspaceRoutingConfig } from "./attribution.ts";
-import { IngestError, MAX_REQUEST_BYTES, parseEnvelope } from "./contract.ts";
+import {
+  type Attribution,
+  type BatchManifest,
+  IngestError,
+  MAX_REQUEST_BYTES,
+  parseEnvelope,
+  sha256Hex,
+} from "./contract.ts";
 import { MemoryBudget } from "./memory_budget.ts";
 import { parseExclusionsRequest, requestOperation } from "./exclusions.ts";
 import {
@@ -317,13 +324,20 @@ export async function handleRequest(
         grant,
         envelope.collector,
       );
-      return await current.service.ingest(
-        attribution,
-        envelope.manifest,
-        envelope.stored_payload,
-        workloadClassHint,
-        () => requestStartedAt + requestDeadlineMs - now(),
-      );
+      try {
+        return await current.service.ingest(
+          attribution,
+          envelope.manifest,
+          envelope.stored_payload,
+          workloadClassHint,
+          () => requestStartedAt + requestDeadlineMs - now(),
+        );
+      } catch (error) {
+        if (error instanceof IngestError && error.status === 409) {
+          await logConflict(error, attribution, envelope.manifest);
+        }
+        throw error;
+      }
     });
     return Response.json(receipt, {
       status: 200,
@@ -349,6 +363,41 @@ export async function handleRequest(
     );
   } finally {
     release();
+  }
+}
+
+// A short, stable stand-in for an identifier in logs.
+async function logKey(value: string): Promise<string> {
+  return (await sha256Hex(new TextEncoder().encode(value))).slice(0, 12);
+}
+
+// One line per refused batch, so repeated 409s can be traced to a collector
+// and a reason (Nov 4: 8,942 a day from one address, 15 distinct batches).
+// Keys are hashed; no email, path or content is logged.
+async function logConflict(
+  error: IngestError,
+  attribution: Attribution,
+  manifest: BatchManifest,
+): Promise<void> {
+  try {
+    console.warn(JSON.stringify({
+      event: "ingest_conflict",
+      code: error.code,
+      collector: await logKey(
+        `${attribution.workspace_id}/${attribution.collector_key}`,
+      ),
+      stream: await logKey(
+        `${manifest.source_kind}/${manifest.source_stream_key}`,
+      ),
+      source_kind: manifest.source_kind,
+      generation_seq: manifest.generation_seq,
+      start_offset: manifest.start_offset,
+      end_offset: manifest.end_offset,
+      record_count: manifest.record_count,
+      collector_version: manifest.collector_version,
+    }));
+  } catch {
+    // Logging must never change the answer.
   }
 }
 
