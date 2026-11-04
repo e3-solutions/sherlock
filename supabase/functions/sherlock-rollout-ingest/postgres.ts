@@ -341,6 +341,30 @@ async function assertNoRangeConflict(
   }
 }
 
+// The exact batch's committed row, or null when the batch is new. A batch the
+// commit would refuse is refused here, before its upload (about 40% of
+// requests on Nov 4 were 409s).
+export async function findExactBeforeUpload(
+  sql: Queryable,
+  attribution: Attribution,
+  manifest: BatchManifest,
+  firstLookup: typeof findExactBatch = findExactBatch,
+): Promise<Record<string, unknown> | null> {
+  const row = await firstLookup(sql, attribution, manifest);
+  if (row) return row;
+  try {
+    await assertNoRangeConflict(sql, attribution, manifest);
+  } catch (error) {
+    if (!(error instanceof IngestError) || error.status !== 409) throw error;
+    // The exact batch may have committed between the two reads; its replay
+    // gets the receipt, as the commit would answer.
+    const committed = await findExactBatch(sql, attribution, manifest);
+    if (committed) return committed;
+    throw error;
+  }
+  return null;
+}
+
 export class PostgresBatchRepository
   implements BatchRepository, ExclusionsRepository {
   constructor(private readonly sql: Sql) {}
@@ -519,23 +543,8 @@ export class PostgresBatchRepository
   ): Promise<CommittedReceipt | null> {
     return await this.sql.begin(async (tx) => {
       await tx.unsafe("set local role sherlock_ingest");
-      const row = await findExactBatch(tx, attribution, manifest);
-      if (row) return receiptFromRow(row);
-      // Checked before the upload, so a batch the commit would refuse is not
-      // stored first (about 40% of requests on Nov 4 were 409s).
-      try {
-        await assertNoRangeConflict(tx, attribution, manifest);
-      } catch (error) {
-        if (!(error instanceof IngestError) || error.status !== 409) {
-          throw error;
-        }
-        // The exact batch may have committed between the two reads; its
-        // replay gets the receipt, as the commit would answer.
-        const committed = await findExactBatch(tx, attribution, manifest);
-        if (committed) return receiptFromRow(committed);
-        throw error;
-      }
-      return null;
+      const row = await findExactBeforeUpload(tx, attribution, manifest);
+      return row ? receiptFromRow(row) : null;
     });
   }
 

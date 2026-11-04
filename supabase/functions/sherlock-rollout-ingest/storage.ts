@@ -5,15 +5,20 @@ const STORAGE_BUCKET = "telemetry-raw";
 const MAX_STORAGE_ERROR_BYTES = 4 * 1024;
 // Storage object writes stall for tens of minutes at a time (Nov 2 19:30-22:30
 // and Nov 4 18:00 UTC: write p50 3-12 s, p99 ~60 s, while reads and duplicate
-// rejections stayed fast). An upload left to run until the request deadline
-// also retired the isolate's shared database client. Each attempt gets its
-// own limit inside the request's time left, keeping room for the commit.
+// rejections stayed fast). An upload left to run into the request deadline
+// also retired the isolate's shared database client, so it now ends early
+// enough to answer 503 storage_unavailable with time kept for the commit.
+// Only a fast failure is retried: an upload aborted here keeps running in
+// Storage, so a second write after a timeout would queue behind the first.
 export const STORAGE_ATTEMPTS = 2;
-export const STORAGE_ATTEMPT_TIMEOUT_MS = 8_000;
 // Time kept back for the batch commit after the object is stored.
 export const STORAGE_COMMIT_RESERVE_MS = 3_000;
 // A shorter attempt than this is not worth starting.
 export const STORAGE_MIN_ATTEMPT_MS = 2_000;
+// Storage itself gives up on a write after 60 s.
+export const STORAGE_MAX_ATTEMPT_MS = 60_000;
+// Rate limits and gateway answers Storage gives while degraded.
+const TRANSIENT_STATUSES = new Set([408, 429]);
 
 export type RemainingMs = () => number;
 
@@ -161,23 +166,24 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
   // the request is left to start one.
   private attemptBudgetMs(remainingMs: RemainingMs): number | null {
     const budget = Math.floor(Math.min(
-      STORAGE_ATTEMPT_TIMEOUT_MS,
+      STORAGE_MAX_ATTEMPT_MS,
       remainingMs() - STORAGE_COMMIT_RESERVE_MS,
     ));
     return budget >= STORAGE_MIN_ATTEMPT_MS ? budget : null;
   }
 
-  // An immutable POST is safe to repeat: if an abandoned attempt did store
-  // the object, the retry gets a duplicate answer and verifies the bytes.
+  // An immutable POST is safe to repeat: if the failed attempt did store the
+  // object, the retry gets a duplicate answer and verifies the bytes.
   private async upload(
     path: string,
     bytes: Uint8Array,
     remainingMs: RemainingMs,
   ): Promise<Response> {
+    let budget = this.attemptBudgetMs(remainingMs);
     for (let attempt = 1;; attempt += 1) {
-      const budget = this.attemptBudgetMs(remainingMs);
       if (budget === null) throw storageUnavailable("no time left");
       let reason: string;
+      let retryable = true;
       try {
         const response = await this.fetcher(
           objectUrl(this.supabaseUrl, path),
@@ -194,22 +200,33 @@ export class SupabaseImmutableStorage implements ImmutableStorage {
             signal: AbortSignal.timeout(budget),
           },
         );
-        if (response.status < 500) return response;
+        if (
+          response.status < 500 && !TRANSIENT_STATUSES.has(response.status)
+        ) {
+          return response;
+        }
         await cancelBody(response);
         reason = `upload answered ${response.status}`;
       } catch (error) {
-        reason = isAbort(error)
-          ? `upload took over ${budget} ms`
-          : "upload request failed";
+        if (isAbort(error)) {
+          reason = `upload took over ${budget} ms`;
+          retryable = false;
+        } else if (error instanceof TypeError) {
+          // fetch reports DNS, TLS and connection failures as TypeError.
+          reason = `upload request failed: ${error.message}`;
+        } else {
+          throw error;
+        }
       }
-      const retry = attempt < STORAGE_ATTEMPTS &&
-        this.attemptBudgetMs(remainingMs) !== null;
+      budget = retryable && attempt < STORAGE_ATTEMPTS
+        ? this.attemptBudgetMs(remainingMs)
+        : null;
       console.error(
         `storage upload attempt ${attempt} failed: ${reason}${
-          retry ? ", retrying" : ""
+          budget === null ? "" : ", retrying"
         }`,
       );
-      if (!retry) throw storageUnavailable(reason);
+      if (budget === null) throw storageUnavailable(reason);
     }
   }
 

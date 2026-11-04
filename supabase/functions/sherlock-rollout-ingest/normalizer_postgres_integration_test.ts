@@ -13,6 +13,7 @@ import {
 } from "./contract.ts";
 import { PostgresBatchNormalizer } from "./normalizer_postgres.ts";
 import {
+  findExactBeforeUpload,
   isDatabaseConnectionError,
   PostgresBatchRepository,
 } from "./postgres.ts";
@@ -1776,6 +1777,21 @@ Deno.test({
         [workspaceId],
       );
       assert(count === 1, `expected one committed batch, found ${count}`);
+
+      // An identical request that committed after this one's first lookup
+      // overlaps itself; the re-check must still answer with its receipt.
+      const raced = await sql.begin((tx) =>
+        findExactBeforeUpload(
+          tx as never,
+          attribution,
+          manifest,
+          () => Promise.resolve(null),
+        )
+      );
+      assert(
+        raced?.id === first.batch_id,
+        "a batch committed between the reads must get its receipt, not a 409",
+      );
 
       // A batch the commit would refuse is refused before its upload.
       const refusals: Array<[string, BatchManifest]> = [

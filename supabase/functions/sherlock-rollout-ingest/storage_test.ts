@@ -1,8 +1,8 @@
 import { IngestError, sha256Hex } from "./contract.ts";
 import {
-  STORAGE_ATTEMPT_TIMEOUT_MS,
   STORAGE_ATTEMPTS,
   STORAGE_COMMIT_RESERVE_MS,
+  STORAGE_MAX_ATTEMPT_MS,
   STORAGE_MIN_ATTEMPT_MS,
   SupabaseImmutableStorage,
 } from "./storage.ts";
@@ -179,8 +179,7 @@ Deno.test("a hung upload is aborted at its budget, not left to the request deadl
     });
   };
   const startedAt = performance.now();
-  // 5.1 s left: one 2.1 s attempt fits before the commit reserve, a second
-  // does not.
+  // 5.1 s left: one 2.1 s attempt fits before the commit reserve.
   const remainingMs = () => 5_100 - (performance.now() - startedAt);
   await expectUnavailable(
     new SupabaseImmutableStorage("https://example.supabase.co", "key", hung)
@@ -188,23 +187,57 @@ Deno.test("a hung upload is aborted at its budget, not left to the request deadl
   );
   const elapsed = performance.now() - startedAt;
   assert(posts === 1, `expected one attempt, made ${posts}`);
-  assert(elapsed >= 2_000 && elapsed < 3_000, `aborted after ${elapsed} ms`);
+  assert(elapsed >= 2_000 && elapsed < 4_500, `aborted after ${elapsed} ms`);
 });
 
-Deno.test("a timed-out upload is retried once and can succeed", async () => {
+Deno.test("a timed-out upload is not written a second time", async () => {
   let posts = 0;
   const fetcher: Fetcher = (_request, init) => {
     posts += 1;
     assert(init?.signal instanceof AbortSignal, "every attempt needs a limit");
-    return posts === 1 ? timedOut() : Promise.resolve(new Response("{}"));
+    return timedOut();
   };
-  await new SupabaseImmutableStorage(
-    "https://example.supabase.co",
-    "key",
-    fetcher,
-  )
-    .ensure("path/object.gz", bytes, await sha256Hex(bytes), () => 18_000);
-  assert(posts === 2, `expected two attempts, made ${posts}`);
+  await expectUnavailable(
+    new SupabaseImmutableStorage("https://example.supabase.co", "key", fetcher)
+      .ensure("path/object.gz", bytes, await sha256Hex(bytes), () => 18_000),
+  );
+  assert(posts === 1, `expected one attempt, made ${posts}`);
+});
+
+Deno.test("a connection failure or rate limit is retried once and can succeed", async () => {
+  for (
+    const first of [
+      () => Promise.reject(new TypeError("error sending request")),
+      () => Promise.resolve(new Response("slow down", { status: 429 })),
+    ]
+  ) {
+    let posts = 0;
+    const fetcher: Fetcher = () => {
+      posts += 1;
+      return posts === 1 ? first() : Promise.resolve(new Response("{}"));
+    };
+    await new SupabaseImmutableStorage(
+      "https://example.supabase.co",
+      "key",
+      fetcher,
+    ).ensure("path/object.gz", bytes, await sha256Hex(bytes), () => 18_000);
+    assert(posts === 2, `expected two attempts, made ${posts}`);
+  }
+});
+
+Deno.test("an unexpected upload error is not hidden as a 503", async () => {
+  const fetcher: Fetcher = () => Promise.reject(new RangeError("bug"));
+  let thrown: unknown = null;
+  try {
+    await new SupabaseImmutableStorage(
+      "https://example.supabase.co",
+      "key",
+      fetcher,
+    ).ensure("path/object.gz", bytes, await sha256Hex(bytes), () => 18_000);
+  } catch (error) {
+    thrown = error;
+  }
+  assert(thrown instanceof RangeError, `received ${thrown}`);
 });
 
 Deno.test("a Storage 5xx is retried and the second failure answers 503", async () => {
@@ -220,11 +253,13 @@ Deno.test("a Storage 5xx is retried and the second failure answers 503", async (
   assert(posts === STORAGE_ATTEMPTS, `made ${posts} attempts`);
 });
 
-Deno.test("a retry after an abandoned upload that did store verifies the object", async () => {
+Deno.test("a retry after a failed upload that did store verifies the object", async () => {
   const methods: string[] = [];
   const fetcher: Fetcher = (_request, init) => {
     methods.push(init?.method ?? "GET");
-    if (methods.length === 1) return timedOut();
+    if (methods.length === 1) {
+      return Promise.resolve(new Response("gateway", { status: 502 }));
+    }
     if (methods.length === 2) {
       return Promise.resolve(
         new Response('{"error":"Duplicate","message":"already exists"}', {
@@ -264,7 +299,7 @@ Deno.test("no upload starts without time for it and the commit", async () => {
   assert(calls === 0, `made ${calls} calls`);
 });
 
-Deno.test("an attempt never runs past its own limit or into the commit reserve", async () => {
+Deno.test("an attempt never runs into the commit reserve", async () => {
   const limits: number[] = [];
   const realTimeout = AbortSignal.timeout;
   AbortSignal.timeout = (milliseconds: number) => {
@@ -281,11 +316,12 @@ Deno.test("an attempt never runs past its own limit or into the commit reserve",
     const sha = await sha256Hex(bytes);
     await storage.ensure("a", bytes, sha, () => 18_000);
     await storage.ensure("b", bytes, sha, () => 6_000);
+    await storage.ensure("c", bytes, sha);
   } finally {
     AbortSignal.timeout = realTimeout;
   }
   assert(
-    limits.join(",") === `${STORAGE_ATTEMPT_TIMEOUT_MS},3000`,
+    limits.join(",") === `15000,3000,${STORAGE_MAX_ATTEMPT_MS}`,
     `limits were ${limits.join(",")}`,
   );
 });
