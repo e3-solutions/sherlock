@@ -89,7 +89,7 @@ function activeUsageNormalizerPredicate(event, session, batch, cutover) {
 // observations fall outside this window. Never mix overlapping native streams.
 // Missing baselines/regressions stay explicit rather than being hidden by a
 // fallback. Late token_count arrivals may intentionally revise prior answers.
-function tokenCountExistsPredicate(workspaceId, sessionId) {
+export function tokenCountExistsPredicate(workspaceId, sessionId) {
   return `exists (
     select 1 from telemetry.events preferred
      where preferred.workspace_id = ${workspaceId}
@@ -522,7 +522,11 @@ with p as not materialized (
     join roster r on r.person_id = s.person_id
 )`;
 
-export const QUERY_USAGE_SQL = `${USAGE_SESSIONS_SQL}, candidates as not materialized (
+// Window-independent per-event assessment over full touched-session history:
+// canonical ranking, source conflicts, model context and cumulative lags.
+// analytics.refresh_usage_contributions() embeds this exact text (see
+// usage-contributions.test.js), so a change here needs a new migration.
+export const USAGE_ASSESSED_SQL = `candidates as not materialized (
   select e.id, e.session_id, s.person_id, s.display_name, s.started_at,
          e.normalizer_version, e.event_kind, e.event_subtype, e.projection_index,
          e.canonical_scope_key, e.logical_event_key, e.usage_stream_key, e.usage_is_cumulative,
@@ -654,7 +658,9 @@ export const QUERY_USAGE_SQL = `${USAGE_SESSIONS_SQL}, candidates as not materia
          null::bigint previous_total, null::bigint previous_id,
          false stream_regressed, false missing_baseline
     from usage_attributed where not usage_is_cumulative
-), contributions as not materialized (
+)`;
+
+export const USAGE_CONTRIBUTIONS_SQL = `contributions as not materialized (
   select *,
     case when stream_regressed or source_uncertain then 0
          when not usage_is_cumulative then coalesce(input_tokens, 0)
@@ -698,7 +704,9 @@ export const QUERY_USAGE_SQL = `${USAGE_SESSIONS_SQL}, candidates as not materia
     end total_delta,
     stream_regressed regression
   from assessed where in_window
-)
+)`;
+
+const USAGE_GROUPS_SQL = `
 select person_id::text, display_name, provider, model,
        sum(input_delta)::bigint input_tokens,
        sum(cached_delta)::bigint cached_input_tokens,
@@ -737,6 +745,86 @@ select person_id::text, display_name, provider, model,
  group by person_id, display_name, provider, model
  order by lower(display_name), person_id, provider, model
  limit ${MCP_QUERY_MAX_GROUPS + 1}
+`;
+
+export const QUERY_USAGE_SQL = `${USAGE_SESSIONS_SQL}, ${USAGE_ASSESSED_SQL}, ${USAGE_CONTRIBUTIONS_SQL}${USAGE_GROUPS_SQL}`;
+
+// COR-5162: the same groups from analytics.usage_contributions, which stores
+// each usage event's assessment over full session history. Only the
+// window-dependent rules run here: event selection, and a stream's first
+// observation counting only when its session started inside the window
+// (otherwise it is a missing baseline and contributes nothing).
+export function precomputedUsageSql(relation = "analytics.usage_contributions") {
+  return `
+with p as not materialized (
+  select $1::uuid workspace_id, $2::timestamptz start_at,
+         $3::timestamptz end_at, $4::text expected_email_domain
+), roster as materialized (
+  select pe.id person_id,
+         coalesce(nullif(btrim(pe.display_name), ''), 'Unknown') display_name
+    from telemetry.people pe
+   where pe.workspace_id = $1
+     and pe.github_id is distinct from 'sherlock-smoke'
+     and split_part(pe.email, '@', 2) = $4
+     and split_part(pe.email, '@', 3) = ''
+), contributions as not materialized (
+  select u.session_id, s.person_id, r.display_name, u.provider, u.model,
+         u.usage_stream_key, u.usage_is_cumulative, u.regression, u.source_uncertain,
+         u.first_in_stream and s.started_at < p.start_at missing_baseline,
+         u.excluded or u.first_in_stream and s.started_at < p.start_at excluded,
+         case when u.first_in_stream and s.started_at < p.start_at then 0 else u.input_delta end input_delta,
+         case when u.first_in_stream and s.started_at < p.start_at then 0 else u.cached_delta end cached_delta,
+         case when u.first_in_stream and s.started_at < p.start_at then 0 else u.output_delta end output_delta,
+         case when u.first_in_stream and s.started_at < p.start_at then 0 else u.reasoning_delta end reasoning_delta,
+         case when u.first_in_stream and s.started_at < p.start_at then 0 else u.total_delta end total_delta,
+         u.input_missing, u.cached_missing, u.output_missing, u.reasoning_missing, u.total_missing
+    from ${relation} u
+    cross join p
+    join telemetry.sessions s on s.workspace_id = u.workspace_id and s.id = u.session_id
+    join roster r on r.person_id = s.person_id
+   where u.workspace_id = p.workspace_id
+     and u.usage_at >= p.start_at and u.usage_at < p.end_at
+     and s.started_at < p.end_at
+)
+select person_id::text, display_name, provider, model,
+       sum(input_delta)::bigint input_tokens,
+       sum(cached_delta)::bigint cached_input_tokens,
+       sum(output_delta)::bigint output_tokens,
+       sum(reasoning_delta)::bigint reasoning_tokens,
+       sum(total_delta)::bigint total_tokens,
+       count(distinct session_id)::bigint session_count,
+       count(*)::bigint usage_event_count,
+       array_agg(distinct session_id::text) session_ids,
+       array_agg(distinct session_id::text || ':' || usage_stream_key || ':' || usage_is_cumulative::text) stream_ids,
+       count(*) filter (where missing_baseline)::bigint missing_baseline_count,
+       array_agg(distinct session_id::text || ':' || usage_stream_key || ':' || usage_is_cumulative::text)
+         filter (where regression) regressed_stream_ids,
+       count(*) filter (where excluded)::bigint excluded_usage_events,
+       count(*) filter (where source_uncertain)::bigint conflicting_source_events,
+       count(*) filter (where model = 'unknown')::bigint missing_model_observations,
+       array_remove(array[
+         case when bool_or(input_missing) then 'input' end,
+         case when bool_or(cached_missing) then 'cachedInput' end,
+         case when bool_or(output_missing) then 'output' end,
+         case when bool_or(reasoning_missing) then 'reasoning' end,
+         case when bool_or(total_missing) then 'total' end
+       ], null) missing_token_components
+ from contributions
+ group by person_id, display_name, provider, model
+ order by lower(display_name), person_id, provider, model
+ limit ${MCP_QUERY_MAX_GROUPS + 1}
+`;
+}
+
+export const PRECOMPUTED_USAGE_SQL = precomputedUsageSql();
+
+// The precomputed table answers a window only when backfill has covered its
+// start and the minute refresh is current; otherwise the live query runs.
+export const USAGE_CONTRIBUTION_STATE_SQL = `
+select backfill_cursor, refreshed_at
+  from analytics.usage_contribution_state
+ where workspace_id = $1 and refreshed_at >= now() - interval '10 minutes'
+   and backfill_cursor <= $2::timestamptz
 `;
 
 export const LIST_SESSIONS_SQL = `
@@ -982,7 +1070,10 @@ export function createSherlockQuerySource(source) {
         // sorts full touched-session histories; the 4MB default spills heavily
         // at month-scale volume. SET LOCAL resets when the transaction ends.
         await runQuery(tx, "set local work_mem = '16MB'", undefined, signal);
-        const rows = await runQuery(tx, QUERY_USAGE_SQL, [
+        const precomputed = await runQuery(tx, USAGE_CONTRIBUTION_STATE_SQL, [
+          source.workspaceId, window.startAt.toISOString(),
+        ], signal);
+        const rows = await runQuery(tx, precomputed.length > 0 ? PRECOMPUTED_USAGE_SQL : QUERY_USAGE_SQL, [
           source.workspaceId,
           window.startAt.toISOString(),
           window.endAt.toISOString(),
