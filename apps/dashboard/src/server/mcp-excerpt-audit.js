@@ -1,8 +1,10 @@
 import { FlameSourceError } from "./flame-source.js";
 import { runQuery } from "./mcp-query-source.js";
 
+// The rows travel as text: postgres.js JSON-encodes a parameter it infers as
+// jsonb, which would turn an already-serialized array into a JSON string.
 export const RECORD_EXCERPT_READS_SQL =
-  "select sherlock_audit.record_excerpt_reads($1::uuid, $2::jsonb) written";
+  "select sherlock_audit.record_excerpt_reads($1::uuid, $2::text::jsonb) written";
 
 const AUDIT_FILTERS = `
  where workspace_id = $1 and read_at >= $2::timestamptz and read_at < $3::timestamptz
@@ -143,15 +145,23 @@ export function createExcerptAuditWriter({
         buffer = buffer.slice(batch.length);
         failing = false;
       } catch (error) {
-        failing = true;
         // SQLSTATE and routine only: database messages can echo row values.
+        const sqlstate = error?.cause?.code ?? null;
         log({
           event: "sherlock_excerpt_audit_write_failed",
           rows: batch.length,
           code: error?.code ?? null,
-          sqlstate: error?.cause?.code ?? null,
+          sqlstate,
           routine: error?.cause?.routine ?? null,
         });
+        // Data and constraint errors (classes 22, 23) fail the same way on
+        // every retry: drop that batch instead of blocking the queue.
+        if (typeof sqlstate === "string" && /^2[23]/.test(sqlstate)) {
+          buffer = buffer.slice(batch.length);
+          log({ event: "sherlock_excerpt_audit_dropped", rows: batch.length });
+          continue;
+        }
+        failing = true;
         schedule();
         return;
       } finally {
