@@ -22,6 +22,7 @@ const START = "2026-01-01T00:00:00.000Z";
 const END = "2026-01-01T12:00:00.000Z";
 const READ_AT = "2026-01-02T00:00:00.000Z";
 const AFTER_READ = "2026-01-02T00:00:00.001Z";
+const WIDE_PLAN_START = "2025-06-01T00:00:00.000Z";
 
 // Sanitized current production privacy helpers and reader policies (pg_get_functiondef
 // bodies and pg_policies.qual). The privacy schema is optional and absent from migrations.
@@ -911,11 +912,14 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
           tsquery, bigint[], uuid[], uuid[], boolean) as ${body}`);
       const execute = async (call, windowFirst) => {
         const [{ "QUERY PLAN": plan }] = await tx.unsafe(`
-          explain (analyze, buffers, format json) execute excerpt_plan('${workspace}', '${START}', '${END}', '${READ_AT}',
+          explain (analyze, buffers, format json) execute excerpt_plan('${workspace}',
+            '${windowFirst ? START : WIDE_PLAN_START}', '${END}', '${READ_AT}',
             'e3group.ai', ${call % 2 ? `'${person.id}'` : "null"}, null, 2000,
             websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}', ${windowFirst})`);
         return { rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) };
       };
+      // The GIN path serves windows over 25 hours; this one spans every decoy,
+      // where reading by time would visit all 50,001 rows for one match.
       // Seven calls each: past the five custom plans a generic plan could replace.
       const owner = [];
       const windowFirst = [];
