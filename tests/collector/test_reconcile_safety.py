@@ -782,8 +782,107 @@ class ProjectExclusionTests(unittest.TestCase):
             EXCLUDED_PROJECT,
         )
 
+    def test_folder_name_patterns_cover_matching_siblings_made_later(self):
+        # COR-5002: "/private/tmp/aeyron-*" must cover new aeyron-* folders.
+        policy = self.policy(f"{self.root / 'work'}/private-*")
+        self.assertTrue(policy.project_excluded(str(self.sibling)))
+        self.assertTrue(policy.project_excluded(str(self.root / "work" / "private-new" / "deep")))
+        self.assertFalse(policy.project_excluded(str(self.project)))
+        self.assertFalse(policy.project_excluded(str(self.root / "work")))
+        self.assertFalse(policy.project_excluded(str(self.root / "elsewhere" / "private-x")))
+        self.assertEqual(policy.blocked_reason("claude_code", str(uuid.uuid4()),
+                                               observed_cwds=[str(self.sibling / "a")]), EXCLUDED_PROJECT)
+        # A plain path still covers only itself and what is inside it.
+        plain = self.policy(self.project)
+        self.assertTrue(plain.project_excluded(str(self.project / "sub")))
+        self.assertFalse(plain.project_excluded(str(self.sibling)))
+
+    def test_folder_name_patterns_match_through_a_symlinked_parent(self):
+        (self.root / "alias").symlink_to(self.root / "work")
+        policy = self.policy(f"{self.root / 'alias'}/private-*")
+        self.assertTrue(policy.project_excluded(str(self.sibling)))
+
+    def test_cli_adds_and_removes_folder_name_patterns(self):
+        path = self.root / "session-exclusions.json"
+        pattern = f"{self.root / 'work'}/private-*"
+        self.assertEqual(update_project_exclusions(add=[pattern], path=path), [pattern])
+        with patch.dict(os.environ, {"SHERLOCK_HOME": str(self.root)}):
+            self.assertTrue(load_policy().project_excluded(str(self.root / "work" / "private-later")))
+        self.assertEqual(update_project_exclusions(remove=[pattern], path=path), [])
+        for bad in ("/*", "//*", f"{self.root}/a**"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                update_project_exclusions(add=[bad], path=path)
+        # A * that does not end the last folder name stays a literal path, as before.
+        literal = update_project_exclusions(add=[f"{self.root}/a*b"], path=path)
+        self.assertEqual(literal, [f"{self.root}/a*b"])
+        with patch.dict(os.environ, {"SHERLOCK_HOME": str(self.root)}):
+            self.assertFalse(load_policy().project_excluded(str(self.root / "aXb")))
+
+    def test_folder_name_patterns_follow_no_symlinked_matches_and_no_remotes(self):
+        # A matching link to "/", home or an E3 checkout must not exclude it, and a
+        # matching folder carrying an E3 repository's remote must not exclude that repo.
+        secret = self.root / "secret"
+        (secret / "sub").mkdir(parents=True)
+        (self.root / "work" / "private-link").symlink_to(secret)
+        (self.root / "work" / "private-root").symlink_to("/")
+        (self.sibling / ".git").mkdir()
+        (self.sibling / ".git" / "config").write_text(
+            '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/Shared.git\n')
+        policy = self.policy(f"{self.root / 'work'}/private-*")
+        self.assertTrue(policy.project_excluded(str(self.root / "work" / "private-link" / "sub")))
+        self.assertFalse(policy.project_excluded(str(secret / "sub")))
+        self.assertFalse(policy.project_excluded(str(self.root / "elsewhere")))
+        self.assertEqual(policy._excluded_repositories(), frozenset())
+        self.assertIsNone(policy._session_reason(str(self.root / "elsewhere"), "https://github.com/acme/shared"))
+
+    def test_folder_name_patterns_resolve_symlinks_before_parent_references(self):
+        target = self.root / "x" / "y"
+        target.mkdir(parents=True)
+        (self.root / "x" / "cfoo").mkdir()
+        (self.root / "work" / "lnk").symlink_to(target)
+        policy = self.policy(f"{self.root / 'work'}/lnk/../c*")
+        self.assertTrue(policy.project_excluded(str(self.root / "x" / "cfoo" / "z")))
+
+    def test_a_pattern_under_a_parent_whose_real_name_has_a_star_still_loads(self):
+        (self.root / "we*ird").mkdir()
+        (self.root / "lnk").symlink_to(self.root / "we*ird")
+        policy = self.policy(f"{self.root}/lnk/aey-*")
+        self.assertIsNone(policy.error)
+        self.assertTrue(policy.project_excluded(str(self.root / "we*ird" / "aey-1")))
+
+    def test_a_pattern_with_a_trailing_dot_reads_as_the_pattern(self):
+        policy = self.policy(f"{self.root / 'work'}/private-*/.")
+        self.assertIsNone(policy.error)
+        self.assertTrue(policy.project_excluded(str(self.sibling)))
+
+    def test_include_project_removes_a_plain_entry_whose_real_name_ends_with_a_star(self):
+        (self.root / "bar*").mkdir()
+        (self.root / "tlink").symlink_to(self.root / "bar*")
+        path = self.root / "p.json"
+        path.write_text(json.dumps({"version": 1, "excluded_project_paths": [str(self.root / "tlink")]}))
+        self.assertEqual(update_project_exclusions(remove=[str(self.root / "tlink")], path=path), [])
+
+    def test_patterns_whose_parent_is_the_root_fail_closed(self):
+        (self.root / "rootlink").symlink_to("/")
+        for value in (["//*"], [f"{self.root}/rootlink/*"]):
+            with self.subTest(value=value):
+                policy = write_policy(self.root, excluded_project_paths=value)
+                self.assertEqual(policy.blocked_reason("codex", str(uuid.uuid4())), UNREADABLE)
+        with self.assertRaises(ValueError):
+            update_project_exclusions(add=[f"{self.root}/rootlink/*"], path=self.root / "p.json")
+
+    def test_a_folder_whose_real_name_ends_with_a_star_is_refused_by_path(self):
+        (self.root / "bar*").mkdir()
+        (self.root / "tlink").symlink_to(self.root / "bar*")
+        with self.assertRaises(ValueError):
+            update_project_exclusions(add=[str(self.root / "tlink")], path=self.root / "p.json")
+        # Loaded from a hand-edited file, its resolved spelling stays literal.
+        policy = self.policy(self.root / "tlink")
+        self.assertTrue(policy.project_excluded(str(self.root / "bar*" / "x")))
+        self.assertFalse(policy.project_excluded(str(self.root / "barbaz")))
+
     def test_invalid_project_entries_fail_closed(self):
-        for value in (["relative/path"], [""], ["/"], "/not/a/list", [7]):
+        for value in (["relative/path"], [""], ["/"], "/not/a/list", [7], ["/*"], ["/tmp/a**"]):
             with self.subTest(value=value):
                 policy = write_policy(self.root, excluded_project_paths=value)
                 self.assertEqual(policy.blocked_reason("codex", str(uuid.uuid4())), UNREADABLE)

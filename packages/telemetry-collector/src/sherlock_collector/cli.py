@@ -20,7 +20,9 @@ from .config import (
 from .drain import Drain
 from .exclusions import (
     _path_key,
+    _resolved_project_path,
     excluded_project_paths,
+    is_project_pattern,
     policy_path,
     update_project_exclusions,
 )
@@ -84,7 +86,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("drain")
     commands.add_parser("health")
     exclude_project = commands.add_parser(
-        "exclude-project", help="never capture or upload sessions in these directories"
+        "exclude-project",
+        help="never capture or upload sessions in these directories; quote a name pattern "
+             "such as '/private/tmp/aeyron-*' so the shell does not expand it"
     )
     exclude_project.add_argument("path", nargs="+")
     include_project = commands.add_parser(
@@ -99,14 +103,14 @@ def _project_exclusions(command: str, paths: list[str]) -> int:
     try:
         if command == "exclude-project":
             for value in paths:
-                if not os.path.isdir(os.path.expanduser(value)):
+                if not is_project_pattern(value) and not os.path.isdir(os.path.expanduser(value)):
                     print(f"warning: {value} is not an existing directory; excluding it anyway",
                           file=sys.stderr)
         elif command == "include-project":
             listed = excluded_project_paths()
-            listed = {_path_key(v) for v in listed} | {_path_key(os.path.realpath(v)) for v in listed}
+            listed = {_path_key(v) for v in listed} | {_path_key(_resolved_project_path(v)) for v in listed}
             for value in paths:
-                if _path_key(os.path.realpath(os.path.expanduser(value))) not in listed:
+                if _path_key(_resolved_project_path(value)) not in listed:
                     print(f"warning: {value} was not excluded", file=sys.stderr)
         projects = (
             excluded_project_paths()

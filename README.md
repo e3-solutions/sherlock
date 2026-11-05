@@ -67,6 +67,17 @@ before the initial backfill, or manage the list later from any checkout:
 ./sherlock excluded-projects
 ```
 
+To cover folders that share a name prefix, including ones made later, end the
+last folder name with `*`: `./sherlock exclude-project '/private/tmp/aeyron-*'`
+excludes every folder in `/private/tmp` whose name starts with `aeyron-`. Quote
+it so the shell does not expand it. `*` means a pattern only at the end of the
+last folder name. Runtimes older than this read a pattern as a plain path that
+matches nothing, so update the collector before relying on one; plain entries
+keep working either way.
+Patterns match by folder path only: they follow no symlinked matching folder
+and read no git remote, so add a checkout as a plain entry to also exclude
+Codex sessions of its removed worktrees.
+
 A session is excluded when its working directory is that directory, is inside
 it, or is inside a git worktree (or a repository nested in one) whose main
 checkout is inside it; on macOS paths match case-insensitively. Codex threads
