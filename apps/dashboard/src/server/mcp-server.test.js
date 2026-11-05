@@ -229,6 +229,19 @@ it("audits list_sessions and get_session reads by session and owner without limi
   });
 });
 
+it("logs each tool call's response size without arguments or content", async () => {
+  const events = [];
+  const client = await connect(searchDatabase().source, { log: (event) => events.push(event) });
+  const docs = await client.callTool({ name: "documentation", arguments: {} });
+  await client.callTool({ name: "search_sessions", arguments: { query: "ocr" } });
+  expect(events[0]).toEqual({
+    event: "sherlock_mcp_result", tool: "documentation", error: false,
+    bytes: Buffer.byteLength(docs.content[0].text, "utf8"),
+  });
+  expect(events[1]).toMatchObject({ tool: "search_sessions", error: false });
+  expect(JSON.stringify(events)).not.toContain("ocr");
+});
+
 it("hides the retired evidence tools by default and stops documenting them", async () => {
   const tools = registeredTools({ fetchUsageEvidence: vi.fn(), fetchProviderUsage: vi.fn() }, { retiredTools: false });
   const retired = ["list_usage_evidence", "list_prompt_evidence", "list_provider_usage"];
@@ -388,7 +401,7 @@ afterEach(async () => {
 });
 
 async function connect(searchSource, {
-  guard = null, identitySecret = "", pass = null, auditStore = null, retiredTools = true,
+  guard = null, identitySecret = "", pass = null, auditStore = null, retiredTools = true, log = null,
 } = {}) {
   const token = "s".repeat(MCP_TOKEN_MIN_LENGTH);
   const source = createCachedMcpSource({
@@ -396,7 +409,7 @@ async function connect(searchSource, {
     source: { fetchPromptEvidence: vi.fn() },
     ...(searchSource ? { searchSource } : {}),
   });
-  const protocol = createBonaparteMcpProtocol(source, { guard, auditStore, retiredTools });
+  const protocol = createBonaparteMcpProtocol(source, { guard, auditStore, retiredTools, log });
   openProtocols.push(protocol);
   const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token, identitySecret });
   const httpServer = createServer((request, response) => void route(request, response));

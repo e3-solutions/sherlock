@@ -112,6 +112,7 @@ const mcpProtocol = mcpSource
   ? createBonaparteMcpProtocol(mcpSource, {
       guard: createExcerptGuard({ audit: excerptAuditWriter }),
       auditStore: excerptAuditStore,
+      log: (event) => console.log(JSON.stringify(event)),
     })
   : null;
 
