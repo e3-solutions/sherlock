@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(152);
+select plan(153);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -220,6 +220,17 @@ select ok(
       and indexdef like '%WHERE ((event_kind = ANY (ARRAY[''message''::text, ''agent_message''::text])) AND (NOT is_replay))%'
   ),
   'date-ranged message search has a window index to AND with the GIN match'
+);
+select ok(
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'telemetry'
+      and tablename = 'events'
+      and indexname = 'events_message_search_time_idx'
+      and indexdef like '%USING gin (occurred_at, message_search)%'
+      and indexdef like '%WHERE ((event_kind = ANY (ARRAY[''message''::text, ''agent_message''::text])) AND (NOT is_replay))%'
+  ),
+  'wide-window message search has a combined time and text GIN index'
 );
 select ok(
   exists (
