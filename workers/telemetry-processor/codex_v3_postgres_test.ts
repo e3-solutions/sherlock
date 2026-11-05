@@ -528,3 +528,295 @@ for (
     fn: () => continuingSessionTest.fn(version),
   });
 }
+
+Deno.test({
+  name:
+    "Codex fork hooks become one primary session whose prompt the rollout copy collapses",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const version = "sherlock.codex-rollout.v4";
+    const sql = postgres(databaseUrl!, { prepare: false, max: 3 });
+    const normalizer = new PostgresBatchNormalizer(sql);
+    const repository = new PostgresBatchRepository(sql);
+    const projector = new PostgresFrameEvidenceProjector(sql);
+    const workspaceId = crypto.randomUUID();
+    const personId = crypto.randomUUID();
+    const attribution = {
+      workspace_id: workspaceId,
+      person_id: personId,
+      collector_key: "codex-hook-test",
+    };
+    const now = new Date();
+    const at = new Date(
+      Math.floor(now.getTime() / 600_000) * 600_000 - 1_200_000,
+    );
+    const stamp = (offsetMs: number) =>
+      new Date(at.getTime() + offsetMs).toISOString().replace(
+        /Z$/,
+        "000Z",
+      );
+    const forkId = crypto.randomUUID();
+    const parentId = crypto.randomUUID();
+    const prompt = "Sanitized side question";
+    async function hook(
+      dispatchEventName: string,
+      payload: Record<string, unknown>,
+      offsetMs: number,
+      parent: string | null = null,
+    ) {
+      const bytes = new TextEncoder().encode(JSON.stringify({
+        hook_event_name: dispatchEventName,
+        session_id: forkId,
+        cwd: "/repo",
+        model: "gpt-5.5-codex",
+        transcript_path: null,
+        ...payload,
+      }));
+      return {
+        type: "codex_hook",
+        schema_version: "sherlock.codex-hook.v1",
+        collector_observed_at: stamp(offsetMs),
+        timestamp: stamp(offsetMs),
+        dispatch_event_name: dispatchEventName,
+        payload_sha256: await sha256Hex(bytes),
+        payload_base64: btoa(String.fromCharCode(...bytes)),
+        native_session_id: forkId,
+        parent_native_session_id: parent,
+        session_source: "fork",
+        git: {
+          repository_url: "https://github.com/e3-solutions/sherlock.git",
+          branch: "main",
+        },
+      };
+    }
+    async function upload(
+      sourceKind: "hook" | "rollout",
+      records: Array<Record<string, unknown> & { timestamp: string }>,
+      parent: string | null = null,
+    ) {
+      const parts = records.map((record) =>
+        new TextEncoder().encode(JSON.stringify(record) + "\n")
+      );
+      const source = new Uint8Array(
+        parts.reduce((size, part) => size + part.length, 0),
+      );
+      let offset = 0;
+      const locators: BatchManifest["records"] = [];
+      for (const [index, part] of parts.entries()) {
+        source.set(part, offset);
+        const payload = records[index].payload as
+          | Record<string, unknown>
+          | undefined;
+        locators.push({
+          record_index: index,
+          source_start_offset: offset,
+          source_end_offset: offset + part.length,
+          record_sha256: await sha256Hex(part),
+          native_type: String(records[index].type),
+          native_payload_type: typeof payload?.type === "string"
+            ? payload.type
+            : null,
+          occurred_at: records[index].timestamp,
+          parse_status: "ok",
+        });
+        offset += part.length;
+      }
+      const hash = await sha256Hex(source);
+      const manifest: BatchManifest = {
+        contract_version: CONTRACT_VERSION,
+        source_provider: "codex",
+        source_kind: sourceKind,
+        source_stream_key: crypto.randomUUID(),
+        generation_key: crypto.randomUUID(),
+        generation_seq: 0,
+        start_offset: 0,
+        end_offset: source.length,
+        source_byte_count: source.length,
+        source_sha256: hash,
+        storage_encoding: "gzip",
+        stored_byte_count: source.length,
+        stored_sha256: hash,
+        record_count: records.length,
+        records: locators,
+        observed_native_session_id: forkId,
+        observed_parent_native_session_id: parent,
+        first_occurred_at: records[0].timestamp,
+        last_occurred_at: records.at(-1)!.timestamp,
+        codex_version: "test",
+        source_version: "test",
+        collector_version: "test",
+      };
+      const receipt = await repository.commit(
+        attribution,
+        manifest,
+        storagePath(attribution, manifest),
+        null,
+      );
+      const jobs = await sql.unsafe(
+        "select normalizer_version from processing.telemetry_jobs where workspace_id=$1 and batch_id=$2",
+        [workspaceId, receipt.batch_id],
+      );
+      assert(
+        jobs.length === 1 && jobs[0].normalizer_version === version,
+        `a Codex ${sourceKind} batch must enqueue one ${version} job`,
+      );
+      return await normalizer.normalize(
+        receipt,
+        manifest,
+        source,
+        undefined,
+        undefined,
+        version,
+      );
+    }
+    try {
+      await sql.unsafe(
+        "insert into telemetry.workspaces(id,slug,name,created_at) values ($1::uuid,$1::text,'Codex hook test',$2)",
+        [workspaceId, new Date(at.getTime() - 3_600_000)],
+      );
+      await sql.unsafe(
+        "insert into telemetry.people(id,workspace_id,identity_key,display_name,email) values($1::uuid,$2,$1::text,'Codex hook test','codex-hook@e3group.ai')",
+        [personId, workspaceId],
+      );
+      // One observation per batch, as the collector writes them.
+      const started = await upload(
+        "hook",
+        [
+          await hook(
+            "SessionStart",
+            { source: "fork", forked_from_id: parentId },
+            0,
+            parentId,
+          ),
+        ],
+        parentId,
+      );
+      const sessionId = started.session_ids[0];
+      await upload("hook", [
+        await hook("UserPromptSubmit", { turn_id: "turn-1", prompt }, 1_000),
+      ]);
+      await upload("hook", [
+        await hook(
+          "Stop",
+          {
+            turn_id: "turn-1",
+            stop_hook_active: false,
+            last_assistant_message: "Sanitized side answer",
+          },
+          5_000,
+        ),
+      ]);
+      const [session] = await sql.unsafe(
+        `select actor_role, parent_native_session_id, cwd, model, repo_remote,
+                branch, title, role_version
+           from telemetry.sessions where workspace_id=$1 and id=$2`,
+        [workspaceId, sessionId],
+      );
+      assert(
+        session.actor_role === "primary" &&
+          session.parent_native_session_id === parentId &&
+          session.cwd === "/repo" && session.model === "gpt-5.5-codex" &&
+          session.repo_remote ===
+            "https://github.com/e3-solutions/sherlock.git" &&
+          session.branch === "main" && session.title === null &&
+          session.role_version === "sherlock.codex-role.v1",
+        "later prompt-only hook batches must not erase the SessionStart role",
+      );
+      const hookEvents = await sql.unsafe(
+        `select event_kind, event_subtype, actor_role, source_kind,
+                source_priority, logical_event_key, message_origin, error_code
+           from telemetry.events
+          where workspace_id=$1 and session_id=$2 and normalizer_version=$3
+          order by id`,
+        [workspaceId, sessionId, version],
+      );
+      assert(
+        hookEvents.map((event) => event.event_subtype).join(",") ===
+            "session_start,user_message,agent_message" &&
+          hookEvents.every((event) =>
+            event.source_kind === "hook" && event.source_priority === 90 &&
+            event.actor_role === "primary" && event.error_code === null
+          ),
+        "hook events must be valid primary-session facts below rollout priority",
+      );
+
+      const window = { workspaceId, sessionId, now };
+      await projector.projectSession({ ...window, requestGeneration: 1n });
+      const promptsBefore = await sql.unsafe(
+        `select source_event_id::text, message_origin, actor_role
+           from analytics.frame_evidence_revisions
+          where workspace_id=$1 and session_id=$2 and evidence_kind='prompt'
+            and not is_tombstone`,
+        [workspaceId, sessionId],
+      );
+      assert(
+        promptsBefore.length === 1 &&
+          promptsBefore[0].message_origin === "human" &&
+          promptsBefore[0].actor_role === "primary",
+        "the fork's hook prompt must count as one human prompt",
+      );
+
+      // A rollout copy of the same turn, should one ever exist, collapses
+      // into the same prompt and outranks the hook copy.
+      await upload("rollout", [
+        {
+          timestamp: stamp(0),
+          type: "session_meta",
+          payload: { id: forkId, source: "cli" },
+        },
+        {
+          timestamp: stamp(1_000),
+          type: "event_msg",
+          payload: { type: "user_message", message: prompt, turn_id: "turn-1" },
+        },
+      ]);
+      await projector.projectSession({ ...window, requestGeneration: 2n });
+      const prompts = await sql.unsafe(
+        `select distinct on (prompt_identity) prompt_identity,
+                source_event_id::text source_event_id, is_tombstone
+           from analytics.frame_evidence_revisions
+          where workspace_id=$1 and session_id=$2 and evidence_kind='prompt'
+          order by prompt_identity, id desc`,
+        [workspaceId, sessionId],
+      );
+      const live = prompts.filter((row) => !row.is_tombstone);
+      const [rolloutPrompt] = await sql.unsafe(
+        `select e.id::text id from telemetry.events e
+           where e.workspace_id=$1 and e.session_id=$2
+             and e.normalizer_version=$3 and e.source_kind='rollout'
+             and e.event_subtype='user_message'`,
+        [workspaceId, sessionId, version],
+      );
+      assert(
+        live.length === 1 && live[0].source_event_id === rolloutPrompt.id,
+        "hook and rollout copies of one turn must be one prompt",
+      );
+    } finally {
+      for (
+        const table of [
+          "analytics.activity_spans",
+          "processing.telemetry_jobs",
+          "analytics.frame_projection_activations",
+          "analytics.frame_evidence_revisions",
+          "analytics.frame_projection_receipts",
+          "telemetry.events",
+          "telemetry.session_scm",
+          "telemetry.native_records",
+          "telemetry.ingest_batches",
+          "telemetry.sessions",
+          "telemetry.people",
+        ]
+      ) {
+        await sql.unsafe(`delete from ${table} where workspace_id=$1`, [
+          workspaceId,
+        ]);
+      }
+      await sql.unsafe("delete from telemetry.workspaces where id=$1", [
+        workspaceId,
+      ]);
+      await sql.end();
+    }
+  },
+});

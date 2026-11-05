@@ -25,12 +25,19 @@ import {
   WorkerProgressWatchdog,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
-import type { BatchManifest } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
+import {
+  type BatchManifest,
+  CONTRACT_VERSION,
+  sha256Hex,
+} from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
 import {
   CLAUDE_NORMALIZER_VERSION,
+  CODEX_V4_NORMALIZER_VERSION,
   LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
+  projectBatch,
 } from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
+import { validateStoredBatch } from "../../supabase/functions/sherlock-rollout-ingest/service.ts";
 import {
   normalizationTarget,
   recordLocatorFromRow,
@@ -68,6 +75,82 @@ Deno.test("version-aware workers keep pre-migration jobs on provider v1", () => 
   assert(normalizationTarget(null, codex) === LEGACY_CODEX_NORMALIZER_VERSION);
   assert(normalizationTarget(null, claude) === CLAUDE_NORMALIZER_VERSION);
   assert(normalizationTarget(NORMALIZER_VERSION, codex) === NORMALIZER_VERSION);
+});
+
+Deno.test("Codex hook batches reach the hook projection at the job's version", async () => {
+  const sessionId = "019a5c5e-7c1d-7d2e-8f3a-4b5c6d7e8f90";
+  const payload = new TextEncoder().encode(JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: sessionId,
+    turn_id: "turn-1",
+    transcript_path: null,
+    prompt: "Sanitized side question",
+  }));
+  const record = new TextEncoder().encode(`${
+    JSON.stringify({
+      type: "codex_hook",
+      schema_version: "sherlock.codex-hook.v1",
+      collector_observed_at: "2026-11-05T18:00:01.000000Z",
+      timestamp: "2026-11-05T18:00:01.000000Z",
+      dispatch_event_name: "UserPromptSubmit",
+      payload_sha256: await sha256Hex(payload),
+      payload_base64: btoa(String.fromCharCode(...payload)),
+      native_session_id: sessionId,
+      parent_native_session_id: null,
+      session_source: "fork",
+      git: { repository_url: null, branch: null },
+    })
+  }\n`);
+  const stored = new Uint8Array(
+    await new Response(
+      new Blob([record]).stream().pipeThrough(new CompressionStream("gzip")),
+    ).arrayBuffer(),
+  );
+  const manifest: BatchManifest = {
+    contract_version: CONTRACT_VERSION,
+    source_provider: "codex",
+    source_kind: "hook",
+    source_stream_key: "codex-hook-stream",
+    generation_key: "codex-hook-generation",
+    generation_seq: 0,
+    start_offset: 0,
+    end_offset: record.byteLength,
+    source_byte_count: record.byteLength,
+    source_sha256: await sha256Hex(record),
+    storage_encoding: "gzip",
+    stored_byte_count: stored.byteLength,
+    stored_sha256: await sha256Hex(stored),
+    record_count: 1,
+    records: [{
+      record_index: 0,
+      source_start_offset: 0,
+      source_end_offset: record.byteLength,
+      record_sha256: await sha256Hex(record),
+      native_type: "codex_hook",
+      native_payload_type: null,
+      occurred_at: "2026-11-05T18:00:01.000000Z",
+      parse_status: "ok",
+    }],
+    observed_native_session_id: sessionId,
+    observed_parent_native_session_id: null,
+    first_occurred_at: "2026-11-05T18:00:01.000000Z",
+    last_occurred_at: "2026-11-05T18:00:01.000000Z",
+    codex_version: "0.56.0",
+    source_version: "0.56.0",
+    collector_version: "test",
+  };
+  // The worker re-validates the stored batch before it normalizes.
+  const source = await validateStoredBatch(manifest, stored);
+  for (const requested of [CODEX_V4_NORMALIZER_VERSION, null]) {
+    const version = normalizationTarget(requested, manifest);
+    const [event] = (await projectBatch(manifest, source, version)).events;
+    assert(
+      event.event_subtype === "user_message" && event.source_priority === 90 &&
+        event.logical_event_key === "message:user:turn-1" &&
+        event.error_code === null,
+      `${version} must use the Codex hook projection`,
+    );
+  }
 });
 
 Deno.test("configuration is bounded and secrets remain required", () => {
