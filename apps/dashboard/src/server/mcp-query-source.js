@@ -854,6 +854,10 @@ with page as materialized (
           and activity.occurred_at >= $2 and activity.occurred_at < $3
           and activity.server_received_at <= $4
      ))
+     -- started_at is the earliest event time, so a session starting at or
+     -- after the window end cannot have activity inside it; this skips the
+     -- activity probe for every newer session when paging a past window.
+     and s.started_at < $3
      and s.created_at <= $4
      and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = $5 and split_part(pe.email, '@', 3) = ''
@@ -867,24 +871,29 @@ select page.id::text session_id, page.person_id::text, page.display_name,
        page.actor_role, coalesce(nullif(btrim(page.model), ''), 'unknown') model,
        page.started_at, page.ended_at, page.parent_session_id::text,
        page.created_at, page.created_at::text cursor_created_at,
-       activity.last_activity_at, provider.normalizer_version
+       activity.last_activity_at,
+       -- Provider is one family per session, so the latest in-window event's
+       -- version is enough. Only when it has none, probe the session's events
+       -- newest id first and stop at the first known version; ordering every
+       -- event by server_received_at read ~500 rows per listed session.
+       coalesce(
+         case when activity.normalizer_version = any($11::text[]) then activity.normalizer_version end,
+         (select e.normalizer_version
+            from telemetry.events e
+           where e.workspace_id = $1 and e.session_id = page.id and not e.is_replay
+             and e.normalizer_version = any($11::text[])
+             and e.server_received_at <= $4
+           order by e.id desc limit 1)
+       ) normalizer_version
   from page
   left join lateral (
-    select e.occurred_at last_activity_at
+    select e.occurred_at last_activity_at, e.normalizer_version
       from telemetry.events e
      where e.workspace_id = $1 and e.session_id = page.id and not e.is_replay
        and e.occurred_at >= $2 and e.occurred_at < $3
        and e.server_received_at <= $4
      order by e.occurred_at desc, e.id desc limit 1
   ) activity on true
-  left join lateral (
-    select e.normalizer_version
-      from telemetry.events e
-     where e.workspace_id = $1 and e.session_id = page.id and not e.is_replay
-       and e.normalizer_version = any($11::text[])
-       and e.server_received_at <= $4
-     order by e.server_received_at desc, e.id desc limit 1
-  ) provider on true
  order by page.created_at desc, page.id desc
 `;
 
