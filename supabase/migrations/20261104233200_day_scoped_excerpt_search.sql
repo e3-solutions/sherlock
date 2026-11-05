@@ -85,8 +85,8 @@ begin
 
   -- A wider window names its UTC days, from the first stored message on (the
   -- default window starts in 1970), so events_message_search_day_idx reads
-  -- one exact day entry per day intersected with the words. Over 400 days it
-  -- keeps the plain match on events_message_search_idx.
+  -- one exact day entry per day intersected with the words. A span of 400
+  -- days or more (both ends counted) keeps the plain text-only match.
   if not v_window_first then
     select min(e.occurred_at) into v_first_message
       from telemetry.events e

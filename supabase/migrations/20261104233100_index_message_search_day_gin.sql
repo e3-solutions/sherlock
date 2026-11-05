@@ -78,6 +78,10 @@ set maintenance_work_mem = '256MB';
 create index concurrently if not exists events_message_search_day_idx
   on telemetry.events
   using gin (((occurred_at at time zone 'UTC')::date), message_search)
+  -- A search names up to 400 days and each day is its own GIN lookup; with a
+  -- pending list every lookup would rescan it. ~24k messages a day insert
+  -- straight into the tree instead.
+  with (fastupdate = off)
   where event_kind in ('message', 'agent_message') and not is_replay;
 
 reset maintenance_work_mem;
