@@ -26,7 +26,7 @@ Data model and roles: `docs/data-schema.md` ("Database roles"). Production proje
   - `apply_migration` wraps the file in one transaction, where `CONCURRENTLY` fails
     (Nov 4). For a small table (under ~100k rows, a build well under a second) a
     plain `create index` with `lock_timeout 1s` is used instead, as in
-    `20261105213000_sessions_created_keyset_indexes.sql`; say so in the PR.
+    `20261105213443_sessions_created_keyset_indexes.sql`; say so in the PR.
   - Other DDL: a short `lock_timeout` so it fails fast instead of queueing behind traffic.
   - On Nov 4, hand-run queries overlapping an ingest stall made an outage worse.
 - **Least privilege.** Grant to the narrow roles (for example `sherlock_ingest`,
