@@ -37,6 +37,7 @@ working directory.
 from __future__ import annotations
 
 import base64
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -101,11 +102,26 @@ def _id_list(raw: dict, key: str) -> frozenset[str] | None:
 
 
 PATTERN = "*"
+# Pattern keys carry this mark, which no path can contain, so a resolved plain
+# path that happens to end with "*" is never read as a pattern.
+_PATTERN_KEY = "\0"
+# A pattern's parent is listed at most this far when finding existing matches.
+MAX_PATTERN_MATCHES = 10_000
 
 
 def is_project_pattern(path: str) -> bool:
     """Whether a configured project entry is a folder-name pattern (``parent/name*``)."""
-    return path.endswith(PATTERN)
+    return isinstance(path, str) and bool(path.strip()) and \
+        os.path.normpath(os.path.expanduser(path.strip())).endswith(PATTERN)
+
+
+def _check_pattern(path: str) -> None:
+    parent, name = os.path.split(path)
+    if PATTERN in parent or name.count(PATTERN) != 1 or not name.endswith(PATTERN):
+        raise ValueError("a project pattern may use * only at the end of its last folder name")
+    # The resolved parent too: "//x*" or a parent linked to "/" must not cover everything.
+    if os.sep in (parent, os.path.normpath(os.path.realpath(parent)) if parent else os.sep):
+        raise ValueError("a project pattern must not cover top-level folders")
 
 
 def normalize_project_path(value: object) -> str:
@@ -116,21 +132,17 @@ def normalize_project_path(value: object) -> str:
     if not os.path.isabs(path):
         raise ValueError("project paths must be absolute")
     path = os.path.normpath(path)
-    if PATTERN in path:
-        parent, name = os.path.split(path)
-        if PATTERN in parent or name.count(PATTERN) != 1 or not name.endswith(PATTERN):
-            raise ValueError("a project pattern may use * only at the end of its last folder name")
-        if parent == os.sep:
-            raise ValueError("a project pattern must not cover top-level folders")
+    if path.endswith(PATTERN):
+        _check_pattern(path)
     return path
 
 
 def _resolved_project_path(value: str) -> str:
-    """Symlinks resolved before "..", as the filesystem does; a pattern's parent only."""
+    """Symlinks resolved before "..", as the filesystem does; for a pattern, its parent."""
     expanded = os.path.expanduser(value.strip())
     if is_project_pattern(expanded):
-        parent, name = os.path.split(os.path.normpath(expanded))
-        return os.path.join(os.path.realpath(parent), name)
+        trimmed = expanded.rstrip(os.sep) or os.sep
+        return os.path.join(os.path.realpath(os.path.dirname(trimmed)), os.path.basename(trimmed))
     return os.path.realpath(expanded)
 
 
@@ -141,7 +153,33 @@ def _absolute_project_path(value: str) -> str:
     """
     if not isinstance(value, str) or not value.strip():
         raise ValueError("project paths must be non-empty strings")
-    return normalize_project_path(_resolved_project_path(value))
+    resolved = os.path.normpath(_resolved_project_path(value))
+    if is_project_pattern(value):
+        return normalize_project_path(resolved)
+    if resolved.endswith(PATTERN):
+        # Stored, it would read as a pattern and cover its siblings too.
+        raise ValueError("a folder whose real name ends with * cannot be excluded by path")
+    return normalize_project_path(resolved)
+
+
+def _pattern_matches(pattern: str) -> list[str]:
+    """Existing folders a resolved pattern covers, so their own spellings
+    (symlink targets) and git remotes are excluded too."""
+    parent, name = os.path.split(pattern)
+    prefix = name[: -len(PATTERN)]
+    found: list[str] = []
+    try:
+        with os.scandir(parent) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_PATTERN_MATCHES:
+                    break
+                if entry.name.startswith(prefix):
+                    with contextlib.suppress(OSError):
+                        if entry.is_dir():
+                            found.append(os.path.join(parent, entry.name))
+    except OSError:
+        pass
+    return found
 
 
 def _project_paths(raw: dict) -> frozenset[str]:
@@ -154,6 +192,11 @@ def _project_paths(raw: dict) -> frozenset[str]:
         # Resolve symlinks before collapsing "..", as the filesystem does, and
         # keep the lexical spelling too (for example /tmp and /private/tmp).
         resolved = _resolved_project_path(value)
+        if normalized.endswith(PATTERN):
+            _check_pattern(resolved)
+            keys |= {_PATTERN_KEY + _path_key(normalized), _PATTERN_KEY + _path_key(resolved)}
+            keys |= {_path_key(os.path.realpath(match)) for match in _pattern_matches(resolved)}
+            continue
         if os.sep in (normalized, resolved):
             raise ValueError("excluded_project_paths must not exclude the filesystem root")
         keys |= {_path_key(normalized), _path_key(resolved)}
@@ -166,8 +209,8 @@ def _under(candidate: str, project: str) -> bool:
     A pattern key ``parent/name*`` matches every path under ``parent`` whose
     first folder below it starts with ``name``.
     """
-    if is_project_pattern(project):
-        return candidate.startswith(project[: -len(PATTERN)])
+    if project.startswith(_PATTERN_KEY):
+        return candidate.startswith(project[len(_PATTERN_KEY): -len(PATTERN)])
     return candidate == project or candidate.startswith(project.rstrip(os.sep) + os.sep)
 
 
@@ -344,8 +387,11 @@ class ExclusionPolicy:
             self._ancestry["repositories"] = frozenset(
                 remote
                 for project in self.excluded_project_paths
-                if not is_project_pattern(project)
-                for remote in _project_remotes(project)
+                for folder in (
+                    _pattern_matches(_resolved_project_path(project))
+                    if is_project_pattern(project) else (project,)
+                )
+                for remote in _project_remotes(folder)
             )
         return self._ancestry["repositories"]
 

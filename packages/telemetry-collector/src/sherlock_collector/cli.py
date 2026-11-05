@@ -86,7 +86,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("drain")
     commands.add_parser("health")
     exclude_project = commands.add_parser(
-        "exclude-project", help="never capture or upload sessions in these directories"
+        "exclude-project",
+        help="never capture or upload sessions in these directories; quote a name pattern "
+             "such as '/private/tmp/aeyron-*' so the shell does not expand it"
     )
     exclude_project.add_argument("path", nargs="+")
     include_project = commands.add_parser(
@@ -101,7 +103,7 @@ def _project_exclusions(command: str, paths: list[str]) -> int:
     try:
         if command == "exclude-project":
             for value in paths:
-                if not is_project_pattern(value.strip()) and not os.path.isdir(os.path.expanduser(value)):
+                if not is_project_pattern(value) and not os.path.isdir(os.path.expanduser(value)):
                     print(f"warning: {value} is not an existing directory; excluding it anyway",
                           file=sys.stderr)
         elif command == "include-project":

@@ -69,8 +69,11 @@ before the initial backfill, or manage the list later from any checkout:
 
 To cover folders that share a name prefix, including ones made later, end the
 last folder name with `*`: `./sherlock exclude-project '/private/tmp/aeyron-*'`
-excludes every folder in `/private/tmp` whose name starts with `aeyron-`. `*` is
-allowed only there; older runtimes read such an entry as a plain path.
+excludes every folder in `/private/tmp` whose name starts with `aeyron-`. Quote
+it so the shell does not expand it. `*` means a pattern only at the end of the
+last folder name. Runtimes older than this read a pattern as a plain path that
+matches nothing, so update the collector before relying on one; plain entries
+keep working either way.
 
 A session is excluded when its working directory is that directory, is inside
 it, or is inside a git worktree (or a repository nested in one) whose main
