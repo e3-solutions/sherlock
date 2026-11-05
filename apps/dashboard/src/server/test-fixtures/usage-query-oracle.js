@@ -22,6 +22,8 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
   // marks. Run it first; its first pass for a new workspace clears that
   // workspace's stored rows.
   await sql.unsafe("select analytics.refresh_usage_contributions(5)");
+  // COR-5178: the Heartbeat presence read must run (no sherlock_access in CI).
+  expect(Array.isArray([...await sql.unsafe("select * from heartbeat_api.coding_presence(60)")])).toBe(true);
   // COR-5162: the stored per-event contributions must answer identically.
   await sql.unsafe(`select analytics.compute_usage_contributions($1::uuid, array(
     select s.id from telemetry.sessions s where s.workspace_id = $1::uuid))`, [workspaceId]);
