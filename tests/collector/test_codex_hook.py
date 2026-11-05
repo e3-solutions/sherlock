@@ -217,15 +217,63 @@ class CaptureTests(CodexHookCase):
         self.assertEqual(self.observations(), [])
         self.assertEqual(self.pending(), [])
 
-    def test_missing_transcript_path_key_produces_no_observation(self):
+    def without_path(self, event, session_id, **values):
+        payload = self.payload(event, session_id, **values)
+        del payload["transcript_path"]
+        return payload
+
+    def test_missing_transcript_path_key_on_a_fork_session_start_is_captured(self):
         session_id = str(uuid.uuid4())
+        events = [
+            ("SessionStart", self.without_path("SessionStart", session_id, source="fork")),
+            ("UserPromptSubmit", self.without_path("UserPromptSubmit", session_id, prompt="q")),
+            ("Stop", self.without_path("Stop", session_id, last_assistant_message="a")),
+        ]
+        raws = []
+        for event, payload in events:
+            raw = json.dumps(payload, separators=(",", ":")).encode()
+            self.assertEqual(self.hook(event, payload, raw=raw).enqueued, 1)
+            raws.append(raw)
+        envelopes = [json.loads(stored) for _, stored in self.pending()]
+        self.assertEqual(
+            sorted(base64.b64decode(e["payload_base64"]) for e in envelopes), sorted(raws)
+        )
+        self.assertTrue(all(e["session_source"] == "fork" for e in envelopes))
+        self.assertTrue(all(e["native_session_id"] == session_id for e in envelopes))
+
+    def test_missing_transcript_path_key_with_a_fork_marker_is_captured(self):
+        session_id = str(uuid.uuid4())
+        # The SessionStart named a null path; later events omit the key.
+        self.hook("SessionStart", self.payload("SessionStart", session_id, source="fork"))
+        self.hook("UserPromptSubmit", self.without_path("UserPromptSubmit", session_id, prompt="q"))
+        self.hook("Stop", self.without_path("Stop", session_id, last_assistant_message="a"))
+        events = sorted(json.loads(stored)["dispatch_event_name"] for _, stored in self.pending())
+        self.assertEqual(events, ["SessionStart", "Stop", "UserPromptSubmit"])
+
+    def test_missing_transcript_path_key_without_a_fork_marker_produces_none(self):
+        unmarked = str(uuid.uuid4())
+        self.hook("UserPromptSubmit", self.without_path("UserPromptSubmit", unmarked, prompt="q"))
+        self.hook("Stop", self.without_path("Stop", unmarked, last_assistant_message="a"))
+        startup = str(uuid.uuid4())
         for event in ("SessionStart", "UserPromptSubmit", "Stop"):
-            payload = self.payload(event, session_id, source="fork")
-            del payload["transcript_path"]
-            self.hook(event, payload)
+            self.hook(event, self.without_path(event, startup, source="startup"))
         self.assertEqual(self.observations(), [])
         self.assertEqual(self.pending(), [])
         self.assertFalse((self.state / "codex-hook-sessions").exists())
+
+    def test_missing_transcript_path_key_with_a_discovered_rollout_produces_none(self):
+        session_id = str(uuid.uuid4())
+        codex_rollout(self.home, session_id, {"cwd": str(self.work)})
+        self.hook("SessionStart", self.without_path("SessionStart", session_id, source="fork"))
+        self.hook("UserPromptSubmit", self.without_path("UserPromptSubmit", session_id, prompt="q"))
+        self.assertEqual(self.observations(), [])
+        self.assertTrue(all(m["source_kind"] == "rollout" for m, _ in self.pending()))
+
+    def test_missing_transcript_path_key_with_a_bad_session_id_produces_none(self):
+        for session_id in ("not-a-uuid", str(uuid.uuid4()).upper()):
+            self.hook("SessionStart", self.without_path("SessionStart", session_id, source="fork"))
+        self.assertEqual(self.observations(), [])
+        self.assertEqual(self.pending(), [])
 
     def test_normal_session_naming_a_transcript_not_yet_written_produces_none(self):
         session_id = str(uuid.uuid4())

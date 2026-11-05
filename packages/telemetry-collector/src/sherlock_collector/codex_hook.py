@@ -88,14 +88,24 @@ def parent_session_id(payload: Mapping[str, object]) -> str | None:
     return None
 
 
-def is_rolloutless(payload: Mapping[str, object], discovery: DiscoveryResult) -> bool:
+def is_rolloutless(
+    payload: Mapping[str, object],
+    discovery: DiscoveryResult,
+    *,
+    fork_marked: bool = False,
+) -> bool:
     """Whether this hook belongs to a Codex session that has no rollout.
 
-    True only when the payload carries ``transcript_path`` explicitly as null
-    (a missing key means skip), ``session_id`` is a canonical UUID, and
-    discovery found no rollout path or state-database row for that id.
+    True only when ``transcript_path`` is null (or, for a fork-marked session,
+    missing), ``session_id`` is a canonical UUID, and discovery found no
+    rollout path or state-database row for that id. A transcript path string
+    always means a normal session. It is not known whether Codex sends null or
+    omits the key for forks, so a missing key counts only for forks.
     """
-    if "transcript_path" not in payload or payload["transcript_path"] is not None:
+    if "transcript_path" in payload:
+        if payload["transcript_path"] is not None:
+            return False
+    elif not fork_marked:
         return False
     session_id = _canonical_uuid(payload.get("session_id"))
     if session_id is None:
@@ -184,6 +194,19 @@ def session_source(state_root: Path, session_id: object) -> str | None:
     """The source a hook-only session recorded at SessionStart, if any."""
     marker = session_marker(state_root, session_id)
     return _text(marker.get("source")) if marker else None
+
+
+def fork_marked(
+    state_root: Path,
+    event_name: str,
+    payload: Mapping[str, object],
+) -> bool:
+    """Whether the SessionStart (its payload, or the marker it left) says fork."""
+    if event_name == "SessionStart":
+        source = payload.get("source")
+    else:
+        source = session_source(state_root, payload.get("session_id"))
+    return source in HOOK_ONLY_SESSION_SOURCES
 
 
 def write_observation(

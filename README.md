@@ -55,7 +55,8 @@ A policy file that exists but is unreadable or invalid blocks all capture and
 upload until repaired. Without the file nothing changes.
 
 Codex side-conversation forks have no rollout file (their hooks name
-`transcript_path: null`), so the Codex hook keeps each fork's `SessionStart`,
+`transcript_path: null`, or, for a session whose `SessionStart` said fork, may
+omit it), so the Codex hook keeps each fork's `SessionStart`,
 `UserPromptSubmit` and `Stop` payload as a `codex`/`hook` source
 (`sherlock.codex-hook.v1`), with the checkout's `origin` remote (credentials
 removed) and branch read locally. Only sessions whose `SessionStart` says

@@ -427,7 +427,14 @@ def _capture_hook(
         provider == "codex"
         and event_name in codex_hook.HOOK_ONLY_EVENTS
         and raw_payload
-        and codex_hook.is_rolloutless(payload, discovery)
+        and codex_hook.is_rolloutless(
+            payload,
+            discovery,
+            fork_marked=(
+                "transcript_path" not in payload
+                and codex_hook.fork_marked(root, event_name, payload)
+            ),
+        )
     ):
         # Sessions Codex never writes a rollout for (side-conversation forks,
         # COR-5208): keep the hook payload itself as the source.
