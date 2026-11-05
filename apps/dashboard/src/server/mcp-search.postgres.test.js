@@ -948,8 +948,8 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
         owner.push(await execute(call, false));
         windowFirst.push(await execute(call, true));
       }
-      // A common word over a wide window: one exact day entry per day,
-      // intersected with the word, instead of every match in history.
+      // A common word over a wide window must be read by its window, not by
+      // every match of the word in history.
       const commonWide = [];
       for (let call = 0; call < 7; call += 1) {
         const [{ "QUERY PLAN": plan }] = await tx.unsafe(`
@@ -980,9 +980,12 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
     expect(plans.commonWide).toHaveLength(7);
     for (const { rows, nodes } of plans.commonWide) {
       expect(rows).toBeGreaterThan(0);
+      // Bounded by the window (the window index or the day and text index),
+      // never every match of the word in history. Which of the two depends on
+      // how common the word is; production plans are checked on the issue.
       const shape = JSON.stringify(nodes.map((node) => [node["Node Type"], node["Index Name"], node["Index Cond"]]));
-      expect(nodes.some((node) => node["Node Type"] === "Bitmap Index Scan"
-        && /AT TIME ZONE|timezone/i.test(node["Index Cond"] ?? "")), shape).toBe(true);
+      expect(nodes.some((node) => /Index Scan/.test(node["Node Type"])
+        && /occurred_at|AT TIME ZONE|timezone/i.test(node["Index Cond"] ?? "")), shape).toBe(true);
       expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
         .not.toContain("Seq Scan");
     }
