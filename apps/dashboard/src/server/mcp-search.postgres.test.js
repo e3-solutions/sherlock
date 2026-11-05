@@ -13,6 +13,7 @@ const migration = (name) => DATABASE_URL ? readFileSync(new FileURL(`../../../..
 const MIGRATION = migration("20261012135923_add_bounded_excerpt_search.sql");
 const PRODUCT_ROLE_MIGRATION = migration("20261012140548_filter_excerpt_search_product_roles.sql");
 const WINDOW_FIRST_MIGRATION = migration("20261104223000_window_first_excerpt_search.sql");
+const DAY_SCOPED_MIGRATION = migration("20261104233200_day_scoped_excerpt_search.sql");
 const BOUNDED_LOOKUP_MIGRATION = migration("20261012065436_bound_protected_record_lookup.sql");
 const SEARCH = "analytics.search_excerpt_candidates(uuid, text, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer)";
 const GATE = "analytics._assert_excerpt_search_policy_shape()";
@@ -23,6 +24,18 @@ const END = "2026-01-01T12:00:00.000Z";
 const READ_AT = "2026-01-02T00:00:00.000Z";
 const AFTER_READ = "2026-01-02T00:00:00.001Z";
 const WIDE_PLAN_START = "2025-06-01T00:00:00.000Z";
+const COMMON_PLAN_START = "2025-12-02T00:00:00.000Z";
+// The UTC days the function lists for a plan window: start day through 2026-01-01.
+const planDays = (start) => `{${Array.from(
+  { length: (Date.parse("2026-01-01T00:00:00Z") - Date.parse(start.slice(0, 10))) / 86_400_000 + 1 },
+  (_, index) => new Date(Date.parse(start.slice(0, 10)) + index * 86_400_000).toISOString().slice(0, 10),
+).join(",")}}`;
+const COMMON_PLAN_DAYS = planDays(COMMON_PLAN_START);
+// The UTC days the function lists for the wide plan window (WIDE_PLAN_START to END).
+const WIDE_PLAN_DAYS = `{${Array.from(
+  { length: (Date.parse("2026-01-01T00:00:00Z") - Date.parse(WIDE_PLAN_START)) / 86_400_000 + 1 },
+  (_, index) => new Date(Date.parse(WIDE_PLAN_START) + index * 86_400_000).toISOString().slice(0, 10),
+).join(",")}}`;
 
 // Sanitized current production privacy helpers and reader policies (pg_get_functiondef
 // bodies and pg_policies.qual). The privacy schema is optional and absent from migrations.
@@ -110,6 +123,7 @@ async function installMigration(tx) {
   await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
   await tx.unsafe(WINDOW_FIRST_MIGRATION);
+  await tx.unsafe(DAY_SCOPED_MIGRATION);
 }
 
 async function installPrivacyShape(tx, { tables = ["events", "sessions", "people"], schema = "telemetry" } = {}) {
@@ -366,6 +380,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
   await tx.unsafe(WINDOW_FIRST_MIGRATION);
+  await tx.unsafe(DAY_SCOPED_MIGRATION);
       expect(await catalogSnapshot(tx)).toEqual(before);
 
       const acl = await tx.unsafe(`
@@ -413,6 +428,10 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await expectEquivalent(tx, fixture, { ...wide, query: "zebrafind -alpha" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { start: "2025-12-31T11:00:00Z" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { start: "2025-12-31T10:59:59.999Z" }, [...all, "bobSession"]);
+      // The default all-history window starts in 1970; days are listed from the first message.
+      await expectEquivalent(tx, fixture, { start: "1970-01-01T00:00:00Z" }, [...all, "bobSession"]);
+      // A wide window with no stored message returns nothing at once.
+      await expectEquivalent(tx, fixture, { start: "2020-01-01T00:00:00Z", end: "2020-03-01T00:00:00Z" }, []);
     });
   });
 
@@ -722,6 +741,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
   await tx.unsafe(WINDOW_FIRST_MIGRATION);
+  await tx.unsafe(DAY_SCOPED_MIGRATION);
       expect(await catalogSnapshot(tx)).toEqual(before);
       const fixture = await seedFixture(tx);
       await tx`insert into sherlock_access.restricted_people values (${fixture.home}, ${fixture.people.bob.id})`;
@@ -900,7 +920,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe("analyze excerpt_search_plan.people; analyze excerpt_search_plan.sessions; analyze excerpt_search_plan.events;");
 
       const params = ["p_workspace", "p_start", "p_end", "p_read_at", "p_domain", "p_person", "p_session", "p_limit",
-        "v_query", "v_protected_records", "v_hidden_sessions", "v_protected_people", "v_window_first"];
+        "v_query", "v_protected_records", "v_hidden_sessions", "v_protected_people", "v_window_first", "v_days"];
       const body = params.reduce(
         (text, name, index) => text.replace(new RegExp(`\\b${name}\\b`, "g"), () => `$${index + 1}`),
         statement.replaceAll("telemetry.", "excerpt_search_plan."),
@@ -909,13 +929,14 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe(`
         set local plan_cache_mode = force_custom_plan;
         prepare excerpt_plan(uuid, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer,
-          tsquery, bigint[], uuid[], uuid[], boolean) as ${body}`);
+          tsquery, bigint[], uuid[], uuid[], boolean, date[]) as ${body}`);
       const execute = async (call, windowFirst) => {
         const [{ "QUERY PLAN": plan }] = await tx.unsafe(`
           explain (analyze, buffers, format json) execute excerpt_plan('${workspace}',
             '${windowFirst ? START : WIDE_PLAN_START}', '${END}', '${READ_AT}',
             'e3group.ai', ${call % 2 ? `'${person.id}'` : "null"}, null, 2000,
-            websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}', ${windowFirst})`);
+            websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}', ${windowFirst},
+            ${windowFirst ? "null" : `'${WIDE_PLAN_DAYS}'::date[]`})`);
         return { rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) };
       };
       // The GIN path serves windows over 25 hours; this one spans every decoy,
@@ -927,6 +948,17 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
         owner.push(await execute(call, false));
         windowFirst.push(await execute(call, true));
       }
+      // A common word over a wide window must be read by its window, not by
+      // every match of the word in history.
+      const commonWide = [];
+      for (let call = 0; call < 7; call += 1) {
+        const [{ "QUERY PLAN": plan }] = await tx.unsafe(`
+          explain (analyze, buffers, format json) execute excerpt_plan('${workspace}',
+            '${COMMON_PLAN_START}', '${END}', '${READ_AT}',
+            'e3group.ai', ${call % 2 ? `'${person.id}'` : "null"}, null, 2000,
+            websearch_to_tsquery('simple', 'routine'), '{}', '{}', '{}', false, '${COMMON_PLAN_DAYS}'::date[])`);
+        commonWide.push({ rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) });
+      }
       const direct = `explain (format json) select e.id from excerpt_search_plan.events e
         where e.workspace_id = '${workspace}' and e.event_kind in ('message', 'agent_message')
           and e.message_search @@ websearch_to_tsquery('simple', 'zebrararetoken')`;
@@ -934,7 +966,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       const reader = await asReader(tx, (sp) => sp.unsafe(direct));
       expect(reader.error).toBeUndefined();
       return {
-        owner, windowFirst, ownerDirect: planNodes(ownerDirect), reader: planNodes(reader.value[0]["QUERY PLAN"]),
+        owner, windowFirst, commonWide, ownerDirect: planNodes(ownerDirect), reader: planNodes(reader.value[0]["QUERY PLAN"]),
       };
     });
 
@@ -942,6 +974,18 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
     for (const { rows, nodes } of plans.owner) {
       expect(rows).toBe(1);
       expect(usesSearchIndex(nodes)).toBe(true);
+      expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
+        .not.toContain("Seq Scan");
+    }
+    expect(plans.commonWide).toHaveLength(7);
+    for (const { rows, nodes } of plans.commonWide) {
+      expect(rows).toBeGreaterThan(0);
+      // Bounded by the window (the window index or the day and text index),
+      // never every match of the word in history. Which of the two depends on
+      // how common the word is; production plans are checked on the issue.
+      const shape = JSON.stringify(nodes.map((node) => [node["Node Type"], node["Index Name"], node["Index Cond"]]));
+      expect(nodes.some((node) => /Index Scan/.test(node["Node Type"])
+        && /occurred_at|AT TIME ZONE|timezone/i.test(node["Index Cond"] ?? "")), shape).toBe(true);
       expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
         .not.toContain("Seq Scan");
     }
