@@ -45,12 +45,12 @@ function payload() {
 
 // These suites cover the retired evidence tools too (COR-5174 keeps them
 // available behind retiredTools); the default surface is tested separately.
-function registeredTools(source, { retiredTools = true } = {}) {
+function registeredTools(source, { retiredTools = true, guard = null } = {}) {
   const tools = new Map();
   const server = {
     registerTool: vi.fn((name, config, handler) => tools.set(name, { config, handler })),
   };
-  registerBonaparteTools(server, source, { retiredTools });
+  registerBonaparteTools(server, source, { retiredTools, guard });
   return tools;
 }
 
@@ -201,6 +201,31 @@ describe("Bonaparte MCP tools", () => {
 
     expect(protocol.handler).toBeTypeOf("function");
     await expect(protocol.close()).resolves.toBeUndefined();
+  });
+});
+
+it("audits list_sessions and get_session reads by session and owner without limiting them", async () => {
+  const rows = [];
+  const guard = createExcerptGuard({
+    limits: { windowMs: 3_600_000, callsPerWindow: 1, sessionsPerWindow: 1,
+      unattributedCallsPerWindow: 1, unattributedSessionsPerWindow: 1, maxCallers: 5 },
+    log: () => {}, audit: { push: (batch) => rows.push(...batch) },
+  });
+  const owner = "33333333-3333-4333-8333-333333333333";
+  const sessions = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
+  const tools = registeredTools({
+    fetchSessions: vi.fn().mockResolvedValue({
+      sessions: sessions.map((sessionId) => ({ sessionId, personId: owner })), nextCursor: null,
+    }),
+    fetchSession: vi.fn().mockResolvedValue({ session: { sessionId: sessions[0], personId: owner } }),
+  }, { guard });
+  for (let index = 0; index < 3; index += 1) {
+    expect((await tools.get("list_sessions").handler({}, {})).isError).not.toBe(true);
+  }
+  expect((await tools.get("get_session").handler({ sessionId: sessions[0] }, {})).isError).not.toBe(true);
+  expect(rows.filter((row) => row.tool === "list_sessions")).toHaveLength(6);
+  expect(rows.at(-1)).toMatchObject({
+    tool: "get_session", outcome: "ok", session_id: sessions[0], owner_person_id: owner,
   });
 });
 

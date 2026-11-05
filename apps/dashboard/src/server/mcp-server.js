@@ -324,7 +324,7 @@ export const RETIRED_TOOLS = Object.freeze(new Set([
   "list_provider_usage",
 ]));
 
-const EXCERPT_LIMIT_DOCUMENTATION = `Excerpt tools (search_sessions, get_session_evidence, list_prompt_evidence) are limited per standard-tier Cosmos caller to ${EXCERPT_LIMITS.sessionsPerWindow} distinct sessions (read with get_session_evidence or named as a search sessionId filter) and ${EXCERPT_LIMITS.callsPerWindow} calls per rolling hour; rate_limited carries retryAfterSeconds. Admin callers are not limited. Every read, admin or not, is recorded in a durable audit with caller and session-owner ids, never content; admins query it with list_excerpt_reads.`;
+const EXCERPT_LIMIT_DOCUMENTATION = `Excerpt tools (search_sessions, get_session_evidence, list_prompt_evidence) are limited per standard-tier Cosmos caller to ${EXCERPT_LIMITS.sessionsPerWindow} distinct sessions (read with get_session_evidence or named as a search sessionId filter) and ${EXCERPT_LIMITS.callsPerWindow} calls per rolling hour; rate_limited carries retryAfterSeconds. Admin callers are not limited. Every read, admin or not, is recorded (list_sessions and get_session metadata reads too, without a limit) in a durable audit with caller and session-owner ids, never content; admins query it with list_excerpt_reads.`;
 
 const QUERY_DOCUMENTATION = Object.freeze({
   schemaVersion: MCP_QUERY_SCHEMA_VERSION,
@@ -537,6 +537,21 @@ async function guardedExcerptRead(guard, tool, args, read) {
   }
 }
 
+// Metadata reads that name whose sessions exist (list_sessions enumerated the
+// Nov 1 crawl's 3,042 sessions) are recorded the same way but not limited.
+async function auditedMetadataRead(guard, tool, args, read) {
+  if (guard === null) return await read();
+  const caller = currentCaller();
+  try {
+    const result = await read();
+    guard.record(caller, { tool, outcome: "ok", reads: excerptReads(tool, args, result) });
+    return result;
+  } catch (error) {
+    guard.record(caller, { tool, outcome: "error", reads: excerptReads(tool, args, null) });
+    throw error;
+  }
+}
+
 const AUDIT_ERRORS = {
   forbidden: {
     message: "list_excerpt_reads is restricted to Cosmos admin callers.",
@@ -588,7 +603,9 @@ const auditOutputSchema = z.object({
     readAt: ISO_TIMESTAMP,
     caller: z.string().max(512).nullable(),
     callerTier: z.string().max(32).nullable(),
-    tool: z.enum(["search_sessions", "get_session_evidence", "list_prompt_evidence"]),
+    tool: z.enum([
+      "search_sessions", "get_session_evidence", "list_prompt_evidence", "list_sessions", "get_session",
+    ]),
     outcome: z.enum(["ok", "error", "rate_limited"]),
     sessionId: UUID.nullable(),
     ownerPersonId: UUID.nullable(),
@@ -736,7 +753,8 @@ export function registerBonaparteTools(server, source, {
     },
     async (args, context = {}) => {
       try {
-        return success(await source.fetchSessions({ ...args, signal: context.signal }));
+        return success(await auditedMetadataRead(guard, "list_sessions", args,
+          async () => await source.fetchSessions({ ...args, signal: context.signal })));
       } catch (error) {
         return failure(error, { query: true });
       }
@@ -754,7 +772,8 @@ export function registerBonaparteTools(server, source, {
     },
     async (args, context = {}) => {
       try {
-        return success(await source.fetchSession({ ...args, signal: context.signal }));
+        return success(await auditedMetadataRead(guard, "get_session", args,
+          async () => await source.fetchSession({ ...args, signal: context.signal })));
       } catch (error) {
         return failure(error, { query: true });
       }
