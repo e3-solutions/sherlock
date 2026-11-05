@@ -124,5 +124,13 @@ jobs:
             commit -m "Docs backstop for #$PR" -m "Bring agent docs in line with #$PR ($TITLE)." -m "Docs-Check: updated"
           git push origin "$branch"
           body="Docs follow-up for #$PR, which changed code but no docs. Proposed by the docs backstop (COR-5202); review and merge if right."
-          gh pr create --base main --head "$branch" --title "Docs backstop for #$PR" --body "$body" --assignee "$AUTHOR" \
-            || gh pr create --base main --head "$branch" --title "Docs backstop for #$PR" --body "$body"
+          if gh pr create --base main --head "$branch" --title "Docs backstop for #$PR" --body "$body" --assignee "$AUTHOR" \
+            || gh pr create --base main --head "$branch" --title "Docs backstop for #$PR" --body "$body"; then
+            exit 0
+          fi
+          # The org or repo may not let Actions open PRs ("Allow GitHub Actions to create
+          # and approve pull requests"). Leave the branch and point the author at it.
+          compare="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$branch?expand=1"
+          gh pr comment "$PR" --body "Docs backstop (COR-5202): this PR changed code but no docs. A proposed docs update is on branch \`$branch\`. Open it as a PR: $compare" \
+            || echo "::warning::Could not comment on #$PR either."
+          echo "::warning::Actions may not open PRs here; docs branch $branch is ready: $compare"
