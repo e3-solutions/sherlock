@@ -24,6 +24,11 @@ const END = "2026-01-01T12:00:00.000Z";
 const READ_AT = "2026-01-02T00:00:00.000Z";
 const AFTER_READ = "2026-01-02T00:00:00.001Z";
 const WIDE_PLAN_START = "2025-06-01T00:00:00.000Z";
+// The UTC days the function lists for the wide plan window (WIDE_PLAN_START to END).
+const WIDE_PLAN_DAYS = `{${Array.from(
+  { length: (Date.parse("2026-01-01T00:00:00Z") - Date.parse(WIDE_PLAN_START)) / 86_400_000 + 1 },
+  (_, index) => new Date(Date.parse(WIDE_PLAN_START) + index * 86_400_000).toISOString().slice(0, 10),
+).join(",")}}`;
 
 // Sanitized current production privacy helpers and reader policies (pg_get_functiondef
 // bodies and pg_policies.qual). The privacy schema is optional and absent from migrations.
@@ -924,8 +929,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
             '${windowFirst ? START : WIDE_PLAN_START}', '${END}', '${READ_AT}',
             'e3group.ai', ${call % 2 ? `'${person.id}'` : "null"}, null, 2000,
             websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}', ${windowFirst},
-            ${windowFirst ? "null" : `(select array_agg(day::date) from generate_series(
-              '${WIDE_PLAN_START}'::timestamp, '${END}'::timestamp, interval '1 day') day)`})`);
+            ${windowFirst ? "null" : `'${WIDE_PLAN_DAYS}'::date[]`})`);
         return { rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) };
       };
       // The GIN path serves windows over 25 hours; this one spans every decoy,
