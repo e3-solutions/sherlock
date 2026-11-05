@@ -294,6 +294,8 @@ class RolloutCapturer:
                     (parent_native_session_ids or {}).get(raw_path),
                     source_home=self.source_home or self.allowed_root,
                     source_path=path,
+                    source_kind=self.source_kind,
+                    hook_state_root=self.state_root,
                 )
                 if blocked:
                     # Local owner policy: capture nothing and step over the file

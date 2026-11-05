@@ -16,6 +16,7 @@ from .claude_hook import (
     transcript_state,
     write_observation,
 )
+from . import codex_hook
 from .config import default_claude_home, default_codex_home, default_state_root
 from .discovery import (
     CLAUDE_DEFAULT_LOOKBACK_SECONDS,
@@ -226,6 +227,58 @@ def _remember_uncaptured(
     )
 
 
+def _capture_codex_hook_only(
+    root: Path,
+    home: Path,
+    event_name: str,
+    payload: Mapping[str, object],
+    raw_payload: bytes,
+) -> tuple[Path | None, CaptureResult]:
+    """Observe a hook-only Codex event of a fork and capture pending observations."""
+    if event_name == "SessionStart":
+        codex_hook.remember_session(root, payload)
+        source = payload.get("source")
+    else:
+        source = codex_hook.session_source(root, payload.get("session_id"))
+    if source not in codex_hook.HOOK_ONLY_SESSION_SOURCES:
+        return None, CaptureResult()
+    observation = codex_hook.write_observation(
+        root, event_name, payload, raw_payload, session_source=source
+    )
+    observation_paths = [
+        observation,
+        *(
+            path
+            for path in sorted((root / "codex-hook-events").glob("*.jsonl"))
+            if path != observation
+        ),
+    ]
+    native_ids: dict[str, str] = {}
+    parent_ids: dict[str, str] = {}
+    for path in observation_paths:
+        native_id, parent_id = codex_hook.observation_identity(path)
+        if native_id is not None:
+            native_ids[str(path.resolve())] = native_id
+        if parent_id is not None:
+            parent_ids[str(path.resolve())] = parent_id
+    outcome = RolloutCapturer(
+        root,
+        DurableSpool(root / "queue"),
+        source_provider="codex",
+        source_kind="hook",
+        state_name="codex-hook",
+        capture_unterminated_tail=False,
+        source_home=home,
+    ).capture(
+        observation_paths,
+        native_session_ids=native_ids,
+        parent_native_session_ids=parent_ids,
+        best_effort=True,
+        priority_count=1,
+    )
+    return observation, outcome
+
+
 def _capture_hook(
     event_name: str,
     payload: Mapping[str, object],
@@ -367,6 +420,20 @@ def _capture_hook(
                 parent_native_session_ids=parent_ids,
                 best_effort=True,
                 priority_count=1,
+            )
+        except (OSError, ValueError):
+            hook_errors += 1
+    if (
+        provider == "codex"
+        and event_name in codex_hook.HOOK_ONLY_EVENTS
+        and raw_payload
+        and codex_hook.is_rolloutless(payload, discovery)
+    ):
+        # Sessions Codex never writes a rollout for (side-conversation forks,
+        # COR-5208): keep the hook payload itself as the source.
+        try:
+            hook_observation, hook_outcome = _capture_codex_hook_only(
+                root, home, event_name, payload, raw_payload
             )
         except (OSError, ValueError):
             hook_errors += 1

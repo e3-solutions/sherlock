@@ -17,7 +17,13 @@ from .contract import (
     validate_stored_payload,
 )
 from . import exclusion_report
-from .exclusions import EXCLUDED_PROJECT, ExclusionPolicy, load_policy, observed_cwds
+from .exclusions import (
+    EXCLUDED_PROJECT,
+    ExclusionPolicy,
+    load_policy,
+    observed_cwds,
+    observed_repositories,
+)
 from .spool import (
     MAX_UPLOAD_BACKOFF_SECONDS,
     DurableSpool,
@@ -244,6 +250,15 @@ class Drain:
                 continue
             if stream in blocked_streams:
                 continue
+            codex_hook = (
+                manifest.source_provider == "codex" and manifest.source_kind == "hook"
+            )
+            queued_bytes = (
+                validate_stored_payload(manifest, item.stored_payload)
+                if self._policy.active
+                and (self._policy.excluded_projects or codex_hook)
+                else b""
+            )
             reason = self._policy.active and self._policy.blocked_reason(
                 manifest.source_provider,
                 manifest.observed_native_session_id,
@@ -252,10 +267,17 @@ class Drain:
                 # Directories recorded in the queued bytes themselves, so a
                 # batch is classified by what it would upload.
                 observed_cwds=(
-                    observed_cwds(validate_stored_payload(manifest, item.stored_payload))
+                    observed_cwds(queued_bytes)
                     if self._policy.excluded_projects
                     else ()
                 ),
+                source_kind=manifest.source_kind,
+                observed_repositories=(
+                    observed_repositories(queued_bytes) if codex_hook else ()
+                ),
+                # The spool lives at <state root>/queue; Codex hook session
+                # markers are under the same state root.
+                hook_state_root=self.spool.root.parent if codex_hook else None,
                 native_fragments=[
                     (
                         record.native_record_start_offset,
