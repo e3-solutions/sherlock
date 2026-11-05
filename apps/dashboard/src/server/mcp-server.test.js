@@ -11,6 +11,7 @@ import {
   EVIDENCE_AFTER_SQL,
   EVIDENCE_ANCHOR_SQL,
   EVIDENCE_BEFORE_SQL,
+  EVIDENCE_OMITTED_SESSION_SQL,
   EVIDENCE_SESSION_SQL,
   PERSON_ROSTER_SQL,
   SEARCH_CANDIDATES_SQL,
@@ -301,6 +302,7 @@ function searchDatabase(overrides = {}) {
       child_session_ids: [CHILD],
       untimed_messages: 0,
     }]],
+    [EVIDENCE_OMITTED_SESSION_SQL, () => []],
     [EVIDENCE_ANCHOR_SQL, (params) => [{ ...eventRow(Number(params[2]), {
       content_excerpt: INJECTED,
     }), canonical_at_read: true }]],

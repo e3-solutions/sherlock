@@ -372,6 +372,22 @@ select s.id::text session_id, s.person_id::text person_id,
    and s.actor_role not in ('guardian', 'automation')
 `;
 
+// Guardian (reviewer) and automation sessions are listed by list_sessions but
+// their content is outside the product view. Opening one returns its metadata
+// and no events instead of not_found, so list-then-open flows do not fail.
+export const EVIDENCE_OMITTED_SESSION_SQL = `
+select s.id::text session_id, s.person_id::text person_id,
+       coalesce(nullif(btrim(pe.display_name), ''), 'Unknown') display_name,
+       s.started_at, s.ended_at, s.parent_session_id is not null parent_omitted,
+       (select e.normalizer_version from telemetry.events e
+         where e.workspace_id = s.workspace_id and e.session_id = s.id
+         limit 1) normalizer_version
+  from telemetry.sessions s
+  join telemetry.people pe on pe.workspace_id = s.workspace_id and pe.id = s.person_id
+ where s.workspace_id = $1 and s.id = $2 and ${roster("pe", "$3")}
+   and s.actor_role in ('guardian', 'automation')
+`;
+
 // The anchor is the exact stored source row, never a substitute; whether it is
 // canonical at read time is reported rather than required.
 export const EVIDENCE_ANCHOR_SQL = `
@@ -727,6 +743,34 @@ function sessionFromRow(row) {
   };
 }
 
+function omittedSessionEvidence(row, readAt) {
+  return {
+    schemaVersion: SEARCH_SCHEMA_VERSION,
+    session: sessionFromRow({
+      ...row, parent_session_id: null, child_session_ids: [],
+    }),
+    readAt: readAt.toISOString(),
+    anchorEventId: null,
+    events: [],
+    hasEarlier: null,
+    nextCursor: null,
+    coverage: {
+      state: "partial",
+      reasons: ["automated_session_omitted", "product_view_omissions"],
+      readAt: readAt.toISOString(),
+      returnedEvents: 0,
+      truncatedExcerpts: 0,
+      redactedExcerpts: 0,
+      scanBudget: EVIDENCE_SCAN_BUDGET,
+      scanBudgetReached: false,
+      nonCanonicalSkipped: 0,
+      runtimeContextOmitted: 0,
+      untimedMessages: 0,
+      untimedMessagesCapped: false,
+    },
+  };
+}
+
 export function createSherlockSearchSource(source) {
   if (typeof source?.transaction !== "function" ||
       typeof source.workspaceId !== "string" || !UUID_PATTERN.test(source.workspaceId) ||
@@ -740,11 +784,12 @@ export function createSherlockSearchSource(source) {
   );
 
   async function openSession(tx, sessionId, signal) {
-    const rows = await runQuery(tx, EVIDENCE_SESSION_SQL, [
-      source.workspaceId, sessionId, source.expectedEmailDomain,
-    ], signal);
-    if (rows.length !== 1) throw new FlameSourceError("flame_mcp_query_not_found");
-    return rows[0];
+    const params = [source.workspaceId, sessionId, source.expectedEmailDomain];
+    const rows = await runQuery(tx, EVIDENCE_SESSION_SQL, params, signal);
+    if (rows.length === 1) return { sessionRow: rows[0], omitted: false };
+    const omitted = await runQuery(tx, EVIDENCE_OMITTED_SESSION_SQL, params, signal);
+    if (omitted.length !== 1) throw new FlameSourceError("flame_mcp_query_not_found");
+    return { sessionRow: omitted[0], omitted: true };
   }
 
   async function context(tx, direction, { sessionId, at, id, readAt, want, signal }) {
@@ -892,7 +937,8 @@ export function createSherlockSearchSource(source) {
       const readAt = position?.readAt ?? requestNow;
 
       const page = await read(signal, async (tx) => {
-        const sessionRow = await openSession(tx, targetSession, signal);
+        const { sessionRow, omitted } = await openSession(tx, targetSession, signal);
+        if (omitted) return { sessionRow, omitted };
         const request = { sessionId: targetSession, readAt, signal };
         if (anchorId === null) {
           const after = await context(tx, "after", {
@@ -921,6 +967,8 @@ export function createSherlockSearchSource(source) {
         });
         return { sessionRow, anchor, before, after };
       });
+
+      if (page.omitted) return omittedSessionEvidence(page.sessionRow, readAt);
 
       const seen = new Set();
       const events = [
