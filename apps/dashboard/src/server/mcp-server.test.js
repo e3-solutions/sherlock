@@ -229,6 +229,35 @@ it("audits list_sessions and get_session reads by session and owner without limi
   });
 });
 
+it("serves presence over MCP, documents it and audits one row per person", async () => {
+  const rows = [];
+  const guard = createExcerptGuard({ log: () => {}, audit: { push: (batch) => rows.push(...batch) } });
+  const person = "33333333-3333-4333-8333-333333333333";
+  const presenceSource = {
+    fetchPresence: vi.fn().mockResolvedValue({
+      schemaVersion: "sherlock.presence.v1", readAt: "2026-11-05T20:00:00.000Z", mode: "now",
+      window: { startInclusive: "2026-11-05T19:45:00.000Z", endInclusive: "2026-11-05T20:00:00.000Z" },
+      activeWithinMinutes: 15,
+      people: [{ personId: person, displayName: "Ada", active: true, activeSessions: 1, sessions: 1,
+        lastActivityAt: "2026-11-05T19:58:00.000Z", agents: ["codex"] }],
+    }),
+  };
+  const client = await connect(searchDatabase().source, { guard, presenceSource });
+  const listed = await client.listTools();
+  expect(listed.tools.find((tool) => tool.name === "presence")?.inputSchema.properties)
+    .toEqual(expect.objectContaining({ person: expect.any(Object), hours: expect.any(Object) }));
+  const result = await client.callTool({ name: "presence", arguments: { hours: 24 } });
+  expect(result.isError).not.toBe(true);
+  expect(result.structuredContent.people[0]).toMatchObject({ personId: person, active: true });
+  expect(presenceSource.fetchPresence).toHaveBeenCalledWith(expect.objectContaining({ hours: 24 }));
+  expect(rows).toEqual([expect.objectContaining({ tool: "presence", owner_person_id: person, session_id: null })]);
+  const docs = await client.callTool({ name: "documentation", arguments: {} });
+  expect(docs.structuredContent.tools.map((tool) => tool.name)).toContain("presence");
+  // Out-of-range hours fail the SDK's input validation before the handler runs.
+  expect((await client.callTool({ name: "presence", arguments: { hours: 721 } })).isError).toBe(true);
+  expect(presenceSource.fetchPresence).toHaveBeenCalledTimes(1);
+});
+
 it("logs each tool call's response size without arguments or content", async () => {
   const events = [];
   const client = await connect(searchDatabase().source, { log: (event) => events.push(event) });
@@ -402,6 +431,7 @@ afterEach(async () => {
 
 async function connect(searchSource, {
   guard = null, identitySecret = "", pass = null, auditStore = null, retiredTools = true, log = null,
+  presenceSource = null,
 } = {}) {
   const token = "s".repeat(MCP_TOKEN_MIN_LENGTH);
   const source = createCachedMcpSource({
@@ -409,7 +439,7 @@ async function connect(searchSource, {
     source: { fetchPromptEvidence: vi.fn() },
     ...(searchSource ? { searchSource } : {}),
   });
-  const protocol = createBonaparteMcpProtocol(source, { guard, auditStore, retiredTools, log });
+  const protocol = createBonaparteMcpProtocol(source, { guard, auditStore, retiredTools, log, presenceSource });
   openProtocols.push(protocol);
   const route = createMcpHttpRoute({ protocolHandler: protocol.handler, token, identitySecret });
   const httpServer = createServer((request, response) => void route(request, response));

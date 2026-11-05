@@ -12,6 +12,7 @@ import {
   isAdminCaller,
 } from "./mcp-excerpt-guard.js";
 import { AUDIT_MAX_LIMIT } from "./mcp-excerpt-audit.js";
+import { PRESENCE_ACTIVE_MINUTES, PRESENCE_MAX_HOURS, PRESENCE_SCHEMA_VERSION } from "./mcp-presence.js";
 import { MCP_QUERY_SCHEMA_VERSION, USAGE_DERIVATION_VERSION } from "./mcp-query-source.js";
 import {
   MCP_PROMPT_SCHEMA_VERSION,
@@ -469,8 +470,14 @@ function requestSignal(context) {
   return context?.mcpReq?.signal ?? context?.signal;
 }
 
-function documentation(source, { retiredTools = false } = {}) {
-  const full = fullDocumentation(source);
+const PRESENCE_DOCUMENTATION = Object.freeze({
+  name: "presence",
+  purpose: "Who is coding now, who was active over the last N hours, or one person's last activity; top-level sessions only, no content.",
+});
+
+function documentation(source, { retiredTools = false, presence = false } = {}) {
+  const base = fullDocumentation(source);
+  const full = presence ? { ...base, tools: [...base.tools, PRESENCE_DOCUMENTATION] } : base;
   if (retiredTools) return full;
   const mentionsRetired = (text) => [...RETIRED_TOOLS].some((name) => text.includes(name));
   return {
@@ -552,6 +559,53 @@ async function auditedMetadataRead(guard, tool, args, read) {
   }
 }
 
+const presenceInputSchema = z.object({
+  person: z.string().min(1).max(256).optional()
+    .describe("personId from resolve_person, or a name or work-email local part. Omit for everyone."),
+  hours: z.number().int().min(1).max(PRESENCE_MAX_HOURS).optional()
+    .describe(`History window in hours (max ${PRESENCE_MAX_HOURS}). Omit for who is active now (last ${PRESENCE_ACTIVE_MINUTES} minutes); with person, defaults to ${PRESENCE_MAX_HOURS}.`),
+}).strict();
+
+const presenceOutputSchema = z.object({
+  schemaVersion: z.literal(PRESENCE_SCHEMA_VERSION),
+  readAt: ISO_TIMESTAMP,
+  mode: z.enum(["now", "history", "person"]),
+  window: z.object({ startInclusive: ISO_TIMESTAMP, endInclusive: ISO_TIMESTAMP }).strict().optional(),
+  activeWithinMinutes: z.literal(PRESENCE_ACTIVE_MINUTES).optional(),
+  found: z.boolean().optional(),
+  ambiguous: z.boolean().optional(),
+  personId: UUID.optional(),
+  matches: z.array(z.object({ personId: UUID, displayName: SHORT_TEXT }).strict()).max(5).optional(),
+  people: z.array(z.object({
+    personId: UUID,
+    displayName: SHORT_TEXT,
+    active: z.boolean().describe(`Model activity in a top-level session in the last ${PRESENCE_ACTIVE_MINUTES} minutes.`),
+    activeSessions: z.number().int().nonnegative(),
+    sessions: z.number().int().nonnegative().describe("Top-level sessions with model activity in the window."),
+    lastActivityAt: ISO_TIMESTAMP.nullable(),
+    agents: z.array(z.enum(["codex", "claude"])).max(2),
+  }).strict()).max(200),
+}).strict();
+
+// COR-5178: Sherlock answers "who is active" itself (replacing Heartbeat's
+// stale codex_sessions view). Metadata only; recorded like list_sessions.
+function registerPresenceTool(server, presenceSource, guard) {
+  server.registerTool("presence", {
+    title: "Sherlock coding presence",
+    description: `Who is coding right now (model activity in the last ${PRESENCE_ACTIVE_MINUTES} minutes), everyone active in the last N hours, or one person's last activity. Counts top-level sessions only (no subagents, reviewer or automation runs); owner-excluded sessions never count. Returns names, agents, counts and times; never content. Pass person as a resolve_person personId, a name or a work-email local part; an ambiguous name returns matches instead of guessing.`,
+    inputSchema: presenceInputSchema,
+    outputSchema: presenceOutputSchema,
+    annotations: READ_ONLY_ANNOTATIONS,
+  }, async (args, context = {}) => {
+    try {
+      return success(await auditedMetadataRead(guard, "presence", args,
+        async () => await presenceSource.fetchPresence({ ...args, signal: requestSignal(context) })));
+    } catch (error) {
+      return failure(error, { query: true });
+    }
+  });
+}
+
 const AUDIT_ERRORS = {
   forbidden: {
     message: "list_excerpt_reads is restricted to Cosmos admin callers.",
@@ -605,6 +659,7 @@ const auditOutputSchema = z.object({
     callerTier: z.string().max(32).nullable(),
     tool: z.enum([
       "search_sessions", "get_session_evidence", "list_prompt_evidence", "list_sessions", "get_session",
+      "presence",
     ]),
     outcome: z.enum(["ok", "error", "rate_limited"]),
     sessionId: UUID.nullable(),
@@ -672,7 +727,7 @@ function registerSearchTools(server, source, guard) {
 }
 
 export function registerBonaparteTools(server, source, {
-  guard = null, auditStore = null, retiredTools = false,
+  guard = null, auditStore = null, retiredTools = false, presenceSource = null,
 } = {}) {
   if (retiredTools && typeof source.fetchProviderUsage === "function") server.registerTool("list_provider_usage", {
     title: "Recovered provider plan usage",
@@ -692,7 +747,7 @@ export function registerBonaparteTools(server, source, {
       outputSchema: documentationOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => success(documentation(source, { retiredTools })),
+    async () => success(documentation(source, { retiredTools, presence: presenceSource !== null })),
   );
 
   server.registerTool(
@@ -840,6 +895,7 @@ export function registerBonaparteTools(server, source, {
 
   if (hasSearchSource(source)) registerSearchTools(server, source, guard);
   if (auditStore !== null) registerAuditTool(server, auditStore);
+  if (presenceSource !== null) registerPresenceTool(server, presenceSource, guard);
 }
 
 const INSTRUCTIONS = "Begin with documentation. For token/model analysis call coverage, then query_usage. Use list_sessions and get_session only for metadata drill-down. Query v1 reports observed data as partial because terminal normalization failures are not yet in its freshness receipt; never treat telemetry as proof of collector completeness, continuous attention, productivity, or personnel performance.";
@@ -864,7 +920,7 @@ function measureToolResults(server, log) {
 }
 
 export function createBonaparteMcpProtocol(source, {
-  guard = null, auditStore = null, retiredTools = false, log = null,
+  guard = null, auditStore = null, retiredTools = false, log = null, presenceSource = null,
 } = {}) {
   const base = retiredTools ? `${INSTRUCTIONS} ${PROMPT_EVIDENCE_INSTRUCTIONS}` : INSTRUCTIONS;
   const instructions = hasSearchSource(source)
@@ -876,7 +932,7 @@ export function createBonaparteMcpProtocol(source, {
       { instructions },
     );
     registerBonaparteTools(log ? measureToolResults(server, log) : server, source, {
-      guard, auditStore, retiredTools,
+      guard, auditStore, retiredTools, presenceSource,
     });
     return server;
   }, { responseMode: "json", maxSubscriptions: 0 });

@@ -11,6 +11,7 @@ import {
   validateDashboardEmailDomain,
 } from "./src/server/flame-source.js";
 import { createExcerptAuditStore, createExcerptAuditWriter } from "./src/server/mcp-excerpt-audit.js";
+import { createPresenceSource } from "./src/server/mcp-presence.js";
 import {
   IDENTITY_PASS_SECRET_MIN_LENGTH,
   createExcerptGuard,
@@ -97,12 +98,16 @@ if (source) await source.reserveCapacity();
 cache?.start();
 freshnessCache?.start();
 const providerUsageSource = source ? createProviderUsageSource(source) : null;
+const searchSource = source ? createSherlockSearchSource(source) : null;
+const presenceSource = source
+  ? createPresenceSource(source, { resolvePerson: searchSource.resolvePerson })
+  : null;
 const mcpSource = source && cache ? createCachedMcpSource({
   cache,
   source,
   querySource: createSherlockQuerySource(source),
   providerUsageSource,
-  searchSource: createSherlockSearchSource(source),
+  searchSource,
 }) : null;
 const excerptAuditStore = mcpSource ? createExcerptAuditStore(source) : null;
 const excerptAuditWriter = excerptAuditStore
@@ -112,6 +117,7 @@ const mcpProtocol = mcpSource
   ? createBonaparteMcpProtocol(mcpSource, {
       guard: createExcerptGuard({ audit: excerptAuditWriter }),
       auditStore: excerptAuditStore,
+      presenceSource,
       log: (event) => console.log(JSON.stringify(event)),
     })
   : null;
