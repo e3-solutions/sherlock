@@ -13,7 +13,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  id-token: write
 
 concurrency:
   group: docs-backstop-${{ github.event.pull_request.number }}
@@ -25,14 +24,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      # Fork PRs get no secrets either, so they also skip here.
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' && github.event.pull_request.head.repo.full_name == github.repository }}
       PR: ${{ github.event.pull_request.number }}
-      BASE: ${{ github.event.pull_request.base.sha }}
-      HEAD: ${{ github.event.pull_request.merge_commit_sha }}
     steps:
       - name: Skip without the key
         if: env.HAS_KEY != 'true'
-        run: echo "::notice::ANTHROPIC_API_KEY is not shared with this repository; docs backstop skipped."
+        run: echo "::notice::Docs backstop skipped (ANTHROPIC_API_KEY not shared with this repository, or a fork PR)."
 
       - uses: actions/checkout@v4
         if: env.HAS_KEY == 'true'
@@ -43,44 +41,56 @@ jobs:
       - name: Gate
         id: gate
         if: env.HAS_KEY == 'true'
-        run: python3 .agents/docs_backstop_gate.py --base "$BASE" --head "$HEAD" --files-out "$RUNNER_TEMP/changed.txt" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .agents/docs_backstop_gate.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --files-out "$RUNNER_TEMP/changed.txt" >> "$GITHUB_OUTPUT"
 
       - name: Update docs with Claude
         if: steps.gate.outputs.needed == 'true'
+        # Hitting the turn cap must not lose partial edits; the next step decides.
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: >-
-            --max-turns 15
+            --max-turns 30
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git diff:*),Bash(git log:*),Bash(python3 .agents/check_agent_docs.py)"
           prompt: |
             [e3-docs-check v1] Docs backstop for merged PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}".
-            It changed code but no docs. See `git diff ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.merge_commit_sha }}`;
-            the changed code files are listed in ${{ runner.temp }}/changed.txt.
+            It changed code but no docs. The changed code files are listed in ${{ runner.temp }}/changed.txt;
+            read them as they are now, and use `git log` to see this PR's commits.
             Check AGENTS.md, docs/README.md (if present) and any skill in .agents/skills/ that covers this area.
             If a command, deploy step, env var, branch, file path, service name or rule they state is now wrong or
             missing because of this PR, fix it with the smallest edit, in the doc that already owns that fact.
-            Edit only AGENTS.md, CLAUDE.md, docs/ and .agents/skills/. Do not change code. Do not commit or push.
+            Edit only AGENTS.md, docs/ and .agents/skills/. Do not change code. Do not commit or push.
             Run `python3 .agents/check_agent_docs.py` after editing. If nothing needs changing, make no edit.
 
       - name: Open docs PR
-        if: steps.gate.outputs.needed == 'true'
+        if: always() && steps.gate.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           TITLE: ${{ github.event.pull_request.title }}
         run: |
+          # Keep only edits to the docs Claude may change (the action itself rewrites
+          # CLAUDE.md and .claude/ from main, so those never count).
           git restore --staged . 2>/dev/null || true
-          git checkout -- $(git diff --name-only | grep -vE '^(AGENTS\.md|CLAUDE\.md|docs/|\.agents/skills/)' || true) 2>/dev/null || true
-          if git diff --quiet -- AGENTS.md CLAUDE.md docs .agents/skills; then
+          git diff --name-only | grep -vE '^(AGENTS\.md|docs/|\.agents/skills/)' | xargs -r git checkout --
+          git clean -fdq -e AGENTS.md -e docs -e .agents/skills >/dev/null 2>&1 || true
+          paths=$(for p in AGENTS.md docs .agents/skills; do [ -e "$p" ] && echo "$p"; done)
+          [ -n "$paths" ] && git add -A -- $paths
+          if git diff --cached --quiet; then
             echo "::notice::Docs checked for #$PR: no change needed."
             exit 0
           fi
           python3 .agents/check_agent_docs.py --warn
           branch="docs-backstop/pr-$PR"
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
+            echo "::notice::$branch already exists; not opening a second docs PR."
+            exit 0
+          fi
           git switch -c "$branch"
-          git add -- AGENTS.md CLAUDE.md docs .agents/skills
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -m "Docs backstop for #$PR" -m "Bring agent docs in line with #$PR ($TITLE)." -m "Docs-Check: updated"
           git push origin "$branch"
