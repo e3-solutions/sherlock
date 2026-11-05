@@ -18,8 +18,8 @@ its fix: `docs/dashboard-queue-recovery.md`.
   the new sessions fit within 80% of `max_connections`.
 - Read-only by default. Retrying a failed job is a production write. Retry one
   reviewed job at a time, with a yes, and check that exactly one row changed.
-- Quiet hours (03:00–19:00 UTC): no large scans. Use the indexed queue queries
-  below with a short `statement_timeout`.
+- Quiet hours (03:00–19:00 UTC): no large scans. Keep to open statuses (the
+  partial indexes) with a short `statement_timeout` and `LIMIT`.
 
 ## Steps
 
@@ -30,13 +30,14 @@ its fix: `docs/dashboard-queue-recovery.md`.
    select workload_class, job_kind, status, count(*) as jobs,
           min(available_at) as oldest_available
    from processing.telemetry_jobs
+   where status in ('queued', 'leased', 'failed')
    group by workload_class, job_kind, status
    order by workload_class, job_kind, status;
    ```
 
    Live lag pauses new backfill claims on purpose (overload mode).
 2. **Failed jobs:** list them with `last_error_code`, `last_error` and
-   `attempt_count` (query in `docs/telemetry-processing.md`). Group by error code
+   `attempt_count` (query in `docs/telemetry-processing.md`; add `limit 50`). Group by error code
    before acting. Jobs requeued dozens of times are a cause, not a symptom.
 3. **Worker health** in the Railway logs of `telemetry-processor`:
    - `worker_progress_stalled`: a control query was wedged for 60 s and the worker exited on purpose.

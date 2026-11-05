@@ -18,12 +18,16 @@ Data model and roles: `docs/data-schema.md` ("Database roles"). Production proje
   history, so repo and ledger match.
 - **Busy database rules:**
   - No index builds or large scans between 03:00 and 19:00 UTC.
-  - Build indexes `concurrently` in a migration of their own.
-  - Set a short `statement_timeout` and `lock_timeout` inside the migration for anything that takes locks.
+  - Build indexes `concurrently`, in a migration of their own, following
+    `supabase/migrations/20261104214000_index_message_search_windows.sql`: a short
+    `lock_timeout` (`1s`), a long `statement_timeout` (`30min`), and a restart-safe
+    check that drops an invalid index left by an earlier attempt. A short
+    `statement_timeout` cancels the build and leaves an invalid index.
+  - Other DDL: a short `lock_timeout` so it fails fast instead of queueing behind traffic.
   - On Nov 4, hand-run queries overlapping an ingest stall made an outage worse.
-- **Least privilege.** Grant to the narrow roles (`sherlock_processor`,
-  `sherlock_normalizer`, `sherlock_reducer`, `sherlock_frame_projector`,
-  `sherlock_reader`) and not to the owner. New tables in exposed schemas need RLS.
+- **Least privilege.** Grant to the narrow roles (for example `sherlock_ingest`,
+  `sherlock_processor`, `sherlock_normalizer`, `sherlock_reducer`,
+  `sherlock_frame_projector`, `sherlock_reader`) and not to the owner. New tables in exposed schemas need RLS.
 - **Forward-only.** Never edit an applied migration; add a new one. Changes must
   work with the worker and dashboard that are already running.
 

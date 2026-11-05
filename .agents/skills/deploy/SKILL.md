@@ -12,9 +12,9 @@ rollback target).
 | Component | How it ships |
 | --- | --- |
 | Telemetry worker (`workers/telemetry-processor/`) | Railway service `telemetry-processor` (project `sherlock-telemetry-worker`) deploys from GitHub on every push to `main`, but only rebuilds when the push touches a path in the root `railway.toml` `watchPatterns`. Otherwise Railway marks it `SKIPPED` |
-| Edge Functions (`supabase/functions/*`) | Manual, one function by name. CI only tests them |
-| Dashboard and MCP (`apps/dashboard/`) | Railway services `codeactivity-dashboard` and `sixtyfour-dashboard` redeploy from GitHub on **every** push to `main`, including docs-only pushes, because `apps/dashboard/railway.json` has no watch patterns. Each restart briefly returns 503 on `/healthz` (`timeline_warming`). See `apps/dashboard/README.md` "Railway deployment" |
-| Collector and hooks (`packages/telemetry-collector/`, `plugins/`) | Only through the `sherlock` commit pinned in jolly-roger `repositories.json` (a jolly-roger PR, capture stream) |
+| Edge Functions `sherlock-rollout-ingest`, `sherlock-collector-activity` | Manual, one function by name. CI only tests them. `supabase/functions/sherlock-rollout-ingest/**` and `sherlock-activity-reducer/**` are also in the worker's `watchPatterns`, so a merge there rebuilds the worker too |
+| Dashboard and MCP (`apps/dashboard/`) | Railway services `codeactivity-dashboard` and `sixtyfour-dashboard` redeploy from GitHub on **every** push to `main`, including docs-only pushes, because `apps/dashboard/railway.json` has no watch patterns. The new container answers 503 on `/healthz` (`timeline_warming`) until warm. Railway's health check keeps traffic on the old one meanwhile. See `apps/dashboard/README.md` "Railway deployment" |
+| Collector and hooks (`packages/telemetry-collector/`, `plugins/`) | Existing machines: through the `sherlock` commit pinned in jolly-roger `repositories.json` (a jolly-roger PR, capture stream). New installs clone `main` directly (README), so a merge reaches them at once |
 
 ## Rules
 

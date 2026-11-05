@@ -44,11 +44,14 @@ for example `collector-status.json` (`runs_without_progress`, `last_progress_at`
 
 ## 3. In the database (read-only, 1-day window, `LIMIT`)
 
-- `telemetry.ingest_batches` by `observed_native_session_id`: did a batch commit,
-  and do its byte ranges and hashes cover the file?
+- `telemetry.ingest_batches`: filter by `workspace_id`, `person_id` and a
+  `committed_at` range first (that is the index), then by `observed_native_session_id`.
+  `observed_native_session_id` alone is not indexed and scans the table. Did a
+  batch commit, and do its byte ranges and hashes cover the file?
 - `processing.telemetry_jobs` for that batch: queued, failed, or done?
 - Old collector versions deleted their local acknowledgements, so check old
-  sessions directly against `telemetry.ingest_batches`.
+  sessions directly against `telemetry.ingest_batches`. Widen the date range
+  only outside quiet hours.
 
 ## Known causes
 
