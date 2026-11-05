@@ -226,6 +226,10 @@ function requestedSession(args) {
 // (session, owner) pairs an excerpt call read, from its result or, when the
 // call failed or was refused, from its arguments.
 export function excerptReads(tool, args, result) {
+  if (tool === "presence") {
+    return (result?.people ?? []).map((person) => ({ sessionId: null, ownerPersonId: person.personId }))
+      .filter((read) => read.ownerPersonId);
+  }
   if (tool === "list_sessions") {
     return (result?.sessions ?? []).map((session) => ({
       sessionId: session.sessionId, ownerPersonId: session.personId,

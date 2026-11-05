@@ -295,6 +295,13 @@ limitation contracts are documented in
   rank diverse canonical excerpt matches, and open exact-source conversation
   context with microsecond keyset cursors. These use a bounded indexed candidate
   function that fails closed on privacy-policy drift and rechecks facts under RLS.
+- `presence` answers who is coding now (model activity in the last 15 minutes),
+  who was active over the last N hours (up to 720), or one person's last
+  activity. It counts top-level sessions only (no subagents, reviewer or
+  automation runs), runs under reader row security so owner-excluded sessions
+  never count, reads hours-long windows from `analytics.usage_contributions`,
+  and returns names, agents, counts and times only. It replaces the Heartbeat
+  leaf's stale `codex_sessions` view (COR-5178).
 - `query_usage` aggregates active Codex/Claude projections by person and model,
   differencing cumulative Codex streams and surfacing missing baselines or
   regressions as partial coverage.
