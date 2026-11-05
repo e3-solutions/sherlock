@@ -3,61 +3,90 @@ name: Docs backstop
 # COR-5202 part 2. After a PR merges into main with code changes but no docs
 # changes, ask Claude to bring AGENTS.md, docs/ and .agents/skills up to date,
 # and open a small docs PR for review. It never merges anything.
-# Skips cleanly (a notice, green run) until the ANTHROPIC_API_KEY org secret
-# is shared with this repository.
+# Skips cleanly (a notice, green run) while ANTHROPIC_API_KEY is not set for
+# this repository. Run it by hand for an already-merged PR with workflow_dispatch.
+# Per run: Sonnet, at most 20 turns, $0.50 and 4,000 output tokens per reply.
 on:
   pull_request:
     types: [closed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Number of an already-merged PR to check
+        required: true
 
 permissions:
   contents: write
   pull-requests: write
 
 concurrency:
-  group: docs-backstop-${{ github.event.pull_request.number }}
+  group: docs-backstop-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: false
 
 jobs:
   backstop:
-    if: github.event.pull_request.merged == true && !startsWith(github.event.pull_request.head.ref, 'docs-backstop/')
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true && !startsWith(github.event.pull_request.head.ref, 'docs-backstop/'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # Fork PRs get no secrets either, so they also skip here.
-      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' && github.event.pull_request.head.repo.full_name == github.repository }}
-      PR: ${{ github.event.pull_request.number }}
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      PR: ${{ github.event.pull_request.number || inputs.pr }}
     steps:
       - name: Skip without the key
         if: env.HAS_KEY != 'true'
-        run: echo "::notice::Docs backstop skipped (ANTHROPIC_API_KEY not shared with this repository, or a fork PR)."
+        run: echo "::notice::Docs backstop skipped (ANTHROPIC_API_KEY is not set for this repository)."
+
+      - name: Resolve the PR
+        id: pr
+        if: env.HAS_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '
+            "merged=\(.merged)",
+            "same_repo=\(.head.repo.full_name == .base.repo.full_name)",
+            "backstop=\(.head.ref | startswith("docs-backstop/"))",
+            "merge_sha=\(.merge_commit_sha)",
+            "author=\(.user.login)"' >> "$GITHUB_OUTPUT"
+          {
+            echo "title<<E3_DOCS_TITLE_EOF"
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '.title'
+            echo "E3_DOCS_TITLE_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
-        if: env.HAS_KEY == 'true'
+        if: steps.pr.outputs.merged == 'true' && steps.pr.outputs.same_repo == 'true' && steps.pr.outputs.backstop == 'false'
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ steps.pr.outputs.merge_sha }}
           fetch-depth: 0
 
       - name: Gate
         id: gate
-        if: env.HAS_KEY == 'true'
+        if: steps.pr.outputs.merged == 'true' && steps.pr.outputs.same_repo == 'true' && steps.pr.outputs.backstop == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .agents/docs_backstop_gate.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --files-out "$RUNNER_TEMP/changed.txt" >> "$GITHUB_OUTPUT"
 
       - name: Update docs with Claude
         if: steps.gate.outputs.needed == 'true'
-        # Hitting the turn cap must not lose partial edits; the next step decides.
+        # Hitting the turn or budget cap must not lose partial edits; the next step decides.
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: >-
-            --max-turns 30
+            --model sonnet
+            --max-turns 20
+            --max-budget-usd 0.50
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git diff:*),Bash(git log:*),Bash(python3 .agents/check_agent_docs.py)"
           prompt: |
-            [e3-docs-check v1] Docs backstop for merged PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}".
+            [e3-docs-check v1] Docs backstop for merged PR #${{ env.PR }}: "${{ steps.pr.outputs.title }}".
             It changed code but no docs. The changed code files are listed in ${{ runner.temp }}/changed.txt;
             read them as they are now, and use `git log` to see this PR's commits.
             Check AGENTS.md, docs/README.md (if present) and any skill in .agents/skills/ that covers this area.
@@ -70,8 +99,8 @@ jobs:
         if: always() && steps.gate.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
-          TITLE: ${{ github.event.pull_request.title }}
+          AUTHOR: ${{ steps.pr.outputs.author }}
+          TITLE: ${{ steps.pr.outputs.title }}
         run: |
           # Keep only edits to the docs Claude may change (the action itself rewrites
           # CLAUDE.md and .claude/ from main, so those never count).
@@ -94,9 +123,6 @@ jobs:
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -m "Docs backstop for #$PR" -m "Bring agent docs in line with #$PR ($TITLE)." -m "Docs-Check: updated"
           git push origin "$branch"
-          gh pr create --base main --head "$branch" \
-            --title "Docs backstop for #$PR" \
-            --body "Docs follow-up for #$PR, which changed code but no docs. Proposed by the docs backstop (COR-5202); review and merge if right." \
-            --assignee "$AUTHOR" || gh pr create --base main --head "$branch" \
-            --title "Docs backstop for #$PR" \
-            --body "Docs follow-up for #$PR, which changed code but no docs. Proposed by the docs backstop (COR-5202); review and merge if right."
+          body="Docs follow-up for #$PR, which changed code but no docs. Proposed by the docs backstop (COR-5202); review and merge if right."
+          gh pr create --base main --head "$branch" --title "Docs backstop for #$PR" --body "$body" --assignee "$AUTHOR" \
+            || gh pr create --base main --head "$branch" --title "Docs backstop for #$PR" --body "$body"
