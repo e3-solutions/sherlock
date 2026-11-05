@@ -65,8 +65,8 @@ begin
     ), sessions as materialized (
       select a.workspace_id, a.session_id, a.last_activity_at, s.person_id, s.actor_role,
              (select case
-                       when x.normalizer_version like 'sherlock.claude-code-transcript.%' then 'claude'
-                       when x.normalizer_version like 'sherlock.codex-rollout.%' then 'codex'
+                       when x.normalizer_version like 'sherlock.claude-code-transcript.%%' then 'claude'
+                       when x.normalizer_version like 'sherlock.codex-rollout.%%' then 'codex'
                        else 'unknown' end
                 from telemetry.events x
                where x.workspace_id = a.workspace_id and x.session_id = a.session_id
