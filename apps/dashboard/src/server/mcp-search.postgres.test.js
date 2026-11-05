@@ -980,8 +980,9 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
     expect(plans.commonWide).toHaveLength(7);
     for (const { rows, nodes } of plans.commonWide) {
       expect(rows).toBeGreaterThan(0);
+      const shape = JSON.stringify(nodes.map((node) => [node["Node Type"], node["Index Name"], node["Index Cond"]]));
       expect(nodes.some((node) => node["Node Type"] === "Bitmap Index Scan"
-        && /AT TIME ZONE|timezone/i.test(node["Index Cond"] ?? ""))).toBe(true);
+        && /AT TIME ZONE|timezone/i.test(node["Index Cond"] ?? "")), shape).toBe(true);
       expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
         .not.toContain("Seq Scan");
     }
