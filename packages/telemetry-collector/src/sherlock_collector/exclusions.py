@@ -105,8 +105,6 @@ PATTERN = "*"
 # Pattern keys carry this mark, which no path can contain, so a resolved plain
 # path that happens to end with "*" is never read as a pattern.
 _PATTERN_KEY = "\0"
-# A pattern's parent is listed at most this far when finding existing matches.
-MAX_PATTERN_MATCHES = 10_000
 
 
 def is_project_pattern(path: str) -> bool:
@@ -115,9 +113,9 @@ def is_project_pattern(path: str) -> bool:
         os.path.normpath(os.path.expanduser(path.strip())).endswith(PATTERN)
 
 
-def _check_pattern(path: str) -> None:
+def _check_pattern(path: str, *, resolved: bool = False) -> None:
     parent, name = os.path.split(path)
-    if PATTERN in parent or name.count(PATTERN) != 1 or not name.endswith(PATTERN):
+    if name.count(PATTERN) != 1 or not name.endswith(PATTERN) or (PATTERN in parent and not resolved):
         raise ValueError("a project pattern may use * only at the end of its last folder name")
     # The resolved parent too: "//x*" or a parent linked to "/" must not cover everything.
     if os.sep in (parent, os.path.normpath(os.path.realpath(parent)) if parent else os.sep):
@@ -167,32 +165,6 @@ def _absolute_project_path(value: str, *, for_removal: bool = False) -> str:
     return normalize_project_path(resolved)
 
 
-def _pattern_matches(pattern: str) -> list[str]:
-    """Existing real folders (not symlinks) a resolved pattern covers, whose git
-    remotes then exclude Codex sessions of their removed worktrees.
-
-    Symlinked matches are never followed: anything that can create a folder in
-    the parent could otherwise point one at "/", the home folder or an E3
-    checkout and silently exclude it. Exclude a link's target by its own path.
-    """
-    parent, name = os.path.split(pattern)
-    prefix = _path_key(name[: -len(PATTERN)])
-    found: list[str] = []
-    try:
-        with os.scandir(parent) as entries:
-            for entry in entries:
-                if not _path_key(entry.name).startswith(prefix):
-                    continue
-                with contextlib.suppress(OSError):
-                    if entry.is_dir(follow_symlinks=False):
-                        found.append(os.path.join(parent, entry.name))
-                        if len(found) >= MAX_PATTERN_MATCHES:
-                            break
-    except OSError:
-        pass
-    return found
-
-
 def _project_paths(raw: dict) -> frozenset[str]:
     values = raw.get("excluded_project_paths", [])
     if not isinstance(values, list):
@@ -204,7 +176,7 @@ def _project_paths(raw: dict) -> frozenset[str]:
         # keep the lexical spelling too (for example /tmp and /private/tmp).
         resolved = _resolved_project_path(value)
         if normalized.endswith(PATTERN):
-            _check_pattern(resolved)
+            _check_pattern(resolved, resolved=True)
             keys |= {_PATTERN_KEY + _path_key(normalized), _PATTERN_KEY + _path_key(resolved)}
             continue
         if os.sep in (normalized, resolved):
@@ -397,11 +369,10 @@ class ExclusionPolicy:
             self._ancestry["repositories"] = frozenset(
                 remote
                 for project in self.excluded_project_paths
-                for folder in (
-                    _pattern_matches(_resolved_project_path(project))
-                    if is_project_pattern(project) else (project,)
-                )
-                for remote in _project_remotes(folder)
+                # Patterns match by path only: a folder created later that
+                # carries an E3 repository's remote must not exclude that repo.
+                if not is_project_pattern(project)
+                for remote in _project_remotes(project)
             )
         return self._ancestry["repositories"]
 

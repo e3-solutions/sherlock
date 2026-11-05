@@ -818,29 +818,22 @@ class ProjectExclusionTests(unittest.TestCase):
         with patch.dict(os.environ, {"SHERLOCK_HOME": str(self.root)}):
             self.assertFalse(load_policy().project_excluded(str(self.root / "aXb")))
 
-    def test_folder_name_patterns_cover_symlinked_matches_and_their_remotes(self):
-        # A matching folder that links elsewhere is never followed, so a link to
-        # "/", home or an E3 checkout cannot silently exclude it.
+    def test_folder_name_patterns_follow_no_symlinked_matches_and_no_remotes(self):
+        # A matching link to "/", home or an E3 checkout must not exclude it, and a
+        # matching folder carrying an E3 repository's remote must not exclude that repo.
         secret = self.root / "secret"
         (secret / "sub").mkdir(parents=True)
         (self.root / "work" / "private-link").symlink_to(secret)
         (self.root / "work" / "private-root").symlink_to("/")
+        (self.sibling / ".git").mkdir()
+        (self.sibling / ".git" / "config").write_text(
+            '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/Shared.git\n')
         policy = self.policy(f"{self.root / 'work'}/private-*")
         self.assertTrue(policy.project_excluded(str(self.root / "work" / "private-link" / "sub")))
         self.assertFalse(policy.project_excluded(str(secret / "sub")))
         self.assertFalse(policy.project_excluded(str(self.root / "elsewhere")))
-        # A matching checkout's origin excludes Codex sessions of its removed worktrees.
-        (self.sibling / ".git").mkdir()
-        (self.sibling / ".git" / "config").write_text(
-            '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/Hidden.git\n')
-        home = self.root / "codex"
-        _, gone = codex_rollout(home, meta={
-            "cwd": str(self.root / "deleted-worktree"),
-            "git": {"repository_url": "https://github.com/acme/hidden"},
-        })
-        _, kept = codex_rollout(home, meta={"cwd": str(self.root / "elsewhere")})
-        transport, _ = self.run_reconcile(home, "codex", self.policy(f"{self.root / 'work'}/private-*"))
-        self.assertEqual(uploaded_ids(transport), {kept})
+        self.assertEqual(policy._excluded_repositories(), frozenset())
+        self.assertIsNone(policy._session_reason(str(self.root / "elsewhere"), "https://github.com/acme/shared"))
 
     def test_folder_name_patterns_resolve_symlinks_before_parent_references(self):
         target = self.root / "x" / "y"
@@ -850,16 +843,12 @@ class ProjectExclusionTests(unittest.TestCase):
         policy = self.policy(f"{self.root / 'work'}/lnk/../c*")
         self.assertTrue(policy.project_excluded(str(self.root / "x" / "cfoo" / "z")))
 
-    def test_pattern_remotes_ignore_case_and_count_only_matches(self):
-        (self.sibling / ".git").mkdir()
-        (self.sibling / ".git" / "config").write_text(
-            '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/Hidden.git\n')
-        for index in range(5):
-            (self.root / "work" / f"zz-{index}").mkdir()
-        with patch.object(exclusions_module, "MAX_PATTERN_MATCHES", 1):
-            policy = self.policy(f"{self.root / 'work'}/PRIVATE-*")
-            if sys.platform == "darwin":
-                self.assertIn("github.com/acme/hidden", " ".join(policy._excluded_repositories()).lower())
+    def test_a_pattern_under_a_parent_whose_real_name_has_a_star_still_loads(self):
+        (self.root / "we*ird").mkdir()
+        (self.root / "lnk").symlink_to(self.root / "we*ird")
+        policy = self.policy(f"{self.root}/lnk/aey-*")
+        self.assertIsNone(policy.error)
+        self.assertTrue(policy.project_excluded(str(self.root / "we*ird" / "aey-1")))
 
     def test_a_pattern_with_a_trailing_dot_reads_as_the_pattern(self):
         policy = self.policy(f"{self.root / 'work'}/private-*/.")

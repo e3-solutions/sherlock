@@ -74,6 +74,9 @@ it so the shell does not expand it. `*` means a pattern only at the end of the
 last folder name. Runtimes older than this read a pattern as a plain path that
 matches nothing, so update the collector before relying on one; plain entries
 keep working either way.
+Patterns match by folder path only: they follow no symlinked matching folder
+and read no git remote, so add a checkout as a plain entry to also exclude
+Codex sessions of its removed worktrees.
 
 A session is excluded when its working directory is that directory, is inside
 it, or is inside a git worktree (or a repository nested in one) whose main
