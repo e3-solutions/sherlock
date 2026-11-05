@@ -9,7 +9,8 @@ const PRESENCE_STATEMENT_TIMEOUT_MS = 15_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // COR-5178: who is coding, from model activity (usage events) on top-level
-// sessions: no parent, not a reviewer (guardian) or automation run. Runs as
+// sessions: no parent, and not a subagent (worker), reviewer (guardian) or
+// automation run; a worker whose parent link is not resolved yet has no parent. Runs as
 // sherlock_reader, so row security hides restricted people and owner-excluded
 // sessions exactly as it does for every other tool. Ids, names, agents and
 // times only.
@@ -18,7 +19,7 @@ const PRESENCE_GROUPS_SQL = `, top_level as materialized (
     from activity a
     join telemetry.sessions s on s.workspace_id = $1 and s.id = a.session_id
    where s.parent_session_id is null and s.parent_native_session_id is null
-     and s.actor_role not in ('guardian', 'automation')
+     and s.actor_role not in ('worker', 'guardian', 'automation')
      and ($5::uuid is null or s.person_id = $5::uuid)
 )
 select t.person_id::text person_id,
@@ -70,6 +71,26 @@ function count(value) {
   return Number.isSafeInteger(number) && number >= 0 ? number : 0;
 }
 
+function mergeActive(windowRows, nowRows) {
+  const now = new Map(nowRows.map((row) => [String(row.person_id), row]));
+  const merged = windowRows.map((row) => {
+    const live = now.get(String(row.person_id));
+    now.delete(String(row.person_id));
+    if (!live) return { ...row, active_sessions: 0 };
+    const latest = [row.last_activity_at, live.last_activity_at]
+      .filter(Boolean).map((value) => new Date(value)).sort((a, b) => b - a)[0] ?? null;
+    return {
+      ...row,
+      active_sessions: live.active_sessions,
+      last_activity_at: latest,
+      agents: [...new Set([...(row.agents ?? []), ...(live.agents ?? [])])],
+    };
+  });
+  // Active in the last minutes but not yet in the precomputed table.
+  return [...merged, ...now.values()]
+    .sort((left, right) => new Date(right.last_activity_at) - new Date(left.last_activity_at));
+}
+
 export function createPresenceSource(source, { resolvePerson } = {}) {
   if (typeof source?.transaction !== "function" || typeof source.workspaceId !== "string") {
     throw new TypeError("A direct Sherlock source is required");
@@ -113,7 +134,14 @@ export function createPresenceSource(source, { resolvePerson } = {}) {
         const precomputed = windowHours !== null && (await runQuery(tx, USAGE_CONTRIBUTION_STATE_SQL, [
           source.workspaceId, since.toISOString(),
         ], signal)).length > 0;
-        return await runQuery(tx, precomputed ? PRESENCE_CONTRIBUTIONS_SQL : PRESENCE_EVENTS_SQL, params, signal);
+        const windowRows = await runQuery(tx, precomputed ? PRESENCE_CONTRIBUTIONS_SQL : PRESENCE_EVENTS_SQL, params, signal);
+        if (!precomputed) return windowRows;
+        // The table runs a few minutes behind; "active now" always comes from
+        // the last 15 minutes of raw usage, which is cheap.
+        const nowRows = await runQuery(tx, PRESENCE_EVENTS_SQL, [
+          params[0], params[5], params[2], params[3], params[4], params[5],
+        ], signal);
+        return mergeActive(windowRows, nowRows);
       }, { signal, statementTimeoutMs: PRESENCE_STATEMENT_TIMEOUT_MS });
       const people = rows.map((row) => ({
         personId: String(row.person_id),

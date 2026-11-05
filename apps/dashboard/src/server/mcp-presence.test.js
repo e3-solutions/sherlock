@@ -55,7 +55,10 @@ describe("presence", () => {
   it("reads history from the precomputed table when it covers the window, else raw usage", async () => {
     const covered = source();
     const result = await createPresenceSource(covered.value).fetchPresence({ hours: 24, now: NOW });
-    expect(covered.calls.map((call) => call.text)).toEqual([USAGE_CONTRIBUTION_STATE_SQL, PRESENCE_CONTRIBUTIONS_SQL]);
+    expect(covered.calls.map((call) => call.text))
+      .toEqual([USAGE_CONTRIBUTION_STATE_SQL, PRESENCE_CONTRIBUTIONS_SQL, PRESENCE_EVENTS_SQL]);
+    // The "active now" pass reads only the last 15 minutes of raw usage.
+    expect(covered.calls[2].params.slice(1, 3)).toEqual(["2026-11-05T19:45:00.000Z", NOW]);
     expect(result.mode).toBe("history");
     expect(result.window.startInclusive).toBe("2026-11-04T20:00:00.000Z");
 
@@ -92,6 +95,34 @@ describe("presence", () => {
     expect(await presence.fetchPresence({ person: ADA, now: NOW })).toMatchObject({ found: false, people: [] });
   });
 
+  it("takes active flags from raw usage when the window comes from the precomputed table", async () => {
+    const BO = "55555555-5555-4555-8555-555555555555";
+    const calls = [];
+    const value = {
+      workspaceId: WORKSPACE, expectedEmailDomain: "e3group.ai",
+      async transaction(callback) {
+        return await callback({ unsafe(text, params) {
+          calls.push(text);
+          const rows = text === USAGE_CONTRIBUTION_STATE_SQL ? [{}]
+            : text === PRESENCE_CONTRIBUTIONS_SQL
+              ? [{ ...ROW, active_sessions: "0", last_activity_at: "2026-11-05T19:40:00.000Z", agents: ["codex"] }]
+              : [
+                { ...ROW, sessions: "1", active_sessions: "1", last_activity_at: "2026-11-05T19:59:00.000Z", agents: ["claude"] },
+                { ...ROW, person_id: BO, display_name: "Bo", sessions: "1", active_sessions: "1", agents: ["codex"] },
+              ];
+          const result = Promise.resolve(rows); result.cancel = () => {}; return result;
+        } });
+      },
+    };
+    const result = await createPresenceSource(value).fetchPresence({ hours: 24, now: NOW });
+    expect(result.people).toEqual([
+      { personId: ADA, displayName: "Ada", active: true, activeSessions: 1, sessions: 3,
+        lastActivityAt: "2026-11-05T19:59:00.000Z", agents: ["claude", "codex"] },
+      { personId: BO, displayName: "Bo", active: true, activeSessions: 1, sessions: 1,
+        lastActivityAt: "2026-11-05T19:58:00.000Z", agents: ["codex"] },
+    ]);
+  });
+
   it("rejects out-of-range hours", async () => {
     const presence = createPresenceSource(source().value);
     for (const hours of [0, PRESENCE_MAX_HOURS + 1, 1.5]) {
@@ -102,7 +133,7 @@ describe("presence", () => {
   it("counts only top-level sessions and never selects content columns", () => {
     for (const sql of [PRESENCE_EVENTS_SQL, PRESENCE_CONTRIBUTIONS_SQL]) {
       expect(sql).toContain("s.parent_session_id is null and s.parent_native_session_id is null");
-      expect(sql).toContain("s.actor_role not in ('guardian', 'automation')");
+      expect(sql).toContain("s.actor_role not in ('worker', 'guardian', 'automation')");
       expect(sql).not.toMatch(/content|title|branch|cwd|repo_remote/);
     }
   });
