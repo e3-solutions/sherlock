@@ -10,6 +10,7 @@ import {
   EVIDENCE_ANCHOR_SQL,
   EVIDENCE_BEFORE_SQL,
   EVIDENCE_SCAN_BUDGET,
+  EVIDENCE_OMITTED_SESSION_SQL,
   EVIDENCE_SESSION_SQL,
   PERSON_ROSTER_SQL,
   SEARCH_CANDIDATES_SQL,
@@ -620,14 +621,53 @@ describe("searchSessions", () => {
 });
 
 describe("readSessionEvidence", () => {
-  function evidenceSource({ session = [SESSION_ROW], anchor = [], before = [], after = [] } = {}) {
+  function evidenceSource({
+    session = [SESSION_ROW], omitted = [], anchor = [], before = [], after = [],
+  } = {}) {
     return fakeSource(new Map([
       [EVIDENCE_SESSION_SQL, () => session],
+      [EVIDENCE_OMITTED_SESSION_SQL, () => omitted],
       [EVIDENCE_ANCHOR_SQL, () => anchor],
       [EVIDENCE_BEFORE_SQL, () => before],
       [EVIDENCE_AFTER_SQL, typeof after === "function" ? after : () => after],
     ]));
   }
+
+  it("returns metadata without events for guardian and automation sessions", async () => {
+    const { source, calls } = evidenceSource({
+      session: [],
+      omitted: [{
+        session_id: SESSION_ROW.session_id, person_id: SESSION_ROW.person_id,
+        display_name: "Reviewer", started_at: SESSION_ROW.started_at, ended_at: null,
+        normalizer_version: "sherlock.codex-rollout.v3",
+      }],
+    });
+    for (const request of [
+      { sessionId: SESSION_ROW.session_id },
+      { sessionId: SESSION_ROW.session_id, anchorEventId: "5" },
+    ]) {
+      const result = await source.readSessionEvidence({ ...request, now: NOW });
+      expect(result).toMatchObject({
+        session: {
+          sessionId: SESSION_ROW.session_id, provider: "codex", parentSessionId: null,
+          childSessionIds: [],
+        },
+        anchorEventId: null,
+        events: [],
+        nextCursor: null,
+        coverage: { reasons: ["automated_session_omitted", "product_view_omissions"], returnedEvents: 0 },
+      });
+    }
+    // No event content is read for an omitted session.
+    expect(calls.map((call) => call.text).every((text) =>
+      text === EVIDENCE_SESSION_SQL || text === EVIDENCE_OMITTED_SESSION_SQL)).toBe(true);
+  });
+
+  it("keeps not_found for sessions outside the roster or reader scope", async () => {
+    const { source } = evidenceSource({ session: [], omitted: [] });
+    await expect(source.readSessionEvidence({ sessionId: SESSION_ROW.session_id, now: NOW }))
+      .rejects.toThrow("flame_mcp_query_not_found");
+  });
 
   it("validates session, anchor, cursor exclusivity, and bigint event IDs", async () => {
     const { source, calls } = evidenceSource();

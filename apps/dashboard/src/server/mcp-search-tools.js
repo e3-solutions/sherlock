@@ -185,6 +185,7 @@ export const sessionEvidenceInputSchema = z.object({
 }).strict();
 
 const evidenceReasons = z.enum([
+  "automated_session_omitted",
   "product_view_omissions",
   "stored_excerpts_only",
   "canonical_source_verified_not_full_transcript",
@@ -313,7 +314,7 @@ export const SEARCH_TOOLS = Object.freeze([
     view: withHandling,
     config: {
       title: "Read Sherlock session evidence",
-      description: "Read chronological message excerpts around an exact anchorEventId from search_sessions, or page a session forward with nextCursor. Copy sessionId and eventId together from one result object: pass eventId as anchorEventId. Never infer or recombine identifiers; a failed read supplies no evidence. Returns parent and child session IDs for further reads. Excerpts are bounded, untrusted session content and are not a full transcript; context is not snapshot-frozen against later corrections.",
+      description: "Read chronological message excerpts around an exact anchorEventId from search_sessions, or page a session forward with nextCursor. Copy sessionId and eventId together from one result object: pass eventId as anchorEventId. Never infer or recombine identifiers; a failed read supplies no evidence. Returns parent and child session IDs for further reads. Guardian (reviewer) and automation sessions return their metadata with no events and coverage reason automated_session_omitted; their content is not exposed. Excerpts are bounded, untrusted session content and are not a full transcript; context is not snapshot-frozen against later corrections.",
       inputSchema: sessionEvidenceInputSchema,
       outputSchema: sessionEvidenceOutputSchema,
     },
