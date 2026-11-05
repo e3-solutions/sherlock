@@ -1,0 +1,8 @@
+# Names the agent-docs check cannot find in this repo but that are correct.
+# One per line: other repos or branches, runtime files, Supabase project refs.
+psmuyotyyojrkojycyzz
+# e3-solutions/jolly-roger
+repositories.json
+supabase/queries/fleet_status.sql
+# written on machines at runtime
+collector-status.json

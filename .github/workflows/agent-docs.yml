@@ -1,0 +1,23 @@
+name: Agent docs
+
+# Checks that paths, modules, workflows and skills named in AGENTS.md, CLAUDE.md,
+# docs/README.md and .agents/skills still exist. Warn-only for the first week
+# (COR-5189); then drop --warn and make this check required.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 .agents/check_agent_docs.py --warn
