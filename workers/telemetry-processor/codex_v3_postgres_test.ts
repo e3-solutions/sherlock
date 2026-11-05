@@ -14,6 +14,7 @@ import {
   TelemetryProcessor,
 } from "./processor.ts";
 import { ACTIVITY_VERSION } from "../../supabase/functions/sherlock-activity-reducer/reducer.ts";
+import { PostgresActivityReducer } from "../../supabase/functions/sherlock-activity-reducer/postgres.ts";
 import { proveAndActivateFrameProjection } from "../../scripts/backfill-frame-evidence.ts";
 import { createSherlockQuerySource } from "../../apps/dashboard/src/server/mcp-query-source.js";
 import {
@@ -680,7 +681,13 @@ Deno.test({
         "insert into telemetry.people(id,workspace_id,identity_key,display_name,email) values($1::uuid,$2,$1::text,'Codex hook test','codex-hook@e3group.ai')",
         [personId, workspaceId],
       );
-      // One observation per batch, as the collector writes them.
+      // One observation per batch, as the collector writes them. Jobs run
+      // concurrently in no fixed order: the prompt batch lands first and
+      // creates the session before SessionStart is normalized.
+      const prompted = await upload("hook", [
+        await hook("UserPromptSubmit", { turn_id: "turn-1", prompt }, 1_000),
+      ]);
+      const sessionId = prompted.session_ids[0];
       const started = await upload(
         "hook",
         [
@@ -693,10 +700,10 @@ Deno.test({
         ],
         parentId,
       );
-      const sessionId = started.session_ids[0];
-      await upload("hook", [
-        await hook("UserPromptSubmit", { turn_id: "turn-1", prompt }, 1_000),
-      ]);
+      assert(
+        started.session_ids[0] === sessionId,
+        "every hook batch must land on one session",
+      );
       await upload("hook", [
         await hook(
           "Stop",
@@ -705,7 +712,7 @@ Deno.test({
             stop_hook_active: false,
             last_assistant_message: "Sanitized side answer",
           },
-          5_000,
+          300_000,
         ),
       ]);
       const [session] = await sql.unsafe(
@@ -734,12 +741,39 @@ Deno.test({
       );
       assert(
         hookEvents.map((event) => event.event_subtype).join(",") ===
-            "session_start,user_message,agent_message" &&
+            "user_message,session_start,agent_message,turn_complete" &&
           hookEvents.every((event) =>
             event.source_kind === "hook" && event.source_priority === 90 &&
             event.actor_role === "primary" && event.error_code === null
           ),
         "hook events must be valid primary-session facts below rollout priority",
+      );
+
+      const reducer = new PostgresActivityReducer(sql);
+      const [{ through }] = await sql.unsafe(
+        "select max(id)::text through from telemetry.events where workspace_id=$1 and session_id=$2",
+        [workspaceId, sessionId],
+      );
+      await reducer.reduceSession({
+        workspaceId,
+        sessionId,
+        normalizerVersion: version,
+        activityVersion: ACTIVITY_VERSION,
+        throughEventId: BigInt(String(through)),
+      });
+      const turns = await sql.unsafe(
+        `select span_state, actor_role,
+                extract(epoch from ended_at - started_at)::float8 seconds
+           from analytics.activity_spans
+          where workspace_id=$1 and session_id=$2 and activity_kind='turn'
+            and not is_tombstone`,
+        [workspaceId, sessionId],
+      );
+      assert(
+        turns.length === 1 && turns[0].span_state === "active" &&
+          turns[0].actor_role === "primary" &&
+          Number(turns[0].seconds) === 299,
+        `Stop must close the fork turn: ${JSON.stringify(turns)}`,
       );
 
       const window = { workspaceId, sessionId, now };

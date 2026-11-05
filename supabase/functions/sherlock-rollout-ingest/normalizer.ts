@@ -555,11 +555,7 @@ async function projectCodexHookBatch(
       native_session_id: nativeSessionId,
       native_thread_id: null,
       parent_native_session_id: parentNativeSessionId,
-      // Only SessionStart says how the session began; a later prompt or Stop
-      // stays unknown, and unknown never overwrites a stored role.
-      actor_role: sessionStart
-        ? actorRoleFromSource(sessionStart.payload.source)
-        : "unknown",
+      actor_role: codexHookActorRole(sessionStart, valid),
       role_version: ROLE_VERSION,
       title: null,
       project_key: null,
@@ -573,7 +569,7 @@ async function projectCodexHookBatch(
   const canonicalScopeKey = session
     ? `session:${session.native_session_id}`
     : `stream:${manifest.source_stream_key}`;
-  const events = await Promise.all(
+  const projected = await Promise.all(
     records.map(({ locator, validation }) =>
       projectCodexHookRecord(
         locator,
@@ -584,7 +580,22 @@ async function projectCodexHookBatch(
       )
     ),
   );
-  return { session, events, session_scm: null };
+  return { session, events: projected.flat(), session_scm: null };
+}
+
+// Hook observations arrive as separate batches in no fixed order, and the
+// worker stamps each event with the session role at insert. So every batch
+// must know the role on its own: SessionStart from its payload source, any
+// other record from the collector's fork marker (written on every event).
+// Without either the role stays unknown, which never overwrites a stored one.
+function codexHookActorRole(
+  sessionStart: CodexHookValidRecord | undefined,
+  valid: readonly CodexHookValidRecord[],
+): ActorRole {
+  if (sessionStart) return actorRoleFromSource(sessionStart.payload.source);
+  return valid.some((record) => record.sessionSource === "fork")
+    ? "primary"
+    : "unknown";
 }
 
 async function projectCodexHookRecord(
@@ -593,7 +604,7 @@ async function projectCodexHookRecord(
   session: SessionProjection | null,
   canonicalScopeKey: string,
   normalizerVersion: string,
-): Promise<EventProjection> {
+): Promise<EventProjection[]> {
   const base: EventProjection = {
     record_index: locator.record_index,
     projection_index: 0,
@@ -633,7 +644,7 @@ async function projectCodexHookRecord(
     content_excerpt: null,
     attributes: null,
   };
-  if (!validation.valid) return { ...base, error_code: validation.error };
+  if (!validation.valid) return [{ ...base, error_code: validation.error }];
 
   const {
     dispatchEventName,
@@ -662,17 +673,17 @@ async function projectCodexHookRecord(
   if (dispatchEventName === "SessionStart") {
     const source = boundedLabel(payload.source);
     if (source !== null) attributes.source = source;
-    return {
+    return [{
       ...valid,
       event_subtype: "session_start",
       logical_event_key: hookKey,
-    };
+    }];
   }
   if (dispatchEventName === "UserPromptSubmit") {
     // Trimmed like a rollout user_message, so both hash the same prompt alike
     // and share `message:user:<turn_id>` when Codex reports the turn.
     const content = stringValue(payload.prompt);
-    return {
+    return [{
       ...valid,
       ...(await messageFields(content)),
       event_kind: "message",
@@ -682,9 +693,9 @@ async function projectCodexHookRecord(
         ? RUNTIME_CONTEXT_MESSAGE_ORIGIN
         : "human",
       logical_event_key: turnId ? `message:user:${turnId}` : hookKey,
-    };
+    }];
   }
-  return {
+  const answer: EventProjection = {
     ...valid,
     ...(await messageFields(stringValue(payload.last_assistant_message))),
     event_kind: "agent_message",
@@ -695,6 +706,16 @@ async function projectCodexHookRecord(
       ? `message:assistant:${turnId}:hook_stop`
       : hookKey,
   };
+  if (!turnId) return [answer];
+  // Stop ends the turn, as Claude's anchored Stop does. Without this the
+  // reducer keeps every fork turn as a provisional open point.
+  return [answer, {
+    ...valid,
+    attributes: { ...attributes },
+    projection_index: 1,
+    event_subtype: "turn_complete",
+    logical_event_key: `codex:lifecycle:${turnId}:turn_complete`,
+  }];
 }
 
 type CodexHookValidRecord = {
@@ -759,6 +780,13 @@ async function validateCodexHookEnvelope(
     parentNativeSessionId !== expectedParentSessionId ||
     parentNativeSessionId !== manifestParentNativeSessionId
   ) return { valid: false, error: "invalid_codex_hook_session" };
+  // Hook capture is only for sessions without a transcript. A hook that names
+  // one belongs to a rollout-backed session and must not touch its facts.
+  if (
+    payload.transcript_path !== undefined && payload.transcript_path !== null
+  ) {
+    return { valid: false, error: "invalid_codex_hook_transcript" };
+  }
   const git = envelope.git;
   const gitObject = objectValue(git);
   if (git !== undefined && git !== null && gitObject === null) {

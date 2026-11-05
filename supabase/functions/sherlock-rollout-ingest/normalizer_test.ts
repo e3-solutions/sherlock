@@ -1584,11 +1584,13 @@ Deno.test("Codex fork hooks project a rolloutless session below rollout priority
     rest.source,
     CODEX_V4_NORMALIZER_VERSION,
   );
-  // Without SessionStart the batch cannot tell the role; unknown never
-  // overwrites the stored one.
-  assert(continued.session?.actor_role === "unknown");
+  // The collector's fork marker sets the role even without SessionStart, so
+  // a prompt batch normalized first is still a primary-session fact.
+  assert(continued.session?.actor_role === "primary");
   assert(continued.session?.parent_native_session_id === null);
-  const [submitted, answered] = continued.events;
+  assert(continued.events.length === 3);
+  const [submitted, answered, completed] = continued.events;
+  assert(submitted.actor_role === "primary");
   assert(submitted.event_kind === "message");
   assert(submitted.event_subtype === "user_message");
   assert(submitted.message_role === "user");
@@ -1612,6 +1614,45 @@ Deno.test("Codex fork hooks project a rolloutless session below rollout priority
     answered.logical_event_key === "message:assistant:turn-1:hook_stop",
   );
   assert(answered.error_code === null);
+  assert(answered.projection_index === 0);
+  // Stop also closes the turn, from the same record.
+  assert(completed.record_index === answered.record_index);
+  assert(completed.projection_index === 1);
+  assert(completed.event_kind === "lifecycle");
+  assert(completed.event_subtype === "turn_complete");
+  assert(completed.turn_id === "turn-1");
+  assert(
+    completed.logical_event_key === "codex:lifecycle:turn-1:turn_complete",
+  );
+  assert(completed.content_sha256 === null && completed.message_role === null);
+  assert(completed.source_priority === 90);
+  assert(completed.observed_at === "2026-11-05T18:00:05.000000Z");
+  assert(completed.attributes?.dispatch_event_name === "Stop");
+
+  // Without SessionStart or a fork marker the role stays unknown, which never
+  // overwrites a stored role.
+  const unmarked = await codexHookFixture(
+    [{ ...prompt, session_source: null }],
+    CODEX_FORK_ID,
+  );
+  const unmarkedProjection = await projectBatch(
+    unmarked.manifest,
+    unmarked.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  assert(unmarkedProjection.session?.actor_role === "unknown");
+  // An unrecognised marker is not a fork.
+  const otherMarker = await codexHookFixture(
+    [{ ...prompt, session_source: "exec" }],
+    CODEX_FORK_ID,
+  );
+  assert(
+    (await projectBatch(
+      otherMarker.manifest,
+      otherMarker.source,
+      CODEX_V4_NORMALIZER_VERSION,
+    )).session?.actor_role === "unknown",
+  );
 });
 
 Deno.test("Codex hook batches project at every Codex normalizer version", async () => {
@@ -1631,7 +1672,7 @@ Deno.test("Codex hook batches project at every Codex normalizer version", async 
     const projection = await projectBatch(manifest, source, version);
     assert(
       projection.events.map((event) => event.event_subtype).join(",") ===
-        "user_message,agent_message",
+        "user_message,agent_message,turn_complete",
       `${version} must use the hook projection, never the rollout one`,
     );
   }
@@ -1721,6 +1762,35 @@ Deno.test("Codex hook projections reject tampered payloads and identity", async 
       error: "invalid_codex_hook_git",
     },
     { hook: "{not json", error: "native_malformed" },
+    // A hook that names a transcript belongs to a rollout-backed session.
+    {
+      hook: await codexHookEnvelope({
+        dispatchEventName: "UserPromptSubmit",
+        nativeSessionId: CODEX_FORK_ID,
+        sessionSource: "fork",
+        payload: {
+          hook_event_name: "UserPromptSubmit",
+          session_id: CODEX_FORK_ID,
+          cwd: "/elsewhere",
+          transcript_path: "/sanitized/rollout.jsonl",
+          prompt: "Prompt from a normal session",
+        },
+      }),
+      error: "invalid_codex_hook_transcript",
+    },
+    {
+      hook: await codexHookEnvelope({
+        dispatchEventName: "Stop",
+        nativeSessionId: CODEX_FORK_ID,
+        payload: {
+          hook_event_name: "Stop",
+          session_id: CODEX_FORK_ID,
+          turn_id: "turn-1",
+          transcript_path: 7,
+        },
+      }),
+      error: "invalid_codex_hook_transcript",
+    },
   ];
   for (const { hook, error, parent, manifestId } of cases) {
     const { manifest, source } = await codexHookFixture(
