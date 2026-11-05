@@ -39,7 +39,8 @@ function caller(principal) {
 describe("identity pass verification", () => {
   it("accepts a pass minted by the Cosmos gateway", () => {
     expect(verifyIdentityPass(GATEWAY_PASS, { secret: SECRET, nowMs: PASS_NOW_MS })).toEqual({
-      principal: "ada",
+      principal: "ada@e3group.ai",
+      verifiedLogin: true,
       tier: "standard",
       requestId: "0f8fad5b-d9cb-469f-a165-70867728950e",
     });
@@ -57,10 +58,13 @@ describe("identity pass verification", () => {
     expect(verifyIdentityPass(anonymous, { secret: SECRET, nowMs: PASS_NOW_MS })).toBeNull();
   });
 
-  it("falls back to the first email and maps headers to a caller bucket", () => {
-    const pass = mintPass({ v: 1, a: "sherlock", e: ["bo@e3group.ai"], t: "admin", x: 1_800_000_120 });
+  it("keys on the verified login, so same-named principals do not share a bucket", () => {
+    const pass = mintPass({ v: 1, a: "sherlock", e: ["Bo@e3group.ai"], p: "bo", t: "admin", x: 1_800_000_120 });
     expect(callerFromHeaders({ "x-e3-identity-pass": pass }, { secret: SECRET, nowMs: PASS_NOW_MS }))
-      .toEqual({ key: "principal:bo@e3group.ai", principal: "bo@e3group.ai", tier: "admin", requestId: null, attributed: true });
+      .toEqual({ key: "login:bo@e3group.ai", principal: "bo@e3group.ai", tier: "admin", requestId: null, attributed: true });
+    const token = mintPass({ v: 1, a: "sherlock", e: [], p: "bo", x: 1_800_000_120 });
+    expect(callerFromHeaders({ "x-e3-identity-pass": token }, { secret: SECRET, nowMs: PASS_NOW_MS }))
+      .toMatchObject({ key: "principal:bo", principal: "bo" });
     expect(callerFromHeaders({}, { secret: SECRET })).toBe(UNATTRIBUTED_CALLER);
     expect(callerFromHeaders({ "x-e3-identity-pass": pass }, { secret: "" })).toBe(UNATTRIBUTED_CALLER);
   });
