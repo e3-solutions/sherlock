@@ -1,0 +1,92 @@
+name: Docs backstop
+
+# COR-5202 part 2. After a PR merges into main with code changes but no docs
+# changes, ask Claude to bring AGENTS.md, docs/ and .agents/skills up to date,
+# and open a small docs PR for review. It never merges anything.
+# Skips cleanly (a notice, green run) until the ANTHROPIC_API_KEY org secret
+# is shared with this repository.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: docs-backstop-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  backstop:
+    if: github.event.pull_request.merged == true && !startsWith(github.event.pull_request.head.ref, 'docs-backstop/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      PR: ${{ github.event.pull_request.number }}
+      BASE: ${{ github.event.pull_request.base.sha }}
+      HEAD: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - name: Skip without the key
+        if: env.HAS_KEY != 'true'
+        run: echo "::notice::ANTHROPIC_API_KEY is not shared with this repository; docs backstop skipped."
+
+      - uses: actions/checkout@v4
+        if: env.HAS_KEY == 'true'
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Gate
+        id: gate
+        if: env.HAS_KEY == 'true'
+        run: python3 .agents/docs_backstop_gate.py --base "$BASE" --head "$HEAD" --files-out "$RUNNER_TEMP/changed.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Update docs with Claude
+        if: steps.gate.outputs.needed == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: >-
+            --max-turns 15
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git diff:*),Bash(git log:*),Bash(python3 .agents/check_agent_docs.py)"
+          prompt: |
+            [e3-docs-check v1] Docs backstop for merged PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}".
+            It changed code but no docs. See `git diff ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.merge_commit_sha }}`;
+            the changed code files are listed in ${{ runner.temp }}/changed.txt.
+            Check AGENTS.md, docs/README.md (if present) and any skill in .agents/skills/ that covers this area.
+            If a command, deploy step, env var, branch, file path, service name or rule they state is now wrong or
+            missing because of this PR, fix it with the smallest edit, in the doc that already owns that fact.
+            Edit only AGENTS.md, CLAUDE.md, docs/ and .agents/skills/. Do not change code. Do not commit or push.
+            Run `python3 .agents/check_agent_docs.py` after editing. If nothing needs changing, make no edit.
+
+      - name: Open docs PR
+        if: steps.gate.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          git restore --staged . 2>/dev/null || true
+          git checkout -- $(git diff --name-only | grep -vE '^(AGENTS\.md|CLAUDE\.md|docs/|\.agents/skills/)' || true) 2>/dev/null || true
+          if git diff --quiet -- AGENTS.md CLAUDE.md docs .agents/skills; then
+            echo "::notice::Docs checked for #$PR: no change needed."
+            exit 0
+          fi
+          python3 .agents/check_agent_docs.py --warn
+          branch="docs-backstop/pr-$PR"
+          git switch -c "$branch"
+          git add -- AGENTS.md CLAUDE.md docs .agents/skills
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Docs backstop for #$PR" -m "Bring agent docs in line with #$PR ($TITLE)." -m "Docs-Check: updated"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Docs backstop for #$PR" \
+            --body "Docs follow-up for #$PR, which changed code but no docs. Proposed by the docs backstop (COR-5202); review and merge if right." \
+            --assignee "$AUTHOR" || gh pr create --base main --head "$branch" \
+            --title "Docs backstop for #$PR" \
+            --body "Docs follow-up for #$PR, which changed code but no docs. Proposed by the docs backstop (COR-5202); review and merge if right."
