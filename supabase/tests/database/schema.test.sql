@@ -227,7 +227,7 @@ select ok(
     where schemaname = 'telemetry'
       and tablename = 'events'
       and indexname = 'events_message_search_day_idx'
-      and indexdef like '%USING gin (((occurred_at AT TIME ZONE ''UTC''::text))::date), message_search)%'
+      and indexdef like '%USING gin ((((occurred_at AT TIME ZONE ''UTC''::text))::date), message_search)%'
       and indexdef like '%WHERE ((event_kind = ANY (ARRAY[''message''::text, ''agent_message''::text])) AND (NOT is_replay))%'
   ),
   'wide-window message search has a combined day and text GIN index'

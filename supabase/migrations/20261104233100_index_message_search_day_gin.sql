@@ -27,7 +27,7 @@ begin
          ) and not i.indisunique and i.indexprs is not null and
          i.indnkeyatts = 2 and i.indnatts = 2 and
          pg_get_indexdef(i.indexrelid) like
-           '%USING gin (((occurred_at AT TIME ZONE ''UTC''::text))::date), message_search)%' and
+           '%USING gin ((((occurred_at AT TIME ZONE ''UTC''::text))::date), message_search)%' and
          i.indpred is not null and
          pg_get_expr(i.indpred, i.indrelid) =
            '((event_kind = ANY (ARRAY[''message''::text, ''agent_message''::text])) AND (NOT is_replay))'
