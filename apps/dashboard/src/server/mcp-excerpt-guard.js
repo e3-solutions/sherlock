@@ -79,10 +79,15 @@ export function verifyIdentityPass(token, { secret, nowMs = Date.now() } = {}) {
   const emails = Array.isArray(payload.e)
     ? payload.e.map((email) => boundedString(email, PRINCIPAL_MAX_LENGTH)).filter(Boolean)
     : [];
-  const principal = boundedString(payload.p, PRINCIPAL_MAX_LENGTH) ?? emails[0] ?? null;
+  // The gateway puts only the verified login in e (e3-mcp#94). Prefer it:
+  // principal names can collide (an OAuth login and a store token both
+  // named "vansh"), verified logins cannot.
+  const login = emails[0]?.toLowerCase() ?? null;
+  const principal = login ?? boundedString(payload.p, PRINCIPAL_MAX_LENGTH);
   if (principal === null) return null;
   return {
     principal,
+    verifiedLogin: login !== null,
     tier: boundedString(payload.t, 32) ?? "standard",
     requestId: boundedString(payload.r, 128),
   };
@@ -92,7 +97,10 @@ export function callerFromHeaders(headers, { secret, nowMs } = {}) {
   const raw = headers?.[IDENTITY_PASS_HEADER];
   const pass = verifyIdentityPass(Array.isArray(raw) ? raw[0] : raw, { secret, nowMs });
   if (pass === null) return UNATTRIBUTED_CALLER;
-  return Object.freeze({ key: `principal:${pass.principal}`, ...pass, attributed: true });
+  const { verifiedLogin, ...identity } = pass;
+  return Object.freeze({
+    key: `${verifiedLogin ? "login" : "principal"}:${pass.principal}`, ...identity, attributed: true,
+  });
 }
 
 export class ExcerptRateLimitError extends Error {
