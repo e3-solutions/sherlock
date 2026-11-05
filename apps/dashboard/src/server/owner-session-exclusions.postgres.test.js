@@ -17,6 +17,7 @@ const SEARCH_MIGRATION = migration("20261012135923_add_bounded_excerpt_search.sq
 const PRODUCT_ROLE_MIGRATION = migration("20261012140548_filter_excerpt_search_product_roles.sql");
 const EXCLUSIONS_MIGRATION = migration("20261027233920_hide_owner_excluded_sessions.sql");
 const WINDOW_FIRST_MIGRATION = migration("20261104223000_window_first_excerpt_search.sql");
+const DAY_SCOPED_MIGRATION = migration("20261104233200_day_scoped_excerpt_search.sql");
 const SEARCH = "analytics.search_excerpt_candidates(uuid, text, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer)";
 const GATE = "analytics._assert_excerpt_search_policy_shape()";
 const RECORD = "sherlock_access.record_owner_session_exclusions(uuid, uuid, text[])";
@@ -339,6 +340,7 @@ describePostgres("owner session exclusions", { timeout: 180_000 }, () => {
       await tx.unsafe(EXCLUSIONS_MIGRATION);
       // The current search body; exclusions must hold on its window path too.
       await tx.unsafe(WINDOW_FIRST_MIGRATION);
+      await tx.unsafe(DAY_SCOPED_MIGRATION);
       const f = await seedFixture(tx);
       const everyone = ["root", "child", "grandchild", "unresolved", "unresolvedChild", "keep", "bob"];
       expect(await visibleSessions(tx, f)).toEqual(pick(f, "sessions", everyone));

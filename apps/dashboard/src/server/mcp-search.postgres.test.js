@@ -13,6 +13,7 @@ const migration = (name) => DATABASE_URL ? readFileSync(new FileURL(`../../../..
 const MIGRATION = migration("20261012135923_add_bounded_excerpt_search.sql");
 const PRODUCT_ROLE_MIGRATION = migration("20261012140548_filter_excerpt_search_product_roles.sql");
 const WINDOW_FIRST_MIGRATION = migration("20261104223000_window_first_excerpt_search.sql");
+const DAY_SCOPED_MIGRATION = migration("20261104233200_day_scoped_excerpt_search.sql");
 const BOUNDED_LOOKUP_MIGRATION = migration("20261012065436_bound_protected_record_lookup.sql");
 const SEARCH = "analytics.search_excerpt_candidates(uuid, text, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer)";
 const GATE = "analytics._assert_excerpt_search_policy_shape()";
@@ -110,6 +111,7 @@ async function installMigration(tx) {
   await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
   await tx.unsafe(WINDOW_FIRST_MIGRATION);
+  await tx.unsafe(DAY_SCOPED_MIGRATION);
 }
 
 async function installPrivacyShape(tx, { tables = ["events", "sessions", "people"], schema = "telemetry" } = {}) {
@@ -366,6 +368,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
   await tx.unsafe(WINDOW_FIRST_MIGRATION);
+  await tx.unsafe(DAY_SCOPED_MIGRATION);
       expect(await catalogSnapshot(tx)).toEqual(before);
 
       const acl = await tx.unsafe(`
@@ -413,6 +416,10 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await expectEquivalent(tx, fixture, { ...wide, query: "zebrafind -alpha" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { start: "2025-12-31T11:00:00Z" }, [...all, "bobSession"]);
       await expectEquivalent(tx, fixture, { start: "2025-12-31T10:59:59.999Z" }, [...all, "bobSession"]);
+      // The default all-history window starts in 1970; days are listed from the first message.
+      await expectEquivalent(tx, fixture, { start: "1970-01-01T00:00:00Z" }, [...all, "bobSession"]);
+      // A wide window with no stored message returns nothing at once.
+      await expectEquivalent(tx, fixture, { start: "2020-01-01T00:00:00Z", end: "2020-03-01T00:00:00Z" }, []);
     });
   });
 
@@ -722,6 +729,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe(MIGRATION);
   await tx.unsafe(PRODUCT_ROLE_MIGRATION);
   await tx.unsafe(WINDOW_FIRST_MIGRATION);
+  await tx.unsafe(DAY_SCOPED_MIGRATION);
       expect(await catalogSnapshot(tx)).toEqual(before);
       const fixture = await seedFixture(tx);
       await tx`insert into sherlock_access.restricted_people values (${fixture.home}, ${fixture.people.bob.id})`;
@@ -900,7 +908,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe("analyze excerpt_search_plan.people; analyze excerpt_search_plan.sessions; analyze excerpt_search_plan.events;");
 
       const params = ["p_workspace", "p_start", "p_end", "p_read_at", "p_domain", "p_person", "p_session", "p_limit",
-        "v_query", "v_protected_records", "v_hidden_sessions", "v_protected_people", "v_window_first"];
+        "v_query", "v_protected_records", "v_hidden_sessions", "v_protected_people", "v_window_first", "v_days"];
       const body = params.reduce(
         (text, name, index) => text.replace(new RegExp(`\\b${name}\\b`, "g"), () => `$${index + 1}`),
         statement.replaceAll("telemetry.", "excerpt_search_plan."),
@@ -909,13 +917,15 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       await tx.unsafe(`
         set local plan_cache_mode = force_custom_plan;
         prepare excerpt_plan(uuid, timestamptz, timestamptz, timestamptz, text, uuid, uuid, integer,
-          tsquery, bigint[], uuid[], uuid[], boolean) as ${body}`);
+          tsquery, bigint[], uuid[], uuid[], boolean, date[]) as ${body}`);
       const execute = async (call, windowFirst) => {
         const [{ "QUERY PLAN": plan }] = await tx.unsafe(`
           explain (analyze, buffers, format json) execute excerpt_plan('${workspace}',
             '${windowFirst ? START : WIDE_PLAN_START}', '${END}', '${READ_AT}',
             'e3group.ai', ${call % 2 ? `'${person.id}'` : "null"}, null, 2000,
-            websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}', ${windowFirst})`);
+            websearch_to_tsquery('simple', 'zebrararetoken'), '{}', '{}', '{}', ${windowFirst},
+            ${windowFirst ? "null" : `(select array_agg(day::date) from generate_series(
+              '${WIDE_PLAN_START}'::timestamp, '${END}'::timestamp, interval '1 day') day)`})`);
         return { rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) };
       };
       // The GIN path serves windows over 25 hours; this one spans every decoy,
@@ -942,6 +952,10 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
     for (const { rows, nodes } of plans.owner) {
       expect(rows).toBe(1);
       expect(usesSearchIndex(nodes)).toBe(true);
+      // A wide window is served by the day and text index, one exact day
+      // entry at a time, not by a scan of every match in history.
+      expect(nodes.some((node) => node["Node Type"] === "Bitmap Index Scan"
+        && /AT TIME ZONE|timezone/i.test(node["Index Cond"] ?? ""))).toBe(true);
       expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
         .not.toContain("Seq Scan");
     }
