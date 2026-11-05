@@ -10,7 +10,10 @@ Side-conversation forks are the one exception: Codex never writes a rollout or
 state-database row for them, so inventory, backfill and the reconciler cannot
 see them. Their `SessionStart`, `UserPromptSubmit` and `Stop` hooks are kept as
 `codex`/`hook` observations instead (`codex-hook-events/` under the state root,
-markers in `codex-hook-sessions/`, capture state in `codex-hook-state.json`).
+moved unchanged to `codex-hook-events/captured/` once queued; fork markers in
+`codex-hook-sessions/`; capture state in `codex-hook-state.json`). Observations
+held by owner policy stay in `codex-hook-events/`, and each fork hook retries at
+most 32 of them.
 A fork missed while its hooks did not run cannot be recovered later.
 
 Install the updated collector runtime on the source machine using the existing

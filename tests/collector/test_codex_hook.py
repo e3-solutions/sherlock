@@ -104,7 +104,8 @@ class CodexHookCase(unittest.TestCase):
                 drain_command=[sys.executable, "-c", "pass"],
             )
 
-    def fork(self, session_id=None, *, policy=None, parent=None, prompt=True, stop=True, cwd=None):
+    def fork(self, session_id=None, *, policy=None, parent=None, prompt=True, stop=True, cwd=None,
+             odd_bytes=False):
         """Run a fork's SessionStart, UserPromptSubmit and Stop; return raw payloads."""
         session_id = session_id or str(uuid.uuid4())
         extra = {"cwd": str(cwd)} if cwd is not None else {}
@@ -122,7 +123,19 @@ class CodexHookCase(unittest.TestCase):
             )))
         raws = []
         for event, payload in events:
-            raw = json.dumps(payload, separators=(",", ":")).encode()
+            if odd_bytes:
+                # Unusual spacing, reversed key order and \u escapes: the
+                # observation must keep these exact bytes, not a re-encoding.
+                payload = {**payload, "note": "caf\u00e9 \U0001F600 \"q\""}
+                raw = (
+                    b" \t" + json.dumps(
+                        dict(reversed(list(payload.items()))),
+                        separators=(" ,  ", " :"), ensure_ascii=True,
+                    ).encode() + b" \n"
+                )
+                payload = json.loads(raw)
+            else:
+                raw = json.dumps(payload, separators=(",", ":")).encode()
             self.hook(event, payload, policy=policy, raw=raw)
             raws.append(raw)
         return session_id, raws
@@ -143,7 +156,9 @@ class CaptureTests(CodexHookCase):
     def test_fork_events_spool_exact_bytes_as_codex_hook(self):
         make_repo(self.work, "https://user:secret-token@github.com/acme/app.git", branch="feature/x")
         parent = str(uuid.uuid4())
-        session_id, raws = self.fork(parent=parent)
+        session_id, raws = self.fork(parent=parent, odd_bytes=True)
+        self.assertIn(b"\\u00e9", raws[0])
+        self.assertIn(b"\\ud83d\\ude00", raws[0])
 
         items = self.pending()
         self.assertEqual(len(items), 3)
@@ -294,7 +309,9 @@ class CaptureTests(CodexHookCase):
         self.hook("Stop", self.payload("Stop", unmarked, last_assistant_message="y"))
         self.assertEqual(self.observations(), [])
         self.assertEqual(self.pending(), [])
-        self.assertEqual(codex_hook.session_source(self.state, startup), "startup")
+        # Only forks leave a marker.
+        self.assertIsNone(codex_hook.session_source(self.state, startup))
+        self.assertFalse((self.state / "codex-hook-sessions").exists())
 
     def test_other_events_ids_and_empty_payloads_produce_none(self):
         session_id = str(uuid.uuid4())
@@ -336,6 +353,65 @@ class CaptureTests(CodexHookCase):
         codex_hook.remember_session(self.state, {"session_id": fresh, "source": "fork"})
         self.assertFalse(path.exists())
         self.assertEqual(codex_hook.session_source(self.state, fresh), "fork")
+
+
+class BoundedSweepTests(CodexHookCase):
+    def test_captured_observations_move_aside_unchanged(self):
+        self.fork()
+        self.assertEqual(self.observations(), [])
+        captured = sorted((self.state / "codex-hook-events" / "captured").glob("*.jsonl"))
+        self.assertEqual(len(captured), 3)
+        self.assertEqual(
+            sorted(path.read_bytes() for path in captured),
+            sorted(stored for _, stored in self.pending()),
+        )
+
+    def test_hook_work_stays_bounded_with_many_captured_observations(self):
+        archive = self.state / "codex-hook-events" / "captured"
+        archive.mkdir(parents=True)
+        for index in range(3000):
+            (archive / f"{uuid.uuid4()}.jsonl").write_text("{}\n")
+        with patch.object(
+            codex_hook, "observation_identity", wraps=codex_hook.observation_identity
+        ) as identity:
+            outcome = self.hook(
+                "SessionStart", self.payload("SessionStart", str(uuid.uuid4()), source="fork")
+            )
+        self.assertEqual(outcome.enqueued, 1)
+        self.assertEqual(identity.call_count, 1)
+
+    def test_held_observations_stay_and_each_hook_retries_a_bounded_window(self):
+        from sherlock_collector.hook import CODEX_HOOK_SWEEP_LIMIT
+
+        private = self.root / "private"
+        private.mkdir()
+        policy = self.policy(excluded_project_paths=[str(private)])
+        for _ in range(CODEX_HOOK_SWEEP_LIMIT + 40):
+            payload = self.payload("SessionStart", str(uuid.uuid4()), source="fork", cwd=str(private))
+            codex_hook.write_observation(
+                self.state, "SessionStart", payload, json.dumps(payload).encode(),
+                session_source="fork",
+            )
+        with patch.object(
+            codex_hook, "observation_identity", wraps=codex_hook.observation_identity
+        ) as identity:
+            self.fork(policy=policy, prompt=False, stop=False)
+        self.assertEqual(identity.call_count, CODEX_HOOK_SWEEP_LIMIT + 1)
+        # Held ones stay listed (never uploaded); the new fork moved aside.
+        self.assertEqual(len(self.observations()), CODEX_HOOK_SWEEP_LIMIT + 40)
+        self.assertEqual(len(self.pending()), 1)
+
+    def test_held_observation_is_captured_once_the_policy_allows_it(self):
+        private = self.root / "private"
+        private.mkdir()
+        held, _ = self.fork(policy=self.policy(excluded_project_paths=[str(private)]),
+                            cwd=private, prompt=False, stop=False)
+        self.assertEqual(len(self.observations()), 1)
+        self.assertEqual(self.pending(), [])
+        self.fork(prompt=False, stop=False)
+        ids = [manifest["observed_native_session_id"] for manifest, _ in self.pending()]
+        self.assertIn(held, ids)
+        self.assertEqual(self.observations(), [])
 
 
 class ExclusionTests(CodexHookCase):
@@ -404,6 +480,41 @@ class ExclusionTests(CodexHookCase):
         policy = self.policy(excluded_session_ids=[excluded])
         self.fork(policy=policy, parent=parent)
         self.assertEqual([m for m, _ in self.pending() if m["source_kind"] == "hook"], [])
+
+    def test_fork_of_a_fork_continues_through_the_parent_marker(self):
+        root = str(uuid.uuid4())
+        codex_rollout(self.home, root, {"cwd": str(self.work)})
+        parent, _ = self.fork(parent=root, prompt=False, stop=False)
+        policy = self.policy(excluded_session_ids=[str(uuid.uuid4())])
+        child, _ = self.fork(policy=policy, parent=parent)
+        ids = [m["observed_native_session_id"] for m, _ in self.pending() if m["source_kind"] == "hook"]
+        self.assertEqual(ids.count(child), 3)
+
+    def test_fork_of_a_fork_of_an_excluded_session_is_blocked(self):
+        excluded, root = str(uuid.uuid4()), str(uuid.uuid4())
+        codex_rollout(self.home, root, {"cwd": str(self.work), "parent_thread_id": excluded})
+        parent, _ = self.fork(parent=root, prompt=False, stop=False)
+        child, _ = self.fork(policy=self.policy(excluded_session_ids=[excluded]), parent=parent)
+        ids = [m["observed_native_session_id"] for m, _ in self.pending()]
+        self.assertNotIn(child, ids)
+
+    def test_fork_of_a_fork_in_an_excluded_project_is_blocked(self):
+        private = self.root / "private"
+        private.mkdir()
+        parent, _ = self.fork(cwd=private, prompt=False, stop=False)
+        child, _ = self.fork(policy=self.policy(excluded_project_paths=[str(private)]),
+                             parent=parent, cwd=self.work)
+        ids = [m["observed_native_session_id"] for m, _ in self.pending()]
+        self.assertNotIn(child, ids)
+
+    def test_fork_of_a_fork_with_an_unverifiable_chain_is_held(self):
+        policy = self.policy(excluded_session_ids=[str(uuid.uuid4())])
+        rootless, _ = self.fork(prompt=False, stop=False)  # its marker names no parent
+        child, _ = self.fork(policy=policy, parent=rootless)
+        unmarked_child, _ = self.fork(policy=policy, parent=str(uuid.uuid4()))
+        ids = [m["observed_native_session_id"] for m, _ in self.pending()]
+        self.assertNotIn(child, ids)
+        self.assertNotIn(unmarked_child, ids)
 
     def test_fork_with_an_unresolvable_parent_is_held(self):
         policy = self.policy(excluded_project_paths=[str(self.root / "elsewhere")])
@@ -484,6 +595,28 @@ class DrainHoldTests(CodexHookCase):
         # Six hook batches plus the excluded parent's own rollout batch.
         self.assertEqual(result.held_by_policy, 7)
 
+    def test_queued_batches_of_an_excluded_fork_are_held(self):
+        excluded, _ = self.fork()
+        kept, _ = self.fork()
+        transport, result = self.drain(self.policy(excluded_session_ids=[excluded]))
+        uploaded = {item.manifest.observed_native_session_id for item in transport.items}
+        self.assertNotIn(excluded, uploaded)
+        self.assertEqual(result.held_by_policy, 3 + 3)  # kept names no parent either
+
+    def test_queued_prompt_is_held_when_its_fork_marker_is_missing(self):
+        parent = str(uuid.uuid4())
+        codex_rollout(self.home, parent, {"cwd": str(self.work)})
+        child, _ = self.fork(parent=parent)
+        (self.state / "codex-hook-sessions" / f"{child}.json").unlink()
+        transport, result = self.drain(self.policy(excluded_session_ids=[str(uuid.uuid4())]))
+        uploaded = [
+            item.manifest.observed_native_session_id
+            for item in transport.items if item.manifest.source_kind == "hook"
+        ]
+        # The SessionStart names its parent; the prompt and Stop relied on the marker.
+        self.assertEqual(uploaded, [child])
+        self.assertEqual(result.held_by_policy, 2)
+
     def test_queued_fork_batches_upload_without_a_policy(self):
         self.fork()
         transport, result = self.drain(None)
@@ -509,6 +642,10 @@ class LocalGitAndCwdTests(CodexHookCase):
         (worktree / "deep").mkdir(parents=True)
         (worktree / ".git").write_text(f"gitdir: {gitdir}\n")
         self.assertEqual(origin_remote_url(str(worktree / "deep")), "ssh://github.com/acme/app.git")
+        (main / ".git" / "config").write_text(
+            '[remote "origin"]\n\turl = https://github.com/acme/app.git?access_token=t#frag\n'
+        )
+        self.assertEqual(origin_remote_url(str(worktree)), "https://github.com/acme/app.git")
         self.assertEqual(head_branch(str(worktree / "deep")), "topic")
         (gitdir / "HEAD").write_text("0123456789abcdef0123456789abcdef01234567\n")
         self.assertIsNone(head_branch(str(worktree)))

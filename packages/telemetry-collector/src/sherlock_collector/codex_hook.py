@@ -8,11 +8,12 @@ payload as an immutable observation under ``codex-hook-events/`` and captures
 it as ``codex``/``hook``. A session that names a transcript (even one not yet
 on disk) or has a discovered rollout is never observed this way.
 
-``SessionStart`` leaves a marker in ``codex-hook-sessions/<id>.json`` with the
-session's source, the parent it names and its working directory. Later events
-are observed only when that marker says ``fork``, which keeps other null-path
-runs (``codex exec --ephemeral``, automation) out. Markers older than seven
-days are pruned.
+A fork's ``SessionStart`` leaves a marker in ``codex-hook-sessions/<id>.json``
+with the parent it names, its working directory and git remote. Later events
+are observed only when that marker exists and says ``fork``; other null-path
+runs (``codex exec --ephemeral``, automation) leave no marker and are never
+observed. Markers older than seven days are pruned. Fully captured
+observations move to ``codex-hook-events/captured/``.
 """
 
 from __future__ import annotations
@@ -130,11 +131,15 @@ def remember_session(
     *,
     now: float | None = None,
 ) -> Path | None:
-    """Record a hook-only session's source at SessionStart; prune old markers."""
+    """Record a fork's SessionStart (source, parent, cwd, remote); prune old markers.
+
+    Only fork sessions are recorded; other null-path runs leave no marker.
+    """
     session_id = _canonical_uuid(payload.get("session_id"))
-    if session_id is None:
+    if session_id is None or payload.get("source") not in HOOK_ONLY_SESSION_SOURCES:
         return None
     path = _marker_path(state_root, session_id)
+    cwd = _absolute(payload.get("cwd"))
     _atomic_json(
         path,
         {
@@ -142,7 +147,8 @@ def remember_session(
             "native_session_id": session_id,
             "source": _text(payload.get("source")),
             "parent_native_session_id": parent_session_id(payload),
-            "cwd": _absolute(payload.get("cwd")),
+            "cwd": cwd,
+            "repository_url": _bounded(origin_remote_url(cwd)),
             "recorded_at": _utc_now(),
         },
     )

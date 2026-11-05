@@ -426,7 +426,13 @@ class ExclusionPolicy:
                 return UNVERIFIED
             meta = self._ancestors(current, codex_home)
             if meta is None:
-                return UNVERIFIED
+                # A fork of a fork: the parent has no rollout either, so its
+                # own SessionStart marker continues the chain.
+                meta = _codex_hook_marker_ancestry(hook_state_root, current)
+                if meta is None:
+                    return UNVERIFIED
+                if not meta[0] and self.excluded:
+                    return UNVERIFIED  # The chain ends without a verified root.
             ancestors, cwd, repository = meta
             if ancestors & self.excluded:
                 return EXCLUDED
@@ -950,14 +956,12 @@ def _git_directories(cwd: str) -> tuple[str, str] | None:
 
 
 def _without_credentials(url: str) -> str:
-    """Drop user info (which can hold a token) from a URL-style remote."""
+    """Drop user info, query and fragment (which can hold a token) from a URL remote."""
     if "://" not in url:
         return url
     parts = urlsplit(url)
-    if "@" not in parts.netloc:
-        return url
-    host = parts.netloc.rsplit("@", 1)[1]
-    return parts._replace(netloc=host).geturl()
+    host = parts.netloc.rsplit("@", 1)[-1]
+    return parts._replace(netloc=host, query="", fragment="").geturl()
 
 
 def origin_remote_url(cwd: object) -> str | None:
@@ -1133,6 +1137,22 @@ def _codex_hook_marker(state_root: Path | None, session_id: str | None) -> dict 
     if not isinstance(value, dict) or _normalize(value.get("native_session_id")) != session_id:
         return None
     return value
+
+
+def _codex_hook_marker_ancestry(
+    state_root: Path | None, session_id: str
+) -> tuple[set[str], str | None, str | None] | None:
+    """(parent ids, cwd, repository) a hook-only fork's marker records, like _ancestors."""
+    marker = _codex_hook_marker(state_root, session_id)
+    if marker is None or marker.get("source") != "fork":
+        return None
+    parent = _normalize(marker.get("parent_native_session_id"))
+    cwd = marker.get("cwd")
+    return (
+        {parent} - {None, session_id},
+        cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None,
+        _repository_key(marker.get("repository_url")),
+    )
 
 
 def _record_range_cwds(path: Path, start: int, end: int, digest: str) -> set[str] | None:

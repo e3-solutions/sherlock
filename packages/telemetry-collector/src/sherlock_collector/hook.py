@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import random
 import subprocess
 import time
 from dataclasses import dataclass
@@ -59,6 +60,10 @@ CLAUDE_HOOK_EVENTS = {
     "SessionEnd",
 }
 HOOK_EVENTS = CODEX_HOOK_EVENTS | CLAUDE_HOOK_EVENTS
+# Earlier Codex hook-only observations a fork hook retries besides its own.
+# Fully captured ones are moved to codex-hook-events/captured/, so only
+# uncaptured or held ones stay listed; this bounds the per-hook work they cost.
+CODEX_HOOK_SWEEP_LIMIT = 32
 POST_TOOL_DEBOUNCE_SECONDS = 30
 POST_TOOL_STATE_VERSION = 1
 SUBAGENT_DISCOVERY_LOOKBACK_SECONDS = 5 * 60
@@ -236,23 +241,24 @@ def _capture_codex_hook_only(
 ) -> tuple[Path | None, CaptureResult]:
     """Observe a hook-only Codex event of a fork and capture pending observations."""
     if event_name == "SessionStart":
-        codex_hook.remember_session(root, payload)
         source = payload.get("source")
     else:
         source = codex_hook.session_source(root, payload.get("session_id"))
     if source not in codex_hook.HOOK_ONLY_SESSION_SOURCES:
         return None, CaptureResult()
+    if event_name == "SessionStart":
+        codex_hook.remember_session(root, payload)
     observation = codex_hook.write_observation(
         root, event_name, payload, raw_payload, session_source=source
     )
-    observation_paths = [
-        observation,
-        *(
-            path
-            for path in sorted((root / "codex-hook-events").glob("*.jsonl"))
-            if path != observation
-        ),
-    ]
+    events = observation.parent
+    leftovers = sorted(path for path in events.glob("*.jsonl") if path != observation)
+    if len(leftovers) > CODEX_HOOK_SWEEP_LIMIT:
+        # Held observations (owner policy) stay here to be re-evaluated; a
+        # random window keeps each hook's share bounded and reaches all of them.
+        start = random.randrange(len(leftovers))
+        leftovers = (leftovers[start:] + leftovers[:start])[:CODEX_HOOK_SWEEP_LIMIT]
+    observation_paths = [observation, *leftovers]
     native_ids: dict[str, str] = {}
     parent_ids: dict[str, str] = {}
     for path in observation_paths:
@@ -261,7 +267,7 @@ def _capture_codex_hook_only(
             native_ids[str(path.resolve())] = native_id
         if parent_id is not None:
             parent_ids[str(path.resolve())] = parent_id
-    outcome = RolloutCapturer(
+    capturer = RolloutCapturer(
         root,
         DurableSpool(root / "queue"),
         source_provider="codex",
@@ -269,14 +275,36 @@ def _capture_codex_hook_only(
         state_name="codex-hook",
         capture_unterminated_tail=False,
         source_home=home,
-    ).capture(
+    )
+    outcome = capturer.capture(
         observation_paths,
         native_session_ids=native_ids,
         parent_native_session_ids=parent_ids,
         best_effort=True,
         priority_count=1,
     )
+    if not outcome.locked:
+        _archive_captured_observations(events, capturer.completed_paths)
     return observation, outcome
+
+
+def _archive_captured_observations(events: Path, completed: Iterable[str]) -> None:
+    """Move fully captured observations (already durable in the spool) aside.
+
+    Moved, never deleted: the observation bytes stay on disk unchanged. Held or
+    unfinished observations are not completed, so they stay to be retried.
+    """
+    directory = events.resolve()
+    archive = directory / "captured"
+    for value in completed:
+        path = Path(value)
+        if path.parent != directory or path.suffix != ".jsonl":
+            continue
+        try:
+            archive.mkdir(mode=0o700, exist_ok=True)
+            os.replace(path, archive / path.name)
+        except OSError:
+            continue  # Retried after the next capture finds it complete.
 
 
 def _capture_hook(
