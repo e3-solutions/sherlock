@@ -819,12 +819,16 @@ class ProjectExclusionTests(unittest.TestCase):
             self.assertFalse(load_policy().project_excluded(str(self.root / "aXb")))
 
     def test_folder_name_patterns_cover_symlinked_matches_and_their_remotes(self):
-        # A matching folder that links elsewhere covers its target too.
+        # A matching folder that links elsewhere is never followed, so a link to
+        # "/", home or an E3 checkout cannot silently exclude it.
         secret = self.root / "secret"
         (secret / "sub").mkdir(parents=True)
         (self.root / "work" / "private-link").symlink_to(secret)
+        (self.root / "work" / "private-root").symlink_to("/")
         policy = self.policy(f"{self.root / 'work'}/private-*")
-        self.assertTrue(policy.project_excluded(str(secret / "sub")))
+        self.assertTrue(policy.project_excluded(str(self.root / "work" / "private-link" / "sub")))
+        self.assertFalse(policy.project_excluded(str(secret / "sub")))
+        self.assertFalse(policy.project_excluded(str(self.root / "elsewhere")))
         # A matching checkout's origin excludes Codex sessions of its removed worktrees.
         (self.sibling / ".git").mkdir()
         (self.sibling / ".git" / "config").write_text(
@@ -845,6 +849,29 @@ class ProjectExclusionTests(unittest.TestCase):
         (self.root / "work" / "lnk").symlink_to(target)
         policy = self.policy(f"{self.root / 'work'}/lnk/../c*")
         self.assertTrue(policy.project_excluded(str(self.root / "x" / "cfoo" / "z")))
+
+    def test_pattern_remotes_ignore_case_and_count_only_matches(self):
+        (self.sibling / ".git").mkdir()
+        (self.sibling / ".git" / "config").write_text(
+            '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/Hidden.git\n')
+        for index in range(5):
+            (self.root / "work" / f"zz-{index}").mkdir()
+        with patch.object(exclusions_module, "MAX_PATTERN_MATCHES", 1):
+            policy = self.policy(f"{self.root / 'work'}/PRIVATE-*")
+            if sys.platform == "darwin":
+                self.assertIn("github.com/acme/hidden", " ".join(policy._excluded_repositories()).lower())
+
+    def test_a_pattern_with_a_trailing_dot_reads_as_the_pattern(self):
+        policy = self.policy(f"{self.root / 'work'}/private-*/.")
+        self.assertIsNone(policy.error)
+        self.assertTrue(policy.project_excluded(str(self.sibling)))
+
+    def test_include_project_removes_a_plain_entry_whose_real_name_ends_with_a_star(self):
+        (self.root / "bar*").mkdir()
+        (self.root / "tlink").symlink_to(self.root / "bar*")
+        path = self.root / "p.json"
+        path.write_text(json.dumps({"version": 1, "excluded_project_paths": [str(self.root / "tlink")]}))
+        self.assertEqual(update_project_exclusions(remove=[str(self.root / "tlink")], path=path), [])
 
     def test_patterns_whose_parent_is_the_root_fail_closed(self):
         (self.root / "rootlink").symlink_to("/")

@@ -141,12 +141,15 @@ def _resolved_project_path(value: str) -> str:
     """Symlinks resolved before "..", as the filesystem does; for a pattern, its parent."""
     expanded = os.path.expanduser(value.strip())
     if is_project_pattern(expanded):
+        # Drop trailing "/" and "/." only; ".." must resolve after symlinks.
         trimmed = expanded.rstrip(os.sep) or os.sep
+        while os.path.basename(trimmed) == "." and trimmed != os.sep:
+            trimmed = os.path.dirname(trimmed).rstrip(os.sep) or os.sep
         return os.path.join(os.path.realpath(os.path.dirname(trimmed)), os.path.basename(trimmed))
     return os.path.realpath(expanded)
 
 
-def _absolute_project_path(value: str) -> str:
+def _absolute_project_path(value: str, *, for_removal: bool = False) -> str:
     """Resolve a command-line path as the filesystem would, symlinks before "..".
 
     Relative paths are taken from the current directory.
@@ -156,27 +159,35 @@ def _absolute_project_path(value: str) -> str:
     resolved = os.path.normpath(_resolved_project_path(value))
     if is_project_pattern(value):
         return normalize_project_path(resolved)
-    if resolved.endswith(PATTERN):
+    if for_removal:
+        return resolved
+    if resolved.endswith(PATTERN) and not for_removal:
         # Stored, it would read as a pattern and cover its siblings too.
         raise ValueError("a folder whose real name ends with * cannot be excluded by path")
     return normalize_project_path(resolved)
 
 
 def _pattern_matches(pattern: str) -> list[str]:
-    """Existing folders a resolved pattern covers, so their own spellings
-    (symlink targets) and git remotes are excluded too."""
+    """Existing real folders (not symlinks) a resolved pattern covers, whose git
+    remotes then exclude Codex sessions of their removed worktrees.
+
+    Symlinked matches are never followed: anything that can create a folder in
+    the parent could otherwise point one at "/", the home folder or an E3
+    checkout and silently exclude it. Exclude a link's target by its own path.
+    """
     parent, name = os.path.split(pattern)
-    prefix = name[: -len(PATTERN)]
+    prefix = _path_key(name[: -len(PATTERN)])
     found: list[str] = []
     try:
         with os.scandir(parent) as entries:
-            for index, entry in enumerate(entries):
-                if index >= MAX_PATTERN_MATCHES:
-                    break
-                if entry.name.startswith(prefix):
-                    with contextlib.suppress(OSError):
-                        if entry.is_dir():
-                            found.append(os.path.join(parent, entry.name))
+            for entry in entries:
+                if not _path_key(entry.name).startswith(prefix):
+                    continue
+                with contextlib.suppress(OSError):
+                    if entry.is_dir(follow_symlinks=False):
+                        found.append(os.path.join(parent, entry.name))
+                        if len(found) >= MAX_PATTERN_MATCHES:
+                            break
     except OSError:
         pass
     return found
@@ -195,7 +206,6 @@ def _project_paths(raw: dict) -> frozenset[str]:
         if normalized.endswith(PATTERN):
             _check_pattern(resolved)
             keys |= {_PATTERN_KEY + _path_key(normalized), _PATTERN_KEY + _path_key(resolved)}
-            keys |= {_path_key(os.path.realpath(match)) for match in _pattern_matches(resolved)}
             continue
         if os.sep in (normalized, resolved):
             raise ValueError("excluded_project_paths must not exclude the filesystem root")
@@ -572,15 +582,16 @@ def load_policy(path: Path | None = None) -> ExclusionPolicy:
         excluded = _id_list(raw, "excluded_session_ids") or frozenset()
         allowed = _id_list(raw, "allowed_claude_session_ids")
         projects = _project_paths(raw)
+        project_paths = tuple(
+            sorted({normalize_project_path(v) for v in raw.get("excluded_project_paths", [])})
+        )
     except (ValueError, UnicodeDecodeError) as error:
         return ExclusionPolicy(error=str(error))
     return ExclusionPolicy(
         excluded=excluded,
         allowed_claude=allowed,
         excluded_projects=projects,
-        excluded_project_paths=tuple(
-            sorted({normalize_project_path(v) for v in raw.get("excluded_project_paths", [])})
-        ),
+        excluded_project_paths=project_paths,
         worktree_origins_path=path.parent / WORKTREE_ORIGINS_NAME,
     )
 
@@ -654,7 +665,7 @@ def update_project_exclusions(
     """
     path = path or policy_path()
     added = {_absolute_project_path(value) for value in add}
-    removed = {_absolute_project_path(value) for value in remove}
+    removed = {_absolute_project_path(value, for_removal=True) for value in remove}
     if os.sep in added or os.sep in {_resolved_project_path(value) for value in added}:
         raise ValueError("refusing to exclude the filesystem root")
     # Serialize read-modify-write so concurrent edits cannot drop each other.
