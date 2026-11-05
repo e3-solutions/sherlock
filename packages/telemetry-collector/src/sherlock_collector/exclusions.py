@@ -15,6 +15,10 @@ tooling already honours::
   directories or inside one, including a git worktree of a repository inside
   one, are never captured or uploaded, nor are the Codex threads descended
   from them or the Claude subagents of a Claude session started there.
+  An entry whose last folder name ends with ``*`` is a name pattern:
+  ``/private/tmp/aeyron-*`` covers every folder in ``/private/tmp`` whose name
+  starts with ``aeyron-``, and everything inside them, including folders made
+  later. ``*`` is allowed only there (COR-5002).
 * ``allowed_claude_session_ids`` (optional): when present, only these Claude
   root sessions are captured or uploaded; Claude subagent transcripts are not.
 
@@ -96,14 +100,38 @@ def _id_list(raw: dict, key: str) -> frozenset[str] | None:
     return frozenset(v for v in (_normalize(item) for item in values) if v)
 
 
+PATTERN = "*"
+
+
+def is_project_pattern(path: str) -> bool:
+    """Whether a configured project entry is a folder-name pattern (``parent/name*``)."""
+    return path.endswith(PATTERN)
+
+
 def normalize_project_path(value: object) -> str:
-    """Absolute, normalized form of a configured project directory."""
+    """Absolute, normalized form of a configured project directory or name pattern."""
     if not isinstance(value, str) or not value.strip() or "\0" in value:
         raise ValueError("project paths must be non-empty strings")
     path = os.path.expanduser(value.strip())
     if not os.path.isabs(path):
         raise ValueError("project paths must be absolute")
-    return os.path.normpath(path)
+    path = os.path.normpath(path)
+    if PATTERN in path:
+        parent, name = os.path.split(path)
+        if PATTERN in parent or name.count(PATTERN) != 1 or not name.endswith(PATTERN):
+            raise ValueError("a project pattern may use * only at the end of its last folder name")
+        if parent == os.sep:
+            raise ValueError("a project pattern must not cover top-level folders")
+    return path
+
+
+def _resolved_project_path(value: str) -> str:
+    """Symlinks resolved before "..", as the filesystem does; a pattern's parent only."""
+    expanded = os.path.expanduser(value.strip())
+    if is_project_pattern(expanded):
+        parent, name = os.path.split(os.path.normpath(expanded))
+        return os.path.join(os.path.realpath(parent), name)
+    return os.path.realpath(expanded)
 
 
 def _absolute_project_path(value: str) -> str:
@@ -113,7 +141,7 @@ def _absolute_project_path(value: str) -> str:
     """
     if not isinstance(value, str) or not value.strip():
         raise ValueError("project paths must be non-empty strings")
-    return normalize_project_path(os.path.realpath(os.path.expanduser(value.strip())))
+    return normalize_project_path(_resolved_project_path(value))
 
 
 def _project_paths(raw: dict) -> frozenset[str]:
@@ -125,11 +153,22 @@ def _project_paths(raw: dict) -> frozenset[str]:
         normalized = normalize_project_path(value)
         # Resolve symlinks before collapsing "..", as the filesystem does, and
         # keep the lexical spelling too (for example /tmp and /private/tmp).
-        resolved = os.path.realpath(os.path.expanduser(value.strip()))
+        resolved = _resolved_project_path(value)
         if os.sep in (normalized, resolved):
             raise ValueError("excluded_project_paths must not exclude the filesystem root")
         keys |= {_path_key(normalized), _path_key(resolved)}
     return frozenset(keys)
+
+
+def _under(candidate: str, project: str) -> bool:
+    """Whether a path key is an excluded project key or inside one.
+
+    A pattern key ``parent/name*`` matches every path under ``parent`` whose
+    first folder below it starts with ``name``.
+    """
+    if is_project_pattern(project):
+        return candidate.startswith(project[: -len(PATTERN)])
+    return candidate == project or candidate.startswith(project.rstrip(os.sep) + os.sep)
 
 
 def _path_key(path: str) -> str:
@@ -305,6 +344,7 @@ class ExclusionPolicy:
             self._ancestry["repositories"] = frozenset(
                 remote
                 for project in self.excluded_project_paths
+                if not is_project_pattern(project)
                 for remote in _project_remotes(project)
             )
         return self._ancestry["repositories"]
@@ -330,7 +370,7 @@ class ExclusionPolicy:
         key = ("cwd", cwd)
         if key not in self._ancestry:
             self._ancestry[key] = any(
-                candidate == project or candidate.startswith(project.rstrip(os.sep) + os.sep)
+                _under(candidate, project)
                 for candidate in self._cwd_candidates(cwd)
                 for project in self.excluded_projects
             )
@@ -569,7 +609,7 @@ def update_project_exclusions(
     path = path or policy_path()
     added = {_absolute_project_path(value) for value in add}
     removed = {_absolute_project_path(value) for value in remove}
-    if os.sep in added or os.sep in {os.path.realpath(value) for value in added}:
+    if os.sep in added or os.sep in {_resolved_project_path(value) for value in added}:
         raise ValueError("refusing to exclude the filesystem root")
     # Serialize read-modify-write so concurrent edits cannot drop each other.
     with secure_lock(path.with_name(f".{path.name}.lock")) as lock:
@@ -579,7 +619,7 @@ def update_project_exclusions(
         removed_keys = {_path_key(value) for value in removed}
         result = sorted(
             value for value in current | added
-            if not {_path_key(value), _path_key(os.path.realpath(value))} & removed_keys
+            if not {_path_key(value), _path_key(_resolved_project_path(value))} & removed_keys
         )
         raw["excluded_project_paths"] = result
         _atomic_json(path, raw)

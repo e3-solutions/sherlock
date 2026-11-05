@@ -782,8 +782,39 @@ class ProjectExclusionTests(unittest.TestCase):
             EXCLUDED_PROJECT,
         )
 
+    def test_folder_name_patterns_cover_matching_siblings_made_later(self):
+        # COR-5002: "/private/tmp/aeyron-*" must cover new aeyron-* folders.
+        policy = self.policy(f"{self.root / 'work'}/private-*")
+        self.assertTrue(policy.project_excluded(str(self.sibling)))
+        self.assertTrue(policy.project_excluded(str(self.root / "work" / "private-new" / "deep")))
+        self.assertFalse(policy.project_excluded(str(self.project)))
+        self.assertFalse(policy.project_excluded(str(self.root / "work")))
+        self.assertFalse(policy.project_excluded(str(self.root / "elsewhere" / "private-x")))
+        self.assertEqual(policy.blocked_reason("claude_code", str(uuid.uuid4()),
+                                               observed_cwds=[str(self.sibling / "a")]), EXCLUDED_PROJECT)
+        # A plain path still covers only itself and what is inside it.
+        plain = self.policy(self.project)
+        self.assertTrue(plain.project_excluded(str(self.project / "sub")))
+        self.assertFalse(plain.project_excluded(str(self.sibling)))
+
+    def test_folder_name_patterns_match_through_a_symlinked_parent(self):
+        (self.root / "alias").symlink_to(self.root / "work")
+        policy = self.policy(f"{self.root / 'alias'}/private-*")
+        self.assertTrue(policy.project_excluded(str(self.sibling)))
+
+    def test_cli_adds_and_removes_folder_name_patterns(self):
+        path = self.root / "session-exclusions.json"
+        pattern = f"{self.root / 'work'}/private-*"
+        self.assertEqual(update_project_exclusions(add=[pattern], path=path), [pattern])
+        with patch.dict(os.environ, {"SHERLOCK_HOME": str(self.root)}):
+            self.assertTrue(load_policy().project_excluded(str(self.root / "work" / "private-later")))
+        self.assertEqual(update_project_exclusions(remove=[pattern], path=path), [])
+        for bad in ("/*", f"{self.root}/a*b", f"{self.root}/*/x", f"{self.root}/a**"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                update_project_exclusions(add=[bad], path=path)
+
     def test_invalid_project_entries_fail_closed(self):
-        for value in (["relative/path"], [""], ["/"], "/not/a/list", [7]):
+        for value in (["relative/path"], [""], ["/"], "/not/a/list", [7], ["/*"], ["/tmp/a*b"], ["/tmp/*/x"]):
             with self.subTest(value=value):
                 policy = write_policy(self.root, excluded_project_paths=value)
                 self.assertEqual(policy.blocked_reason("codex", str(uuid.uuid4())), UNREADABLE)
