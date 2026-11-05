@@ -24,6 +24,13 @@ const END = "2026-01-01T12:00:00.000Z";
 const READ_AT = "2026-01-02T00:00:00.000Z";
 const AFTER_READ = "2026-01-02T00:00:00.001Z";
 const WIDE_PLAN_START = "2025-06-01T00:00:00.000Z";
+const COMMON_PLAN_START = "2025-12-02T00:00:00.000Z";
+// The UTC days the function lists for a plan window: start day through 2026-01-01.
+const planDays = (start) => `{${Array.from(
+  { length: (Date.parse("2026-01-01T00:00:00Z") - Date.parse(start.slice(0, 10))) / 86_400_000 + 1 },
+  (_, index) => new Date(Date.parse(start.slice(0, 10)) + index * 86_400_000).toISOString().slice(0, 10),
+).join(",")}}`;
+const COMMON_PLAN_DAYS = planDays(COMMON_PLAN_START);
 // The UTC days the function lists for the wide plan window (WIDE_PLAN_START to END).
 const WIDE_PLAN_DAYS = `{${Array.from(
   { length: (Date.parse("2026-01-01T00:00:00Z") - Date.parse(WIDE_PLAN_START)) / 86_400_000 + 1 },
@@ -941,6 +948,17 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
         owner.push(await execute(call, false));
         windowFirst.push(await execute(call, true));
       }
+      // A common word over a wide window: one exact day entry per day,
+      // intersected with the word, instead of every match in history.
+      const commonWide = [];
+      for (let call = 0; call < 7; call += 1) {
+        const [{ "QUERY PLAN": plan }] = await tx.unsafe(`
+          explain (analyze, buffers, format json) execute excerpt_plan('${workspace}',
+            '${COMMON_PLAN_START}', '${END}', '${READ_AT}',
+            'e3group.ai', ${call % 2 ? `'${person.id}'` : "null"}, null, 2000,
+            websearch_to_tsquery('simple', 'routine'), '{}', '{}', '{}', false, '${COMMON_PLAN_DAYS}'::date[])`);
+        commonWide.push({ rows: plan[0].Plan["Actual Rows"], nodes: planNodes(plan) });
+      }
       const direct = `explain (format json) select e.id from excerpt_search_plan.events e
         where e.workspace_id = '${workspace}' and e.event_kind in ('message', 'agent_message')
           and e.message_search @@ websearch_to_tsquery('simple', 'zebrararetoken')`;
@@ -948,7 +966,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       const reader = await asReader(tx, (sp) => sp.unsafe(direct));
       expect(reader.error).toBeUndefined();
       return {
-        owner, windowFirst, ownerDirect: planNodes(ownerDirect), reader: planNodes(reader.value[0]["QUERY PLAN"]),
+        owner, windowFirst, commonWide, ownerDirect: planNodes(ownerDirect), reader: planNodes(reader.value[0]["QUERY PLAN"]),
       };
     });
 
@@ -956,8 +974,12 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
     for (const { rows, nodes } of plans.owner) {
       expect(rows).toBe(1);
       expect(usesSearchIndex(nodes)).toBe(true);
-      // A wide window is served by the day and text index, one exact day
-      // entry at a time, not by a scan of every match in history.
+      expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
+        .not.toContain("Seq Scan");
+    }
+    expect(plans.commonWide).toHaveLength(7);
+    for (const { rows, nodes } of plans.commonWide) {
+      expect(rows).toBeGreaterThan(0);
       expect(nodes.some((node) => node["Node Type"] === "Bitmap Index Scan"
         && /AT TIME ZONE|timezone/i.test(node["Index Cond"] ?? ""))).toBe(true);
       expect(nodes.filter((node) => node["Relation Name"] === "events").map((node) => node["Node Type"]))
