@@ -28,7 +28,7 @@ FRAGMENT_BYTES = 4 * 1024 * 1024
 # Each request/allocation stays bounded independently of the logical record.
 MAX_LOGICAL_RECORD_BYTES = (2**31 - 1) * FRAGMENT_BYTES
 SOURCE_KINDS = {
-    "codex": frozenset({"rollout"}),
+    "codex": frozenset({"rollout", "hook"}),
     "claude_code": frozenset({"transcript", "hook"}),
 }
 

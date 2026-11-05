@@ -54,6 +54,19 @@ keep their cursor and already-queued batches stay queued unsent
 A policy file that exists but is unreadable or invalid blocks all capture and
 upload until repaired. Without the file nothing changes.
 
+Codex side-conversation forks have no rollout file (their hooks name
+`transcript_path: null`, or, for a session whose `SessionStart` said fork, may
+omit it), so the Codex hook keeps each fork's `SessionStart`,
+`UserPromptSubmit` and `Stop` payload as a `codex`/`hook` source
+(`sherlock.codex-hook.v1`), with the checkout's `origin` remote (credentials,
+query and fragment removed) and branch read locally. Only sessions whose `SessionStart` says
+`source: "fork"` and that have no discovered rollout are kept this way. Owner
+exclusions apply to them as to rollouts: the fork, its parent, its directory and
+its remote are checked at capture and upload (a fork of a fork through the
+parent fork's own record), and while any session ids are excluded a fork whose
+ancestry cannot be verified is held, never uploaded. Deploy the
+ingest that accepts `codex`/`hook` before updating collector runtimes.
+
 ### Exclude a project
 
 To keep every Codex and Claude Code session in a directory out of Sherlock,

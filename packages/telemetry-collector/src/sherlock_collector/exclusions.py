@@ -22,6 +22,14 @@ tooling already honours::
 * ``allowed_claude_session_ids`` (optional): when present, only these Claude
   root sessions are captured or uploaded; Claude subagent transcripts are not.
 
+Codex hook-only sessions (side-conversation forks, which have no rollout and
+no session_meta; see codex_hook.py) are classified from their hook
+observation: the session and the parent it names (or its SessionStart named)
+against ``excluded_session_ids``, its working directory and recorded git
+remote against ``excluded_project_paths``, then the parent's recorded
+ancestry. While any session ids are excluded, one with no known parent is held
+as unverified, so a fork of an excluded session never leaves the machine.
+
 No file means no policy. A file that exists but cannot be read or validated
 fails closed: nothing is captured or uploaded until it is repaired. A session
 whose working directory cannot be read yet while project exclusions exist is
@@ -77,6 +85,12 @@ _FOLD_CASE = sys.platform == "darwin"
 # A "cwd" field at any depth, also inside a fragment of a record too large to parse.
 _CWD_FIELD = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Sherlock hook observations carry the raw hook payload base64-encoded.
+HOOK_OBSERVATION_TYPES = frozenset({"claude_hook", "codex_hook"})
+# Where the Codex hook writes a marker for each hook-only session it saw start
+# (see codex_hook.py); the marker keeps the parent named by the SessionStart.
+CODEX_HOOK_SESSIONS = "codex-hook-sessions"
+CODEX_HOOK_EVENTS = "codex-hook-events"
 
 
 def policy_path() -> Path:
@@ -232,6 +246,9 @@ class ExclusionPolicy:
         source_path: Path | None = None,
         observed_cwds: Iterable[str] = (),
         native_fragments: Iterable[tuple[int, int, str]] = (),
+        source_kind: str | None = None,
+        observed_repositories: Iterable[str] = (),
+        hook_state_root: Path | None = None,
     ) -> str | None:
         """Return why this source/batch must not be captured or uploaded.
 
@@ -242,6 +259,11 @@ class ExclusionPolicy:
         ``native_fragments`` are (start, end, sha256) of oversized native records
         a batch carries only part of; each is classified by the complete record,
         read back from its source file, and held when that cannot be verified.
+        ``source_kind`` ``hook`` with provider ``codex`` selects the Codex
+        hook-only branch (sessions with no rollout, such as side-conversation
+        forks; see ``_codex_hook_reason``). ``observed_repositories`` are git
+        remotes recorded in the bytes being uploaded, and ``hook_state_root`` is
+        the collector state root holding the Codex hook session markers.
         """
         if not self.active:
             return None
@@ -275,6 +297,16 @@ class ExclusionPolicy:
             return None
         if not (self.excluded or self.excluded_projects):
             return None
+        if provider == "codex" and source_kind == "hook":
+            return self._codex_hook_reason(
+                native,
+                parent,
+                source_home,
+                source_path,
+                set(observed_cwds),
+                set(observed_repositories),
+                hook_state_root,
+            )
         if {native, parent} & self.excluded:
             return EXCLUDED
         blocked = self._cwds_reason(set(observed_cwds))
@@ -313,6 +345,94 @@ class ExclusionPolicy:
             meta = self._ancestors(current, codex_home)
             if meta is None:
                 return UNVERIFIED
+            ancestors, cwd, repository = meta
+            if ancestors & self.excluded:
+                return EXCLUDED
+            blocked = self._session_reason(cwd, repository)
+            if blocked:
+                return blocked
+            pending.extend(ancestors - seen)
+        return None
+
+    def _codex_hook_reason(
+        self,
+        native: str | None,
+        parent: str | None,
+        codex_home: Path | None,
+        source_path: Path | None,
+        cwds: set[str],
+        repositories: set[str],
+        hook_state_root: Path | None,
+    ) -> str | None:
+        """Classify a Codex hook-only observation (no rollout, no session_meta).
+
+        In order: the session or its parent excluded; no session id; no
+        working directory while project exclusions exist; an excluded
+        directory or repository remote; the recorded ancestry of a known
+        parent. A session with no known parent is held while any session ids
+        are excluded, so a fork of an excluded session never leaves the machine.
+        The parent is the one the observation names, else the one its
+        SessionStart named (kept in the local session marker).
+        """
+        if source_path is not None and hook_state_root is None and (
+            source_path.parent.name == CODEX_HOOK_EVENTS
+        ):
+            hook_state_root = source_path.parent.parent
+        marker = _codex_hook_marker(hook_state_root, native)
+        marker_parent = _normalize(marker.get("parent_native_session_id")) if marker else None
+        known_parent = parent or marker_parent
+        if {native, parent, marker_parent} & self.excluded:
+            return EXCLUDED
+        if native is None:
+            return UNVERIFIED
+        if source_path is not None:
+            record = _codex_hook_record(source_path)
+            if record is None or record[0] != native:
+                return UNVERIFIED
+            _, own_parent, cwd, repository = record
+            if own_parent is not None:
+                if own_parent in self.excluded:
+                    return EXCLUDED
+                known_parent = known_parent or own_parent
+            if cwd is not None:
+                cwds.add(cwd)
+            if repository is not None:
+                repositories.add(repository)
+        marker_cwd = marker.get("cwd") if marker else None
+        if isinstance(marker_cwd, str) and os.path.isabs(marker_cwd):
+            cwds.add(marker_cwd)
+        if self.excluded_projects:
+            if not cwds:
+                return UNVERIFIED
+            blocked = self._cwds_reason(cwds)
+            if blocked:
+                return blocked
+            excluded_repositories = self._excluded_repositories()
+            if any(
+                _repository_key(repository) in excluded_repositories
+                for repository in repositories
+            ):
+                return EXCLUDED_PROJECT
+        if known_parent is None:
+            return UNVERIFIED if self.excluded else None
+        seen: set[str] = {native}
+        pending = [known_parent]
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if len(seen) > MAX_ANCESTRY_DEPTH:
+                return UNVERIFIED
+            meta = self._ancestors(current, codex_home)
+            if meta is None:
+                # A fork of a fork: the parent has no rollout either, so its
+                # own SessionStart marker continues the chain.
+                meta = _codex_hook_marker_ancestry(hook_state_root, current)
+                if meta is None:
+                    return UNVERIFIED
+                if not meta[0] and self.excluded:
+                    return UNVERIFIED  # The chain ends without a verified root.
             ancestors, cwd, repository = meta
             if ancestors & self.excluded:
                 return EXCLUDED
@@ -774,24 +894,18 @@ def _git_config_value(raw: str) -> str:
     return "".join(result)
 
 
-def _project_remotes(project: str) -> set[str]:
-    """The origin remote of an excluded main checkout or bare repository.
-
-    Only origin is used, as that is what Codex records; linked worktrees and
-    repositories nested in an excluded directory are matched by path instead,
-    so unrelated clones of their remotes are not excluded.
-    """
-    config = _git_config_path(project)
+def _origin_urls(config: str | None) -> list[str]:
+    """Decoded ``url`` values of ``[remote "origin"]`` in a git config file."""
     if config is None:
-        return set()
+        return []
     try:
         with open(config, "rb") as handle:
             text = handle.read(MAX_GIT_FILE_BYTES * 16).decode("utf-8", "replace")
     except OSError:
-        return set()
+        return []
     # A backslash at the end of a line continues the value on the next one.
     lines = re.sub(r"(?<!\\)((?:\\\\)*)\\\r?\n", r"\1", text).splitlines()
-    remotes: set[str] = set()
+    urls: list[str] = []
     in_origin = False
     for line in lines:
         line = line.strip()
@@ -799,10 +913,83 @@ def _project_remotes(project: str) -> set[str]:
             header = line.split("]", 1)[0] + "]"  # ignore a trailing comment
             in_origin = header.replace(" ", "").lower() in {'[remote"origin"]', "[remote.origin]"}
         elif in_origin and "=" in line and line.split("=", 1)[0].strip().lower() == "url":
-            key = _repository_key(_git_config_value(line.split("=", 1)[1]))
-            if key:
-                remotes.add(key)
-    return remotes
+            urls.append(_git_config_value(line.split("=", 1)[1]))
+    return urls
+
+
+def _project_remotes(project: str) -> set[str]:
+    """The origin remote of an excluded main checkout or bare repository.
+
+    Only origin is used, as that is what Codex records; linked worktrees and
+    repositories nested in an excluded directory are matched by path instead,
+    so unrelated clones of their remotes are not excluded.
+    """
+    return {
+        key
+        for url in _origin_urls(_git_config_path(project))
+        if (key := _repository_key(url))
+    }
+
+
+def _git_directories(cwd: str) -> tuple[str, str] | None:
+    """(git dir, common dir) of the checkout or linked worktree containing cwd.
+
+    Reads local files only (no git subprocess); the nearest ``.git`` wins.
+    """
+    current = os.path.normpath(cwd)
+    while True:
+        marker = os.path.join(current, ".git")
+        if os.path.isdir(marker):
+            return marker, marker
+        if os.path.isfile(marker):
+            gitdir = _git_pointer(marker, "gitdir:")
+            if gitdir is None:
+                return None
+            gitdir = os.path.normpath(os.path.join(current, gitdir))
+            common = _git_pointer(os.path.join(gitdir, "commondir"), "")
+            common = os.path.normpath(os.path.join(gitdir, common)) if common else gitdir
+            return gitdir, common
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _without_credentials(url: str) -> str:
+    """Drop user info, query and fragment (which can hold a token) from a URL remote."""
+    if "://" not in url:
+        return url
+    parts = urlsplit(url)
+    host = parts.netloc.rsplit("@", 1)[-1]
+    return parts._replace(netloc=host, query="", fragment="").geturl()
+
+
+def origin_remote_url(cwd: object) -> str | None:
+    """The origin remote of the git checkout containing cwd, without credentials."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return None
+    directories = _git_directories(cwd)
+    if directories is None:
+        return None
+    config = os.path.join(directories[1], "config")
+    for url in _origin_urls(config if os.path.isfile(config) else None):
+        if url.strip():
+            return _without_credentials(url.strip())
+    return None
+
+
+def head_branch(cwd: object) -> str | None:
+    """The branch checked out at cwd (None when detached or unknown)."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return None
+    directories = _git_directories(cwd)
+    if directories is None:
+        return None
+    ref = _git_pointer(os.path.join(directories[0], "HEAD"), "ref:")
+    prefix = "refs/heads/"
+    if ref is None or not ref.startswith(prefix) or len(ref) == len(prefix):
+        return None
+    return ref[len(prefix):]
 
 
 def _git_config_path(checkout: str) -> str | None:
@@ -884,6 +1071,90 @@ def observed_cwds(source: bytes) -> set[str]:
     return cwds
 
 
+def observed_repositories(source: bytes) -> set[str]:
+    """Git remotes recorded by Codex hook observations in a source byte range."""
+    remotes: set[str] = set()
+    for line in source.splitlines():
+        if b"codex_hook" not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        git = record.get("git") if isinstance(record, dict) else None
+        if record.get("type") == "codex_hook" and isinstance(git, dict):
+            url = git.get("repository_url")
+            if isinstance(url, str) and url.strip():
+                remotes.add(url)
+    return remotes
+
+
+def _codex_hook_record(
+    path: Path,
+) -> tuple[str | None, str | None, str | None, str | None] | None:
+    """(session id, parent id, cwd, repository) of a Codex hook observation file.
+
+    None when the file is not a readable Codex hook observation.
+    """
+    try:
+        handle = _open_regular(path)
+        if handle is None:
+            return None
+        with handle:
+            data = handle.read(MAX_SOURCE_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > MAX_SOURCE_BYTES:
+        return None
+    try:
+        record = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "codex_hook":
+        return None
+    git = record.get("git")
+    repository = git.get("repository_url") if isinstance(git, dict) else None
+    return (
+        _normalize(record.get("native_session_id")),
+        _normalize(record.get("parent_native_session_id")),
+        _record_cwd(record),
+        repository if isinstance(repository, str) and repository.strip() else None,
+    )
+
+
+def _codex_hook_marker(state_root: Path | None, session_id: str | None) -> dict | None:
+    """The local marker the Codex hook wrote when a hook-only session started."""
+    if state_root is None or session_id is None or not _UUID.fullmatch(session_id):
+        return None
+    try:
+        handle = _open_regular(Path(state_root) / CODEX_HOOK_SESSIONS / f"{session_id}.json")
+        if handle is None:
+            return None
+        with handle:
+            value = json.loads(handle.read(MAX_SESSION_META_BYTES))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or _normalize(value.get("native_session_id")) != session_id:
+        return None
+    return value
+
+
+def _codex_hook_marker_ancestry(
+    state_root: Path | None, session_id: str
+) -> tuple[set[str], str | None, str | None] | None:
+    """(parent ids, cwd, repository) a hook-only fork's marker records, like _ancestors."""
+    marker = _codex_hook_marker(state_root, session_id)
+    if marker is None or marker.get("source") != "fork":
+        return None
+    parent = _normalize(marker.get("parent_native_session_id"))
+    cwd = marker.get("cwd")
+    return (
+        {parent} - {None, session_id},
+        cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None,
+        _repository_key(marker.get("repository_url")),
+    )
+
+
 def _record_range_cwds(path: Path, start: int, end: int, digest: str) -> set[str] | None:
     """Directories in bytes [start, end) of path, or None unless they hash to digest."""
     overlap = 64 * 1024
@@ -917,7 +1188,7 @@ def _record_cwd(record: object) -> str | None:
             if isinstance(cwd, str) and os.path.isabs(cwd):
                 return cwd
     encoded = record.get("payload_base64")
-    if record.get("type") == "claude_hook" and isinstance(encoded, str):
+    if record.get("type") in HOOK_OBSERVATION_TYPES and isinstance(encoded, str):
         try:
             payload = json.loads(base64.b64decode(encoded, validate=True))
         except (ValueError, UnicodeDecodeError):
