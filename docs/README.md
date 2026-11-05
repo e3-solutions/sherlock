@@ -23,7 +23,8 @@ Dated incident notes are history: open them when the task names that incident.
   2026-11-12, then required). Put correct names it cannot find (other repos, runtime
   files, Supabase refs) in `.agents/doc-check-allow.txt`.
 - After a PR merges with code changes but no docs changes, `.github/workflows/docs-backstop.yml`
-  asks Claude for a small docs follow-up PR (COR-5202). It skips until the
-  `ANTHROPIC_API_KEY` org secret is shared with this repo.
+  asks Claude for a small docs follow-up PR (COR-5202). It uses the `ANTHROPIC_API_KEY`
+  repo secret and skips if that is unset. Each run is capped (Sonnet, 20 turns, $0.50).
+  To run it for an already-merged PR, start it with `workflow_dispatch` and the PR number.
 - One fact, one home. Link to it instead of copying it into a skill or `AGENTS.md`.
 - Add a row here in the same PR that adds a durable doc.
