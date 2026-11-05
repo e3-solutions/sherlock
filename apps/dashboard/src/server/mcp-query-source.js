@@ -854,10 +854,6 @@ with page as materialized (
           and activity.occurred_at >= $2 and activity.occurred_at < $3
           and activity.server_received_at <= $4
      ))
-     -- started_at is the earliest event time, so a session starting at or
-     -- after the window end cannot have activity inside it; this skips the
-     -- activity probe for every newer session when paging a past window.
-     and s.started_at < $3
      and s.created_at <= $4
      and pe.github_id is distinct from 'sherlock-smoke'
      and split_part(pe.email, '@', 2) = $5 and split_part(pe.email, '@', 3) = ''

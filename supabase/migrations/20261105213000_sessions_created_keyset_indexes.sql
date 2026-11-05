@@ -14,3 +14,6 @@ create index if not exists sessions_person_created_idx
   on telemetry.sessions (workspace_id, person_id, created_at, id);
 create index if not exists sessions_created_idx
   on telemetry.sessions (workspace_id, created_at, id);
+
+reset statement_timeout;
+reset lock_timeout;
