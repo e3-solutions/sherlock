@@ -47,7 +47,9 @@ Keeping one exact definition prevents the architecture notes from drifting.
 - Railway dispatches every native record to the immutable provider-specific
   `sherlock.codex-rollout.v4` or `sherlock.claude-code-transcript.v1`
   normalizer, then reduces only affected sessions into append-only
-  `sherlock.activity.v1` span revisions.
+  `sherlock.activity.v1` span revisions. Each normalizer reads its provider's
+  hook batches through a separate hook projection (`codex/hook` carries
+  rolloutless Codex forks; see `telemetry-processing.md`).
 - Railway also projects payload-free activity and prompt selections with one
   bounded, fingerprinted session receipt per run. An owner-written activation
   fact gates dashboard cutover after the current window is proven.
@@ -197,6 +199,11 @@ they stay in immutable raw Storage, rather than becoming additional usage facts.
 Every projection retains its exact `source_record_id`. Duplicate response
 occurrences remain source facts and collapse to the earliest canonical response
 in readers, including copies in later transport generations.
+
+Codex hook batches (`source_kind = 'hook'`) are interpreted at the same Codex
+normalizer versions. Their events keep `source_kind = 'hook'` and
+`source_priority = 90`, carry `dispatch_event_name` and `payload_sha256` in
+`attributes`, and never produce `session_scm` facts.
 
 For both v4 `token_count` and native response usage, inclusive Codex input is
 split into uncached input and cached input. Cached input includes cache reads

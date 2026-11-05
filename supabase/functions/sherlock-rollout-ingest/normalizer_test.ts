@@ -8,6 +8,7 @@ import {
   NORMALIZER_VERSION,
   normalizerVersionFor,
   projectBatch,
+  ROLE_VERSION,
   RUNTIME_CONTEXT_MESSAGE_ORIGIN,
   SCM_SOURCE_VERSION,
 } from "./normalizer.ts";
@@ -45,6 +46,49 @@ async function claudeHookEnvelope(input: {
     transcript_byte_count: transcript?.byteLength ?? null,
     transcript_sha256: transcript ? await sha256Hex(transcript) : null,
   };
+}
+
+async function codexHookEnvelope(input: {
+  dispatchEventName: "SessionStart" | "UserPromptSubmit" | "Stop";
+  payload: Record<string, unknown>;
+  nativeSessionId: string;
+  parentNativeSessionId?: string | null;
+  sessionSource?: string | null;
+  git?: unknown;
+  observedAt?: string;
+}): Promise<Record<string, unknown>> {
+  const payloadBytes = new TextEncoder().encode(JSON.stringify(input.payload));
+  const observedAt = input.observedAt ?? "2026-11-05T18:00:00.000000Z";
+  return {
+    type: "codex_hook",
+    schema_version: "sherlock.codex-hook.v1",
+    collector_observed_at: observedAt,
+    timestamp: observedAt,
+    dispatch_event_name: input.dispatchEventName,
+    payload_sha256: await sha256Hex(payloadBytes),
+    payload_base64: encodeBase64(payloadBytes),
+    native_session_id: input.nativeSessionId,
+    parent_native_session_id: input.parentNativeSessionId ?? null,
+    session_source: input.sessionSource ?? null,
+    git: input.git === undefined
+      ? {
+        repository_url: "https://github.com/e3-solutions/sherlock.git",
+        branch: "main",
+      }
+      : input.git,
+  };
+}
+
+async function codexHookFixture(
+  records: Array<Record<string, unknown> | string>,
+  nativeSessionId: string | null,
+  parentNativeSessionId: string | null = null,
+) {
+  const result = await fixture(records);
+  result.manifest.source_kind = "hook";
+  result.manifest.observed_native_session_id = nativeSessionId;
+  result.manifest.observed_parent_native_session_id = parentNativeSessionId;
+  return result;
 }
 
 function assert(
@@ -1433,4 +1477,428 @@ Deno.test("Codex v4 keeps v3 runtime message classification", async () => {
       event.message_origin === RUNTIME_CONTEXT_MESSAGE_ORIGIN
     ),
   );
+});
+
+const CODEX_FORK_ID = "019a5c5e-7c1d-7d2e-8f3a-4b5c6d7e8f90";
+const CODEX_FORK_PARENT_ID = "019a5c5e-0000-7000-8000-000000000001";
+
+async function codexForkHooks(): Promise<Record<string, unknown>[]> {
+  return [
+    await codexHookEnvelope({
+      dispatchEventName: "SessionStart",
+      nativeSessionId: CODEX_FORK_ID,
+      parentNativeSessionId: CODEX_FORK_PARENT_ID,
+      sessionSource: "fork",
+      observedAt: "2026-11-05T18:00:00.000000Z",
+      payload: {
+        hook_event_name: "SessionStart",
+        session_id: CODEX_FORK_ID,
+        forked_from_id: CODEX_FORK_PARENT_ID,
+        cwd: "/repo",
+        model: "gpt-5.5-codex",
+        transcript_path: null,
+        source: "fork",
+      },
+    }),
+    await codexHookEnvelope({
+      dispatchEventName: "UserPromptSubmit",
+      nativeSessionId: CODEX_FORK_ID,
+      sessionSource: "fork",
+      observedAt: "2026-11-05T18:00:01.000000Z",
+      payload: {
+        hook_event_name: "UserPromptSubmit",
+        session_id: CODEX_FORK_ID,
+        turn_id: "turn-1",
+        cwd: "/repo",
+        model: "gpt-5.5-codex",
+        transcript_path: null,
+        prompt: "  Sanitized side question  ",
+      },
+    }),
+    await codexHookEnvelope({
+      dispatchEventName: "Stop",
+      nativeSessionId: CODEX_FORK_ID,
+      sessionSource: "fork",
+      observedAt: "2026-11-05T18:00:05.000000Z",
+      payload: {
+        hook_event_name: "Stop",
+        session_id: CODEX_FORK_ID,
+        turn_id: "turn-1",
+        cwd: "/repo",
+        model: "gpt-5.5-codex",
+        transcript_path: null,
+        stop_hook_active: false,
+        last_assistant_message: "Sanitized side answer",
+      },
+    }),
+  ];
+}
+
+Deno.test("Codex fork hooks project a rolloutless session below rollout priority", async () => {
+  // SessionStart is the only hook that names the parent; its batch carries it.
+  const [start, prompt, stop] = await codexForkHooks();
+  const first = await codexHookFixture(
+    [start],
+    CODEX_FORK_ID,
+    CODEX_FORK_PARENT_ID,
+  );
+  const started = await projectBatch(
+    first.manifest,
+    first.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  assert(started.session?.native_session_id === CODEX_FORK_ID);
+  assert(
+    started.session?.parent_native_session_id === CODEX_FORK_PARENT_ID,
+  );
+  assert(started.session?.actor_role === "primary");
+  assert(started.session?.role_version === ROLE_VERSION);
+  assert(started.session?.title === null);
+  assert(started.session?.cwd === "/repo");
+  assert(started.session?.model === "gpt-5.5-codex");
+  assert(
+    started.session?.repo_remote ===
+      "https://github.com/e3-solutions/sherlock.git",
+  );
+  assert(started.session?.branch === "main");
+  assert(started.session?.started_at === "2026-11-05T18:00:00.000000Z");
+  assert(started.session_scm === null);
+  const lifecycle = started.events[0];
+  assert(lifecycle.event_kind === "lifecycle");
+  assert(lifecycle.event_subtype === "session_start");
+  assert(lifecycle.source_priority === 90);
+  assert(lifecycle.error_code === null);
+  assert(
+    lifecycle.logical_event_key ===
+      `codex:hook:${lifecycle.attributes?.payload_sha256}`,
+  );
+  assert(lifecycle.canonical_scope_key === `session:${CODEX_FORK_ID}`);
+  assert(lifecycle.attributes?.dispatch_event_name === "SessionStart");
+  assert(lifecycle.attributes?.session_source === "fork");
+  assert(lifecycle.attributes?.source === "fork");
+  assert(lifecycle.content_excerpt === null);
+
+  const rest = await codexHookFixture([prompt, stop], CODEX_FORK_ID);
+  const continued = await projectBatch(
+    rest.manifest,
+    rest.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  // The collector's fork marker sets the role even without SessionStart, so
+  // a prompt batch normalized first is still a primary-session fact.
+  assert(continued.session?.actor_role === "primary");
+  assert(continued.session?.parent_native_session_id === null);
+  assert(continued.events.length === 3);
+  const [submitted, answered, completed] = continued.events;
+  assert(submitted.actor_role === "primary");
+  assert(submitted.event_kind === "message");
+  assert(submitted.event_subtype === "user_message");
+  assert(submitted.message_role === "user");
+  assert(submitted.message_origin === "human");
+  assert(submitted.turn_id === "turn-1");
+  assert(submitted.logical_event_key === "message:user:turn-1");
+  assert(submitted.source_priority === 90);
+  assert(submitted.observed_at === "2026-11-05T18:00:01.000000Z");
+  assert(submitted.cwd === "/repo" && submitted.model === "gpt-5.5-codex");
+  // Trimmed exactly like a rollout user_message, so the hashes agree.
+  assert(
+    submitted.content_sha256 ===
+      await sha256Hex(new TextEncoder().encode("Sanitized side question")),
+  );
+  assert(submitted.content_excerpt === "Sanitized side question");
+  assert(answered.event_kind === "agent_message");
+  assert(answered.event_subtype === "agent_message");
+  assert(answered.message_role === "assistant");
+  assert(answered.content_excerpt === "Sanitized side answer");
+  assert(
+    answered.logical_event_key === "message:assistant:turn-1:hook_stop",
+  );
+  assert(answered.error_code === null);
+  assert(answered.projection_index === 0);
+  // Stop also closes the turn, from the same record.
+  assert(completed.record_index === answered.record_index);
+  assert(completed.projection_index === 1);
+  assert(completed.event_kind === "lifecycle");
+  assert(completed.event_subtype === "turn_complete");
+  assert(completed.turn_id === "turn-1");
+  assert(
+    completed.logical_event_key === "codex:lifecycle:turn-1:turn_complete",
+  );
+  assert(completed.content_sha256 === null && completed.message_role === null);
+  assert(completed.source_priority === 90);
+  assert(completed.observed_at === "2026-11-05T18:00:05.000000Z");
+  assert(completed.attributes?.dispatch_event_name === "Stop");
+
+  // Without SessionStart or a fork marker the role stays unknown, which never
+  // overwrites a stored role.
+  const unmarked = await codexHookFixture(
+    [{ ...prompt, session_source: null }],
+    CODEX_FORK_ID,
+  );
+  const unmarkedProjection = await projectBatch(
+    unmarked.manifest,
+    unmarked.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  assert(unmarkedProjection.session?.actor_role === "unknown");
+  // An unrecognised marker is not a fork.
+  const otherMarker = await codexHookFixture(
+    [{ ...prompt, session_source: "exec" }],
+    CODEX_FORK_ID,
+  );
+  assert(
+    (await projectBatch(
+      otherMarker.manifest,
+      otherMarker.source,
+      CODEX_V4_NORMALIZER_VERSION,
+    )).session?.actor_role === "unknown",
+  );
+});
+
+Deno.test("Codex hook batches project at every Codex normalizer version", async () => {
+  const hooks = await codexForkHooks();
+  const { manifest, source } = await codexHookFixture(
+    hooks.slice(1),
+    CODEX_FORK_ID,
+  );
+  for (
+    const version of [
+      CODEX_V4_NORMALIZER_VERSION,
+      CODEX_V3_NORMALIZER_VERSION,
+      NORMALIZER_VERSION,
+      LEGACY_CODEX_NORMALIZER_VERSION,
+    ]
+  ) {
+    const projection = await projectBatch(manifest, source, version);
+    assert(
+      projection.events.map((event) => event.event_subtype).join(",") ===
+        "user_message,agent_message,turn_complete",
+      `${version} must use the hook projection, never the rollout one`,
+    );
+  }
+  let rejected = false;
+  try {
+    await projectBatch(manifest, source, CLAUDE_NORMALIZER_VERSION);
+  } catch (error) {
+    rejected = (error as { code?: string }).code ===
+      "unsupported_normalizer_version";
+  }
+  assert(rejected, "a Claude normalizer must not read Codex hooks");
+});
+
+Deno.test("Codex hook projections reject tampered payloads and identity", async () => {
+  const [start, prompt] = await codexForkHooks();
+  const otherPayload = new TextEncoder().encode(JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: CODEX_FORK_ID,
+    prompt: "Forged prompt",
+  }));
+  const cases: Array<{
+    hook: Record<string, unknown> | string;
+    error: string;
+    parent?: string | null;
+    manifestId?: string | null;
+  }> = [
+    {
+      hook: { ...prompt, type: "claude_hook" },
+      error: "invalid_codex_hook_schema",
+    },
+    {
+      hook: { ...prompt, schema_version: "sherlock.codex-hook.v2" },
+      error: "invalid_codex_hook_schema",
+    },
+    {
+      hook: { ...prompt, collector_observed_at: "2026-11-05T18:00:01+00:00" },
+      error: "invalid_codex_hook_observed_at",
+    },
+    {
+      hook: { ...prompt, dispatch_event_name: "PreToolUse" },
+      error: "invalid_codex_hook_event",
+    },
+    {
+      hook: { ...prompt, dispatch_event_name: "Stop" },
+      error: "invalid_codex_hook_payload_event",
+    },
+    {
+      hook: { ...prompt, payload_sha256: "0".repeat(64) },
+      error: "invalid_codex_hook_payload_hash",
+    },
+    {
+      hook: { ...prompt, payload_base64: encodeBase64(otherPayload) },
+      error: "invalid_codex_hook_payload_hash",
+    },
+    {
+      hook: { ...prompt, payload_sha256: "short" },
+      error: "invalid_codex_hook_payload",
+    },
+    {
+      hook: { ...prompt, native_session_id: CODEX_FORK_PARENT_ID },
+      error: "invalid_codex_hook_session",
+      manifestId: CODEX_FORK_PARENT_ID,
+    },
+    {
+      hook: prompt,
+      error: "invalid_codex_hook_session",
+      manifestId: CODEX_FORK_PARENT_ID,
+    },
+    // A parent the payload never named is not trusted.
+    {
+      hook: { ...prompt, parent_native_session_id: CODEX_FORK_PARENT_ID },
+      error: "invalid_codex_hook_session",
+      parent: CODEX_FORK_PARENT_ID,
+    },
+    // The payload's parent must reach the manifest too.
+    { hook: start, error: "invalid_codex_hook_session", parent: null },
+    { hook: { ...prompt, git: "main" }, error: "invalid_codex_hook_git" },
+    {
+      hook: { ...prompt, git: { repository_url: 42, branch: "main" } },
+      error: "invalid_codex_hook_git",
+    },
+    {
+      hook: {
+        ...prompt,
+        git: { repository_url: null, branch: "b".repeat(2049) },
+      },
+      error: "invalid_codex_hook_git",
+    },
+    { hook: "{not json", error: "native_malformed" },
+    // A hook that names a transcript belongs to a rollout-backed session.
+    {
+      hook: await codexHookEnvelope({
+        dispatchEventName: "UserPromptSubmit",
+        nativeSessionId: CODEX_FORK_ID,
+        sessionSource: "fork",
+        payload: {
+          hook_event_name: "UserPromptSubmit",
+          session_id: CODEX_FORK_ID,
+          cwd: "/elsewhere",
+          transcript_path: "/sanitized/rollout.jsonl",
+          prompt: "Prompt from a normal session",
+        },
+      }),
+      error: "invalid_codex_hook_transcript",
+    },
+    {
+      hook: await codexHookEnvelope({
+        dispatchEventName: "Stop",
+        nativeSessionId: CODEX_FORK_ID,
+        payload: {
+          hook_event_name: "Stop",
+          session_id: CODEX_FORK_ID,
+          turn_id: "turn-1",
+          transcript_path: 7,
+        },
+      }),
+      error: "invalid_codex_hook_transcript",
+    },
+  ];
+  for (const { hook, error, parent, manifestId } of cases) {
+    const { manifest, source } = await codexHookFixture(
+      [hook],
+      manifestId === undefined ? CODEX_FORK_ID : manifestId,
+      parent ?? null,
+    );
+    const projection = await projectBatch(
+      manifest,
+      source,
+      CODEX_V4_NORMALIZER_VERSION,
+    );
+    const [event] = projection.events;
+    assert(
+      event.event_subtype === "hook_invalid" && event.error_code === error,
+      `expected ${error}, got ${event.error_code}`,
+    );
+    assert(event.content_sha256 === null && event.turn_id === null);
+    assert(event.logical_event_key === null);
+    // Rejected records never contribute session facts.
+    assert(projection.session?.cwd === null);
+    assert(projection.session?.repo_remote === null);
+  }
+  const absent = await codexHookFixture([prompt], null);
+  const unattributed = await projectBatch(
+    absent.manifest,
+    absent.source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  assert(unattributed.session === null);
+  assert(unattributed.events[0].error_code === "invalid_codex_hook_session");
+});
+
+Deno.test("Codex hook prompts classify runtime context and tolerate missing optional fields", async () => {
+  const runtime = await codexHookEnvelope({
+    dispatchEventName: "UserPromptSubmit",
+    nativeSessionId: CODEX_FORK_ID,
+    git: null,
+    payload: {
+      hook_event_name: "UserPromptSubmit",
+      session_id: CODEX_FORK_ID,
+      prompt:
+        "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>",
+    },
+  });
+  const bare = await codexHookEnvelope({
+    dispatchEventName: "UserPromptSubmit",
+    nativeSessionId: CODEX_FORK_ID,
+    git: { repository_url: null },
+    payload: {
+      hook_event_name: "UserPromptSubmit",
+      session_id: CODEX_FORK_ID,
+      prompt: "Plain human question",
+    },
+  });
+  const { manifest, source } = await codexHookFixture(
+    [runtime, bare],
+    CODEX_FORK_ID,
+  );
+  const projection = await projectBatch(
+    manifest,
+    source,
+    CODEX_V4_NORMALIZER_VERSION,
+  );
+  const [context, human] = projection.events;
+  assert(context.error_code === null);
+  assert(context.message_origin === RUNTIME_CONTEXT_MESSAGE_ORIGIN);
+  assert(human.message_origin === "human");
+  // No turn_id: the payload hash keys the prompt instead.
+  assert(human.turn_id === null);
+  assert(
+    human.logical_event_key ===
+      `codex:hook:${human.attributes?.payload_sha256}`,
+  );
+  assert(human.attributes?.session_source === undefined);
+  assert(human.cwd === null && human.model === null);
+  assert(projection.session?.repo_remote === null);
+  assert(projection.session?.branch === null);
+  assert(projection.session?.cwd === null);
+});
+
+Deno.test("Codex Stop hooks without a final message stay observable but contentless", async () => {
+  for (const lastAssistantMessage of [undefined, null, "   "]) {
+    const stop = await codexHookEnvelope({
+      dispatchEventName: "Stop",
+      nativeSessionId: CODEX_FORK_ID,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: CODEX_FORK_ID,
+        stop_hook_active: false,
+        ...(lastAssistantMessage === undefined
+          ? {}
+          : { last_assistant_message: lastAssistantMessage }),
+      },
+    });
+    const { manifest, source } = await codexHookFixture([stop], CODEX_FORK_ID);
+    const [event] = (await projectBatch(
+      manifest,
+      source,
+      CODEX_V4_NORMALIZER_VERSION,
+    )).events;
+    assert(event.event_kind === "agent_message");
+    assert(event.message_role === "assistant");
+    assert(event.error_code === "empty_message_content");
+    assert(event.content_sha256 === null && event.content_excerpt === null);
+    assert(
+      event.logical_event_key ===
+        `codex:hook:${event.attributes?.payload_sha256}`,
+    );
+  }
 });

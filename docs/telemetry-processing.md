@@ -35,6 +35,41 @@ interpreted by the Claude normalizer, while the immutable source bytes and
 provider/kind facts remain separate and auditable. Only an anchored Stop or
 SubagentStop projects a completed turn.
 
+Codex accepts `codex/rollout` and `codex/hook`. Hook batches carry sessions that
+never write a rollout, chiefly side-conversation forks (COR-5208): one
+`sherlock.codex-hook.v1` envelope per SessionStart, UserPromptSubmit, or Stop,
+holding the exact payload bytes (base64) and their SHA-256. Codex hook jobs use
+the queued Codex version (v4 for new batches) and dispatch to the hook
+projection, never the rollout one. A record is trusted only when the schema,
+UTC `collector_observed_at`, payload hash, `hook_event_name`, and session id
+(envelope, payload, and manifest) agree; a parent is accepted only when the
+payload names it in `forked_from_id` or `parent_thread_id`. A payload with a
+non-null `transcript_path` belongs to a rollout-backed session and is refused,
+so a hook can never overwrite rollout facts. Anything else becomes a
+`lifecycle/hook_invalid` event with an `invalid_codex_hook_*` error.
+Valid hooks project at `source_priority` 90, below the rollout's 100:
+
+| Hook | Event | Logical key |
+| --- | --- | --- |
+| SessionStart | `lifecycle/session_start` | `codex:hook:<payload sha>` |
+| UserPromptSubmit | `message/user_message`, origin `human` or `runtime_context` | `message:user:<turn_id>`, else `codex:hook:<payload sha>` |
+| Stop | `agent_message/agent_message` with `last_assistant_message` | `message:assistant:<turn_id>:hook_stop`, else `codex:hook:<payload sha>` |
+| Stop with a `turn_id` | also `lifecycle/turn_complete` (projection 1), which closes the reduced turn | `codex:lifecycle:<turn_id>:turn_complete` |
+
+Prompt text is trimmed and keyed like a rollout `user_message`, so a rollout
+copy of the same turn collapses into one prompt and outranks the hook copy.
+The session takes `cwd` and `model` from the payload and `repo_remote`/`branch`
+from the envelope's optional `git`. Hook batches arrive and run in no fixed
+order, and each event is stamped with the session role when it is inserted, so
+every batch derives the role itself: SessionStart from its payload `source`,
+any other record from the collector's `session_source = "fork"` marker (both
+give `primary`). A batch with neither sends `unknown`, which never overwrites a
+stored role.
+
+Deploy this ingest and worker before any collector that writes `codex/hook`.
+Older ingest refuses those batches with `unsupported_contract`, which is a
+collector-wide upload error and blocks the drain.
+
 `processing` is private mutable operational state. Immutable receipts and
 record locators stay in `telemetry`; rebuildable product projections stay in
 `analytics`.

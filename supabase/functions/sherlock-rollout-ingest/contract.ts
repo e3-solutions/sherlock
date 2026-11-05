@@ -14,6 +14,15 @@ export const VERSION_HINT_BYTES = 128;
 export const PERSON_NAME_BYTES = 256;
 export const EMAIL_BYTES = 320;
 
+// Which source kinds each provider may upload. Codex hooks carry rolloutless
+// sessions (side-conversation forks) that never write a rollout (COR-5208).
+const SOURCE_KINDS_BY_PROVIDER: Readonly<
+  Record<string, readonly string[] | undefined>
+> = Object.freeze({
+  codex: Object.freeze(["rollout", "hook"]),
+  claude_code: Object.freeze(["transcript", "hook"]),
+});
+
 const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_SEGMENT = /^[A-Za-z0-9._~-]{1,200}$/;
 const GITHUB_ID = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
@@ -517,9 +526,7 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
     contractVersion !== CONTRACT_VERSION ||
     !(["codex", "claude_code"] as string[]).includes(sourceProvider) ||
     !(["rollout", "transcript", "hook"] as string[]).includes(sourceKind) ||
-    (sourceProvider === "codex" && sourceKind !== "rollout") ||
-    (sourceProvider === "claude_code" &&
-      !(["transcript", "hook"] as string[]).includes(sourceKind))
+    !(SOURCE_KINDS_BY_PROVIDER[sourceProvider] ?? []).includes(sourceKind)
   ) {
     throw new IngestError(
       "unsupported_contract",
@@ -594,10 +601,9 @@ export function parseEnvelope(value: unknown): IngestEnvelope {
 
 export function validateManifest(manifest: BatchManifest): void {
   if (
-    (manifest.source_provider === "codex" &&
-      manifest.source_kind !== "rollout") ||
-    (manifest.source_provider === "claude_code" &&
-      !(["transcript", "hook"] as string[]).includes(manifest.source_kind))
+    !(SOURCE_KINDS_BY_PROVIDER[manifest.source_provider] ?? []).includes(
+      manifest.source_kind,
+    )
   ) {
     throw new IngestError(
       "unsupported_contract",

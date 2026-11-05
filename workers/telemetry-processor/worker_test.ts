@@ -25,12 +25,23 @@ import {
   WorkerProgressWatchdog,
 } from "./main.ts";
 import { normalizationStatementTimeout } from "../../supabase/functions/sherlock-rollout-ingest/normalizer_postgres.ts";
-import type { BatchManifest } from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
+import {
+  type BatchManifest,
+  CONTRACT_VERSION,
+  sha256Hex,
+} from "../../supabase/functions/sherlock-rollout-ingest/contract.ts";
 import {
   CLAUDE_NORMALIZER_VERSION,
+  CODEX_V4_NORMALIZER_VERSION,
   LEGACY_CODEX_NORMALIZER_VERSION,
   NORMALIZER_VERSION,
+  projectBatch,
 } from "../../supabase/functions/sherlock-rollout-ingest/normalizer.ts";
+import { validateStoredBatch } from "../../supabase/functions/sherlock-rollout-ingest/service.ts";
+import {
+  type ActivityEvent,
+  reduceActivity,
+} from "../../supabase/functions/sherlock-activity-reducer/reducer.ts";
 import {
   normalizationTarget,
   recordLocatorFromRow,
@@ -68,6 +79,173 @@ Deno.test("version-aware workers keep pre-migration jobs on provider v1", () => 
   assert(normalizationTarget(null, codex) === LEGACY_CODEX_NORMALIZER_VERSION);
   assert(normalizationTarget(null, claude) === CLAUDE_NORMALIZER_VERSION);
   assert(normalizationTarget(NORMALIZER_VERSION, codex) === NORMALIZER_VERSION);
+});
+
+const CODEX_FORK_ID = "019a5c5e-7c1d-7d2e-8f3a-4b5c6d7e8f90";
+
+async function codexHookRecord(
+  dispatchEventName: string,
+  payload: Record<string, unknown>,
+  at: string,
+): Promise<Record<string, unknown>> {
+  const bytes = new TextEncoder().encode(JSON.stringify({
+    hook_event_name: dispatchEventName,
+    session_id: CODEX_FORK_ID,
+    transcript_path: null,
+    ...payload,
+  }));
+  return {
+    type: "codex_hook",
+    schema_version: "sherlock.codex-hook.v1",
+    collector_observed_at: at,
+    timestamp: at,
+    dispatch_event_name: dispatchEventName,
+    payload_sha256: await sha256Hex(bytes),
+    payload_base64: btoa(String.fromCharCode(...bytes)),
+    native_session_id: CODEX_FORK_ID,
+    parent_native_session_id: null,
+    session_source: "fork",
+    git: { repository_url: null, branch: null },
+  };
+}
+
+// One observation per stored batch, as the collector writes them.
+async function codexHookBatch(
+  observation: Record<string, unknown>,
+): Promise<{ manifest: BatchManifest; stored: Uint8Array }> {
+  const record = new TextEncoder().encode(`${JSON.stringify(observation)}\n`);
+  const at = String(observation.timestamp);
+  const stored = new Uint8Array(
+    await new Response(
+      new Blob([record]).stream().pipeThrough(new CompressionStream("gzip")),
+    ).arrayBuffer(),
+  );
+  return {
+    stored,
+    manifest: {
+      contract_version: CONTRACT_VERSION,
+      source_provider: "codex",
+      source_kind: "hook",
+      source_stream_key: `codex-hook-${await sha256Hex(record)}`,
+      generation_key: "codex-hook-generation",
+      generation_seq: 0,
+      start_offset: 0,
+      end_offset: record.byteLength,
+      source_byte_count: record.byteLength,
+      source_sha256: await sha256Hex(record),
+      storage_encoding: "gzip",
+      stored_byte_count: stored.byteLength,
+      stored_sha256: await sha256Hex(stored),
+      record_count: 1,
+      records: [{
+        record_index: 0,
+        source_start_offset: 0,
+        source_end_offset: record.byteLength,
+        record_sha256: await sha256Hex(record),
+        native_type: "codex_hook",
+        native_payload_type: null,
+        occurred_at: at,
+        parse_status: "ok",
+      }],
+      observed_native_session_id: CODEX_FORK_ID,
+      observed_parent_native_session_id: null,
+      first_occurred_at: at,
+      last_occurred_at: at,
+      codex_version: "0.56.0",
+      source_version: "0.56.0",
+      collector_version: "test",
+    },
+  };
+}
+
+Deno.test("Codex hook batches reach the hook projection at the job's version", async () => {
+  const { manifest, stored } = await codexHookBatch(
+    await codexHookRecord(
+      "UserPromptSubmit",
+      { turn_id: "turn-1", prompt: "Sanitized side question" },
+      "2026-11-05T18:00:01.000000Z",
+    ),
+  );
+  // The worker re-validates the stored batch before it normalizes.
+  const source = await validateStoredBatch(manifest, stored);
+  for (const requested of [CODEX_V4_NORMALIZER_VERSION, null]) {
+    const version = normalizationTarget(requested, manifest);
+    const [event] = (await projectBatch(manifest, source, version)).events;
+    assert(
+      event.event_subtype === "user_message" && event.source_priority === 90 &&
+        event.logical_event_key === "message:user:turn-1" &&
+        event.error_code === null && event.actor_role === "primary",
+      `${version} must use the Codex hook projection`,
+    );
+  }
+});
+
+Deno.test("a fork's prompt and Stop hooks reduce to one closed turn", async () => {
+  const sessionId = "00000000-0000-4000-8000-0000000000f1";
+  const observations = [
+    await codexHookRecord(
+      "UserPromptSubmit",
+      { turn_id: "turn-1", prompt: "Sanitized side question" },
+      "2026-11-05T18:00:00.000000Z",
+    ),
+    await codexHookRecord(
+      "Stop",
+      {
+        turn_id: "turn-1",
+        stop_hook_active: false,
+        last_assistant_message: "Sanitized side answer",
+      },
+      "2026-11-05T18:05:00.000000Z",
+    ),
+  ];
+  const events: ActivityEvent[] = [];
+  for (const observation of observations) {
+    const { manifest, stored } = await codexHookBatch(observation);
+    const source = await validateStoredBatch(manifest, stored);
+    const projection = await projectBatch(
+      manifest,
+      source,
+      CODEX_V4_NORMALIZER_VERSION,
+    );
+    for (const event of projection.events) {
+      events.push({
+        id: BigInt(events.length + 1),
+        workspace_id: "00000000-0000-4000-8000-000000000001",
+        session_id: sessionId,
+        normalizer_version: CODEX_V4_NORMALIZER_VERSION,
+        canonical_scope_key: event.canonical_scope_key,
+        logical_event_key: event.logical_event_key,
+        source_priority: event.source_priority,
+        is_replay: false,
+        event_kind: event.event_kind,
+        event_subtype: event.event_subtype,
+        phase: event.phase,
+        actor_role: event.actor_role,
+        occurred_at: event.occurred_at,
+        observed_at: event.observed_at,
+        server_received_at: "2026-11-05T18:06:00.000000Z",
+        turn_id: event.turn_id,
+        tool_call_id: event.tool_call_id,
+        tool_status: event.tool_status,
+        message_origin: event.message_origin,
+        project_key: event.project_key,
+      });
+    }
+  }
+  const turns = reduceActivity(sessionId, events).filter((span) =>
+    span.activity_kind === "turn"
+  );
+  assert(turns.length === 1, "one fork turn");
+  const [turn] = turns;
+  assert(turn.span_state === "active", "Stop must close the turn");
+  assert(turn.timing_basis === "paired_events");
+  assert(turn.started_at === "2026-11-05T18:00:00.000000Z");
+  assert(turn.ended_at === "2026-11-05T18:05:00.000000Z");
+  assert(turn.actor_role === "primary");
+  assert(
+    turn.end_event_id ===
+      events.find((event) => event.event_subtype === "turn_complete")?.id,
+  );
 });
 
 Deno.test("configuration is bounded and secrets remain required", () => {

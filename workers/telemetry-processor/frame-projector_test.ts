@@ -247,6 +247,69 @@ Deno.test("native and envelope copies remain one canonical prompt", () => {
   );
 });
 
+Deno.test("Codex hook prompts count as human prompts and yield to the rollout copy", () => {
+  const hookPrompt = sourceEvent({
+    id: 20n,
+    normalizer_version: "sherlock.codex-rollout.v4",
+    canonical_scope_key: "session:fork",
+    logical_event_key: "message:user:turn-1",
+    source_priority: 90,
+    turn_id: "turn-1",
+    source_kind: "hook",
+    source_native_type: "codex_hook",
+    source_native_payload_type: null,
+    source_stream_key: "hook-stream",
+  });
+  const window = [
+    "2026-08-20T11:59:00.000000Z",
+    new Date("2026-08-20T11:00:00Z"),
+    new Date("2026-08-20T13:00:00Z"),
+  ] as const;
+  const alone = canonicalEvidence([hookPrompt], ...window);
+  const prompts = alone.filter((row) => row.evidence_kind === "prompt");
+  assert(prompts.length === 1, "a fork's hook prompt is a human prompt");
+  assert(prompts[0].source_event_id === hookPrompt.id);
+  assert(prompts[0].message_origin === "human");
+  assert(
+    prompts[0].prompt_identity ===
+      "logical:session:fork:codex:message:user:turn-1:message",
+  );
+  assert(
+    alone.some((row) =>
+      row.evidence_kind === "activity" && row.source_event_id === hookPrompt.id
+    ),
+    "the hook prompt is activity evidence too",
+  );
+  const unkeyedTurn = sourceEvent({
+    ...hookPrompt,
+    id: 21n,
+    turn_id: null,
+    logical_event_key: `codex:hook:${"b".repeat(64)}`,
+  });
+  assert(
+    canonicalEvidence([unkeyedTurn], ...window).filter((row) =>
+      row.evidence_kind === "prompt"
+    ).length === 1,
+    "a hook prompt without a turn id still counts once",
+  );
+
+  const rolloutPrompt = sourceEvent({
+    id: 30n,
+    normalizer_version: "sherlock.codex-rollout.v4",
+    canonical_scope_key: "session:fork",
+    logical_event_key: "message:user:turn-1",
+    source_priority: 100,
+    turn_id: "turn-1",
+  });
+  const both = canonicalEvidence([hookPrompt, rolloutPrompt], ...window)
+    .filter((row) => row.evidence_kind === "prompt");
+  assert(both.length === 1, "hook and rollout copies are one prompt");
+  assert(
+    both[0].source_event_id === rolloutPrompt.id,
+    "the rollout copy outranks the hook copy",
+  );
+});
+
 Deno.test("projector reads only bounded source metadata and never copies content", () => {
   assert(FRAME_SOURCE_EVENTS_SQL.includes("e.content_excerpt is not null"));
   assert(!FRAME_SOURCE_EVENTS_SQL.includes("<recommended_plugins>"));

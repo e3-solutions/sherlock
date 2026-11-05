@@ -730,7 +730,7 @@ Deno.test("ingest parses Claude transcripts without relabeling them as rollouts"
   );
 });
 
-Deno.test("ingest accepts Claude hook evidence but rejects Codex hook batches", async () => {
+Deno.test("ingest accepts Claude and Codex hook evidence but no Codex transcripts", async () => {
   const { manifest, stored } = await fixture();
   const hookManifest = {
     ...manifest,
@@ -755,16 +755,61 @@ Deno.test("ingest accepts Claude hook evidence but rejects Codex hook batches", 
     }, value.manifest).includes("/hook/"),
   );
 
-  try {
-    parseEnvelope({
-      collector: COLLECTOR,
-      manifest: { ...hookManifest, source_provider: "codex" },
-      stored_payload_base64: btoa(String.fromCharCode(...stored)),
-    });
-    assert(false, "Codex hook batches must remain unsupported");
-  } catch (error) {
-    assert(error instanceof IngestError);
-    assert(error.code === "unsupported_contract");
+  // Codex side-conversation forks never write a rollout (COR-5208).
+  const codexHook = parseEnvelope({
+    collector: COLLECTOR,
+    manifest: {
+      ...hookManifest,
+      source_provider: "codex",
+      observed_native_session_id: "019a5c5e-7c1d-7d2e-8f3a-4b5c6d7e8f90",
+      observed_parent_native_session_id: "019a5c5e-0000-7000-8000-000000000001",
+      codex_version: "0.56.0",
+      source_version: "0.56.0",
+    },
+    stored_payload_base64: btoa(String.fromCharCode(...stored)),
+  });
+  assert(codexHook.manifest.source_provider === "codex");
+  assert(codexHook.manifest.source_kind === "hook");
+  assert(
+    codexHook.manifest.observed_parent_native_session_id ===
+      "019a5c5e-0000-7000-8000-000000000001",
+  );
+  assert(
+    storagePath({
+      workspace_id: "00000000-0000-4000-8000-000000000001",
+      person_id: "00000000-0000-4000-8000-000000000002",
+      collector_key: "collector-test",
+    }, codexHook.manifest).includes("/hook/"),
+  );
+  validateManifest(codexHook.manifest);
+
+  for (
+    const unsupported of [
+      { source_provider: "codex", source_kind: "transcript" },
+      { source_provider: "claude_code", source_kind: "rollout" },
+    ]
+  ) {
+    try {
+      parseEnvelope({
+        collector: COLLECTOR,
+        manifest: { ...hookManifest, ...unsupported },
+        stored_payload_base64: btoa(String.fromCharCode(...stored)),
+      });
+      assert(false, `${JSON.stringify(unsupported)} must remain unsupported`);
+    } catch (error) {
+      assert(error instanceof IngestError);
+      assert(error.code === "unsupported_contract");
+    }
+    try {
+      validateManifest({
+        ...codexHook.manifest,
+        ...unsupported,
+      } as BatchManifest);
+      assert(false, `stored ${JSON.stringify(unsupported)} must be refused`);
+    } catch (error) {
+      assert(error instanceof IngestError);
+      assert(error.code === "unsupported_contract");
+    }
   }
 });
 
