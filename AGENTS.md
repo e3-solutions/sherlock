@@ -21,6 +21,11 @@ it to the dashboard and to the `sherlock__*` tools in Cosmos. Sesh syncs from it
 
 ## Rules for every task
 
+- **Keep docs current in the same change.** When you change code, check whether AGENTS.md,
+  docs/ or a skill in .agents/skills now states a wrong or missing command, deploy step, env
+  var, branch, path, service or rule, and fix it in the same commit or PR. Add the commit
+  trailer `Docs-Check: updated` or `Docs-Check: none-needed`. If you miss it, the docs
+  backstop opens a docs PR after merge.
 - Production writes, deploys, secrets and job retries need an explicit yes, and
   each production change gets its own Linear comment.
 - Keep raw telemetry immutable, keep database facts auditable, and keep
