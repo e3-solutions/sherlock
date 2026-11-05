@@ -378,7 +378,7 @@ select s.id::text session_id, s.person_id::text person_id,
 export const EVIDENCE_OMITTED_SESSION_SQL = `
 select s.id::text session_id, s.person_id::text person_id,
        coalesce(nullif(btrim(pe.display_name), ''), 'Unknown') display_name,
-       s.started_at, s.ended_at,
+       s.started_at, s.ended_at, s.parent_session_id is not null parent_omitted,
        (select e.normalizer_version from telemetry.events e
          where e.workspace_id = s.workspace_id and e.session_id = s.id
          limit 1) normalizer_version
@@ -747,7 +747,7 @@ function omittedSessionEvidence(row, readAt) {
   return {
     schemaVersion: SEARCH_SCHEMA_VERSION,
     session: sessionFromRow({
-      ...row, parent_session_id: null, parent_omitted: false, child_session_ids: [],
+      ...row, parent_session_id: null, child_session_ids: [],
     }),
     readAt: readAt.toISOString(),
     anchorEventId: null,

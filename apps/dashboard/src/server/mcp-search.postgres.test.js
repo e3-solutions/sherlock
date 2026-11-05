@@ -672,8 +672,11 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
         async transaction(cb) { const result = await asReader(tx, cb); if (result.error) throw result.error; return result.value; } });
       const child = await api.readSessionEvidence({ sessionId: f.sessions.bobChild.id });
       expect(child.session).toMatchObject({ parentSessionId: null, parentOmitted: true });
+      // COR-5180: listed guardian/automation sessions open as metadata only.
       for (const sessionId of [f.sessions.alice.id, f.sessions.alice2.id]) {
-        await expect(api.readSessionEvidence({ sessionId })).rejects.toMatchObject({ code: 'flame_mcp_query_not_found' });
+        const omitted = await api.readSessionEvidence({ sessionId });
+        expect(omitted).toMatchObject({ session: { sessionId }, events: [], nextCursor: null });
+        expect(omitted.coverage.reasons).toContain('automated_session_omitted');
       }
     });
   });
