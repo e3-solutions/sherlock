@@ -11,9 +11,9 @@ rollback target).
 
 | Component | How it ships |
 | --- | --- |
-| Telemetry worker (`workers/telemetry-processor/`) | Railway's GitHub link deploys `main`. GitHub shows a `sherlock-telemetry-worker / production` deployment for each push. The root `railway.toml` `watchPatterns` list the paths that should trigger a rebuild. Check in Railway whether a given push really rebuilt it |
+| Telemetry worker (`workers/telemetry-processor/`) | Railway service `telemetry-processor` (project `sherlock-telemetry-worker`) deploys from GitHub on every push to `main`, but only rebuilds when the push touches a path in the root `railway.toml` `watchPatterns`. Otherwise Railway marks it `SKIPPED` |
 | Edge Functions (`supabase/functions/*`) | Manual, one function by name. CI only tests them |
-| Dashboard and MCP (`apps/dashboard/`) | Railway service with `apps/dashboard` as its source root (`apps/dashboard/railway.json`). See `apps/dashboard/README.md` "Railway deployment" |
+| Dashboard and MCP (`apps/dashboard/`) | Railway services `codeactivity-dashboard` and `sixtyfour-dashboard` redeploy from GitHub on **every** push to `main`, including docs-only pushes, because `apps/dashboard/railway.json` has no watch patterns. Each restart briefly returns 503 on `/healthz` (`timeline_warming`). See `apps/dashboard/README.md` "Railway deployment" |
 | Collector and hooks (`packages/telemetry-collector/`, `plugins/`) | Only through the `sherlock` commit pinned in jolly-roger `repositories.json` (a jolly-roger PR, capture stream) |
 
 ## Rules

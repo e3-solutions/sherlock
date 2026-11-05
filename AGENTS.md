@@ -28,6 +28,10 @@ it to the dashboard and to the `sherlock__*` tools in Cosmos. Sesh syncs from it
 - **Deploy Edge Functions one at a time, by name** (`deploy` skill). A bare
   `supabase functions deploy` replaced `sherlock-rollout-ingest` with an
   unrecorded version on Nov 4.
+- **Every merge to `main` redeploys both dashboards** (`codeactivity-dashboard`,
+  `sixtyfour-dashboard`), which serve the `sherlock__*` MCP, even for docs-only
+  changes. Merge when a short MCP restart is acceptable. The worker rebuilds only
+  for paths in `railway.toml` `watchPatterns`.
 - **Quiet hours on the shared database:** no index builds or large scans between
   03:00 and 19:00 UTC. Hand-run queries use a 1-day window, indexed columns,
   `LIMIT` and a short `statement_timeout`.
