@@ -303,3 +303,37 @@ of the e3group.ai workspace, with window discovery approximated through
 
 Re-measure after applying the index migration before relying on these
 estimates.
+
+## Precomputed usage and its daily check (COR-5162, COR-5214)
+
+`query_usage` sums `analytics.usage_contributions`, the per-event result of
+the full-history assessment, when `USAGE_CONTRIBUTION_STATE_SQL` passes:
+
+- the minute refresh (`sherlock-usage-contributions` cron) ran in the last 10 minutes;
+- the window starts at or after `backfill_cursor`;
+- no session has waited in the dirty queue for more than 10 minutes;
+- `analytics.usage_contribution_gap_open(workspace, start, end)` is false.
+
+Otherwise it runs the live query. The last condition comes from a per-day
+comparison with raw usage events, `analytics.check_usage_contribution_day`,
+recorded in `analytics.usage_contribution_checks`. A session with raw usage
+that day that was never computed (`missing_sessions`), or that was computed
+before a usage event of the day was inserted (`stale_sessions`), is queued as
+dirty and listed in `gap_session_ids`. The gap stays open until every listed
+session has been recomputed.
+
+The check scans one day of usage events (about 7 s for a busy day), so it runs
+outside quiet hours only: `sherlock-usage-contribution-checks-full` checks
+the last 8 covered days at 19:30 UTC, and `sherlock-usage-contribution-checks-gaps`
+re-checks days with an open gap at :45 past 20:00-02:00 UTC. To see the latest
+results:
+
+```sql
+select day, raw_sessions, computed_sessions, contribution_rows,
+       missing_sessions, stale_sessions, checked_at
+  from analytics.usage_contribution_checks
+ where workspace_id = '<workspace>' order by day desc limit 14;
+```
+
+`raw_events` counts every normalizer version of an event, so it is larger than
+`contribution_rows` (about 2x for Codex-heavy days); compare sessions, not events.

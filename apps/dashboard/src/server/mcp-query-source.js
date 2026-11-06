@@ -831,6 +831,9 @@ select st.backfill_cursor, st.refreshed_at
      select 1 from analytics.usage_contribution_dirty d
       where d.workspace_id = $1 and d.first_marked_at < now() - interval '10 minutes'
    )
+   -- COR-5214: the nightly check against raw usage found sessions missing or
+   -- stale on a day this window touches, and they are not recomputed yet.
+   and not analytics.usage_contribution_gap_open($1, $2::timestamptz, $3::timestamptz)
 `;
 
 export const LIST_SESSIONS_SQL = `
@@ -1082,7 +1085,7 @@ export function createSherlockQuerySource(source) {
         // at month-scale volume. SET LOCAL resets when the transaction ends.
         await runQuery(tx, "set local work_mem = '16MB'", undefined, signal);
         const precomputed = await runQuery(tx, USAGE_CONTRIBUTION_STATE_SQL, [
-          source.workspaceId, window.startAt.toISOString(),
+          source.workspaceId, window.startAt.toISOString(), window.endAt.toISOString(),
         ], signal);
         const rows = await runQuery(tx, precomputed.length > 0 ? PRECOMPUTED_USAGE_SQL : QUERY_USAGE_SQL, [
           source.workspaceId,
