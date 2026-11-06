@@ -964,6 +964,7 @@ describePostgres("bounded excerpt search candidates", { timeout: 180_000 }, () =
       }
       const direct = `explain (format json) select e.id from excerpt_search_plan.events e
         where e.workspace_id = '${workspace}' and e.event_kind in ('message', 'agent_message')
+          and not e.is_replay
           and e.message_search @@ websearch_to_tsquery('simple', 'zebrararetoken')`;
       const [{ "QUERY PLAN": ownerDirect }] = await tx.unsafe(direct);
       const reader = await asReader(tx, (sp) => sp.unsafe(direct));
