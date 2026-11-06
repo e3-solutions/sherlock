@@ -202,13 +202,13 @@ select has_column(
   'normalized message excerpts have a generated search vector'
 );
 select ok(
-  exists (
+  not exists (
     select 1 from pg_indexes
     where schemaname = 'telemetry'
       and tablename = 'events'
       and indexname = 'events_message_search_idx'
   ),
-  'normalized message search has a partial GIN index'
+  'the text-only message GIN is gone; the day and text GIN serves search'
 );
 select ok(
   exists (
