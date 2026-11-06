@@ -53,10 +53,11 @@ async function expectHeartbeatTokensMatch(sql, workspaceId, { start, end }) {
   const windowMs = new Date(end) - new Date(start);
   await sql.begin(async (tx) => {
     await tx.unsafe("update telemetry.workspaces set slug = 'e3-development' where id = $1::uuid", [workspaceId]);
-    await tx.unsafe(
-      "update analytics.usage_contribution_state set backfill_cursor = $2::timestamptz, refreshed_at = now() where workspace_id = $1::uuid",
-      [workspaceId, start],
-    );
+    await tx.unsafe(`insert into analytics.usage_contribution_state as st
+        (workspace_id, backfill_cursor, backfill_floor, cutover_fingerprint, refreshed_at)
+      values ($1::uuid, $2::timestamptz, $2::timestamptz, analytics.usage_cutover_fingerprint($1::uuid), now())
+      on conflict (workspace_id) do update set backfill_cursor = excluded.backfill_cursor, refreshed_at = now()`,
+    [workspaceId, start]);
     const groups = await tx.unsafe(PRECOMPUTED_USAGE_SQL, [workspaceId, start, end, "e3group.ai"]);
     // The local postgres user is not a member of the NOLOGIN Heartbeat role,
     // so check its execute rights instead of switching to it.
@@ -179,9 +180,8 @@ async function expectHeartbeatReads(sql, { end }) {
     expect(timeline[0].result).toMatchObject({
       schema_version: "sherlock.heartbeat.timeline.v1", buckets: [], sessions: [], truncated: false,
     });
-    await tx.unsafe("savepoint tokens");
-    await expect(tx.unsafe(`select * from heartbeat_api.fresh_token_sessions(${window})`, [end]))
-      .rejects.toThrow("heartbeat_usage_window_not_covered");
-    await tx.unsafe("rollback to savepoint tokens");
+    await expect(tx.savepoint((sp) => sp.unsafe(
+      `select * from heartbeat_api.fresh_token_sessions(${window})`, [end],
+    ))).rejects.toThrow("heartbeat_usage_window_not_covered");
   });
 }
