@@ -15,11 +15,19 @@
 --   stale_sessions: computed before a usage event of the day was inserted, and
 --     not waiting in the dirty queue;
 --   gap_session_ids: the missing and stale sessions.
--- Gap sessions are queued as dirty, so the minute refresh recomputes them.
--- usage_contribution_gap_open() is true for a window while any gap session of
--- a day it touches has not been recomputed since the check; query_usage then
--- uses the live query. So a gap closes as soon as the refresh catches up,
--- without another scan.
+-- queue_usage_contribution_gaps() then marks gap sessions dirty in one sorted
+-- upsert, so the minute refresh recomputes them. usage_contribution_gap_open()
+-- is true for a window while any gap session of a day it touches has not been
+-- recomputed since the check; query_usage then uses the live query. So a gap
+-- closes as soon as the refresh catches up, without another scan.
+--
+-- Detection is read-only apart from the checks table. Dirty rows are written
+-- only by the final queue step, in (workspace, session) order like the ingest
+-- trigger, so a long cron run never holds dirty-row locks while it scans.
+--
+-- Known blind spots: a lost mark from an UPDATE of an existing event (created_at
+-- does not change), a turn_context insert without a usage insert, and a change
+-- on a day outside the checked range.
 --
 -- Cost: one indexed 1-day scan of usage events per day (about 7 s for a busy
 -- day). The cron runs only outside the 03:00-19:00 UTC quiet hours: every
@@ -53,8 +61,8 @@ begin
 end
 $revoke$;
 
--- Check one UTC day of one workspace, queue gap sessions for recompute, and
--- record the result. Returns the recorded row.
+-- Check one UTC day of one workspace and record the result, including the gap
+-- sessions. Writes nothing but the checks table. Returns the recorded row.
 create or replace function analytics.check_usage_contribution_day(p_workspace_id uuid, p_day date)
 returns analytics.usage_contribution_checks
 language plpgsql
@@ -89,18 +97,6 @@ begin
       from raw r
       left join analytics.usage_contribution_sessions cs
         on cs.workspace_id = p_workspace_id and cs.session_id = r.session_id
-  ), queued as (
-    insert into analytics.usage_contribution_dirty as d (
-      workspace_id, session_id, mark_seq, first_marked_at, last_marked_at
-    )
-    select p_workspace_id, a.session_id, pg_catalog.nextval('analytics.usage_contribution_mark_seq'),
-           pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp()
-      from assessed a
-     where not a.dirty and (a.missing or a.stale)
-     order by a.session_id
-    on conflict (workspace_id, session_id) do update
-       set mark_seq = excluded.mark_seq, last_marked_at = excluded.last_marked_at
-    returning d.session_id
   )
   insert into analytics.usage_contribution_checks as c (
     workspace_id, day, checked_at, raw_sessions, raw_events, computed_sessions,
@@ -114,7 +110,8 @@ begin
            where u.workspace_id = p_workspace_id and u.usage_at >= v_start and u.usage_at < v_end),
          (select pg_catalog.count(*) from assessed a where not a.dirty and a.missing),
          (select pg_catalog.count(*) from assessed a where not a.dirty and a.stale),
-         coalesce((select pg_catalog.array_agg(q.session_id order by q.session_id) from queued q), '{}')
+         coalesce((select pg_catalog.array_agg(a.session_id order by a.session_id) from assessed a
+                    where not a.dirty and (a.missing or a.stale)), '{}')
   on conflict (workspace_id, day) do update set
     checked_at = excluded.checked_at, raw_sessions = excluded.raw_sessions,
     raw_events = excluded.raw_events, computed_sessions = excluded.computed_sessions,
@@ -125,7 +122,42 @@ begin
 end
 $body$;
 comment on function analytics.check_usage_contribution_day(uuid, date) is
-  'COR-5214: compare one UTC day of usage_contributions with raw usage events, queue missing or stale sessions for recompute, record the result.';
+  'COR-5214: compare one UTC day of usage_contributions with raw usage events and record missing or stale sessions; queue them with queue_usage_contribution_gaps().';
+
+-- Mark every open gap session of a workspace dirty, in one upsert sorted like
+-- the ingest trigger's. Run it last in a transaction. Returns sessions queued.
+create or replace function analytics.queue_usage_contribution_gaps(p_workspace_id uuid)
+returns integer
+language plpgsql
+volatile
+security definer
+set search_path = ''
+set lock_timeout = '5s'
+as $body$
+declare
+  v_queued integer;
+begin
+  insert into analytics.usage_contribution_dirty as d (
+    workspace_id, session_id, mark_seq, first_marked_at, last_marked_at
+  )
+  select p_workspace_id, g.session_id, pg_catalog.nextval('analytics.usage_contribution_mark_seq'),
+         pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp()
+    from (
+      select distinct gs.session_id
+        from analytics.usage_contribution_checks c
+        cross join lateral pg_catalog.unnest(c.gap_session_ids) gs(session_id)
+        left join analytics.usage_contribution_sessions cs
+          on cs.workspace_id = c.workspace_id and cs.session_id = gs.session_id
+       where c.workspace_id = p_workspace_id
+         and (cs.computed_at is null or cs.computed_at < c.checked_at)
+       order by gs.session_id
+    ) g
+  on conflict (workspace_id, session_id) do update
+     set mark_seq = excluded.mark_seq, last_marked_at = excluded.last_marked_at;
+  get diagnostics v_queued = row_count;
+  return v_queued;
+end
+$body$;
 
 -- True while a day that [p_start, p_end) touches has a gap session that has
 -- not been recomputed since that day was checked. Reads no session data.
@@ -145,8 +177,8 @@ select exists (
     left join analytics.usage_contribution_sessions cs
       on cs.workspace_id = c.workspace_id and cs.session_id = g.session_id
    where c.workspace_id = p_workspace_id
-     and c.day >= (p_start at time zone 'UTC')::date
-     and c.day <= (p_end at time zone 'UTC')::date
+     and c.day::timestamp at time zone 'UTC' < p_end
+     and c.day::timestamp at time zone 'UTC' + interval '1 day' > p_start
      and (cs.computed_at is null or cs.computed_at < c.checked_at)
 )
 $body$;
@@ -186,12 +218,18 @@ begin
           v_today, interval '1 day') d(day)
        where p_full or analytics.usage_contribution_gap_open(
          v_state.workspace_id, d.day::date::timestamp at time zone 'UTC',
-         d.day::date::timestamp at time zone 'UTC')
+         d.day::date::timestamp at time zone 'UTC' + interval '1 day')
        order by 1 desc
     loop
       perform analytics.check_usage_contribution_day(v_state.workspace_id, v_day);
       v_checked := v_checked + 1;
     end loop;
+  end loop;
+  -- Last, so dirty-row locks are held only until commit.
+  for v_state in
+    select st.workspace_id from analytics.usage_contribution_state st order by st.workspace_id
+  loop
+    perform analytics.queue_usage_contribution_gaps(v_state.workspace_id);
   end loop;
   return v_checked;
 end
@@ -199,12 +237,14 @@ $body$;
 
 revoke all on function analytics.check_usage_contribution_day(uuid, date) from public;
 revoke all on function analytics.usage_contribution_gap_open(uuid, timestamptz, timestamptz) from public;
+revoke all on function analytics.queue_usage_contribution_gaps(uuid) from public;
 revoke all on function analytics.run_usage_contribution_checks(boolean, integer) from public;
 do $revoke_functions$
 begin
   if exists (select from pg_catalog.pg_roles where rolname = 'anon') then
     revoke all on function analytics.check_usage_contribution_day(uuid, date) from anon, authenticated, service_role;
     revoke all on function analytics.usage_contribution_gap_open(uuid, timestamptz, timestamptz) from anon, authenticated, service_role;
+    revoke all on function analytics.queue_usage_contribution_gaps(uuid) from anon, authenticated, service_role;
     revoke all on function analytics.run_usage_contribution_checks(boolean, integer) from anon, authenticated, service_role;
   end if;
 end

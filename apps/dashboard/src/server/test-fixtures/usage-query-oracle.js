@@ -44,6 +44,7 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
 
 // COR-5214: the per-day check against raw usage finds a session that was never
 // computed, keeps the window off the table until it is recomputed, and queues it.
+// The check covers the whole UTC day of start.
 async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
   const day = "($2::timestamptz at time zone 'UTC')::date";
   const check = () => sql.unsafe(
@@ -71,8 +72,8 @@ async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
   const [{ session_id: lost }] = await sql.unsafe(`
     select e.session_id from telemetry.events e
      where e.workspace_id = $1::uuid and e.event_kind = 'usage' and not e.is_replay
-       and e.occurred_at >= $2::timestamptz and e.occurred_at < $2::timestamptz + interval '1 day'
-       and (e.occurred_at at time zone 'UTC')::date = ${day}
+       and e.occurred_at >= ${day}::timestamp at time zone 'UTC'
+       and e.occurred_at < (${day} + 1)::timestamp at time zone 'UTC'
      order by e.session_id limit 1`, [workspaceId, start]);
   await sql.unsafe(
     "delete from analytics.usage_contribution_sessions where workspace_id = $1::uuid and session_id = $2::uuid",
@@ -82,6 +83,11 @@ async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
   expect(Number(flagged.missing_sessions)).toBe(1);
   expect(flagged.gap_session_ids).toEqual([lost]);
   expect(await gapOpen()).toBe(true);
+  // Detection writes no dirty rows; the queue step does.
+  const queueCount = await sql.unsafe(
+    "select analytics.queue_usage_contribution_gaps($1::uuid) queued", [workspaceId],
+  );
+  expect(queueCount[0].queued).toBe(1);
   const [{ queued }] = await sql.unsafe(
     "select count(*)::int queued from analytics.usage_contribution_dirty where workspace_id = $1::uuid and session_id = $2::uuid",
     [workspaceId, lost],
@@ -92,4 +98,6 @@ async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
   await sql.unsafe("select analytics.compute_usage_contributions($1::uuid, array[$2::uuid])", [workspaceId, lost]);
   expect(await gapOpen()).toBe(false);
   expect(Number((await check()).missing_sessions)).toBe(0);
+  await sql.unsafe("delete from analytics.usage_contribution_dirty where workspace_id = $1::uuid", [workspaceId]);
+  await sql.unsafe("delete from analytics.usage_contribution_checks where workspace_id = $1::uuid", [workspaceId]);
 }

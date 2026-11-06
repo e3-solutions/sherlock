@@ -318,9 +318,12 @@ Otherwise it runs the live query. The last condition comes from a per-day
 comparison with raw usage events, `analytics.check_usage_contribution_day`,
 recorded in `analytics.usage_contribution_checks`. A session with raw usage
 that day that was never computed (`missing_sessions`), or that was computed
-before a usage event of the day was inserted (`stale_sessions`), is queued as
-dirty and listed in `gap_session_ids`. The gap stays open until every listed
-session has been recomputed.
+before a usage event of the day was inserted (`stale_sessions`), is listed in
+`gap_session_ids`. `analytics.queue_usage_contribution_gaps(workspace)` then
+marks those sessions dirty in one sorted upsert at the end of the run, so the
+scan never holds dirty-row locks. The gap stays open until every listed
+session has been recomputed. Blind spots: a lost mark from an UPDATE of an
+existing event, and a `turn_context` insert without a usage insert.
 
 The check scans one day of usage events (about 7 s for a busy day), so it runs
 outside quiet hours only: `sherlock-usage-contribution-checks-full` checks
