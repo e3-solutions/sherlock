@@ -26,6 +26,7 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
   await sql.unsafe("select analytics.refresh_usage_contributions(5)");
   // COR-5178: the Heartbeat presence read must run (no sherlock_access in CI).
   expect(Array.isArray([...await sql.unsafe("select * from heartbeat_api.coding_presence(60)")])).toBe(true);
+  await expectHeartbeatReads(sql, { end });
   // COR-5162: the stored per-event contributions must answer identically.
   await sql.unsafe(`select analytics.compute_usage_contributions($1::uuid, array(
     select s.id from telemetry.sessions s where s.workspace_id = $1::uuid))`, [workspaceId]);
@@ -39,7 +40,70 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
     expect([...await tx.unsafe(COVERAGE_SQL, coverageParams)])
       .toEqual([...await tx.unsafe(oldCoverage, coverageParams)]);
   });
+  await expectHeartbeatTokensMatch(sql, workspaceId, { start, end });
   await expectDayCheckHealsGaps(sql, workspaceId, { start, end });
+}
+
+const ROLLBACK = new Error("rollback heartbeat fixture");
+
+// COR-5215: with the test workspace standing in for E3, the per-session token
+// rows add up to query_usage's precomputed groups, and the timeline and people
+// reads run over real rows. Everything is rolled back.
+async function expectHeartbeatTokensMatch(sql, workspaceId, { start, end }) {
+  const windowMs = new Date(end) - new Date(start);
+  await sql.begin(async (tx) => {
+    await tx.unsafe("update telemetry.workspaces set slug = 'e3-development' where id = $1::uuid", [workspaceId]);
+    await tx.unsafe(`insert into analytics.usage_contribution_state as st
+        (workspace_id, backfill_cursor, backfill_floor, cutover_fingerprint, refreshed_at)
+      values ($1::uuid, $2::timestamptz, $2::timestamptz, analytics.usage_cutover_fingerprint($1::uuid), now())
+      on conflict (workspace_id) do update set backfill_cursor = excluded.backfill_cursor, refreshed_at = now()`,
+    [workspaceId, start]);
+    const groups = await tx.unsafe(PRECOMPUTED_USAGE_SQL, [workspaceId, start, end, "e3group.ai"]);
+    // The local postgres user is not a member of the NOLOGIN Heartbeat role,
+    // so check its execute rights instead of switching to it.
+    const [rights] = await tx.unsafe(`select
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.people()', 'execute') people,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.usage_receipt(timestamptz,timestamptz)', 'execute') receipt,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.fresh_token_sessions(timestamptz,timestamptz)', 'execute') tokens,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.timeline_activity(timestamptz,timestamptz,integer)', 'execute') timeline,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.hidden_sessions()', 'execute') hidden,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.e3_workspace_id()', 'execute') workspace,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.session_key(uuid)', 'execute') session_key,
+      has_function_privilege('sherlock_reader', 'heartbeat_api.people()', 'execute') reader_people`);
+    expect(rights).toEqual({
+      people: true, receipt: true, tokens: true, timeline: true,
+      hidden: false, workspace: false, session_key: false, reader_people: false,
+    });
+    const people = await tx.unsafe("select * from heartbeat_api.people()");
+    expect(people.length).toBeGreaterThan(0);
+    const [receipt] = await tx.unsafe("select * from heartbeat_api.usage_receipt($1::timestamptz, $2::timestamptz)", [start, end]);
+    expect(receipt.path).not.toBe("not_covered");
+    if (windowMs <= 7 * 86_400_000) {
+      const rows = await tx.unsafe(
+        "select * from heartbeat_api.fresh_token_sessions($1::timestamptz, $2::timestamptz)", [start, end],
+      );
+      const e3 = rows.filter((row) => /^[^@]+@e3group\.ai$/.test(row.email ?? ""));
+      const sum = (list, pick) => list.reduce((total, row) => total + Number(pick(row) ?? 0), 0);
+      expect(sum(e3, (row) => row.input_delta)).toBe(sum(groups, (group) => group.input_tokens));
+      expect(sum(e3, (row) => row.cached_delta)).toBe(sum(groups, (group) => group.cached_input_tokens));
+      expect(sum(e3, (row) => row.output_delta))
+        .toBe(sum(groups, (group) => Number(group.output_tokens ?? 0) + Number(group.reasoning_tokens ?? 0)));
+      expect(sum(e3, (row) => row.usage_events)).toBe(sum(groups, (group) => group.usage_event_count));
+      for (const row of rows) {
+        expect(row.session_key).toMatch(/^[0-9a-f]{64}$/);
+        expect(["measured", "missing_baseline", "regressed", "source_conflict", "component_missing"])
+          .toContain(row.status);
+      }
+    }
+    const timelineEnd = windowMs <= 86_400_000 ? end : new Date(new Date(start).getTime() + 86_400_000).toISOString();
+    const [{ result }] = await tx.unsafe(
+      "select heartbeat_api.timeline_activity($1::timestamptz, $2::timestamptz, 10) result", [start, timelineEnd],
+    );
+    expect(result.schema_version).toBe("sherlock.heartbeat.timeline.v1");
+    expect(Array.isArray(result.buckets)).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(workspaceId);
+    throw ROLLBACK;
+  }).catch((error) => { if (error !== ROLLBACK) throw error; });
 }
 
 // COR-5214: the per-day check against raw usage finds a session that was never
@@ -100,4 +164,24 @@ async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
   expect(Number((await check()).missing_sessions)).toBe(0);
   await sql.unsafe("delete from analytics.usage_contribution_dirty where workspace_id = $1::uuid", [workspaceId]);
   await sql.unsafe("delete from analytics.usage_contribution_checks where workspace_id = $1::uuid", [workspaceId]);
+}
+
+// COR-5215: the Heartbeat reads run (CI has no E3 workspace, so they return
+// nothing). Execute rights are checked in expectHeartbeatTokensMatch.
+async function expectHeartbeatReads(sql, { end }) {
+  await sql.begin(async (tx) => {
+    expect(Array.isArray([...await tx.unsafe("select * from heartbeat_api.people()")])).toBe(true);
+    const window = ["(($1::timestamptz) - interval '1 hour')", "$1::timestamptz"].join(", ");
+    const [receipt] = await tx.unsafe(`select * from heartbeat_api.usage_receipt(${window})`, [end]);
+    expect(receipt.path).toBe("not_covered");
+    const timeline = await tx.unsafe(
+      `select heartbeat_api.timeline_activity(${window}, 10) result`, [end],
+    );
+    expect(timeline[0].result).toMatchObject({
+      schema_version: "sherlock.heartbeat.timeline.v1", buckets: [], sessions: [], truncated: false,
+    });
+    await expect(tx.savepoint((sp) => sp.unsafe(
+      `select * from heartbeat_api.fresh_token_sessions(${window})`, [end],
+    ))).rejects.toThrow("heartbeat_usage_window_not_covered");
+  });
 }
