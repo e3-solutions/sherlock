@@ -340,3 +340,27 @@ select day, raw_sessions, computed_sessions, contribution_rows,
 
 `raw_events` counts every normalizer version of an event, so it is larger than
 `contribution_rows` (about 2x for Codex-heavy days); compare sessions, not events.
+
+## Heartbeat read functions (COR-5215)
+
+heartbeat-dashboard reads Sherlock through `heartbeat_api`. The schema has five
+functions, executable only by the NOLOGIN role `sherlock_presence_reader`:
+
+| Function | Returns |
+| --- | --- |
+| `coding_presence(window_minutes)` | who has model activity now (COR-5178) |
+| `people()` | E3 people: id, email, name, last activity (7-day usage, else last session start) |
+| `fresh_token_sessions(start, end)` | tokens per session over `[start, end)`, at most 7 days, from precomputed usage |
+| `usage_receipt(start, end)` | `path` (`precomputed`, `precomputed_catching_up`, `not_covered`), backfill cursor, watermarks, pending normalization, dirty queue, daily-check gap |
+| `timeline_activity(start, end, bucket_minutes)` | jsonb `sherlock.heartbeat.timeline.v1`: buckets per person and session (prompts, tool calls and results, tool names, active seconds) and session metadata, at most 24 hours |
+
+They run as their owner, cover only the E3 workspace (`e3-development`), drop
+`sherlock_access.hidden_session_ids()` and the smoke-test account, and return
+no content. Sessions are named by `session_key`, sha256 of the session id.
+Timeline prompts and activity come from the active frame-evidence version, so
+they trail ingest by the frame projector's lag (`stats.evidence_watermark`).
+Measured on Nov 6: a 24-hour timeline takes about 8 s and returns about 0.9 MB,
+2 hours takes 0.2 s.
+
+The Heartbeat login is created outside migrations, by someone who holds the
+password, and is granted `sherlock_presence_reader` with a statement timeout.

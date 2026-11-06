@@ -26,6 +26,7 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
   await sql.unsafe("select analytics.refresh_usage_contributions(5)");
   // COR-5178: the Heartbeat presence read must run (no sherlock_access in CI).
   expect(Array.isArray([...await sql.unsafe("select * from heartbeat_api.coding_presence(60)")])).toBe(true);
+  await expectHeartbeatReads(sql, { end });
   // COR-5162: the stored per-event contributions must answer identically.
   await sql.unsafe(`select analytics.compute_usage_contributions($1::uuid, array(
     select s.id from telemetry.sessions s where s.workspace_id = $1::uuid))`, [workspaceId]);
@@ -100,4 +101,29 @@ async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
   expect(Number((await check()).missing_sessions)).toBe(0);
   await sql.unsafe("delete from analytics.usage_contribution_dirty where workspace_id = $1::uuid", [workspaceId]);
   await sql.unsafe("delete from analytics.usage_contribution_checks where workspace_id = $1::uuid", [workspaceId]);
+}
+
+// COR-5215: the Heartbeat reads run as their NOLOGIN role (CI has no E3
+// workspace, so they return nothing), and the private helpers stay private.
+async function expectHeartbeatReads(sql, { end }) {
+  await sql.begin(async (tx) => {
+    await tx.unsafe("set local role sherlock_presence_reader");
+    expect(Array.isArray([...await tx.unsafe("select * from heartbeat_api.people()")])).toBe(true);
+    const window = ["(($1::timestamptz) - interval '1 hour')", "$1::timestamptz"].join(", ");
+    const [receipt] = await tx.unsafe(`select * from heartbeat_api.usage_receipt(${window})`, [end]);
+    expect(receipt.path).toBe("not_covered");
+    const timeline = await tx.unsafe(
+      `select heartbeat_api.timeline_activity(${window}, 10) result`, [end],
+    );
+    expect(timeline[0].result).toMatchObject({
+      schema_version: "sherlock.heartbeat.timeline.v1", buckets: [], sessions: [], truncated: false,
+    });
+    await tx.unsafe("savepoint tokens");
+    await expect(tx.unsafe(`select * from heartbeat_api.fresh_token_sessions(${window})`, [end]))
+      .rejects.toThrow("heartbeat_usage_window_not_covered");
+    await tx.unsafe("rollback to savepoint tokens");
+    await tx.unsafe("savepoint helpers");
+    await expect(tx.unsafe("select * from heartbeat_api.hidden_sessions()")).rejects.toThrow(/permission denied/);
+    await tx.unsafe("rollback to savepoint helpers");
+  });
 }
