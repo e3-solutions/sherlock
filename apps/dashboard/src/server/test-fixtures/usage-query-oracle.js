@@ -58,6 +58,8 @@ async function expectHeartbeatTokensMatch(sql, workspaceId, { start, end }) {
       [workspaceId, start],
     );
     const groups = await tx.unsafe(PRECOMPUTED_USAGE_SQL, [workspaceId, start, end, "e3group.ai"]);
+    // The local postgres user is not a member of the NOLOGIN Heartbeat role.
+    await tx.unsafe("grant sherlock_presence_reader to current_user");
     await tx.unsafe("set local role sherlock_presence_reader");
     const people = await tx.unsafe("select * from heartbeat_api.people()");
     expect(people.length).toBeGreaterThan(0);
@@ -155,6 +157,8 @@ async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
 // workspace, so they return nothing), and the private helpers stay private.
 async function expectHeartbeatReads(sql, { end }) {
   await sql.begin(async (tx) => {
+    // The local postgres user is not a member of the NOLOGIN Heartbeat role.
+    await tx.unsafe("grant sherlock_presence_reader to current_user");
     await tx.unsafe("set local role sherlock_presence_reader");
     expect(Array.isArray([...await tx.unsafe("select * from heartbeat_api.people()")])).toBe(true);
     const window = ["(($1::timestamptz) - interval '1 hour')", "$1::timestamptz"].join(", ");
