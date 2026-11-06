@@ -2,7 +2,9 @@ import { URL as FileURL } from "node:url";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
 
-import { COVERAGE_SQL, PRECOMPUTED_USAGE_SQL, QUERY_USAGE_SQL } from "../mcp-query-source.js";
+import {
+  COVERAGE_SQL, PRECOMPUTED_USAGE_SQL, QUERY_USAGE_SQL, USAGE_CONTRIBUTION_STATE_SQL,
+} from "../mcp-query-source.js";
 
 // Frozen queries from 04491385f921e692982c188ba1027c5e6bbf4e1a provide an
 // independent pre-optimization oracle. Keep them frozen when editing live SQL.
@@ -37,4 +39,65 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
     expect([...await tx.unsafe(COVERAGE_SQL, coverageParams)])
       .toEqual([...await tx.unsafe(oldCoverage, coverageParams)]);
   });
+  await expectDayCheckHealsGaps(sql, workspaceId, { start, end });
+}
+
+// COR-5214: the per-day check against raw usage finds a session that was never
+// computed, keeps the window off the table until it is recomputed, and queues it.
+// The check covers the whole UTC day of start.
+async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
+  const day = "($2::timestamptz at time zone 'UTC')::date";
+  const check = () => sql.unsafe(
+    `select * from analytics.check_usage_contribution_day($1::uuid, ${day})`, [workspaceId, start],
+  ).then((rows) => rows[0]);
+  const gapOpen = () => sql.begin(async (tx) => {
+    await tx.unsafe("set local role sherlock_reader");
+    // The reader can run the gate and the whole freshness check.
+    await tx.unsafe(USAGE_CONTRIBUTION_STATE_SQL, [workspaceId, start, end]);
+    const [row] = await tx.unsafe(
+      "select analytics.usage_contribution_gap_open($1::uuid, $2::timestamptz, $3::timestamptz) open",
+      [workspaceId, start, end],
+    );
+    return row.open;
+  });
+  await sql.unsafe("delete from analytics.usage_contribution_dirty where workspace_id = $1::uuid", [workspaceId]);
+  const clean = await check();
+  expect(Number(clean.missing_sessions)).toBe(0);
+  expect(Number(clean.stale_sessions)).toBe(0);
+  expect(clean.gap_session_ids).toEqual([]);
+  expect(await gapOpen()).toBe(false);
+  if (Number(clean.raw_sessions) === 0) return;
+
+  // Lose one session's computed state without a dirty mark.
+  const [{ session_id: lost }] = await sql.unsafe(`
+    select e.session_id from telemetry.events e
+     where e.workspace_id = $1::uuid and e.event_kind = 'usage' and not e.is_replay
+       and e.occurred_at >= ${day}::timestamp at time zone 'UTC'
+       and e.occurred_at < (${day} + 1)::timestamp at time zone 'UTC'
+     order by e.session_id limit 1`, [workspaceId, start]);
+  await sql.unsafe(
+    "delete from analytics.usage_contribution_sessions where workspace_id = $1::uuid and session_id = $2::uuid",
+    [workspaceId, lost],
+  );
+  const flagged = await check();
+  expect(Number(flagged.missing_sessions)).toBe(1);
+  expect(flagged.gap_session_ids).toEqual([lost]);
+  expect(await gapOpen()).toBe(true);
+  // Detection writes no dirty rows; the queue step does.
+  const queueCount = await sql.unsafe(
+    "select analytics.queue_usage_contribution_gaps($1::uuid) queued", [workspaceId],
+  );
+  expect(queueCount[0].queued).toBe(1);
+  const [{ queued }] = await sql.unsafe(
+    "select count(*)::int queued from analytics.usage_contribution_dirty where workspace_id = $1::uuid and session_id = $2::uuid",
+    [workspaceId, lost],
+  );
+  expect(queued).toBe(1);
+
+  // The refresh recomputes it; the gap closes without another check.
+  await sql.unsafe("select analytics.compute_usage_contributions($1::uuid, array[$2::uuid])", [workspaceId, lost]);
+  expect(await gapOpen()).toBe(false);
+  expect(Number((await check()).missing_sessions)).toBe(0);
+  await sql.unsafe("delete from analytics.usage_contribution_dirty where workspace_id = $1::uuid", [workspaceId]);
+  await sql.unsafe("delete from analytics.usage_contribution_checks where workspace_id = $1::uuid", [workspaceId]);
 }

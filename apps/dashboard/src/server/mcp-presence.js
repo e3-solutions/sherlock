@@ -132,7 +132,7 @@ export function createPresenceSource(source, { resolvePerson } = {}) {
       ];
       const rows = await source.transaction(async (tx) => {
         const precomputed = windowHours !== null && (await runQuery(tx, USAGE_CONTRIBUTION_STATE_SQL, [
-          source.workspaceId, since.toISOString(),
+          source.workspaceId, since.toISOString(), readAt.toISOString(),
         ], signal)).length > 0;
         const windowRows = await runQuery(tx, precomputed ? PRESENCE_CONTRIBUTIONS_SQL : PRESENCE_EVENTS_SQL, params, signal);
         if (!precomputed) return windowRows;

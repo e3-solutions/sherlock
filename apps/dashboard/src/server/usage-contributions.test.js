@@ -55,7 +55,13 @@ describe("precomputed usage contributions", () => {
     const { unsafe, value } = source([{ backfill_cursor: new Date(NOW - 86_400_000 * 2), refreshed_at: NOW }]);
     await createSherlockQuerySource(value).fetchUsage({ now: NOW });
     const state = unsafe.mock.calls.find(([text]) => text === USAGE_CONTRIBUTION_STATE_SQL);
-    expect(state[1]).toEqual([value.workspaceId, new Date(NOW - 86_400_000).toISOString()]);
+    expect(state[1]).toEqual([
+      value.workspaceId, new Date(NOW - 86_400_000).toISOString(), NOW.toISOString(),
+    ]);
+    // COR-5214: a day with an open gap against raw usage keeps the live query.
+    expect(USAGE_CONTRIBUTION_STATE_SQL).toContain(
+      "and not analytics.usage_contribution_gap_open($1, $2::timestamptz, $3::timestamptz)",
+    );
     expect(unsafe.mock.calls.at(-1)[0]).toBe(PRECOMPUTED_USAGE_SQL);
     expect(unsafe.mock.calls.some(([text]) => text === QUERY_USAGE_SQL)).toBe(false);
   });
