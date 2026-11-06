@@ -163,7 +163,7 @@ begin
     pg_catalog.now(),
     case
       when v_state.backfill_cursor is null or v_state.backfill_cursor > p_start then 'not_covered'
-      when v_state.refreshed_at < pg_catalog.now() - interval '10 minutes'
+      when v_state.refreshed_at is null or v_state.refreshed_at < pg_catalog.now() - interval '10 minutes'
         or v_oldest < pg_catalog.now() - interval '10 minutes' or v_gap
         then 'precomputed_catching_up'
       else 'precomputed' end,
@@ -277,12 +277,15 @@ comment on function heartbeat_api.fresh_token_sessions(timestamptz, timestamptz)
 -- Activity per (person, session, bucket) for [p_start, p_end), at most 24
 -- hours, bucket 5-60 minutes, from the dashboard's frame evidence (the active
 -- frame version), so prompts are deduplicated the same way:
---   prompts       distinct human prompts first seen in the bucket
+--   prompts       distinct human prompts first seen in the bucket, leaving
+--                 out automated runs (Bonaparte classification), as the dashboard does
+--   automated_run the bucket has activity from a classified automated run
 --   tool_calls / tool_results  tool activity evidence in the bucket
 --   tools         up to 20 tool names
 --   active_seconds  union of activity spans (sherlock.activity.v1) in the bucket;
 --                 spans starting over 12 hours before the window are not counted
--- Reviewer (guardian) sessions and automation sessions are left out. Frame
+-- Reviewer (guardian) sessions and automation sessions are left out. When
+-- more than 50,000 buckets match, the newest are kept and truncated is true. Frame
 -- evidence trails ingest by the projector's lag; stats.evidence_watermark is
 -- the latest evidence observed in the window. Returns jsonb:
 --   schema_version, source, frame_version, window, bucket_minutes, truncated,
@@ -315,16 +318,20 @@ begin
 
   with hidden as materialized (
     select h from heartbeat_api.hidden_sessions() h
+  ), run_classifications as materialized (
+    select c.id, c.session_id, c.effective_start, c.effective_end, c.classification
+      from analytics.bonaparte_run_classifications c
+     where c.workspace_id = v_ws and c.effective_end > p_start and c.effective_start < p_end
   ), ranked as materialized (
     select distinct on (r.evidence_kind, r.source_event_id)
            r.evidence_kind, r.source_event_id, r.session_id, r.person_id, r.observed_at,
-           r.actor_role, r.event_kind, r.prompt_identity, r.is_tombstone
+           r.anchor_observed_at, r.actor_role, r.event_kind, r.prompt_identity, r.is_tombstone
       from analytics.frame_evidence_revisions r
      where r.workspace_id = v_ws and r.frame_version = v_frame
        and r.anchor_observed_at >= p_start - interval '1 minute'
        and r.anchor_observed_at < p_end + interval '1 minute'
      order by r.evidence_kind, r.source_event_id, r.id desc
-  ), evidence as materialized (
+  ), visible as materialized (
     select e.*, s.actor_role session_role
       from ranked e
       join telemetry.sessions s on s.workspace_id = v_ws and s.id = e.session_id
@@ -335,15 +342,30 @@ begin
        and s.actor_role not in ('guardian', 'automation')
        and pe.github_id is distinct from 'sherlock-smoke'
        and not exists (select 1 from hidden where hidden.h = e.session_id)
+  ), classified as materialized (
+    -- The dashboard's Bonaparte classification of automated runs: the latest
+    -- classification covering the evidence time.
+    select distinct on (v.evidence_kind, v.source_event_id)
+           v.evidence_kind, v.source_event_id, c.classification = 'automated_run' is_automated_run
+      from visible v
+      join run_classifications c
+        on c.session_id = v.session_id
+       and v.observed_at >= c.effective_start and v.observed_at < c.effective_end
+     order by v.evidence_kind, v.source_event_id, c.id desc
+  ), evidence as materialized (
+    select v.*, coalesce(c.is_automated_run, false) is_automated_run
+      from visible v
+      left join classified c
+        on c.evidence_kind = v.evidence_kind and c.source_event_id = v.source_event_id
   ), first_prompts as materialized (
     select distinct on (e.person_id, e.prompt_identity) e.person_id, e.session_id, e.observed_at
       from evidence e
-     where e.evidence_kind = 'prompt' and e.prompt_identity is not null
-     order by e.person_id, e.prompt_identity, e.observed_at, e.source_event_id
+     where e.evidence_kind = 'prompt' and e.prompt_identity is not null and not e.is_automated_run
+     order by e.person_id, e.prompt_identity, e.observed_at, e.anchor_observed_at, e.source_event_id
   ), binned as materialized (
     select e.person_id, e.session_id, e.session_role,
            pg_catalog.date_bin(pg_catalog.make_interval(mins => p_bucket_minutes), e.observed_at, p_start) bucket_start,
-           e.evidence_kind, e.event_kind, e.source_event_id, e.observed_at
+           e.evidence_kind, e.event_kind, e.source_event_id, e.observed_at, e.is_automated_run
       from evidence e
      where e.evidence_kind = 'activity'
   ), bucket_rows as materialized (
@@ -351,6 +373,7 @@ begin
            pg_catalog.min(b.observed_at) first_activity_at, pg_catalog.max(b.observed_at) last_activity_at,
            pg_catalog.count(*) filter (where b.event_kind = 'tool_call') tool_calls,
            pg_catalog.count(*) filter (where b.event_kind = 'tool_result') tool_results,
+           pg_catalog.bool_or(b.is_automated_run) automated_run,
            pg_catalog.array_agg(b.source_event_id) filter (where b.event_kind = 'tool_call') tool_event_ids
       from binned b
      group by b.person_id, b.session_id, b.bucket_start
@@ -365,12 +388,13 @@ begin
            coalesce(b.bucket_start, p.bucket_start) bucket_start, b.actor_role,
            b.first_activity_at, b.last_activity_at,
            coalesce(b.tool_calls, 0) tool_calls, coalesce(b.tool_results, 0) tool_results,
-           coalesce(p.prompts, 0) prompts, b.tool_event_ids
+           coalesce(p.prompts, 0) prompts, coalesce(b.automated_run, false) automated_run, b.tool_event_ids
       from bucket_rows b
       full join prompt_rows p
         on p.person_id = b.person_id and p.session_id = b.session_id and p.bucket_start = b.bucket_start
   ), limited as materialized (
-    select * from all_buckets order by bucket_start, session_id limit 50000
+    -- When truncated, keep the newest buckets.
+    select * from all_buckets order by bucket_start desc, session_id limit 50000
   ), spans as materialized (
     -- Spans that start more than 12 hours before the window are not counted.
     select sp.session_id, greatest(sp.started_at, p_start) started_at, least(sp.ended_at, p_end) ended_at
@@ -437,6 +461,7 @@ begin
         'prompts', l.prompts,
         'tool_calls', l.tool_calls,
         'tool_results', l.tool_results,
+        'automated_run', l.automated_run,
         'tools', coalesce((
           select pg_catalog.to_jsonb(pg_catalog.array_agg(t.tool_name order by t.tool_name))
             from (select distinct ev.tool_name

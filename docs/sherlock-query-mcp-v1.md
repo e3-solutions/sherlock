@@ -359,6 +359,11 @@ They run as their owner, cover only the E3 workspace (`e3-development`), drop
 no content. Sessions are named by `session_key`, sha256 of the session id.
 Timeline prompts and activity come from the active frame-evidence version, so
 they trail ingest by the frame projector's lag (`stats.evidence_watermark`).
+Prompts from runs the dashboard classifies as automated are left out; such
+buckets carry `automated_run: true`. Past 50,000 buckets the newest are kept.
+`people()` and `fresh_token_sessions()` cover every email domain in the E3
+workspace, so their totals can exceed `query_usage`, which counts only
+`e3group.ai`.
 Measured on Nov 6: a 24-hour timeline takes about 8 s and returns about 0.9 MB,
 2 hours takes 0.2 s.
 

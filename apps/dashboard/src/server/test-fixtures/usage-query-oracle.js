@@ -40,7 +40,55 @@ export async function expectUsageQueryParity(sql, workspaceId, { start, end }) {
     expect([...await tx.unsafe(COVERAGE_SQL, coverageParams)])
       .toEqual([...await tx.unsafe(oldCoverage, coverageParams)]);
   });
+  await expectHeartbeatTokensMatch(sql, workspaceId, { start, end });
   await expectDayCheckHealsGaps(sql, workspaceId, { start, end });
+}
+
+const ROLLBACK = new Error("rollback heartbeat fixture");
+
+// COR-5215: with the test workspace standing in for E3, the per-session token
+// rows add up to query_usage's precomputed groups, and the timeline and people
+// reads run over real rows. Everything is rolled back.
+async function expectHeartbeatTokensMatch(sql, workspaceId, { start, end }) {
+  const windowMs = new Date(end) - new Date(start);
+  await sql.begin(async (tx) => {
+    await tx.unsafe("update telemetry.workspaces set slug = 'e3-development' where id = $1::uuid", [workspaceId]);
+    await tx.unsafe(
+      "update analytics.usage_contribution_state set backfill_cursor = $2::timestamptz, refreshed_at = now() where workspace_id = $1::uuid",
+      [workspaceId, start],
+    );
+    const groups = await tx.unsafe(PRECOMPUTED_USAGE_SQL, [workspaceId, start, end, "e3group.ai"]);
+    await tx.unsafe("set local role sherlock_presence_reader");
+    const people = await tx.unsafe("select * from heartbeat_api.people()");
+    expect(people.length).toBeGreaterThan(0);
+    const [receipt] = await tx.unsafe("select * from heartbeat_api.usage_receipt($1::timestamptz, $2::timestamptz)", [start, end]);
+    expect(receipt.path).not.toBe("not_covered");
+    if (windowMs <= 7 * 86_400_000) {
+      const rows = await tx.unsafe(
+        "select * from heartbeat_api.fresh_token_sessions($1::timestamptz, $2::timestamptz)", [start, end],
+      );
+      const e3 = rows.filter((row) => /^[^@]+@e3group\.ai$/.test(row.email ?? ""));
+      const sum = (list, pick) => list.reduce((total, row) => total + Number(pick(row) ?? 0), 0);
+      expect(sum(e3, (row) => row.input_delta)).toBe(sum(groups, (group) => group.input_tokens));
+      expect(sum(e3, (row) => row.cached_delta)).toBe(sum(groups, (group) => group.cached_input_tokens));
+      expect(sum(e3, (row) => row.output_delta))
+        .toBe(sum(groups, (group) => Number(group.output_tokens ?? 0) + Number(group.reasoning_tokens ?? 0)));
+      expect(sum(e3, (row) => row.usage_events)).toBe(sum(groups, (group) => group.usage_event_count));
+      for (const row of rows) {
+        expect(row.session_key).toMatch(/^[0-9a-f]{64}$/);
+        expect(["measured", "missing_baseline", "regressed", "source_conflict", "component_missing"])
+          .toContain(row.status);
+      }
+    }
+    const timelineEnd = windowMs <= 86_400_000 ? end : new Date(new Date(start).getTime() + 86_400_000).toISOString();
+    const [{ result }] = await tx.unsafe(
+      "select heartbeat_api.timeline_activity($1::timestamptz, $2::timestamptz, 10) result", [start, timelineEnd],
+    );
+    expect(result.schema_version).toBe("sherlock.heartbeat.timeline.v1");
+    expect(Array.isArray(result.buckets)).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(workspaceId);
+    throw ROLLBACK;
+  }).catch((error) => { if (error !== ROLLBACK) throw error; });
 }
 
 // COR-5214: the per-day check against raw usage finds a session that was never
