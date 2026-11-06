@@ -58,9 +58,21 @@ async function expectHeartbeatTokensMatch(sql, workspaceId, { start, end }) {
       [workspaceId, start],
     );
     const groups = await tx.unsafe(PRECOMPUTED_USAGE_SQL, [workspaceId, start, end, "e3group.ai"]);
-    // The local postgres user is not a member of the NOLOGIN Heartbeat role.
-    await tx.unsafe("grant sherlock_presence_reader to current_user");
-    await tx.unsafe("set local role sherlock_presence_reader");
+    // The local postgres user is not a member of the NOLOGIN Heartbeat role,
+    // so check its execute rights instead of switching to it.
+    const [rights] = await tx.unsafe(`select
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.people()', 'execute') people,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.usage_receipt(timestamptz,timestamptz)', 'execute') receipt,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.fresh_token_sessions(timestamptz,timestamptz)', 'execute') tokens,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.timeline_activity(timestamptz,timestamptz,integer)', 'execute') timeline,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.hidden_sessions()', 'execute') hidden,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.e3_workspace_id()', 'execute') workspace,
+      has_function_privilege('sherlock_presence_reader', 'heartbeat_api.session_key(uuid)', 'execute') session_key,
+      has_function_privilege('sherlock_reader', 'heartbeat_api.people()', 'execute') reader_people`);
+    expect(rights).toEqual({
+      people: true, receipt: true, tokens: true, timeline: true,
+      hidden: false, workspace: false, session_key: false, reader_people: false,
+    });
     const people = await tx.unsafe("select * from heartbeat_api.people()");
     expect(people.length).toBeGreaterThan(0);
     const [receipt] = await tx.unsafe("select * from heartbeat_api.usage_receipt($1::timestamptz, $2::timestamptz)", [start, end]);
@@ -153,13 +165,10 @@ async function expectDayCheckHealsGaps(sql, workspaceId, { start, end }) {
   await sql.unsafe("delete from analytics.usage_contribution_checks where workspace_id = $1::uuid", [workspaceId]);
 }
 
-// COR-5215: the Heartbeat reads run as their NOLOGIN role (CI has no E3
-// workspace, so they return nothing), and the private helpers stay private.
+// COR-5215: the Heartbeat reads run (CI has no E3 workspace, so they return
+// nothing). Execute rights are checked in expectHeartbeatTokensMatch.
 async function expectHeartbeatReads(sql, { end }) {
   await sql.begin(async (tx) => {
-    // The local postgres user is not a member of the NOLOGIN Heartbeat role.
-    await tx.unsafe("grant sherlock_presence_reader to current_user");
-    await tx.unsafe("set local role sherlock_presence_reader");
     expect(Array.isArray([...await tx.unsafe("select * from heartbeat_api.people()")])).toBe(true);
     const window = ["(($1::timestamptz) - interval '1 hour')", "$1::timestamptz"].join(", ");
     const [receipt] = await tx.unsafe(`select * from heartbeat_api.usage_receipt(${window})`, [end]);
@@ -174,8 +183,5 @@ async function expectHeartbeatReads(sql, { end }) {
     await expect(tx.unsafe(`select * from heartbeat_api.fresh_token_sessions(${window})`, [end]))
       .rejects.toThrow("heartbeat_usage_window_not_covered");
     await tx.unsafe("rollback to savepoint tokens");
-    await tx.unsafe("savepoint helpers");
-    await expect(tx.unsafe("select * from heartbeat_api.hidden_sessions()")).rejects.toThrow(/permission denied/);
-    await tx.unsafe("rollback to savepoint helpers");
   });
 }
