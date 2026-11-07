@@ -18,6 +18,7 @@ from .contract import (
 )
 from . import exclusion_report
 from .exclusions import (
+    EXCLUDED_MARKER,
     EXCLUDED_PROJECT,
     ExclusionPolicy,
     load_policy,
@@ -150,7 +151,13 @@ class Drain:
                 return exclusion_report.SKIPPED
             # Explicitly excluded sessions, plus sessions whose queued batches
             # this drain held because they ran in an excluded project.
-            ids = set(policy.excluded) | self._project_held_sessions
+            # Plus root sessions excluded by a marker (markers.py), remembered
+            # across runs so copies uploaded before the marker appeared are hidden.
+            ids = (
+                set(policy.excluded)
+                | self._project_held_sessions
+                | policy.marker_excluded_ids()
+            )
             if not exclusion_report.normalized_session_ids(ids):
                 return exclusion_report.NONE
             send = getattr(self.transport, "report_exclusions", None)
@@ -289,7 +296,7 @@ class Drain:
                 ],
             )
             if reason:
-                if reason == EXCLUDED_PROJECT and manifest.observed_native_session_id:
+                if reason in (EXCLUDED_PROJECT, EXCLUDED_MARKER) and manifest.observed_native_session_id:
                     self._project_held_sessions.add(manifest.observed_native_session_id)
                 self._held.add(path)
                 self._held_streams.add(stream)
