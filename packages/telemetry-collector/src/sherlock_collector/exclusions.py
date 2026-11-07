@@ -60,6 +60,14 @@ from typing import Iterable, Mapping
 from urllib.parse import urlsplit
 
 from .contract import MAX_SOURCE_BYTES
+from .markers import (
+    EXCLUDED_MARKER,
+    MARKER_UNVERIFIED,
+    STATE_NAME as MARKER_STATE_NAME,
+    MarkerClassifier,
+    parse_marker_allowed,
+    parse_markers,
+)
 from .spool import _atomic_json, secure_lock
 
 
@@ -225,6 +233,8 @@ class ExclusionPolicy:
     excluded_project_paths: tuple[str, ...] = ()
     worktree_origins_path: Path | None = None
     error: str | None = None
+    # Session markers for shared folders (see markers.py); None when unused.
+    markers: MarkerClassifier | None = field(default=None, compare=False)
     _ancestry: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
@@ -233,7 +243,68 @@ class ExclusionPolicy:
             self.error
             or self.excluded
             or self.excluded_projects
+            or self.markers is not None
             or self.allowed_claude is not None
+        )
+
+    def marker_excluded_ids(self) -> set[str]:
+        """Root sessions excluded by a marker, remembered across runs."""
+        return self.markers.excluded_ids() if self.markers is not None else set()
+
+    def _scope_keys(self, cwds: Iterable[str | None]) -> set[str]:
+        keys: set[str] = set()
+        for cwd in cwds:
+            if isinstance(cwd, str) and os.path.isabs(cwd):
+                keys |= {
+                    _path_key(os.path.normpath(cwd)),
+                    _path_key(os.path.realpath(cwd)),
+                }
+        return keys
+
+    def _codex_scope_reason(self, cwds: Iterable[str | None]) -> str | None:
+        """Codex sessions in a marker-scoped folder cannot be classified yet: hold."""
+        if self.markers is not None and self.markers.in_scope(self._scope_keys(cwds)):
+            return MARKER_UNVERIFIED
+        return None
+
+    def _claude_marker_reason(
+        self,
+        native: str,
+        parent: str | None,
+        source_home: Path | None,
+        source_path: Path | None,
+        observed: set[str],
+    ) -> str | None:
+        """Classify a Claude session whose root session ran in a marker-scoped folder."""
+        markers = self.markers
+        if markers is None:
+            return None
+        root = parent or native
+        roots, agents = (
+            self._claude_index(source_home) if source_home is not None else ({}, {})
+        )
+        if source_path is not None and parent is None and source_path.stem.lower() == root:
+            root_path: Path | None = source_path
+        else:
+            root_path = roots.get(root)
+        if source_path is not None:
+            own_path: Path | None = source_path
+        elif parent is not None:
+            own_path = agents.get((parent, native))
+        else:
+            own_path = root_path
+        root_cwd = self._file_cwd(root_path) if root_path is not None else None
+        own_cwd = self._file_cwd(own_path) if own_path is not None else None
+        if root_cwd is None:
+            # Without the root session's folder its scope is unknown.
+            return MARKER_UNVERIFIED
+        if not markers.in_scope(self._scope_keys(set(observed) | {root_cwd, own_cwd})):
+            return None
+        return markers.claude_reason(
+            root,
+            native,
+            root_path,
+            own_path if parent is not None else None,
         )
 
     def blocked_reason(
@@ -290,12 +361,18 @@ class ExclusionPolicy:
                 )
                 if blocked:
                     return blocked
+            if self.markers is not None:
+                blocked = self._claude_marker_reason(
+                    native, parent, source_home, source_path, set(observed_cwds)
+                )
+                if blocked:
+                    return blocked
             if self.allowed_claude is not None and (
                 parent is not None or native not in self.allowed_claude
             ):
                 return NOT_ALLOWED
             return None
-        if not (self.excluded or self.excluded_projects):
+        if not (self.excluded or self.excluded_projects or self.markers is not None):
             return None
         if provider == "codex" and source_kind == "hook":
             return self._codex_hook_reason(
@@ -309,7 +386,9 @@ class ExclusionPolicy:
             )
         if {native, parent} & self.excluded:
             return EXCLUDED
-        blocked = self._cwds_reason(set(observed_cwds))
+        blocked = self._cwds_reason(set(observed_cwds)) or self._codex_scope_reason(
+            observed_cwds
+        )
         if blocked:
             return blocked
         codex_home = source_home
@@ -413,6 +492,12 @@ class ExclusionPolicy:
                 for repository in repositories
             ):
                 return EXCLUDED_PROJECT
+        if self.markers is not None:
+            if not cwds:
+                return MARKER_UNVERIFIED
+            blocked = self._codex_scope_reason(cwds)
+            if blocked:
+                return blocked
         if known_parent is None:
             return UNVERIFIED if self.excluded else None
         seen: set[str] = {native}
@@ -482,7 +567,7 @@ class ExclusionPolicy:
         removed worktree: a remote of an excluded checkout excludes them."""
         if repository is not None and repository in self._excluded_repositories():
             return EXCLUDED_PROJECT
-        return self._cwd_reason(cwd)
+        return self._cwd_reason(cwd) or self._codex_scope_reason((cwd,))
 
     def _excluded_repositories(self) -> frozenset[str]:
         if "repositories" not in self._ancestry:
@@ -676,15 +761,32 @@ def load_policy(path: Path | None = None) -> ExclusionPolicy:
         project_paths = tuple(
             sorted({normalize_project_path(v) for v in raw.get("excluded_project_paths", [])})
         )
+        scoped, session_markers = parse_markers(raw)
+        marker_allowed = parse_marker_allowed(raw)
     except (ValueError, UnicodeDecodeError) as error:
         return ExclusionPolicy(error=str(error))
-    return ExclusionPolicy(
+    classifier = None
+    if scoped:
+        keys: set[str] = set()
+        for value in scoped:
+            keys |= {_path_key(value), _path_key(os.path.realpath(value))}
+        classifier = MarkerClassifier(
+            scoped_keys=frozenset(keys),
+            markers=session_markers,
+            state_path=path.parent / MARKER_STATE_NAME,
+            allowed_roots=marker_allowed,
+        )
+    policy = ExclusionPolicy(
+        markers=classifier,
         excluded=excluded,
         allowed_claude=allowed,
         excluded_projects=projects,
         excluded_project_paths=project_paths,
         worktree_origins_path=path.parent / WORKTREE_ORIGINS_NAME,
     )
+    if classifier is not None:
+        classifier.path_excluded = policy.project_excluded
+    return policy
 
 
 def _read_worktree_origins(path: Path | None) -> dict[str, list[str]] | None:
@@ -736,6 +838,7 @@ def _read_policy_object(path: Path) -> dict | None:
     _id_list(raw, "excluded_session_ids")
     _id_list(raw, "allowed_claude_session_ids")
     _project_paths(raw)
+    parse_markers(raw)
     return raw
 
 

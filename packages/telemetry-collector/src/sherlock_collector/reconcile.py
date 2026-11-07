@@ -12,7 +12,7 @@ from pathlib import Path
 from . import pending_sources
 from .discovery import discover_all_sources
 from .drain import Drain, UploadTransport
-from .exclusions import EXCLUDED, EXCLUDED_PROJECT, NOT_ALLOWED
+from .exclusions import EXCLUDED, EXCLUDED_MARKER, EXCLUDED_PROJECT, NOT_ALLOWED
 from .overlap_repair import repair_overlap_dead_letters
 from .rollout import (
     CaptureResult,
@@ -31,7 +31,7 @@ DEFAULT_RECONCILE_BYTES = 128 * 1024 * 1024
 # 0 disables the bound for an explicit, operator-run history recovery.
 DEFAULT_RECONCILE_MAX_AGE_DAYS = 31
 # Ledger reasons that owner policy decided; they are not capture failures.
-POLICY_REASONS = frozenset({EXCLUDED, EXCLUDED_PROJECT, NOT_ALLOWED})
+POLICY_REASONS = frozenset({EXCLUDED, EXCLUDED_MARKER, EXCLUDED_PROJECT, NOT_ALLOWED})
 STATUS_NAME = "collector-status.json"
 
 

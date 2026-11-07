@@ -106,6 +106,37 @@ that later moves into an excluded project is held from the first batch that
 records it. A session whose directory is not recorded yet, or whose root
 session cannot be read, is held until it is.
 
+### Exclude sessions by marker in a shared folder
+
+When private work is started from the same folder as company work (for
+example the workspace root that holds every company repository), a folder rule
+cannot tell the two apart. Name that folder and the words that identify the
+private work in the policy file:
+
+```json
+"marker_scoped_project_paths": ["/Users/me/work"],
+"excluded_session_markers": ["myproject", "facebook"],
+"marker_allowed_session_ids": []
+```
+
+Only Claude sessions whose root session ran in exactly that folder are checked
+(not its subfolders). One is excluded when a marker (case-insensitive, at least
+3 characters) appears in:
+- the Claude desktop app's record of it: its title or scheduled task name;
+- the same record of any session it was spawned or forked from;
+- its first real user prompt or a title record in its transcript;
+- a file path a tool was given inside an excluded project folder.
+
+A subagent whose own transcript has a marker is excluded alone; the subagents
+of an excluded root session go with it. It fails closed. A session with no app
+record, title or readable transcript yet is held (`session_marker_unverified`)
+and retried, and so is any Codex session in that folder. Exclusions are
+remembered in `session-marker-state.json` beside the policy. Excluded root
+sessions are reported to Sherlock like `excluded_session_ids`. List a root
+session in `marker_allowed_session_ids` to stop markers applying to it after
+checking it is company work. The full rules are in
+`packages/telemetry-collector/src/sherlock_collector/markers.py`.
+
 Each linked worktree seen while exclusions exist is remembered in
 `worktree-origins.json` beside the policy, so its sessions stay excluded after
 the worktree is removed or its path is reused; if that file becomes unreadable,

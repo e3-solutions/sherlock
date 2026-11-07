@@ -33,12 +33,12 @@ from .rollout import (
     SourceSnapshot,
 )
 from . import pending_sources
-from .exclusions import EXCLUDED, EXCLUDED_PROJECT, NOT_ALLOWED
+from .exclusions import EXCLUDED, EXCLUDED_MARKER, EXCLUDED_PROJECT, NOT_ALLOWED
 from .spool import DurableSpool, _atomic_json, secure_lock
 
 # Owner-policy outcomes that will not change on retry (a policy edit is picked
 # up by the periodic reconciler). Unverified ancestry may resolve later.
-FINAL_POLICY_REASONS = frozenset({EXCLUDED, EXCLUDED_PROJECT, NOT_ALLOWED})
+FINAL_POLICY_REASONS = frozenset({EXCLUDED, EXCLUDED_MARKER, EXCLUDED_PROJECT, NOT_ALLOWED})
 
 
 CODEX_HOOK_EVENTS = {
