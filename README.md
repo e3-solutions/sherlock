@@ -134,7 +134,16 @@ and retried, and so is any Codex session in that folder. Exclusions are
 remembered in `session-marker-state.json` beside the policy. Excluded root
 sessions are reported to Sherlock like `excluded_session_ids`. List a root
 session in `marker_allowed_session_ids` to stop markers applying to it after
-checking it is company work. The full rules are in
+checking it is company work.
+
+Changing the markers or excluded folders makes every transcript be read again.
+
+Known limits:
+- Terminal sessions in the scoped folder have no app record, so they stay held.
+- A subagent excluded on its own can't be reported, because its id is not a session UUID. Copies it uploaded before the marker appeared stay visible until its root session is excluded.
+- Sherlock hides copies uploaded earlier but does not delete them.
+
+The full rules are in
 `packages/telemetry-collector/src/sherlock_collector/markers.py`.
 
 Each linked worktree seen while exclusions exist is remembered in
