@@ -205,6 +205,56 @@ class MarkerTests(unittest.TestCase):
         agent, path = self.subagent(root, user("Run the tests", self.work))
         self.assertEqual(self.reason(self.policy(), agent, root, path), EXCLUDED_MARKER)
 
+    def test_marker_in_a_wrapped_slash_command_before_the_first_prompt(self):
+        sid = self.session(
+            user("<command-name>/aeyron-plan</command-name>", self.work),
+            user("go on", self.work),
+        )
+        self.app_record(sid)
+        self.assertEqual(self.reason(self.policy(), sid), EXCLUDED_MARKER)
+
+    def test_changed_markers_read_everything_again(self):
+        sid = self.session(user("Plan the garmin sync", self.work))
+        self.app_record(sid)
+        self.assertIsNone(self.reason(self.policy(), sid))
+        markers = self.policy_value["excluded_session_markers"] + ["garmin"]
+        self.assertEqual(
+            self.reason(self.policy(excluded_session_markers=markers), sid), EXCLUDED_MARKER
+        )
+
+    def test_subagent_without_its_own_transcript_is_held(self):
+        root = self.session()
+        self.app_record(root, "Sesh work")
+        policy = self.policy(excluded_project_paths=[])  # the marker rule alone
+        reason = policy.blocked_reason("claude_code", "a" * 17, root, source_home=self.claude)
+        self.assertEqual(reason, MARKER_UNVERIFIED)
+
+    def test_excluded_subagent_stays_excluded_after_its_transcript_is_gone(self):
+        root = self.session(user("Sesh work", self.work))
+        self.app_record(root, "Sesh work")
+        agent, path = self.subagent(root, user("Read the Aeyron notes", self.work))
+        self.assertEqual(self.reason(self.policy(), agent, root, path), EXCLUDED_MARKER)
+        path.unlink()
+        policy = self.policy(excluded_project_paths=[])  # the marker rule alone
+        reason = policy.blocked_reason("claude_code", agent, root, source_home=self.claude)
+        self.assertEqual(reason, EXCLUDED_MARKER)
+
+    def test_hook_observations_are_classified_by_the_session_transcript(self):
+        root = self.session(user("Sesh work", self.work))
+        self.app_record(root, "Sesh work")
+        agent, _ = self.subagent(root, user("Read the Aeyron notes", self.work))
+        observation = Path(self.tmp.name) / "observation.json"
+        observation.write_text(json.dumps({"payload": "e30="}) + "\n")
+        reason = self.policy(excluded_project_paths=[]).blocked_reason(
+            "claude_code", agent, root, source_home=self.claude,
+            source_path=observation, source_kind="hook",
+        )
+        self.assertEqual(reason, EXCLUDED_MARKER)
+
+    def test_non_ascii_markers_are_rejected(self):
+        policy = self.policy(excluded_session_markers=["Ärzte"])
+        self.assertEqual(self.reason(policy, self.session()), UNREADABLE)
+
     # -- scope and configuration ----------------------------------------
     def test_sessions_outside_the_scoped_folder_are_not_classified(self):
         sub = os.path.join(self.work, "repo")

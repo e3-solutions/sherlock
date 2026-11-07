@@ -44,6 +44,7 @@ to the first real user prompt, are parsed. Nothing read here leaves the machine.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,8 @@ MAX_ANCESTRY = 64
 # One run reads at most this much new transcript per file; the rest is read
 # on later runs, and the session stays held until it has been read in full.
 MAX_SCAN_BYTES_PER_RUN = 512 * 1024 * 1024
+# And at most this much across all files in one run (one policy load).
+MAX_SCAN_BYTES_PER_PROCESS = 2 * 1024 * 1024 * 1024
 # A single JSONL line longer than this cannot be classified: hold.
 MAX_LINE_BYTES = 64 * 1024 * 1024
 
@@ -74,6 +77,7 @@ _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 _PATH_FIELDS = frozenset(
     {"file_path", "path", "notebook_path", "cwd", "directory", "dir", "root", "paths", "file_paths"}
 )
+_COMMAND = re.compile(r"<command-(?:name|args)>(.*?)</command-(?:name|args)>", re.S)
 _TITLE_TYPES = frozenset({"custom-title", "ai-title", "summary"})
 _TITLE_FIELDS = ("customTitle", "aiTitle", "title", "summary")
 
@@ -106,6 +110,9 @@ def parse_markers(raw: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if not isinstance(markers, list) or not all(isinstance(v, str) for v in markers):
         raise ValueError("excluded_session_markers must be a list of strings")
     cleaned = tuple(sorted({v.strip().lower() for v in markers if v.strip()}))
+    if not all(v.isascii() for v in cleaned):
+        # Transcript bytes are matched case-insensitively for ASCII only.
+        raise ValueError("session markers must be ASCII")
     if any(len(v) < MIN_MARKER_LENGTH for v in cleaned):
         raise ValueError(f"session markers must be at least {MIN_MARKER_LENGTH} characters")
     if len(cleaned) > MAX_MARKERS:
@@ -123,6 +130,11 @@ def parse_markers(raw: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
         # A scope with nothing to look for would silently capture everything.
         raise ValueError("marker_scoped_project_paths needs excluded_session_markers")
     return tuple(sorted(set(paths))), cleaned
+
+
+def settings_fingerprint(markers: Iterable[str], excluded_paths: Iterable[str]) -> str:
+    payload = json.dumps([sorted(markers), sorted(excluded_paths)])
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _text_of(content: object) -> str:
@@ -165,7 +177,13 @@ class MarkerClassifier:
     # Whether a tool path lies in an excluded project folder (set by the policy).
     path_excluded: Callable[[str], bool] | None = None
     allowed_roots: frozenset[str] = frozenset()
+    # Identifies the markers and excluded folders a scan was made with; scans
+    # made under other settings are discarded so their bytes are read again.
+    fingerprint: str = ""
     _app_index: dict | None = field(default=None, repr=False)
+    _refreshed: bool = field(default=False, repr=False)
+    _pruned: bool = field(default=False, repr=False)
+    _scanned_bytes: int = field(default=0, repr=False)
     _state: dict | None = field(default=None, repr=False)
     _verdicts: dict = field(default_factory=dict, repr=False)
 
@@ -201,6 +219,11 @@ class MarkerClassifier:
                 or not isinstance(raw.setdefault("excluded_agents", []), list)
             ):
                 return None
+            if raw.get("fingerprint") != self.fingerprint:
+                # Markers or excluded folders changed: what was read before
+                # must be read again. Exclusions already made stay.
+                raw["scans"] = {}
+                raw["fingerprint"] = self.fingerprint
             state = raw
         self._state = state
         return state
@@ -238,6 +261,14 @@ class MarkerClassifier:
                     return False  # Never replace a state that cannot be read.
                 current["excluded"] = sorted(set(current["excluded"]) | excluded)
                 current["excluded_agents"] = sorted(set(current["excluded_agents"]) | agents)
+                if not self._pruned:
+                    # Forget scans of files that no longer exist (once per run).
+                    current["scans"] = {
+                        key: value
+                        for key, value in current["scans"].items()
+                        if os.path.exists(key)
+                    }
+                    self._pruned = True
                 for key, value in (scans or {}).items():
                     old = current["scans"].get(key)
                     # Concurrent runs: keep the furthest scan of the same file.
@@ -257,8 +288,10 @@ class MarkerClassifier:
 
     # -- Claude desktop app records ---------------------------------------
     def _index(self, refresh: bool = False) -> dict | None:
-        if self._app_index is not None and not refresh:
+        if self._app_index is not None and (not refresh or self._refreshed):
             return self._app_index
+        if refresh:
+            self._refreshed = True  # Re-read the app records at most once per run.
         by_cli: dict[str, dict] = {}
         by_local: dict[str, dict] = {}
         root = self.app_root or app_sessions_root()
@@ -360,7 +393,10 @@ class MarkerClassifier:
             ):
                 offset, first_done = cached["offset"], bool(cached.get("first_prompt_done"))
             handle.seek(offset)
-            budget = MAX_SCAN_BYTES_PER_RUN
+            budget = min(
+                MAX_SCAN_BYTES_PER_RUN, MAX_SCAN_BYTES_PER_PROCESS - self._scanned_bytes
+            )
+            start_offset = offset
             verdict: str | None = None
             while budget > 0:
                 line = handle.readline(MAX_LINE_BYTES + 1)
@@ -387,11 +423,18 @@ class MarkerClassifier:
                 if kind == "user" and not record.get("isMeta"):
                     message = record.get("message") if isinstance(record.get("message"), dict) else {}
                     text = _text_of(message.get("content")).strip()
-                    if text and not text.startswith("<") and not first_done:
-                        first_done = True
-                        if self.hit(text):
+                    if text and not first_done:
+                        # Wrapped text before the first prompt is not a prompt,
+                        # but a slash command in it (such as "/myproject-plan")
+                        # and its arguments are what the owner typed: check
+                        # those. Only an unwrapped prompt ends the search.
+                        wrapped = text.startswith("<")
+                        typed = " ".join(_COMMAND.findall(text)) if wrapped else text
+                        if self.hit(typed):
                             verdict = EXCLUDED_MARKER
                             break
+                        if not wrapped:
+                            first_done = True
                 elif has_marker and kind in _TITLE_TYPES:
                     if any(self.hit(record.get(name)) for name in _TITLE_FIELDS):
                         verdict = EXCLUDED_MARKER
@@ -410,6 +453,7 @@ class MarkerClassifier:
                     if verdict:
                         break
             at_end = offset >= info.st_size
+            self._scanned_bytes += offset - start_offset
         scan = {"dev": info.st_dev, "ino": info.st_ino, "offset": offset, "first_prompt_done": first_done}
         if verdict == EXCLUDED_MARKER:
             return EXCLUDED_MARKER
@@ -471,7 +515,7 @@ class MarkerClassifier:
         if root in self.excluded_ids():
             return EXCLUDED_MARKER, "root"
         agent_key = f"{root}/{native}"
-        if own_transcript is not None and agent_key in state["excluded_agents"]:
+        if native != root and agent_key in state["excluded_agents"]:
             return EXCLUDED_MARKER, "agent"
         app = self._app_reason(root)
         if app == EXCLUDED_MARKER:
@@ -483,6 +527,8 @@ class MarkerClassifier:
         if reason == EXCLUDED_MARKER:
             return reason, "root"
         held = held or reason == MARKER_UNVERIFIED
+        if native != root and own_transcript is None:
+            return MARKER_UNVERIFIED, "agent"  # A subagent must be read itself.
         if own_transcript is not None and own_transcript != root_transcript:
             reason = self._transcript_reason(own_transcript)
             if reason == EXCLUDED_MARKER:

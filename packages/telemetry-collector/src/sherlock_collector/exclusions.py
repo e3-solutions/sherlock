@@ -67,6 +67,7 @@ from .markers import (
     MarkerClassifier,
     parse_marker_allowed,
     parse_markers,
+    settings_fingerprint,
 )
 from .spool import _atomic_json, secure_lock
 
@@ -274,8 +275,15 @@ class ExclusionPolicy:
         source_home: Path | None,
         source_path: Path | None,
         observed: set[str],
+        source_kind: str | None = None,
     ) -> str | None:
-        """Classify a Claude session whose root session ran in a marker-scoped folder."""
+        """Classify a Claude session whose root session ran in a marker-scoped folder.
+
+        A hook observation file is not a transcript: the session's own
+        transcript is looked up instead.
+        """
+        if source_kind == "hook":
+            source_path = None
         markers = self.markers
         if markers is None:
             return None
@@ -300,6 +308,8 @@ class ExclusionPolicy:
             return MARKER_UNVERIFIED
         if not markers.in_scope(self._scope_keys(set(observed) | {root_cwd, own_cwd})):
             return None
+        # A subagent with no transcript of its own is held by the classifier
+        # (unless it was already excluded).
         return markers.claude_reason(
             root,
             native,
@@ -363,7 +373,12 @@ class ExclusionPolicy:
                     return blocked
             if self.markers is not None:
                 blocked = self._claude_marker_reason(
-                    native, parent, source_home, source_path, set(observed_cwds)
+                    native,
+                    parent,
+                    source_home,
+                    source_path,
+                    set(observed_cwds),
+                    source_kind,
                 )
                 if blocked:
                     return blocked
@@ -775,6 +790,7 @@ def load_policy(path: Path | None = None) -> ExclusionPolicy:
             markers=session_markers,
             state_path=path.parent / MARKER_STATE_NAME,
             allowed_roots=marker_allowed,
+            fingerprint=settings_fingerprint(session_markers, project_paths),
         )
     policy = ExclusionPolicy(
         markers=classifier,
