@@ -272,7 +272,7 @@ describe("searchSessions", () => {
       { query: "secret-canary", limit: 21 },
       { query: "secret-canary", perSessionLimit: 6 },
       { query: "secret-canary", order: "oldest" },
-      { query: "secret-canary", end: "2026-10-01T12:00:00.001Z", now: NOW },
+      { query: "secret-canary", start: "2026-10-01T12:00:00.001Z", now: NOW },
     ];
     for (const request of invalidRequests) {
       const error = await source.searchSessions(request).catch((caught) => caught);
@@ -280,6 +280,34 @@ describe("searchSessions", () => {
       expect(error.message).not.toContain("canary");
     }
     expect(calls).toHaveLength(0);
+  });
+
+  it("caps a future end at the read time instead of rejecting it", async () => {
+    for (const end of ["2026-10-02", "2026-10-01T12:00:00.001Z", new Date("2027-01-01T00:00:00Z")]) {
+      const { source, calls } = searchSource([], []);
+      const result = await source.searchSessions({
+        query: "test", personId: PERSON, start: "2026-10-01", end, now: NOW,
+      });
+      expect(result.window).toEqual({
+        startInclusive: "2026-10-01T00:00:00.000Z",
+        endExclusive: NOW.toISOString(),
+        readAt: NOW.toISOString(),
+      });
+      expect(calls[0].params.slice(2, 5)).toEqual([
+        "2026-10-01T00:00:00.000Z", NOW.toISOString(), NOW.toISOString(),
+      ]);
+    }
+    // A past end is untouched, and a future start still has no window to read.
+    const past = searchSource([], []);
+    const kept = await past.source.searchSessions({
+      query: "test", personId: PERSON, start: "2026-09-30", end: "2026-10-01", now: NOW,
+    });
+    expect(kept.window.endExclusive).toBe("2026-10-01T00:00:00.000Z");
+    const late = searchSource([], []);
+    await expect(late.source.searchSessions({
+      query: "test", start: "2026-10-02", end: "2026-10-03", now: NOW,
+    })).rejects.toThrow("flame_mcp_query_request_invalid");
+    expect(late.calls).toHaveLength(0);
   });
 
   it("verifies helper candidates canonically under the reader and diversifies sessions", async () => {

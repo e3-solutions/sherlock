@@ -13,6 +13,18 @@ import {
   runQuery,
 } from "./mcp-query-source.js";
 
+// Search reads "through now" when end is in the future: a date-only end of
+// tomorrow is the natural way to ask for all of today. Unlike the metadata
+// tools, a future end is capped at the read time instead of being rejected.
+export function searchWindow({ start, end } = {}, now = new Date()) {
+  const read = now instanceof Date ? now : new Date(now);
+  if (end !== undefined && Number.isFinite(read.getTime())) {
+    const endAt = end instanceof Date ? end : new Date(end);
+    if (Number.isFinite(endAt.getTime()) && endAt > read) end = read;
+  }
+  return queryWindow({ start, end }, read);
+}
+
 export const SEARCH_SCHEMA_VERSION = "sherlock.search.v2";
 export const SEARCH_CANDIDATE_BUDGET = 500;
 export const SEARCH_DEFAULT_LIMIT = 10;
@@ -846,7 +858,7 @@ export function createSherlockSearchSource(source) {
       );
       if (order !== "relevance" && order !== "recent") throw invalid();
       if (typeof groupIdenticalExcerpts !== "boolean") throw invalid();
-      const window = queryWindow({ start, end }, now);
+      const window = searchWindow({ start, end }, now);
       const bounds = [
         window.startAt.toISOString(), window.endAt.toISOString(), window.readAt.toISOString(),
       ];
