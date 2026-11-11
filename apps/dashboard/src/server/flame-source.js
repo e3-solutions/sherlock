@@ -1047,6 +1047,7 @@ function projectedEvidenceCte({
   sessionScoped = false,
   activityThroughReadAt = false,
   splitEvidenceWindows = false,
+  includeSummaryCandidates = true,
   evidenceKind = null,
 } = {}) {
   const visibility = snapshotVisible
@@ -1084,7 +1085,7 @@ frame_revision_candidates as materialized (
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, null::text prompt_identity,
-         revision.is_tombstone, revision.is_summary_candidate
+         revision.is_tombstone${includeSummaryCandidates ? ", revision.is_summary_candidate" : ""}
          ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
     ${candidatePersonJoin}
@@ -1100,7 +1101,7 @@ frame_revision_candidates as materialized (
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, revision.prompt_identity,
-         revision.is_tombstone, revision.is_summary_candidate
+         revision.is_tombstone${includeSummaryCandidates ? ", revision.is_summary_candidate" : ""}
          ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
     ${candidatePersonJoin}
@@ -1116,7 +1117,7 @@ frame_revision_candidates as materialized (
          revision.evidence_kind, revision.source_event_id,
          revision.anchor_observed_at, revision.observed_at,
          revision.actor_role, revision.prompt_identity,
-         revision.is_tombstone, revision.is_summary_candidate
+         revision.is_tombstone${includeSummaryCandidates ? ", revision.is_summary_candidate" : ""}
          ${sessionScoped ? ", revision.event_kind, revision.message_role, revision.message_origin" : ""}
     from analytics.frame_evidence_revisions revision
     ${candidatePersonJoin}
@@ -1214,7 +1215,8 @@ ${splitCandidates}ranked_frame_revisions as materialized (
 )`;
 }
 
-export const PROJECTION_FLAME_SQL = `
+function projectionFlameSql({ includeOverviews }) {
+  return `
 with p as materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text frame_version,
@@ -1235,7 +1237,8 @@ with p as materialized (
 ), ${projectedEvidenceCte({
   activityThroughReadAt: true,
   splitEvidenceWindows: true,
-})}, bucket_work as materialized (
+  includeSummaryCandidates: includeOverviews,
+})}${includeOverviews ? `, bucket_work as materialized (
   select evidence.person_id, evidence.session_id,
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          case when evidence.actor_role = 'primary' then 'agent'
@@ -1281,7 +1284,7 @@ with p as materialized (
     'summary_event_id', summary_event_id, 'summary', summary
   ) order by session_id, semantic_role) day_summaries
     from day_overview_summaries group by person_id
-), bucket_activity as materialized (
+)` : ""}, bucket_activity as materialized (
   select evidence.person_id,
          date_bin(interval '10 minutes', evidence.observed_at, p.start_at) bucket_start,
          count(distinct evidence.session_id) filter (where evidence.actor_role = 'primary')::bigint agent,
@@ -1332,23 +1335,27 @@ select r.person_id::text person_id, r.display_name, b.bucket_start,
        coalesce(pc.prompts, 0)::bigint prompts,
        d.day_agent, d.day_subagent, d.day_other, d.day_automated_runs,
        coalesce(ba.automated_runs, 0)::bigint automated_runs, l.latest,
-       ra.latest_activity,
+       ra.latest_activity${includeOverviews ? `,
        coalesce(bo.work_rows, '[]'::jsonb) work_rows,
-       case when b.bucket_start = p.start_at then ps.day_summaries end day_summaries
+       case when b.bucket_start = p.start_at then ps.day_summaries end day_summaries` : ""}
   from roster r cross join buckets b
   join day_activity d using (person_id)
   join recent_activity ra using (person_id)
   cross join p
   cross join latest_observation l
   left join bucket_activity ba
-    on ba.person_id = r.person_id and ba.bucket_start = b.bucket_start
+    on ba.person_id = r.person_id and ba.bucket_start = b.bucket_start${includeOverviews ? `
   left join bucket_overviews bo
     on bo.person_id = r.person_id and bo.bucket_start = b.bucket_start
-  left join person_overview_summaries ps on ps.person_id = r.person_id
+  left join person_overview_summaries ps on ps.person_id = r.person_id` : ""}
   left join prompt_counts pc
     on pc.person_id = r.person_id and pc.bucket_start = b.bucket_start
  order by lower(r.display_name), r.person_id, b.bucket_start
 `;
+}
+
+export const PROJECTION_FLAME_SQL = projectionFlameSql({ includeOverviews: true });
+export const PROJECTION_FLAME_COUNTS_SQL = projectionFlameSql({ includeOverviews: false });
 
 export const PROJECTION_INTERVAL_WORK_SQL = `
 with p as materialized (
@@ -2069,11 +2076,13 @@ export class DirectFlameSource {
     expectedEmailDomain,
     maxPeople = 500,
     projectionEnabled = true,
+    timelineOverviews = true,
   }) {
     this.workspaceId = workspaceId;
     this.expectedEmailDomain = validateDashboardEmailDomain(expectedEmailDomain);
     this.maxPeople = maxPeople;
     this.projectionEnabled = projectionEnabled;
+    this.timelineOverviews = timelineOverviews;
     this.applicationName = `sherlock-dashboard:${workspaceId}`;
     this.overviewAuthorizationRequests = 0;
     this.overviewSql = postgres(dashboardDatabaseUrl(databaseUrl), {
@@ -2236,6 +2245,7 @@ export class DirectFlameSource {
         : receipt.compatible_work_projection_active === true
           ? COMPATIBLE_WORK_FRAME_VERSION
           : null;
+      const includeOverviews = this.timelineOverviews !== false;
       const rows = selectedFrameVersion === null
         ? await runQuery(tx, FLAME_SQL, [
           this.workspaceId,
@@ -2245,7 +2255,7 @@ export class DirectFlameSource {
           read.toISOString(),
           this.expectedEmailDomain,
         ], signal)
-        : await runQuery(tx, PROJECTION_FLAME_SQL, [
+        : await runQuery(tx, includeOverviews ? PROJECTION_FLAME_SQL : PROJECTION_FLAME_COUNTS_SQL, [
           this.workspaceId,
           start.toISOString(),
           end.toISOString(),
@@ -2263,7 +2273,9 @@ export class DirectFlameSource {
       });
       const recovery = await readRecovery(tx, { workspaceId:this.workspaceId, read, snapshot:receipt.snapshot, expectedEmailDomain:this.expectedEmailDomain });
       const merged = mergeRecoveredTimeline(payload, recovery);
-      if (selectedFrameVersion === null || !recovery.length) return limitFrameOverviewPayload(merged);
+      if (!includeOverviews || selectedFrameVersion === null || !recovery.length) {
+        return limitFrameOverviewPayload(merged);
+      }
       const recoveryByPerson = new Map();
       for (const interval of recovery) {
         const owned = recoveryByPerson.get(interval.personId) ?? [];

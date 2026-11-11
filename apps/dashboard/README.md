@@ -174,6 +174,10 @@ running the multi-second aggregate on the request path. Concurrent cold callers
 share one computation, and disconnecting one caller does not cancel work needed
 by the others.
 
+The cached timeline publishes activity counts and recency. Frame details and
+work summaries load when a user opens a time bucket. This keeps the work of
+building previews for the whole day off the refresh path.
+
 The process refreshes at each ten-minute boundary plus 90 seconds, allowing the
 normalization pipeline to settle. Timeline refreshes have a 120-second database
 statement timeout. A failed refresh never replaces the last-good
@@ -234,6 +238,8 @@ server connection; every dashboard transaction explicitly assumes the restricted
 `sherlock_reader` role. SHERLOCK_DASHBOARD_MAX_PEOPLE defaults to 500 and may not
 exceed 1000. Set SHERLOCK_FRAME_PROJECTION_ENABLED=false while deploying before
 the additive frame-projection migration or when stopping new v2 token minting.
+`SHERLOCK_TIMELINE_OVERVIEWS_ENABLED=true` opts a deployment back into embedding
+work previews in the projected timeline. It defaults to off.
 
 For shared Supavisor connections, the dashboard routes session endpoints (port
 `5432` or an omitted port) to transaction mode on port `6543`. This also works
