@@ -104,6 +104,12 @@ The normal collector remains unchanged and defaults to automatic scheduling.
 Historical uploaders send `x-sherlock-workload-class: backfill`; this does not
 change the batch body. Legacy batches without the header are conservatively
 classified by source time (older than 24 hours is backfill, otherwise live).
+One exception (trigger `ingest_batches_promote_active_session`, COR-5279): a
+backfill-hinted batch whose newest record is under an hour old, from a session
+(or a subagent of a session) that received a non-backfill batch in the last
+hour, gets its normalize job moved to live. The batch keeps its backfill hint.
+This lets the collector's backstop scan deliver a running session's subagents
+without waiting behind historical backfill.
 The default four-job worker keeps three slots exclusively available to live
 work and one backfill slot; live work may borrow the backfill slot, never the
 reverse. Concurrency and database pools are bounded, session reductions have a

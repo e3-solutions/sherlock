@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = extensions, public, pg_catalog;
 
-select plan(153);
+select plan(156);
 
 select has_schema('telemetry', 'telemetry schema exists');
 select has_schema('analytics', 'analytics schema exists');
@@ -1210,6 +1210,73 @@ select is(
     -> 'sessions',
   '{}'::jsonb,
   'unknown sessions map to nothing'
+);
+
+-- COR-5279: backfill uploads from a session a hook saw live in the last hour
+-- are promoted to the live queue; old or unrelated backfill stays backfill.
+insert into telemetry.ingest_batches (
+  id, workspace_id, person_id, collector_key, source_provider, source_kind,
+  source_stream_key, generation_key, generation_seq, start_offset, end_offset,
+  source_byte_count, source_sha256, storage_path, storage_encoding,
+  stored_byte_count, stored_sha256, record_count, contract_version,
+  observed_native_session_id, observed_parent_native_session_id,
+  first_occurred_at, last_occurred_at, processing_class_hint
+) values
+  (
+    '00000000-0000-0000-0000-000000000401',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101',
+    'test-promote-collector', 'claude_code', 'transcript', 'promote-root',
+    'promote-root-generation', 0, 0, 1, 1, repeat('a', 64), 'promote-root-evidence',
+    'identity', 1, repeat('b', 64), 1, 'test-v1',
+    'promote-root', null, now(), now(), null
+  ),
+  (
+    '00000000-0000-0000-0000-000000000402',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101',
+    'test-promote-collector', 'claude_code', 'transcript', 'promote-agent-recent',
+    'promote-agent-recent-generation', 0, 0, 1, 1, repeat('a', 64), 'promote-agent-recent-evidence',
+    'identity', 1, repeat('b', 64), 1, 'test-v1',
+    'promote-agent-a', 'promote-root', now(), now(), 'backfill'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000403',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101',
+    'test-promote-collector', 'claude_code', 'transcript', 'promote-agent-old',
+    'promote-agent-old-generation', 0, 0, 1, 1, repeat('a', 64), 'promote-agent-old-evidence',
+    'identity', 1, repeat('b', 64), 1, 'test-v1',
+    'promote-agent-b', 'promote-root', now() - interval '2 hours', now() - interval '2 hours', 'backfill'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000404',
+    '00000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000101',
+    'test-promote-collector', 'claude_code', 'transcript', 'promote-other',
+    'promote-other-generation', 0, 0, 1, 1, repeat('a', 64), 'promote-other-evidence',
+    'identity', 1, repeat('b', 64), 1, 'test-v1',
+    'promote-agent-c', 'promote-idle-root', now(), now(), 'backfill'
+  );
+
+select ok(
+  (select workload_class = 'live' from processing.telemetry_jobs
+    where batch_id = '00000000-0000-0000-0000-000000000402' and job_kind = 'normalize'),
+  'a recent backfill batch of a session live in the last hour is promoted to live'
+);
+
+select ok(
+  (select workload_class = 'backfill' from processing.telemetry_jobs
+    where batch_id = '00000000-0000-0000-0000-000000000403' and job_kind = 'normalize'),
+  'a backfill batch whose newest record is over an hour old stays backfill'
+);
+
+select ok(
+  (select j.workload_class = 'backfill' and b.processing_class_hint = 'backfill'
+     from processing.telemetry_jobs j
+     join telemetry.ingest_batches b on b.id = j.batch_id
+    where j.batch_id = '00000000-0000-0000-0000-000000000404' and j.job_kind = 'normalize'),
+  'backfill from a session with no live upload stays backfill and keeps its hint'
 );
 
 select * from finish();
