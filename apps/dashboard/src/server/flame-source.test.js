@@ -1092,19 +1092,31 @@ describe("Sherlock Flame payload", () => {
       "select distinct on (revision.evidence_kind, revision.source_event_id)",
     );
     expect(PROJECTION_FLAME_SQL.match(/union all/g)).toHaveLength(2);
-    expectSqlInOrder(
-      PROJECTION_FLAME_SQL,
-      "revision.evidence_kind = 'activity'",
-      "revision.observed_at >= p.start_at",
-      "union all",
-      "revision.evidence_kind = 'prompt'",
-      "revision.anchor_observed_at >= p.start_at",
-      "union all",
-      "revision.evidence_kind = 'prompt'",
-      "revision.observed_at >= p.start_at",
-      "and not coalesce(",
-      "ranked_frame_revisions as materialized",
-    );
+    for (const query of [PROJECTION_FLAME_SQL, PROJECTION_FLAME_COUNTS_SQL]) {
+      expectSqlInOrder(
+        query,
+        "with p as not materialized",
+        "$2::timestamptz - interval '6 seconds' activity_start",
+        "$5::timestamptz + interval '6 seconds' activity_end",
+        "$2::timestamptz - interval '2 seconds' prompt_start",
+        "$3::timestamptz + interval '2 seconds' prompt_end",
+        "revision.evidence_kind = 'activity'",
+        "revision.observed_at >= p.activity_start",
+        "revision.observed_at < p.activity_end",
+        "union all",
+        "revision.evidence_kind = 'prompt'",
+        "revision.anchor_observed_at >= p.prompt_start",
+        "revision.anchor_observed_at < p.prompt_end",
+        "union all",
+        "revision.evidence_kind = 'prompt'",
+        "revision.observed_at >= p.prompt_start",
+        "revision.observed_at < p.prompt_end",
+        "and not coalesce(",
+        "revision.anchor_observed_at >= p.prompt_start",
+        "revision.anchor_observed_at < p.prompt_end",
+        "ranked_frame_revisions as materialized",
+      );
+    }
     for (const query of [
       PROJECTION_INTERVAL_WORK_SQL,
       PROJECTION_INTERVAL_PROMPTS_SQL,

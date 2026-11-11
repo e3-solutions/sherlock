@@ -1054,16 +1054,6 @@ function projectedEvidenceCte({
     ? "and pg_visible_in_snapshot(revision.xmin::text::xid8, p.snapshot)"
     : "";
   const activityEnd = activityThroughReadAt ? "p.read_at" : "p.end_at";
-  // RLS can keep non-leakproof timestamp arithmetic out of index conditions.
-  // Scoped queries materialize expanded bounds in p before comparing columns.
-  const activityStartBound = personScoped ? "p.activity_start"
-    : `p.start_at - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`;
-  const activityEndBound = personScoped ? "p.activity_end"
-    : `${activityEnd} + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds'`;
-  const promptStartBound = personScoped ? "p.prompt_start"
-    : `p.start_at - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`;
-  const promptEndBound = personScoped ? "p.prompt_end"
-    : `p.end_at + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds'`;
   const candidatePersonJoin = personScoped
     ? `join telemetry.people evidence_person
       on evidence_person.workspace_id = revision.workspace_id
@@ -1094,8 +1084,8 @@ frame_revision_candidates as materialized (
      and revision.frame_version = p.frame_version
      ${candidateScope}
      and revision.evidence_kind = 'activity'
-     and revision.observed_at >= ${activityStartBound}
-     and revision.observed_at < ${activityEndBound}
+     and revision.observed_at >= p.activity_start
+     and revision.observed_at < p.activity_end
   union all
   select revision.id, revision.session_id, revision.person_id,
          revision.evidence_kind, revision.source_event_id,
@@ -1110,8 +1100,8 @@ frame_revision_candidates as materialized (
      and revision.frame_version = p.frame_version
      ${candidateScope}
      and revision.evidence_kind = 'prompt'
-     and revision.anchor_observed_at >= ${promptStartBound}
-     and revision.anchor_observed_at < ${promptEndBound}
+     and revision.anchor_observed_at >= p.prompt_start
+     and revision.anchor_observed_at < p.prompt_end
   union all
   select revision.id, revision.session_id, revision.person_id,
          revision.evidence_kind, revision.source_event_id,
@@ -1126,11 +1116,11 @@ frame_revision_candidates as materialized (
      and revision.frame_version = p.frame_version
      ${candidateScope}
      and revision.evidence_kind = 'prompt'
-     and revision.observed_at >= ${promptStartBound}
-     and revision.observed_at < ${promptEndBound}
+     and revision.observed_at >= p.prompt_start
+     and revision.observed_at < p.prompt_end
      and not coalesce(
-       revision.anchor_observed_at >= ${promptStartBound}
-       and revision.anchor_observed_at < ${promptEndBound},
+       revision.anchor_observed_at >= p.prompt_start
+       and revision.anchor_observed_at < p.prompt_end,
        false
      )
 ), `
@@ -1216,12 +1206,17 @@ ${splitCandidates}ranked_frame_revisions as materialized (
 }
 
 function projectionFlameSql({ includeOverviews }) {
+  // Let the planner see the range bounds while choosing indexes under reader RLS.
   return `
-with p as materialized (
+with p as not materialized (
   select $1::uuid workspace_id, $2::timestamptz start_at,
          $3::timestamptz end_at, $4::text frame_version,
          $5::timestamptz read_at, null::uuid person_id,
-         null::pg_snapshot snapshot, $6::text expected_email_domain
+         null::pg_snapshot snapshot, $6::text expected_email_domain,
+         $2::timestamptz - interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_start,
+         $5::timestamptz + interval '${ACTIVITY_REPRESENTATION_NEIGHBORHOOD_SECONDS} seconds' activity_end,
+         $2::timestamptz - interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_start,
+         $3::timestamptz + interval '${UNKEYED_PROMPT_MATCH_SECONDS} seconds' prompt_end
 ), roster as materialized (
   select pe.id person_id,
          coalesce(nullif(btrim(pe.display_name), ''), pe.identity_key) display_name
