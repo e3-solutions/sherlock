@@ -4,7 +4,9 @@
 -- presence_history still read the old Codex logger store, which has had no Codex
 -- data since Nov 4, so every Codex user looks idle. Two small functions give the
 -- leaf the same facts from Sherlock:
---   person_sessions(emails, window_minutes)  one person's recent top-level sessions
+--   person_sessions(emails, window_minutes)  recent top-level sessions for up to 100
+--                                            people (branch for who_is_active, the
+--                                            session list for person_presence)
 --   hourly_sessions(hours)                   sessions per person per hour, for the
 --                                            aggregate presence_history
 --
@@ -52,7 +54,7 @@ begin
     raise exception using errcode = '22023', message = 'person_sessions_window_invalid';
   end if;
   if p_emails is null or pg_catalog.cardinality(p_emails) < 1
-     or pg_catalog.cardinality(p_emails) > 20 then
+     or pg_catalog.cardinality(p_emails) > 100 then
     raise exception using errcode = '22023', message = 'person_sessions_emails_invalid';
   end if;
   v_since := pg_catalog.now() - pg_catalog.make_interval(mins => p_window_minutes);
@@ -65,13 +67,13 @@ begin
        and pe.github_id is distinct from 'sherlock-smoke'
   ), candidates as materialized (
     -- Top-level sessions only (a Claude session with subagents is one agent), started
-    -- at most 30 days before the window so the per-session lookups stay bounded.
+    -- at most 7 days before the window so the per-session lookups stay bounded.
     select s.id, s.person_id, s.repo_remote, s.branch, s.started_at, s.ended_at
       from telemetry.sessions s
      where s.workspace_id = v_ws
        and s.person_id in (select w.id from who w)
        and s.actor_role = 'primary'
-       and s.started_at >= v_since - interval '30 days'
+       and s.started_at >= v_since - interval '7 days'
        and s.id not in (select h from heartbeat_api.hidden_sessions() h)
   ), activity as materialized (
     select c.*, a.last_activity_at, a.agent
@@ -89,15 +91,19 @@ begin
          limit 1
       ) a
      where a.last_activity_at >= v_since
+  ), ranked as materialized (
+    select a.*, pg_catalog.row_number() over (
+             partition by a.person_id order by a.last_activity_at desc, a.id) rn
+      from activity a
   )
   select w.id, w.email, coalesce(nullif(pg_catalog.btrim(w.display_name), ''), 'Unknown'),
          heartbeat_api.session_key(a.id), a.agent,
          pg_catalog.regexp_replace(a.repo_remote, '://[^/@]*@', '://'),
          a.branch, a.started_at, a.ended_at, a.last_activity_at
-    from activity a
+    from ranked a
     join who w on w.id = a.person_id
-   order by a.last_activity_at desc
-   limit 50;
+   where a.rn <= 50  -- at most 50 sessions per person
+   order by w.id, a.last_activity_at desc;
 end
 $body$;
 
