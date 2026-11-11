@@ -175,7 +175,8 @@ share one computation, and disconnecting one caller does not cancel work needed
 by the others.
 
 The process refreshes at each ten-minute boundary plus 90 seconds, allowing the
-normalization pipeline to settle. A failed refresh never replaces the last-good
+normalization pipeline to settle. Timeline refreshes have a 120-second database
+statement timeout. A failed refresh never replaces the last-good
 payload; the API serves it immediately while retrying after 60 seconds. The page
 always displays the timeline's through time and read age, and explicitly marks a
 result delayed once the post-boundary grace has elapsed. A detail-recovery refresh

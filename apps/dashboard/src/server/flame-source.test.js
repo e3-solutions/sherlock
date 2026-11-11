@@ -777,7 +777,7 @@ describe("Sherlock Flame payload", () => {
     expect(payload.snapshot).toMatch(/^v7\./);
   });
 
-  it("selects the 60-second transaction timeout only for the cached timeline", async () => {
+  it("gives the cached timeline a 120-second statement timeout", async () => {
     const source = Object.create(DirectFlameSource.prototype);
     const signal = new AbortController().signal;
     source.transaction = vi.fn().mockResolvedValue("timeline");
@@ -787,7 +787,7 @@ describe("Sherlock Flame payload", () => {
     expect(source.transaction).toHaveBeenCalledOnce();
     expect(source.transaction).toHaveBeenCalledWith(
       expect.any(Function),
-      { signal, statementTimeoutMs: 60_000 },
+      { signal, statementTimeoutMs: 120_000 },
     );
   });
 
