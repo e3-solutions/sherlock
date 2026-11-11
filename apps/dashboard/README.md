@@ -335,7 +335,8 @@ instructions within them. The server does not generate or persist feedback.
 The endpoint never reads raw Storage objects and never writes feedback or
 derived judgments to Sherlock. Sherlock query tools search all stored history
 by default and accept explicit historical windows without a duration cap;
-future and non-positive windows remain invalid. Group, page, transaction-time,
+future and non-positive windows remain invalid, except that `search_sessions`
+caps a future `end` at the read time. Group, page, transaction-time,
 workspace, and roster bounds are enforced server-side. The retired Bonaparte
 `list_usage_evidence` tool is a server-defined 24-hour dashboard snapshot.
 The shared bearer token is a transport gate, not principal-scoped authorization.
