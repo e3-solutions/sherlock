@@ -313,6 +313,8 @@ rollback without v2 support must reject them rather than change their source.
 | `sherlock_reducer` | Read sessions and normalized events; select/insert activity spans |
 | `sherlock_frame_projector` | Read sessions/events and only the native/batch columns needed for canonical representation pairing; select/insert frame receipts and revisions |
 | `sherlock_reader` | Read telemetry and analytics; no writes |
+| `sherlock_presence_reader` | EXECUTE on the `heartbeat_api.*` read functions only (presence, people, tokens, timeline, `person_sessions`, `hourly_sessions`); no table access |
+| `heartbeat_leaf_login` | Login for the Cosmos Heartbeat leaf (e3-heartbeat); member of `sherlock_presence_reader` only, read-only, 15 s statement timeout, 10 connections. Password set out of band as a SCRAM verifier, never in migration history |
 
 The ingest role cannot write events or spans. The normalizer cannot write spans.
 The reducer cannot read raw receipts or native locators, change session caches
