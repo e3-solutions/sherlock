@@ -26,6 +26,7 @@ import {
   CORRECTED_CODEX_NORMALIZER_VERSION,
   PEOPLE_SQL,
   PREFERRED_DASHBOARD_EMAIL_DOMAIN,
+  PROJECTION_FLAME_COUNTS_SQL,
   PROJECTION_FLAME_SQL,
   PROJECTION_INTERVAL_PROMPTS_SQL,
   PROJECTION_INTERVAL_WORK_SQL,
@@ -684,6 +685,46 @@ describe("Sherlock Flame payload", () => {
       READ.toISOString(),
       "e3group.ai",
     ]);
+  });
+
+  it("serves a projection snapshot with recovered counts and no eager previews", async () => {
+    const roster = [{ person_id: PERSON_ID, display_name: "Ada" }];
+    const startedAt = START.getTime() / 1000 + 1;
+    const completedAt = startedAt + 1;
+    const recovery = [{
+      person_id: PERSON_ID,
+      manifest_sha256: "a".repeat(64),
+      manifest_text: JSON.stringify({
+        schemaVersion: "thread-api-timing-manifest-v1",
+        rootThreadId: SESSION_ID,
+        sessions: [{
+          threadId: SESSION_ID,
+          turns: [{ id: SESSION_ID, status: "completed", startedAt, completedAt }],
+        }],
+      }),
+    }];
+    const { source, unsafe } = mockSource(
+      [{ now: READ, snapshot: PG_SNAPSHOT, frame_projection_active: true }],
+      roster,
+      rowsFor(PERSON_ID),
+      recovery,
+    );
+    source.timelineOverviews = false;
+
+    const payload = await source.fetchDay();
+
+    expect(unsafe.mock.calls[2][0]).toBe(PROJECTION_FLAME_COUNTS_SQL);
+    expect(PROJECTION_FLAME_COUNTS_SQL).not.toMatch(
+      /bucket_work|day_overview_summaries|is_summary_candidate|telemetry\.events/,
+    );
+    expect(decodeSnapshotToken(payload.snapshot)).toMatchObject({
+      read: READ, snapshot: PG_SNAPSHOT, frameVersion: FRAME_VERSION,
+    });
+    expect(payload.people[0].buckets).toHaveLength(BUCKET_COUNT);
+    expect(payload.people[0].buckets[0][0]).toBe(1);
+    expect(payload.people[0].total[0]).toBe(1);
+    expect(payload.people[0].overview).toBeUndefined();
+    expect(payload.recovery.latestCompletedAt).toBe(new Date(completedAt * 1000).toISOString());
   });
 
   it.each([

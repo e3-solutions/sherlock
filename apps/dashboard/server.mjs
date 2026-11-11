@@ -60,6 +60,7 @@ const source = databaseUrl && validWorkspaceId && validMaxPeople && validDashboa
       expectedEmailDomain: dashboardEmailDomain,
       maxPeople,
       projectionEnabled,
+      timelineOverviews: process.env.SHERLOCK_TIMELINE_OVERVIEWS_ENABLED === "true",
     })
   : null;
 

@@ -961,6 +961,26 @@ describePostgres("Sherlock Flame PostgreSQL integration", () => {
 
       expect(projectedDay.snapshot).toMatch(/^v6\./);
       expect(projectedDay.people.map(({ overview, ...person }) => person)).toEqual(legacyDay.people);
+      source.timelineOverviews = false;
+      const countsOnlyDay = await source.fetchDay({ now: partialRead });
+      source.timelineOverviews = true;
+      const { snapshot: countsSnapshot, ...countsOnlyPayload } = countsOnlyDay;
+      const { snapshot: _snapshot, people: projectedPeople, ...projectedMetadata } = projectedDay;
+      expect(decodeSnapshotToken(countsSnapshot)).toMatchObject({
+        read: partialRead,
+        frameVersion: FRAME_VERSION,
+      });
+      expect(countsOnlyPayload).toEqual({
+        ...projectedMetadata,
+        people: projectedPeople.map(({ overview, ...person }) => person),
+      });
+      await expect(source.fetchInterval({
+        personId,
+        start: bucketStart.toISOString(),
+        snapshot: countsSnapshot,
+        now: partialRead,
+      })).resolves.toMatchObject({ work: projectedInterval.work });
+
       const personOverview = projectedDay.people[0].overview;
       expect(personOverview).toBeDefined();
       expect(personOverview.summaries).not.toContain(tailSummary);
