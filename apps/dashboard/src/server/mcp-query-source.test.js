@@ -53,6 +53,13 @@ describe("Sherlock MCP query source", () => {
     }, NOW)).toThrow(FlameSourceError);
   });
 
+  it("still rejects a future end for query_usage and metadata windows", () => {
+    // Only search_sessions caps a future end (searchWindow); the shared window does not.
+    const end = "2026-09-01T20:00:00.001Z";
+    expect(() => queryWindow({ end }, NOW)).toThrow("flame_mcp_query_request_invalid");
+    expect(() => usageWindow({ end }, NOW)).toThrow("flame_mcp_query_request_invalid");
+  });
+
   it("defaults relative to the requested end and accepts exactly 7 days", () => {
     const end = new Date(NOW.getTime() - 86400000);
     expect(usageWindow({ end }, NOW).startAt)
